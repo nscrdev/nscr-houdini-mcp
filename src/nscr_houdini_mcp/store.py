@@ -794,7 +794,8 @@ class Store:
         if found is not None:
             return found
         row = self._read_one(
-            "SELECT * FROM sessions WHERE alias = ? AND state <> ? ORDER BY started_at DESC, rowid DESC",
+            "SELECT * FROM sessions WHERE alias = ? AND state <> ?"
+            " ORDER BY started_at DESC, rowid DESC",
             (handle, SESSION_GONE),
         )
         return None if row is None else SessionRecord._from_row(row)
