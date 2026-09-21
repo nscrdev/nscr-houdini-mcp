@@ -8,6 +8,7 @@ every supported system, so the child imports this module by name and calls
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 
 import pytest
 
@@ -27,7 +28,7 @@ def race(path: str, index: int, barrier, results) -> None:
     """One racer: take a slot, a name, an operation id and some versions."""
     with Store(path) as store:
         barrier.wait()
-        report: dict[str, object] = {"index": index}
+        report: dict[str, object] = {"index": index, "pid": os.getpid()}
 
         try:
             worker = store.reserve_worker(cap=POOL_CAP, token=f"token-{index}")
@@ -79,6 +80,12 @@ def reports(tmp_path_factory: pytest.TempPathFactory) -> list[dict]:
 
     collected.sort(key=lambda report: report["index"])
     return collected
+
+
+def test_the_racers_really_are_separate_processes(reports: list[dict]) -> None:
+    pids = {report["pid"] for report in reports}
+    assert len(pids) == RACERS
+    assert os.getpid() not in pids
 
 
 def test_exactly_one_racer_takes_the_last_worker_slot(reports: list[dict]) -> None:
