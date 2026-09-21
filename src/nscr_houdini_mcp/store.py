@@ -269,8 +269,9 @@ class RunRecord:
 
 # One entry per schema version. A step runs inside its own transaction and is
 # never edited once it has shipped: a later change is a new step.
-def _migrate_to_1(cur: sqlite3.Cursor) -> None:
-    cur.executescript(
+def _migrate_to_1(db: sqlite3.Connection) -> None:
+    _run_statements(
+        db,
         """
         CREATE TABLE sessions (
             session_id   TEXT PRIMARY KEY,
@@ -352,11 +353,23 @@ def _migrate_to_1(cur: sqlite3.Cursor) -> None:
             scene       TEXT,
             created_at  REAL NOT NULL
         );
-        """
+        """,
     )
 
 
 MIGRATIONS = (_migrate_to_1,)
+
+
+def _run_statements(db: sqlite3.Connection, script: str) -> None:
+    """Run a schema script statement by statement.
+
+    The sqlite3 module's own script runner commits whatever transaction is
+    open before it starts, which would take a migration out of the
+    transaction that guards it.
+    """
+    for statement in script.split(";"):
+        if statement.strip():
+            db.execute(statement)
 
 
 class Store:
@@ -391,7 +404,7 @@ class Store:
     # -- transactions -----------------------------------------------------
 
     @contextmanager
-    def _txn(self, *, write: bool) -> Iterator[sqlite3.Cursor]:
+    def _txn(self, *, write: bool) -> Iterator[sqlite3.Connection]:
         """Short transaction. Private so no caller can hold one open.
 
         Writes take `BEGIN IMMEDIATE`, so a caller that reads a count and then
@@ -400,10 +413,9 @@ class Store:
         if self._in_txn:
             raise StoreError("store transactions do not nest")
         self._in_txn = True
-        cur = self._conn.cursor()
-        cur.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+        self._conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
         try:
-            yield cur
+            yield self._conn
         except BaseException:
             self._conn.rollback()
             raise
@@ -411,14 +423,13 @@ class Store:
             self._conn.commit()
         finally:
             self._in_txn = False
-            cur.close()
 
     def _apply_migrations(self) -> None:
-        with self._txn(write=True) as cur:
-            current = cur.execute("PRAGMA user_version").fetchone()[0]
+        with self._txn(write=True) as db:
+            current = db.execute("PRAGMA user_version").fetchone()[0]
             for step, migrate in enumerate(MIGRATIONS[current:], start=current + 1):
-                migrate(cur)
-                cur.execute(f"PRAGMA user_version={step}")
+                migrate(db)
+                db.execute(f"PRAGMA user_version={step}")
 
     def schema_version(self) -> int:
         """Schema version of the open file."""
@@ -454,24 +465,24 @@ class Store:
         if (alias is None) == (alias_template is None):
             raise ValueError("pass exactly one of alias or alias_template")
         now = _now()
-        with self._txn(write=True) as cur:
+        with self._txn(write=True) as db:
             if alias_template is not None:
                 taken = {
                     row["alias"]
-                    for row in cur.execute(
+                    for row in db.execute(
                         "SELECT alias FROM sessions WHERE state <> ?", (SESSION_GONE,)
                     )
                 }
                 name = _first_free_alias(alias_template, taken)
             else:
                 name = alias
-                row = cur.execute(
+                row = db.execute(
                     "SELECT session_id FROM sessions WHERE alias = ? AND state <> ?",
                     (name, SESSION_GONE),
                 ).fetchone()
                 if row is not None:
                     raise AliasInUse(f"alias {name} belongs to session {row['session_id']}")
-            cur.execute(
+            db.execute(
                 "INSERT INTO sessions (session_id, alias, kind, pid, port, state, scene_epoch,"
                 " hip_path, capabilities, started_at, heartbeat_at)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -490,7 +501,7 @@ class Store:
                 ),
             )
             return SessionRecord._from_row(
-                cur.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+                db.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
             )
 
     def get_session(self, session_id: str) -> SessionRecord | None:
@@ -526,35 +537,35 @@ class Store:
         if state is not None and state not in SESSION_STATES:
             raise ValueError(f"unknown session state: {state}")
         now = _now()
-        with self._txn(write=True) as cur:
+        with self._txn(write=True) as db:
             if state is None:
-                cur.execute(
+                written = db.execute(
                     "UPDATE sessions SET heartbeat_at = ? WHERE session_id = ?", (now, session_id)
                 )
             else:
-                cur.execute(
+                written = db.execute(
                     "UPDATE sessions SET heartbeat_at = ?, state = ? WHERE session_id = ?",
                     (now, state, session_id),
                 )
-            if cur.rowcount == 0:
+            if written.rowcount == 0:
                 raise UnknownRecord(f"no session {session_id}")
         return now
 
     def bump_scene_epoch(self, session_id: str, *, hip_path: str | None = None) -> int:
         """Count a scene open, new or reset. Returns the new epoch."""
-        with self._txn(write=True) as cur:
-            row = cur.execute(
+        with self._txn(write=True) as db:
+            row = db.execute(
                 "SELECT scene_epoch FROM sessions WHERE session_id = ?", (session_id,)
             ).fetchone()
             if row is None:
                 raise UnknownRecord(f"no session {session_id}")
             epoch = int(row["scene_epoch"]) + 1
             if hip_path is None:
-                cur.execute(
+                db.execute(
                     "UPDATE sessions SET scene_epoch = ? WHERE session_id = ?", (epoch, session_id)
                 )
             else:
-                cur.execute(
+                db.execute(
                     "UPDATE sessions SET scene_epoch = ?, hip_path = ? WHERE session_id = ?",
                     (epoch, hip_path, session_id),
                 )
@@ -562,12 +573,12 @@ class Store:
 
     def end_session(self, session_id: str) -> None:
         """Mark a session gone, which frees its alias for a later process."""
-        with self._txn(write=True) as cur:
-            cur.execute(
+        with self._txn(write=True) as db:
+            written = db.execute(
                 "UPDATE sessions SET state = ?, heartbeat_at = ? WHERE session_id = ?",
                 (SESSION_GONE, _now(), session_id),
             )
-            if cur.rowcount == 0:
+            if written.rowcount == 0:
                 raise UnknownRecord(f"no session {session_id}")
 
     # -- workers ----------------------------------------------------------
@@ -591,21 +602,21 @@ class Store:
             raise ValueError("cap must be at least 1")
         now = _now()
         placeholders = ", ".join("?" * len(WORKER_ACTIVE_STATES))
-        with self._txn(write=True) as cur:
-            rows = cur.execute(
+        with self._txn(write=True) as db:
+            rows = db.execute(
                 f"SELECT alias FROM workers WHERE state IN ({placeholders})",
                 WORKER_ACTIVE_STATES,
             ).fetchall()
             if len(rows) >= cap:
                 raise PoolFull(f"{len(rows)} of {cap} worker slots are in use")
             alias = _first_free_alias(alias_template, {row["alias"] for row in rows})
-            cur.execute(
+            db.execute(
                 "INSERT INTO workers (token, alias, state, session_id, job_id, reserved_at,"
                 " leased_at) VALUES (?, ?, 'reserved', NULL, ?, ?, ?)",
                 (token, alias, job_id, now, now),
             )
             return WorkerRecord._from_row(
-                cur.execute("SELECT * FROM workers WHERE token = ?", (token,)).fetchone()
+                db.execute("SELECT * FROM workers WHERE token = ?", (token,)).fetchone()
             )
 
     def set_worker_state(
@@ -619,11 +630,11 @@ class Store:
         """Move a reservation on. The token proves who owns the slot."""
         if state not in WORKER_STATES:
             raise ValueError(f"unknown worker state: {state}")
-        with self._txn(write=True) as cur:
-            row = cur.execute("SELECT * FROM workers WHERE token = ?", (token,)).fetchone()
+        with self._txn(write=True) as db:
+            row = db.execute("SELECT * FROM workers WHERE token = ?", (token,)).fetchone()
             if row is None:
                 raise UnknownRecord(f"no worker reservation {token}")
-            cur.execute(
+            db.execute(
                 "UPDATE workers SET state = ?, session_id = ?, job_id = ?, leased_at = ?"
                 " WHERE token = ?",
                 (
@@ -635,7 +646,7 @@ class Store:
                 ),
             )
             return WorkerRecord._from_row(
-                cur.execute("SELECT * FROM workers WHERE token = ?", (token,)).fetchone()
+                db.execute("SELECT * FROM workers WHERE token = ?", (token,)).fetchone()
             )
 
     def release_worker(self, token: str, *, state: str = "stopped") -> WorkerRecord:
@@ -647,9 +658,9 @@ class Store:
     def touch_worker_lease(self, token: str) -> float:
         """Renew the idle lease. Routing a call to a worker renews it."""
         now = _now()
-        with self._txn(write=True) as cur:
-            cur.execute("UPDATE workers SET leased_at = ? WHERE token = ?", (now, token))
-            if cur.rowcount == 0:
+        with self._txn(write=True) as db:
+            written = db.execute("UPDATE workers SET leased_at = ? WHERE token = ?", (now, token))
+            if written.rowcount == 0:
                 raise UnknownRecord(f"no worker reservation {token}")
         return now
 
@@ -701,8 +712,8 @@ class Store:
         different call by mistake, so it raises `OperationMismatch`.
         """
         now = _now()
-        with self._txn(write=True) as cur:
-            row = cur.execute(
+        with self._txn(write=True) as db:
+            row = db.execute(
                 "SELECT * FROM operations WHERE operation_id = ?", (operation_id,)
             ).fetchone()
             if row is not None:
@@ -711,13 +722,13 @@ class Store:
                         f"operation {operation_id} was recorded with different arguments"
                     )
                 return OperationRecord._from_row(row), False
-            cur.execute(
+            db.execute(
                 "INSERT INTO operations (operation_id, session_id, scene_epoch, digest, state,"
                 " outcome, error, job_id, created_at, updated_at)"
                 " VALUES (?, ?, ?, ?, 'running', NULL, NULL, NULL, ?, ?)",
                 (operation_id, session_id, scene_epoch, digest, now, now),
             )
-            row = cur.execute(
+            row = db.execute(
                 "SELECT * FROM operations WHERE operation_id = ?", (operation_id,)
             ).fetchone()
             return OperationRecord._from_row(row), True
@@ -734,16 +745,16 @@ class Store:
         """Store the outcome so a retry can be answered without redoing work."""
         if state not in OPERATION_STATES:
             raise ValueError(f"unknown operation state: {state}")
-        with self._txn(write=True) as cur:
-            cur.execute(
+        with self._txn(write=True) as db:
+            written = db.execute(
                 "UPDATE operations SET state = ?, outcome = ?, error = ?, job_id = ?,"
                 " updated_at = ? WHERE operation_id = ?",
                 (state, _dump(outcome), _dump(error), job_id, _now(), operation_id),
             )
-            if cur.rowcount == 0:
+            if written.rowcount == 0:
                 raise UnknownRecord(f"no operation {operation_id}")
             return OperationRecord._from_row(
-                cur.execute(
+                db.execute(
                     "SELECT * FROM operations WHERE operation_id = ?", (operation_id,)
                 ).fetchone()
             )
@@ -758,9 +769,8 @@ class Store:
     def prune_operations(self, max_age_s: float) -> int:
         """Drop receipts older than the retention window. Returns the count."""
         cutoff = _now() - max_age_s
-        with self._txn(write=True) as cur:
-            cur.execute("DELETE FROM operations WHERE updated_at < ?", (cutoff,))
-            return cur.rowcount
+        with self._txn(write=True) as db:
+            return db.execute("DELETE FROM operations WHERE updated_at < ?", (cutoff,)).rowcount
 
     # -- jobs -------------------------------------------------------------
 
@@ -779,15 +789,15 @@ class Store:
         if state not in JOB_STATES:
             raise ValueError(f"unknown job state: {state}")
         now = _now()
-        with self._txn(write=True) as cur:
-            cur.execute(
+        with self._txn(write=True) as db:
+            db.execute(
                 "INSERT INTO jobs (job_id, session_id, kind, state, weight, progress, outputs,"
                 " error, scene, created_at, updated_at, finished_at)"
                 " VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, NULL)",
                 (job_id, session_id, kind, state, weight, _dump(progress), _dump(scene), now, now),
             )
             return JobRecord._from_row(
-                cur.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+                db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
             )
 
     def update_job(
@@ -803,13 +813,13 @@ class Store:
         if state is not None and state not in JOB_STATES:
             raise ValueError(f"unknown job state: {state}")
         now = _now()
-        with self._txn(write=True) as cur:
-            row = cur.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        with self._txn(write=True) as db:
+            row = db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
             if row is None:
                 raise UnknownRecord(f"no job {job_id}")
             new_state = state or row["state"]
             finished = now if new_state in JOB_FINAL_STATES else row["finished_at"]
-            cur.execute(
+            db.execute(
                 "UPDATE jobs SET state = ?, progress = ?, outputs = ?, error = ?, updated_at = ?,"
                 " finished_at = ? WHERE job_id = ?",
                 (
@@ -823,7 +833,7 @@ class Store:
                 ),
             )
             return JobRecord._from_row(
-                cur.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+                db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
             )
 
     def get_job(self, job_id: str) -> JobRecord | None:
@@ -857,9 +867,8 @@ class Store:
     def prune_jobs(self, max_age_s: float) -> int:
         """Drop job rows older than the retention window. Returns the count."""
         cutoff = _now() - max_age_s
-        with self._txn(write=True) as cur:
-            cur.execute("DELETE FROM jobs WHERE updated_at < ?", (cutoff,))
-            return cur.rowcount
+        with self._txn(write=True) as db:
+            return db.execute("DELETE FROM jobs WHERE updated_at < ?", (cutoff,)).rowcount
 
     # -- version allocation ----------------------------------------------
 
@@ -878,14 +887,14 @@ class Store:
         the `v<ver>` folder with an exclusive mkdir, which is the last guard
         when the scene folder is shared between machines.
         """
-        with self._txn(write=True) as cur:
-            row = cur.execute(
+        with self._txn(write=True) as db:
+            row = db.execute(
                 "SELECT MAX(version) AS top FROM versions"
                 " WHERE kind = ? AND name = ? AND hip_family = ?",
                 (kind, name, hip_family),
             ).fetchone()
             version = int(row["top"] or 0) + 1
-            cur.execute(
+            db.execute(
                 "INSERT INTO versions (kind, name, hip_family, version, run_id, created_at)"
                 " VALUES (?, ?, ?, ?, ?, ?)",
                 (kind, name, hip_family, version, run_id, _now()),
@@ -918,8 +927,8 @@ class Store:
         scene: Any = None,
     ) -> RunRecord:
         """Record one output run with its expanded paths frozen at accept time."""
-        with self._txn(write=True) as cur:
-            cur.execute(
+        with self._txn(write=True) as db:
+            db.execute(
                 "INSERT INTO runs (run_id, kind, name, hip_family, version, session_id,"
                 " source_node, job_id, paths, scene, created_at)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -938,7 +947,7 @@ class Store:
                 ),
             )
             return RunRecord._from_row(
-                cur.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+                db.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             )
 
     def get_run(self, run_id: str) -> RunRecord | None:
