@@ -4,7 +4,7 @@ plan/
 plans/
 assets/
 
-# Agent and editor state
+# Agent and editor state. lint-allow: client-names
 .claude/
 .agent/
 .DS_Store
