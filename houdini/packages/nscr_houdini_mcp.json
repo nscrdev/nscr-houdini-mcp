@@ -1,0 +1,19 @@
+{
+    "//": "Template. Copy to a Houdini packages folder and replace the two paths.",
+    "//src": "__SOURCE_ROOT__ is the src folder of this project, the one holding nscr_houdini_mcp.",
+    "//payload": "__PAYLOAD_ROOT__ is the houdini folder of this project.",
+    "//autostart": "NSCR_MCP_AUTOSTART is 0 by default. Set it to 1 to start a bridge with the interface.",
+    "enable": true,
+    "env": [
+        {"NSCR_MCP_PAYLOAD": "__PAYLOAD_ROOT__"},
+        {"NSCR_MCP_SRC": "__SOURCE_ROOT__"},
+        {"NSCR_MCP_AUTOSTART": "0"},
+        {
+            "PYTHONPATH": {
+                "value": "$NSCR_MCP_SRC",
+                "method": "prepend"
+            }
+        }
+    ],
+    "path": "$NSCR_MCP_PAYLOAD"
+}
