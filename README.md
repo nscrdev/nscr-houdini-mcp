@@ -12,6 +12,7 @@ Status: early. Nothing here is usable yet.
 - Agents check their work against a reference image before they call it done.
 - Renders, caches and captures go to managed folders next to the scene file.
 - Plain `SKILL.md` skills that help an agent build scenes a person can read, change and reuse. You can edit them to fit how you work.
+- Runs on macOS, Windows and Linux.
 
 ## Development
 
@@ -24,7 +25,7 @@ uv venv
 uv pip install -e ".[dev]"
 ```
 
-Or with the standard library:
+Or with the standard library (`.venv\Scripts\activate` on Windows):
 
 ```sh
 python3 -m venv .venv && . .venv/bin/activate
@@ -48,7 +49,7 @@ make it fail over a budget.
 Git hooks:
 
 ```sh
-scripts/install-hooks
+python scripts/install_hooks.py
 ```
 
 This sets `core.hooksPath` to the tracked `hooks/` directory. The hooks check

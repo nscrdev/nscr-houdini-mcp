@@ -80,7 +80,7 @@ def read_text(path: Path) -> str | None:
     if path.suffix.lower() in SKIP_SUFFIXES or not path.is_file():
         return None
     try:
-        return path.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8-sig")
     except (UnicodeDecodeError, OSError):
         return None
 

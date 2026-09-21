@@ -1,5 +1,11 @@
 #!/bin/sh
-# Block staged changes that carry private working material. See hooks/leak_guard.py.
-set -e
+# Tiny wrapper: the real check is hooks/leak_guard.py.
+# Runs under any POSIX shell and under the bash that Git for Windows uses.
 root=$(git rev-parse --show-toplevel)
-exec python3 "$root/hooks/leak_guard.py" --staged
+for py in python3 python py; do
+  if command -v "$py" >/dev/null 2>&1; then
+    exec "$py" "$root/hooks/leak_guard.py" --staged
+  fi
+done
+echo "leak guard: no python interpreter found on PATH" >&2
+exit 1

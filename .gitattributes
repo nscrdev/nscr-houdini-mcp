@@ -1,0 +1,20 @@
+# Normalise line endings: LF in the repository, native in the working tree.
+* text=auto
+
+# These are run by a shell, so they must keep LF even on Windows.
+hooks/* text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+
+# Binary formats git must not touch.
+*.png binary
+*.jpg binary
+*.exr binary
+*.pdf binary
+*.zip binary
+*.hip binary
+*.hiplc binary
+*.hipnc binary
+*.hda binary
+*.otl binary
+*.bgeo binary

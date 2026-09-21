@@ -21,7 +21,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-TERMS_PATH = Path(".context/leak-terms.txt")
+TERMS_PATH = Path(".context") / "leak-terms.txt"
+
+# The term list may have been written on any platform, so read it with a
+# tolerant encoding and strip the carriage return a CRLF file leaves behind.
+TEXT_ENCODING = "utf-8-sig"
 
 SKIP_SUFFIXES = {
     ".png",
@@ -60,13 +64,13 @@ def load_terms(root: Path) -> tuple[list[str], re.Pattern[str]] | None:
     if not path.is_file():
         return None
     try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError:
+        raw = path.read_text(encoding=TEXT_ENCODING)
+    except (OSError, UnicodeDecodeError):
         return None
 
     terms: list[str] = []
     for line in raw.splitlines():
-        line = line.split("#", 1)[0].strip()
+        line = line.split("#", 1)[0].strip().strip("\r")
         if line:
             terms.append(line)
     if not terms:
@@ -149,8 +153,8 @@ def main(argv: list[str] | None = None) -> int:
         source = "staged changes"
     else:
         try:
-            text = args.message.read_text(encoding="utf-8")
-        except OSError as error:
+            text = args.message.read_text(encoding=TEXT_ENCODING)
+        except (OSError, UnicodeDecodeError) as error:
             return fail(f"cannot read the commit message: {error}")
         hits = scan(text, pattern, "commit message")
         source = "the commit message"
