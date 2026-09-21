@@ -6,7 +6,9 @@ holds: the token. That is why the file is written so only its owner can read
 it, and why nothing else in the project prints its contents.
 
 There is no clean exit marker. A clean exit deletes the file, so a file whose
-process is gone means a crash.
+process is gone means a crash. A file left by a crash is worse than useless:
+the port it names is free again and anything could be answering on it, so a
+reader clears those before handing any of them back.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from nscr_houdini_mcp.bridge import liveness
 from nscr_houdini_mcp.bridge.security import private_dir, write_private
 
 REGISTRY_DIR_NAME = "sessions"
@@ -69,3 +72,38 @@ def list_entries(home: Path) -> list[dict[str, Any]]:
 def ensure_registry_dir(home: Path) -> Path:
     """Make the session folder, private to its owner."""
     return private_dir(registry_dir(home))
+
+
+def entry_is_live(entry: Mapping[str, Any]) -> bool | None:
+    """Whether the process named in an entry is still the one that wrote it.
+
+    `False` means the process is gone, so the entry is rubbish and the port it
+    names may belong to something else now. `None` means this system would not
+    say which process a pid is, so the entry cannot be ruled out or in.
+    """
+    return liveness.same_process(entry.get("pid"), entry.get("pid_start"))
+
+
+def live_entries(home: Path, *, remove_stale: bool = True) -> list[dict[str, Any]]:
+    """Session files whose process is still there, dropping the rest.
+
+    A Houdini that crashes leaves its file behind, holding a token and a port
+    that anything could be sitting on by now. Clearing those on read keeps a
+    caller from ever reaching for one.
+    """
+    live = []
+    for entry in list_entries(home):
+        if entry_is_live(entry) is False:
+            if remove_stale:
+                remove_entry(home, entry.get("session_id", ""))
+            continue
+        live.append(entry)
+    return live
+
+
+def find_entry(home: Path, handle: str, *, remove_stale: bool = True) -> dict[str, Any] | None:
+    """One live session by id or by alias, or nothing."""
+    for entry in live_entries(home, remove_stale=remove_stale):
+        if handle in (entry.get("session_id"), entry.get("alias")):
+            return entry
+    return None
