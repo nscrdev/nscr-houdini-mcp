@@ -608,13 +608,18 @@ class Store:
         self._conn = sqlite3.connect(str(self.path), timeout=busy_timeout_s, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._in_txn = False
-        # The busy handler comes first, before anything that can block.
-        self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_s * 1000)}")
-        # Switching the journal takes a lock the busy handler does not cover,
-        # which is the usual first move of every process on a fresh file.
-        self._retry_while_busy(lambda: self._conn.execute("PRAGMA journal_mode=WAL"))
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._retry_while_busy(self._apply_migrations)
+        try:
+            # The busy handler comes first, before anything that can block.
+            self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_s * 1000)}")
+            # Switching the journal takes a lock the busy handler does not
+            # cover, and it is the first move of every process on a fresh file.
+            self._retry_while_busy(lambda: self._conn.execute("PRAGMA journal_mode=WAL"))
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._retry_while_busy(self._apply_migrations)
+        except BaseException:
+            # An open that did not finish leaves no handle on the file.
+            self._conn.close()
+            raise
 
     # -- lifetime ---------------------------------------------------------
 
