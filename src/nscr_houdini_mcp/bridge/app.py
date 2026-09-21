@@ -12,6 +12,16 @@ Two endpoints, both on paths of the bridge's own:
 - `/nscr-mcp/call` takes one request envelope and dispatches it to a tool, one
   call at a time in the whole process.
 
+What this protects against, and what it does not. Anything running as the
+same person on the same machine is already inside: it can read that person's
+files, including the token file, and it could drive Houdini without this
+bridge at all. So the checks below are not a wall against the owner's own
+programs. They are a wall against a web page in a browser on this machine,
+against another person with an account on it, and against the network. The
+signing on top of that is for the case where this Houdini has crashed and
+something else has taken its port: a caller sends nothing reusable and can
+tell it is not talking to the bridge.
+
 What every request meets, in this order, before anything is parsed:
 
 1. `Origin` or `Referer` present: refused. Only a browser sends those.
@@ -218,8 +228,12 @@ class Bridge:
             try:
                 record = self._announce(port)
             except BaseException:
-                backend.stop()
+                # A start that did not finish leaves nothing behind: no token
+                # file, no session row, no listening port.
+                self._undo_announce()
+                _try(backend.stop)
                 self.port = None
+                self.started_at = None
                 raise
 
             self._running = True
@@ -232,38 +246,57 @@ class Bridge:
         self._remove_quit_hook = host.install_quit_hook(self.stop)
         return record
 
-    def stop(self) -> None:
+    def stop(self) -> list[str]:
         """Take the session out of the store, the file off disk, the port down.
 
-        Safe to call more than once, and safe to call while the process is
-        already quitting, which is where it usually runs.
+        Every step runs whatever the ones before it did, because a step that
+        fails must not leave the rest undone: a token file nobody clears is
+        worse than a port nobody closes. Whatever went wrong is collected and
+        handed back, and written to the session log. Stopping never raises,
+        because it usually runs while the process is already quitting.
+
+        Safe to call more than once.
         """
         with self._lock:
             if not self._running:
-                return
+                return []
             self._running = False
 
+        problems: list[str] = []
         self._heartbeat_stop.set()
-        if self._remove_quit_hook is not None:
-            self._remove_quit_hook()
-            self._remove_quit_hook = None
-        atexit.unregister(self.stop)
-
-        try:
-            with self._open_store() as store:
-                store.end_session(self.session_id)
-        except Exception as error:  # noqa: BLE001 - quitting must not raise
-            self._note(f"could not end the session row: {error}")
-        try:
-            registry.remove_entry(self.home, self.session_id)
-        except OSError as error:
-            self._note(f"could not remove the session file: {error}")
-        if self._backend is not None:
-            try:
-                self._backend.stop()
-            except Exception as error:  # noqa: BLE001 - quitting must not raise
-                self._note(f"could not stop the server: {error}")
+        hook, self._remove_quit_hook = self._remove_quit_hook, None
+        for what, step in (
+            ("take the quit hook off", hook),
+            ("stop being called at exit", lambda: atexit.unregister(self.stop)),
+            ("end the session row", self._end_session_row),
+            ("remove the session file", self._remove_session_file),
+            ("stop the server", self._stop_backend),
+        ):
+            if step is None:
+                continue
+            failure = _try(step)
+            if failure is not None:
+                problems.append(f"could not {what}: {failure}")
         self.port = None
+        for problem in problems:
+            self._log(problem)
+        return problems
+
+    def _end_session_row(self) -> None:
+        with self._open_store() as store:
+            store.end_session(self.session_id)
+
+    def _remove_session_file(self) -> None:
+        registry.remove_entry(self.home, self.session_id)
+
+    def _stop_backend(self) -> None:
+        if self._backend is not None:
+            self._backend.stop()
+
+    def _undo_announce(self) -> None:
+        """Clear whatever a half finished announcement managed to write."""
+        for step in (self._remove_session_file, self._end_session_row):
+            _try(step)
 
     def __enter__(self) -> Bridge:
         self.start()
@@ -603,3 +636,12 @@ class Bridge:
         """Keep the last few problems where a status call can find them."""
         self.problems.append(problem)
         del self.problems[:-10]
+
+
+def _try(step: Any) -> str | None:
+    """Run a cleanup step. Returns what went wrong, or nothing."""
+    try:
+        step()
+    except Exception as error:  # noqa: BLE001 - one failed step, not a failed cleanup
+        return f"{type(error).__name__}: {error}"
+    return None

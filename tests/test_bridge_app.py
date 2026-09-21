@@ -667,3 +667,182 @@ def test_the_tool_table_refuses_a_name_twice() -> None:
 
 def _explode(arguments: Mapping[str, Any]) -> Any:
     raise ValueError("could not open /work/secret-scene_v012.hip")
+
+
+# Each guard is the thing doing the refusing
+
+
+def counting_bridge(tmp_path: Path, **overrides: Any) -> tuple[Bridge, RecordingBackend, list]:
+    """A bridge whose one tool records every time it is reached."""
+    reached: list[Mapping[str, Any]] = []
+    tools = ToolRegistry()
+    tools.add(
+        "bridge.count", lambda arguments: reached.append(arguments) or {"count": len(reached)}
+    )
+    backend = RecordingBackend()
+    settings: dict[str, Any] = {
+        "home": tmp_path,
+        "kind": "hython",
+        "verify_loopback": False,
+        "heartbeat_s": 3600.0,
+    }
+    settings.update(overrides)
+    bridge = Bridge(BridgeConfig(**settings), backend=backend, tools=tools)
+    bridge.start()
+    return bridge, backend, reached
+
+
+def test_the_browser_header_check_is_what_refuses_a_page(tmp_path: Path) -> None:
+    bridge, backend, reached = counting_bridge(tmp_path)
+    try:
+        args = {"tool": "bridge.count"}
+        headers = {"origin": "http://evil.example"}
+        refused = send(bridge, backend, CALL_PATH, args, headers=headers)
+        assert refused.status == 403
+        assert reached == []
+
+        # With the check taken away the same request runs the tool, so the
+        # check is what stopped it and not something else.
+        import nscr_houdini_mcp.bridge.app as app_module
+
+        original = app_module.browser_header
+        app_module.browser_header = lambda headers: None
+        try:
+            allowed = send(bridge, backend, CALL_PATH, args, headers=headers)
+        finally:
+            app_module.browser_header = original
+        assert allowed.status == 200
+        assert len(reached) == 1
+    finally:
+        bridge.stop()
+
+
+def test_the_host_check_is_what_refuses_another_name(tmp_path: Path) -> None:
+    bridge, backend, reached = counting_bridge(tmp_path)
+    try:
+        args = {"tool": "bridge.count"}
+        headers = {"host": "evil.example:1"}
+        assert send(bridge, backend, CALL_PATH, args, headers=headers).status == 403
+        assert reached == []
+
+        import nscr_houdini_mcp.bridge.app as app_module
+
+        original = app_module.host_allowed
+        app_module.host_allowed = lambda headers, port: True
+        try:
+            assert send(bridge, backend, CALL_PATH, args, headers=headers).status == 200
+        finally:
+            app_module.host_allowed = original
+        assert len(reached) == 1
+    finally:
+        bridge.stop()
+
+
+def test_the_signature_check_is_what_refuses_an_unsigned_request(tmp_path: Path) -> None:
+    bridge, backend, reached = counting_bridge(tmp_path)
+    try:
+        args = {"tool": "bridge.count"}
+        assert backend.send(build(bridge, CALL_PATH, args, sign=False)).status == 401
+        assert reached == []
+
+        original = bridge._verifier.check
+        bridge._verifier.check = lambda *rest, **more: None
+        try:
+            assert backend.send(build(bridge, CALL_PATH, args, sign=False)).status == 200
+        finally:
+            bridge._verifier.check = original
+        assert len(reached) == 1
+    finally:
+        bridge.stop()
+
+
+def test_the_size_cap_is_what_refuses_a_large_body(tmp_path: Path) -> None:
+    bridge, backend, reached = counting_bridge(tmp_path, max_body_bytes=200)
+    try:
+        args = {"tool": "bridge.count", "arguments": {"echo": "x" * 500}}
+        assert send(bridge, backend, CALL_PATH, args).status == 413
+        assert reached == []
+    finally:
+        bridge.stop()
+
+    wide, backend, reached = counting_bridge(tmp_path, max_body_bytes=100_000)
+    try:
+        assert send(wide, backend, CALL_PATH, args).status == 200
+        assert len(reached) == 1
+    finally:
+        wide.stop()
+
+
+def test_the_depth_limit_is_what_refuses_a_nested_body(tmp_path: Path) -> None:
+    nested = b'{"tool": "bridge.count", "arguments": {"echo": ' + b"[" * 200 + b"]" * 200 + b"}}"
+    bridge, backend, reached = counting_bridge(tmp_path)
+    try:
+        reply = backend.send(build(bridge, CALL_PATH, body=nested))
+        assert reply.status == 400
+        assert body_of(reply)["error"]["code"] == "BODY_REFUSED"
+        assert reached == []
+    finally:
+        bridge.stop()
+
+    deep, backend, reached = counting_bridge(tmp_path, max_depth=1000)
+    try:
+        assert backend.send(build(deep, CALL_PATH, body=nested)).status == 200
+        assert len(reached) == 1
+    finally:
+        deep.stop()
+
+
+def test_the_content_type_check_is_what_refuses_a_form(tmp_path: Path) -> None:
+    bridge, backend, reached = counting_bridge(tmp_path)
+    try:
+        reply = backend.send(
+            build(bridge, CALL_PATH, {"tool": "bridge.count"}, content_type="text/plain")
+        )
+        assert reply.status == 415
+        assert reached == []
+        assert send(bridge, backend, CALL_PATH, {"tool": "bridge.count"}).status == 200
+        assert len(reached) == 1
+    finally:
+        bridge.stop()
+
+
+def test_a_start_that_fails_part_way_leaves_nothing_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(*rest: Any, **more: Any) -> None:
+        raise OSError("the disk said no")
+
+    bridge, backend = make_bridge(tmp_path)
+    monkeypatch.setattr("nscr_houdini_mcp.bridge.app.registry.write_entry", refuse)
+    with pytest.raises(OSError):
+        bridge.start()
+    assert registry.list_entries(tmp_path) == []
+    assert backend.stops == 1
+    assert bridge.port is None
+    assert bridge.running is False
+    with store_module.Store(bridge.store_path) as store:
+        assert store.list_sessions() == []
+
+
+def test_every_step_of_stopping_runs_even_when_one_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, backend = make_bridge(tmp_path)
+    bridge.start()
+    monkeypatch.setattr(
+        bridge, "_end_session_row", lambda: (_ for _ in ()).throw(OSError("the store said no"))
+    )
+    problems = bridge.stop()
+    assert any("end the session row" in problem for problem in problems)
+    assert registry.list_entries(tmp_path) == []
+    assert backend.stops == 1
+    assert bridge.running is False
+
+
+def test_stopping_a_bridge_that_is_already_stopped_says_nothing_went_wrong(
+    tmp_path: Path,
+) -> None:
+    bridge, _ = make_bridge(tmp_path)
+    bridge.start()
+    assert bridge.stop() == []
+    assert bridge.stop() == []
