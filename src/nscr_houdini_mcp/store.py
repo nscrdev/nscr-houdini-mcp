@@ -14,6 +14,14 @@ finishes its work and commits before it returns, and the transaction helper
 itself is private, so there is no supported way to hold one open across a
 hython start, a cook or a render.
 
+Time and liveness. A process that crashes cannot clean up after itself, so the
+first question asked about any held slot is whether its owner process is still
+alive. Wall clock ages are the second signal and only a budget: a clock step
+backwards would make an age negative, so ages are clamped at zero and a step
+forward can only make something look older, which at worst reclaims a slot
+early from an owner that is already gone. Monotonic clocks are not stored: they
+restart with the machine and are not comparable between processes.
+
 This module never imports `hou`.
 """
 
@@ -25,10 +33,10 @@ import os
 import sqlite3
 import sys
 import time
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +44,7 @@ APP_DIR_NAME = "nscr-houdini-mcp"
 HOME_ENV_VAR = "NSCR_MCP_HOME"
 STORE_FILE_NAME = "coord.sqlite"
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SESSION_KINDS = frozenset({"gui", "hython"})
 SESSION_STATES = frozenset({"live", "busy", "unresponsive", "crashed", "gone"})
@@ -45,38 +53,100 @@ SESSION_GONE = "gone"
 # States that still hold a slot against the pool cap. A reservation counts from
 # the moment it is made, before hython has started.
 WORKER_ACTIVE_STATES = ("reserved", "starting", "running", "leased", "stopping")
+WORKER_STARTING_STATES = ("reserved", "starting")
 WORKER_FINAL_STATES = ("failed", "stopped")
 WORKER_STATES = frozenset(WORKER_ACTIVE_STATES + WORKER_FINAL_STATES)
 
 OPERATION_STATES = frozenset({"running", "done", "failed"})
 JOB_STATES = frozenset({"queued", "running", "done", "failed", "cancelled", "lost"})
 JOB_FINAL_STATES = frozenset({"done", "failed", "cancelled", "lost"})
+JOB_LIVE_STATES = ("queued", "running")
 
 MAX_ALIAS_INDEX = 4096
+
+DEFAULT_START_BUDGET_S = 180.0
+DEFAULT_OPERATION_LEASE_S = 300.0
+
+# Folder names that usually mean a synced or mounted location. The store must
+# stay on a local disk, so a match is worth saying out loud, not worth failing
+# over: the check is a name comparison and nothing else.
+SHARED_FOLDER_NAMES = (
+    "dropbox",
+    "onedrive",
+    "google drive",
+    "googledrive",
+    "icloud drive",
+    "com~apple~clouddocs",
+    "nextcloud",
+    "owncloud",
+    "box sync",
+    "pcloud",
+    "creative cloud files",
+)
 
 
 class StoreError(Exception):
     """Base class for coordination store failures."""
 
 
-class PoolFull(StoreError):
-    """No worker slot is free under the current cap."""
+class StoreBusy(StoreError):
+    """The store stayed locked by other processes for longer than allowed."""
 
 
-class AliasInUse(StoreError):
-    """The requested alias already belongs to a live session."""
+class DuplicateRecord(StoreError):
+    """An id or a name that must be unique is already in the store."""
 
 
 class UnknownRecord(StoreError):
     """A session, reservation, job or run id is not in the store."""
 
 
+class PoolFull(StoreError):
+    """No worker slot is free under the current cap."""
+
+
+class AliasInUse(DuplicateRecord):
+    """The requested alias already belongs to a live session."""
+
+
 class OperationMismatch(StoreError):
     """An operation id came back with different arguments than the first time."""
 
 
+class SceneReplaced(StoreError):
+    """An operation id came back against a scene that has since been replaced."""
+
+    def __init__(self, message: str, *, recorded_epoch: int, current_epoch: int) -> None:
+        super().__init__(message)
+        self.recorded_epoch = recorded_epoch
+        self.current_epoch = current_epoch
+
+
+class SchemaTooNew(StoreError):
+    """The file on disk was written by a newer build of this package."""
+
+
+class UndigestableArgument(StoreError):
+    """An argument has no stable text form, so it cannot go in a digest."""
+
+
+class _Clear:
+    """Sentinel: write NULL, as against leaving a stored value alone."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "CLEAR"
+
+
+CLEAR = _Clear()
+
+
 def default_home() -> Path:
-    """Per user state folder for this tool, overridable by environment."""
+    """Per user state folder for this tool.
+
+    Every component asks here for its folder, so the store, the session
+    registry, the config file and the logs stay together and move together
+    when the environment override is set.
+    """
     override = os.environ.get(HOME_ENV_VAR)
     if override:
         return Path(override).expanduser()
@@ -96,14 +166,111 @@ def default_store_path() -> Path:
     return default_home() / STORE_FILE_NAME
 
 
+def shared_location_warning(path: Path | str) -> str | None:
+    """One line when the path looks synced or mounted, otherwise nothing.
+
+    SQLite locking is not reliable on a share, and a synced folder copies the
+    file behind its own back. The caller decides what to do with the line.
+    """
+    text = str(path)
+    if text.startswith("\\\\") or text.startswith("//"):
+        return f"{text} looks like a network path. Keep the store on a local disk."
+    parts = Path(text).parts
+    lowered = [part.lower() for part in parts]
+    for name in SHARED_FOLDER_NAMES:
+        if any(name in part for part in lowered):
+            return f"{text} looks like a synced folder. Keep the store on a local disk."
+    if sys.platform != "win32" and len(parts) > 2 and lowered[1] in {"volumes", "net", "mnt"}:
+        return f"{text} looks like a mounted volume. Keep the store on a local disk."
+    return None
+
+
+def process_is_alive(pid: int | None) -> bool:
+    """Whether a pid is running, on every supported system.
+
+    Pids are reused eventually, so this answers the cheap question and the
+    owner token answers the exact one.
+    """
+    if pid is None or pid <= 0:
+        return False
+    if sys.platform == "win32":
+        return _windows_process_is_alive(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Someone else's process, so it exists.
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _windows_process_is_alive(pid: int) -> bool:
+    """Windows has no signal 0, so ask the kernel for the process directly."""
+    import ctypes
+
+    process_query_limited_information = 0x1000
+    error_access_denied = 5
+    still_active = 259
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        # Access denied means the process is there and belongs to somebody else.
+        return kernel32.GetLastError() == error_access_denied
+    try:
+        code = ctypes.c_ulong()
+        if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return code.value == still_active
+        return True
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def digest_arguments(payload: Any) -> str:
-    """Stable digest of one call's arguments, for operation receipts."""
-    text = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    """Stable digest of one call's arguments, for operation receipts.
+
+    The same arguments must digest the same in any process, so the value is
+    put in a canonical form first rather than handed to a fallback that prints
+    whatever an object happens to print. Arguments arrive over a JSON
+    transport, so `1` and `1.0` are the same argument, and a type that JSON
+    cannot carry is refused instead of being guessed at.
+    """
+    text = json.dumps(_canonical(payload), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _now() -> float:
-    return time.time()
+def _canonical(value: Any) -> Any:
+    """Canonical form of one argument value, or `UndigestableArgument`."""
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            raise UndigestableArgument(f"cannot digest the float {value!r}")
+        return int(value) if value.is_integer() else value
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return value.as_posix()
+    if isinstance(value, Mapping):
+        items = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise UndigestableArgument(f"cannot digest the key {key!r}")
+            items[key] = _canonical(item)
+        return items
+    if isinstance(value, (list, tuple)):
+        return [_canonical(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        # A set has no order of its own, and iteration order changes between
+        # processes, so sort the members by their own canonical text.
+        members = [_canonical(item) for item in value]
+        return sorted(members, key=lambda member: json.dumps(member, sort_keys=True))
+    raise UndigestableArgument(f"cannot digest a value of type {type(value).__name__}")
 
 
 def _iso(value: float | None) -> str | None:
@@ -118,6 +285,27 @@ def _dump(value: Any) -> str | None:
 
 def _load(text: str | None) -> Any:
     return None if text is None else json.loads(text)
+
+
+def _age(now: float, then: float | None) -> float:
+    """Age in seconds, never negative, so a clock step cannot rewind a lease."""
+    if then is None:
+        return 0.0
+    return max(0.0, now - then)
+
+
+def _is_busy(error: sqlite3.Error) -> bool:
+    text = str(error).lower()
+    return "locked" in text or "busy" in text
+
+
+def _translate(error: sqlite3.Error) -> StoreError:
+    """Turn a raw database failure into one of this module's errors."""
+    if isinstance(error, sqlite3.IntegrityError):
+        return DuplicateRecord(str(error))
+    if isinstance(error, sqlite3.OperationalError) and _is_busy(error):
+        return StoreBusy(str(error))
+    return StoreError(str(error))
 
 
 @dataclass(frozen=True)
@@ -158,6 +346,8 @@ class WorkerRecord:
     state: str
     session_id: str | None
     job_id: str | None
+    owner_pid: int | None
+    start_deadline: float | None
     reserved_at: float
     leased_at: float
 
@@ -169,6 +359,8 @@ class WorkerRecord:
             state=row["state"],
             session_id=row["session_id"],
             job_id=row["job_id"],
+            owner_pid=row["owner_pid"],
+            start_deadline=row["start_deadline"],
             reserved_at=row["reserved_at"],
             leased_at=row["leased_at"],
         )
@@ -184,6 +376,7 @@ class OperationRecord:
     outcome: Any
     error: Any
     job_id: str | None
+    owner_pid: int | None
     created_at: float
     updated_at: float
 
@@ -198,9 +391,25 @@ class OperationRecord:
             outcome=_load(row["outcome"]),
             error=_load(row["error"]),
             job_id=row["job_id"],
+            owner_pid=row["owner_pid"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+
+@dataclass(frozen=True)
+class OperationClaim:
+    """What a caller learned by presenting an operation id.
+
+    `claimed` says this caller may run the work. `outcome_unknown` says an
+    earlier attempt ran and its result is not recorded, so the work may
+    already be half done: with `claimed` it was abandoned and has been taken
+    over, without it another process is still on it.
+    """
+
+    record: OperationRecord
+    claimed: bool
+    outcome_unknown: bool
 
 
 @dataclass(frozen=True)
@@ -214,6 +423,9 @@ class JobRecord:
     outputs: Any
     error: Any
     scene: Any
+    cancel_requested: bool
+    worker_pid: int | None
+    heartbeat_at: float | None
     created_at: float
     updated_at: float
     finished_at: float | None
@@ -230,6 +442,9 @@ class JobRecord:
             outputs=_load(row["outputs"]),
             error=_load(row["error"]),
             scene=_load(row["scene"]),
+            cancel_requested=bool(row["cancel_requested"]),
+            worker_pid=row["worker_pid"],
+            heartbeat_at=row["heartbeat_at"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             finished_at=row["finished_at"],
@@ -267,109 +482,108 @@ class RunRecord:
         )
 
 
-# One entry per schema version. A step runs inside its own transaction and is
-# never edited once it has shipped: a later change is a new step.
-def _migrate_to_1(db: sqlite3.Connection) -> None:
-    _run_statements(
-        db,
-        """
-        CREATE TABLE sessions (
-            session_id   TEXT PRIMARY KEY,
-            alias        TEXT NOT NULL,
-            kind         TEXT NOT NULL,
-            pid          INTEGER NOT NULL,
-            port         INTEGER,
-            state        TEXT NOT NULL,
-            scene_epoch  INTEGER NOT NULL DEFAULT 0,
-            hip_path     TEXT,
-            capabilities TEXT,
-            started_at   REAL NOT NULL,
-            heartbeat_at REAL NOT NULL
-        );
-        CREATE UNIQUE INDEX sessions_live_alias
-            ON sessions(alias) WHERE state <> 'gone';
-
-        CREATE TABLE workers (
-            token       TEXT PRIMARY KEY,
-            alias       TEXT NOT NULL,
-            state       TEXT NOT NULL,
-            session_id  TEXT,
-            job_id      TEXT,
-            reserved_at REAL NOT NULL,
-            leased_at   REAL NOT NULL
-        );
-        CREATE UNIQUE INDEX workers_live_alias
-            ON workers(alias) WHERE state NOT IN ('failed', 'stopped');
-
-        CREATE TABLE operations (
-            operation_id TEXT PRIMARY KEY,
-            session_id   TEXT,
-            scene_epoch  INTEGER,
-            digest       TEXT NOT NULL,
-            state        TEXT NOT NULL,
-            outcome      TEXT,
-            error        TEXT,
-            job_id       TEXT,
-            created_at   REAL NOT NULL,
-            updated_at   REAL NOT NULL
-        );
-
-        CREATE TABLE jobs (
-            job_id      TEXT PRIMARY KEY,
-            session_id  TEXT,
-            kind        TEXT NOT NULL,
-            state       TEXT NOT NULL,
-            weight      TEXT NOT NULL,
-            progress    TEXT,
-            outputs     TEXT,
-            error       TEXT,
-            scene       TEXT,
-            created_at  REAL NOT NULL,
-            updated_at  REAL NOT NULL,
-            finished_at REAL
-        );
-        CREATE INDEX jobs_by_state ON jobs(state, updated_at);
-
-        CREATE TABLE versions (
-            kind       TEXT NOT NULL,
-            name       TEXT NOT NULL,
-            hip_family TEXT NOT NULL,
-            version    INTEGER NOT NULL,
-            run_id     TEXT,
-            created_at REAL NOT NULL,
-            PRIMARY KEY (kind, name, hip_family, version)
-        );
-
-        CREATE TABLE runs (
-            run_id      TEXT PRIMARY KEY,
-            kind        TEXT NOT NULL,
-            name        TEXT,
-            hip_family  TEXT,
-            version     INTEGER,
-            session_id  TEXT,
-            source_node TEXT,
-            job_id      TEXT,
-            paths       TEXT,
-            scene       TEXT,
-            created_at  REAL NOT NULL
-        );
-        """,
-    )
-
-
-MIGRATIONS = (_migrate_to_1,)
-
-
-def _run_statements(db: sqlite3.Connection, script: str) -> None:
-    """Run a schema script statement by statement.
-
-    The sqlite3 module's own script runner commits whatever transaction is
-    open before it starts, which would take a migration out of the
-    transaction that guards it.
+# One entry per schema version, applied in order inside one transaction each.
+# A step is never edited once it has shipped: a later change is a new step.
+_SCHEMA_1 = (
     """
-    for statement in script.split(";"):
-        if statement.strip():
-            db.execute(statement)
+    CREATE TABLE sessions (
+        session_id   TEXT PRIMARY KEY,
+        alias        TEXT NOT NULL,
+        kind         TEXT NOT NULL,
+        pid          INTEGER NOT NULL,
+        port         INTEGER,
+        state        TEXT NOT NULL,
+        scene_epoch  INTEGER NOT NULL DEFAULT 0,
+        hip_path     TEXT,
+        capabilities TEXT,
+        started_at   REAL NOT NULL,
+        heartbeat_at REAL NOT NULL
+    )
+    """,
+    "CREATE UNIQUE INDEX sessions_live_alias ON sessions(alias) WHERE state <> 'gone'",
+    """
+    CREATE TABLE workers (
+        token       TEXT PRIMARY KEY,
+        alias       TEXT NOT NULL,
+        state       TEXT NOT NULL,
+        session_id  TEXT,
+        job_id      TEXT,
+        reserved_at REAL NOT NULL,
+        leased_at   REAL NOT NULL
+    )
+    """,
+    "CREATE UNIQUE INDEX workers_live_alias"
+    " ON workers(alias) WHERE state NOT IN ('failed', 'stopped')",
+    """
+    CREATE TABLE operations (
+        operation_id TEXT PRIMARY KEY,
+        session_id   TEXT,
+        scene_epoch  INTEGER,
+        digest       TEXT NOT NULL,
+        state        TEXT NOT NULL,
+        outcome      TEXT,
+        error        TEXT,
+        job_id       TEXT,
+        created_at   REAL NOT NULL,
+        updated_at   REAL NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE jobs (
+        job_id      TEXT PRIMARY KEY,
+        session_id  TEXT,
+        kind        TEXT NOT NULL,
+        state       TEXT NOT NULL,
+        weight      TEXT NOT NULL,
+        progress    TEXT,
+        outputs     TEXT,
+        error       TEXT,
+        scene       TEXT,
+        created_at  REAL NOT NULL,
+        updated_at  REAL NOT NULL,
+        finished_at REAL
+    )
+    """,
+    "CREATE INDEX jobs_by_state ON jobs(state, updated_at)",
+    """
+    CREATE TABLE versions (
+        kind       TEXT NOT NULL,
+        name       TEXT NOT NULL,
+        hip_family TEXT NOT NULL,
+        version    INTEGER NOT NULL,
+        run_id     TEXT,
+        created_at REAL NOT NULL,
+        PRIMARY KEY (kind, name, hip_family, version)
+    )
+    """,
+    """
+    CREATE TABLE runs (
+        run_id      TEXT PRIMARY KEY,
+        kind        TEXT NOT NULL,
+        name        TEXT,
+        hip_family  TEXT,
+        version     INTEGER,
+        session_id  TEXT,
+        source_node TEXT,
+        job_id      TEXT,
+        paths       TEXT,
+        scene       TEXT,
+        created_at  REAL NOT NULL
+    )
+    """,
+)
+
+# Owners and budgets, so a process that dies stops holding what it took.
+_SCHEMA_2 = (
+    "ALTER TABLE workers ADD COLUMN owner_pid INTEGER",
+    "ALTER TABLE workers ADD COLUMN start_deadline REAL",
+    "ALTER TABLE operations ADD COLUMN owner_pid INTEGER",
+    "ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE jobs ADD COLUMN worker_pid INTEGER",
+    "ALTER TABLE jobs ADD COLUMN heartbeat_at REAL",
+)
+
+MIGRATIONS = (_SCHEMA_1, _SCHEMA_2)
 
 
 class Store:
@@ -379,16 +593,28 @@ class Store:
     same file is the normal case and is what the store is for.
     """
 
-    def __init__(self, path: Path | str | None = None, *, busy_timeout_s: float = 10.0) -> None:
+    def __init__(
+        self,
+        path: Path | str | None = None,
+        *,
+        busy_timeout_s: float = 10.0,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
         self.path = Path(path) if path is not None else default_store_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.location_warning = shared_location_warning(self.path)
+        self._clock = clock or time.time
+        self._busy_timeout_s = busy_timeout_s
         self._conn = sqlite3.connect(str(self.path), timeout=busy_timeout_s, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._in_txn = False
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
+        # The busy handler comes first, before anything that can block.
         self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_s * 1000)}")
-        self._apply_migrations()
+        # Switching the journal takes a lock the busy handler does not cover,
+        # which is the usual first move of every process on a fresh file.
+        self._retry_while_busy(lambda: self._conn.execute("PRAGMA journal_mode=WAL"))
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._retry_while_busy(self._apply_migrations)
 
     # -- lifetime ---------------------------------------------------------
 
@@ -401,6 +627,9 @@ class Store:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
+    def _now(self) -> float:
+        return self._clock()
+
     # -- transactions -----------------------------------------------------
 
     @contextmanager
@@ -408,32 +637,77 @@ class Store:
         """Short transaction. Private so no caller can hold one open.
 
         Writes take `BEGIN IMMEDIATE`, so a caller that reads a count and then
-        decides on it wins or loses the whole decision, never half of it.
+        decides on it wins or loses the whole decision, never half of it. The
+        open flag is set only once the statement has been accepted, so a
+        failed start leaves the handle usable.
         """
         if self._in_txn:
             raise StoreError("store transactions do not nest")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+        except sqlite3.Error as error:
+            raise _translate(error) from error
         self._in_txn = True
-        self._conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
         try:
             yield self._conn
-        except BaseException:
+        except BaseException as error:
             self._conn.rollback()
+            if isinstance(error, sqlite3.Error):
+                raise _translate(error) from error
             raise
         else:
             self._conn.commit()
         finally:
             self._in_txn = False
 
+    def _retry_while_busy(self, action: Callable[[], Any]) -> Any:
+        """Repeat an action that other processes can lock out, then give up.
+
+        Uses a monotonic clock for the wait itself, which is safe because the
+        value never leaves this call.
+        """
+        deadline = time.monotonic() + self._busy_timeout_s
+        delay = 0.01
+        while True:
+            try:
+                return action()
+            except (sqlite3.OperationalError, StoreBusy) as error:
+                if isinstance(error, sqlite3.OperationalError) and not _is_busy(error):
+                    raise _translate(error) from error
+                if time.monotonic() >= deadline:
+                    raise StoreBusy(f"{self.path} stayed locked by other processes") from error
+                time.sleep(delay)
+                delay = min(delay * 2, 0.1)
+
     def _apply_migrations(self) -> None:
         with self._txn(write=True) as db:
-            current = db.execute("PRAGMA user_version").fetchone()[0]
-            for step, migrate in enumerate(MIGRATIONS[current:], start=current + 1):
-                migrate(db)
+            current = int(db.execute("PRAGMA user_version").fetchone()[0])
+            if current > len(MIGRATIONS):
+                raise SchemaTooNew(
+                    f"{self.path} is at schema {current}, this build knows {SCHEMA_VERSION}"
+                )
+            for step, statements in enumerate(MIGRATIONS[current:], start=current + 1):
+                for statement in statements:
+                    db.execute(statement)
                 db.execute(f"PRAGMA user_version={step}")
 
     def schema_version(self) -> int:
         """Schema version of the open file."""
-        return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+        return int(self._read_one("PRAGMA user_version")[0])
+
+    # -- reads ------------------------------------------------------------
+
+    def _read_all(self, sql: str, args: Sequence[Any] = ()) -> list[sqlite3.Row]:
+        try:
+            return self._conn.execute(sql, args).fetchall()
+        except sqlite3.Error as error:
+            raise _translate(error) from error
+
+    def _read_one(self, sql: str, args: Sequence[Any] = ()) -> sqlite3.Row | None:
+        try:
+            return self._conn.execute(sql, args).fetchone()
+        except sqlite3.Error as error:
+            raise _translate(error) from error
 
     # -- sessions ---------------------------------------------------------
 
@@ -464,7 +738,7 @@ class Store:
             raise ValueError(f"unknown session state: {state}")
         if (alias is None) == (alias_template is None):
             raise ValueError("pass exactly one of alias or alias_template")
-        now = _now()
+        now = self._now()
         with self._txn(write=True) as db:
             if alias_template is not None:
                 taken = {
@@ -506,9 +780,7 @@ class Store:
 
     def get_session(self, session_id: str) -> SessionRecord | None:
         """Session by id, gone or not. Ids are never reused."""
-        row = self._conn.execute(
-            "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
-        ).fetchone()
+        row = self._read_one("SELECT * FROM sessions WHERE session_id = ?", (session_id,))
         return None if row is None else SessionRecord._from_row(row)
 
     def resolve_session(self, handle: str) -> SessionRecord | None:
@@ -516,10 +788,10 @@ class Store:
         found = self.get_session(handle)
         if found is not None:
             return found
-        row = self._conn.execute(
+        row = self._read_one(
             "SELECT * FROM sessions WHERE alias = ? AND state <> ? ORDER BY started_at DESC",
             (handle, SESSION_GONE),
-        ).fetchone()
+        )
         return None if row is None else SessionRecord._from_row(row)
 
     def list_sessions(self, *, include_gone: bool = False) -> list[SessionRecord]:
@@ -530,13 +802,13 @@ class Store:
             sql += " WHERE state <> ?"
             args = (SESSION_GONE,)
         sql += " ORDER BY started_at"
-        return [SessionRecord._from_row(row) for row in self._conn.execute(sql, args)]
+        return [SessionRecord._from_row(row) for row in self._read_all(sql, args)]
 
     def touch_session(self, session_id: str, *, state: str | None = None) -> float:
         """Write a heartbeat, and a new state when one is given."""
         if state is not None and state not in SESSION_STATES:
             raise ValueError(f"unknown session state: {state}")
-        now = _now()
+        now = self._now()
         with self._txn(write=True) as db:
             if state is None:
                 written = db.execute(
@@ -576,7 +848,7 @@ class Store:
         with self._txn(write=True) as db:
             written = db.execute(
                 "UPDATE sessions SET state = ?, heartbeat_at = ? WHERE session_id = ?",
-                (SESSION_GONE, _now(), session_id),
+                (SESSION_GONE, self._now(), session_id),
             )
             if written.rowcount == 0:
                 raise UnknownRecord(f"no session {session_id}")
@@ -590,19 +862,25 @@ class Store:
         token: str,
         alias_template: str = "w{n}",
         job_id: str | None = None,
+        owner_pid: int | None = None,
+        start_budget_s: float = DEFAULT_START_BUDGET_S,
     ) -> WorkerRecord:
         """Take a slot under the pool cap, or raise `PoolFull`.
 
-        Counting and inserting are one transaction, so two processes that see
-        the same count cannot both get the last slot. A reservation counts from
-        here, before hython starts, and stops counting only when the worker
-        ends up failed or stopped.
+        Slots held by processes that are gone are reclaimed first, in the same
+        transaction, so a crash does not shrink the pool for good. Counting and
+        inserting are that same transaction, so two processes that see the same
+        count cannot both get the last slot. A reservation counts from here,
+        before hython starts, and stops counting once the worker ends up failed
+        or stopped.
         """
         if cap < 1:
             raise ValueError("cap must be at least 1")
-        now = _now()
+        now = self._now()
+        pid = os.getpid() if owner_pid is None else owner_pid
         placeholders = ", ".join("?" * len(WORKER_ACTIVE_STATES))
         with self._txn(write=True) as db:
+            self._reclaim_workers(db, now)
             rows = db.execute(
                 f"SELECT alias FROM workers WHERE state IN ({placeholders})",
                 WORKER_ACTIVE_STATES,
@@ -611,37 +889,80 @@ class Store:
                 raise PoolFull(f"{len(rows)} of {cap} worker slots are in use")
             alias = _first_free_alias(alias_template, {row["alias"] for row in rows})
             db.execute(
-                "INSERT INTO workers (token, alias, state, session_id, job_id, reserved_at,"
-                " leased_at) VALUES (?, ?, 'reserved', NULL, ?, ?, ?)",
-                (token, alias, job_id, now, now),
+                "INSERT INTO workers (token, alias, state, session_id, job_id, owner_pid,"
+                " start_deadline, reserved_at, leased_at)"
+                " VALUES (?, ?, 'reserved', NULL, ?, ?, ?, ?, ?)",
+                (token, alias, job_id, pid, now + start_budget_s, now, now),
             )
             return WorkerRecord._from_row(
                 db.execute("SELECT * FROM workers WHERE token = ?", (token,)).fetchone()
             )
+
+    def reclaim_workers(self) -> list[str]:
+        """Fail slots whose owner is gone or that never finished starting.
+
+        Returns the tokens that were reclaimed. `reserve_worker` does this for
+        itself, so this is for a caller that only wants to tidy up or report.
+        """
+        with self._txn(write=True) as db:
+            return self._reclaim_workers(db, self._now())
+
+    def _reclaim_workers(self, db: sqlite3.Connection, now: float) -> list[str]:
+        placeholders = ", ".join("?" * len(WORKER_ACTIVE_STATES))
+        rows = db.execute(
+            f"SELECT * FROM workers WHERE state IN ({placeholders})", WORKER_ACTIVE_STATES
+        ).fetchall()
+        reclaimed: list[str] = []
+        for row in rows:
+            owner_gone = row["owner_pid"] is not None and not process_is_alive(row["owner_pid"])
+            deadline = row["start_deadline"]
+            never_started = (
+                row["state"] in WORKER_STARTING_STATES and deadline is not None and now > deadline
+            )
+            if owner_gone or never_started:
+                db.execute(
+                    "UPDATE workers SET state = 'failed', job_id = NULL, leased_at = ?"
+                    " WHERE token = ?",
+                    (now, row["token"]),
+                )
+                reclaimed.append(row["token"])
+        return reclaimed
 
     def set_worker_state(
         self,
         token: str,
         state: str,
         *,
-        session_id: str | None = None,
-        job_id: str | None = None,
+        session_id: str | None | _Clear = None,
+        job_id: str | None | _Clear = None,
+        owner_pid: int | None = None,
+        start_budget_s: float | None = None,
     ) -> WorkerRecord:
-        """Move a reservation on. The token proves who owns the slot."""
+        """Move a reservation on. The token proves who owns the slot.
+
+        A field left out keeps its stored value. Pass `CLEAR` to empty one, for
+        example to hand a worker back to the pool when its job is done.
+        """
         if state not in WORKER_STATES:
             raise ValueError(f"unknown worker state: {state}")
+        now = self._now()
         with self._txn(write=True) as db:
             row = db.execute("SELECT * FROM workers WHERE token = ?", (token,)).fetchone()
             if row is None:
                 raise UnknownRecord(f"no worker reservation {token}")
+            deadline = row["start_deadline"]
+            if start_budget_s is not None:
+                deadline = now + start_budget_s
             db.execute(
-                "UPDATE workers SET state = ?, session_id = ?, job_id = ?, leased_at = ?"
-                " WHERE token = ?",
+                "UPDATE workers SET state = ?, session_id = ?, job_id = ?, owner_pid = ?,"
+                " start_deadline = ?, leased_at = ? WHERE token = ?",
                 (
                     state,
-                    session_id if session_id is not None else row["session_id"],
-                    job_id if job_id is not None else row["job_id"],
-                    _now(),
+                    _settle(session_id, row["session_id"]),
+                    _settle(job_id, row["job_id"]),
+                    row["owner_pid"] if owner_pid is None else owner_pid,
+                    deadline,
+                    now,
                     token,
                 ),
             )
@@ -653,11 +974,11 @@ class Store:
         """Give a slot back. Use `failed` when the start never came up."""
         if state not in WORKER_FINAL_STATES:
             raise ValueError(f"not a final worker state: {state}")
-        return self.set_worker_state(token, state)
+        return self.set_worker_state(token, state, job_id=CLEAR)
 
     def touch_worker_lease(self, token: str) -> float:
         """Renew the idle lease. Routing a call to a worker renews it."""
-        now = _now()
+        now = self._now()
         with self._txn(write=True) as db:
             written = db.execute("UPDATE workers SET leased_at = ? WHERE token = ?", (now, token))
             if written.rowcount == 0:
@@ -666,7 +987,7 @@ class Store:
 
     def get_worker(self, token: str) -> WorkerRecord | None:
         """One reservation by its owner token."""
-        row = self._conn.execute("SELECT * FROM workers WHERE token = ?", (token,)).fetchone()
+        row = self._read_one("SELECT * FROM workers WHERE token = ?", (token,))
         return None if row is None else WorkerRecord._from_row(row)
 
     def list_workers(self, *, active_only: bool = True) -> list[WorkerRecord]:
@@ -677,22 +998,26 @@ class Store:
             sql += f" WHERE state IN ({', '.join('?' * len(WORKER_ACTIVE_STATES))})"
             args = WORKER_ACTIVE_STATES
         sql += " ORDER BY reserved_at"
-        return [WorkerRecord._from_row(row) for row in self._conn.execute(sql, args)]
+        return [WorkerRecord._from_row(row) for row in self._read_all(sql, args)]
 
     def idle_workers(self, max_idle_s: float) -> list[WorkerRecord]:
-        """Workers whose lease is older than the idle limit.
+        """Live workers with no job whose lease is older than the limit.
 
         An expired lease only says a worker may exit by itself. It never hands
-        a reserved worker to somebody else.
+        a reserved worker to somebody else, and a worker on a job never counts
+        as idle however long the job runs. A worker whose owner is gone is a
+        job for `reclaim_workers`, not an idle worker.
         """
-        cutoff = _now() - max_idle_s
-        placeholders = ", ".join("?" * len(WORKER_ACTIVE_STATES))
-        rows = self._conn.execute(
-            f"SELECT * FROM workers WHERE leased_at < ? AND state IN ({placeholders})"
-            " AND job_id IS NULL ORDER BY leased_at",
-            (cutoff, *WORKER_ACTIVE_STATES),
-        )
-        return [WorkerRecord._from_row(row) for row in rows]
+        now = self._now()
+        idle = []
+        for record in self.list_workers():
+            if record.job_id is not None:
+                continue
+            if record.owner_pid is not None and not process_is_alive(record.owner_pid):
+                continue
+            if _age(now, record.leased_at) >= max_idle_s:
+                idle.append(record)
+        return sorted(idle, key=lambda record: record.leased_at)
 
     # -- operation receipts ----------------------------------------------
 
@@ -703,35 +1028,84 @@ class Store:
         *,
         session_id: str | None = None,
         scene_epoch: int | None = None,
-    ) -> tuple[OperationRecord, bool]:
+        owner_pid: int | None = None,
+        lease_s: float = DEFAULT_OPERATION_LEASE_S,
+    ) -> OperationClaim:
         """Claim an operation id, or hand back what it did the first time.
 
-        Returns the record and whether this call is the one that claimed it.
         A retry after a lost reply passes the same id and the same digest and
-        gets the stored outcome. The same id with different arguments is a
-        different call by mistake, so it raises `OperationMismatch`.
+        gets the stored outcome. The same id with different arguments, or from
+        a different session, is a different call by mistake and raises
+        `OperationMismatch`. An id presented against a scene that has moved on
+        raises `SceneReplaced`, because the stored outcome describes a scene
+        that is gone.
+
+        A receipt left `running` by a process that died is taken over, and the
+        claim says the outcome is unknown so the caller can check the scene
+        before repeating the work.
         """
-        now = _now()
+        now = self._now()
+        pid = os.getpid() if owner_pid is None else owner_pid
         with self._txn(write=True) as db:
             row = db.execute(
                 "SELECT * FROM operations WHERE operation_id = ?", (operation_id,)
             ).fetchone()
-            if row is not None:
-                if row["digest"] != digest:
-                    raise OperationMismatch(
-                        f"operation {operation_id} was recorded with different arguments"
-                    )
-                return OperationRecord._from_row(row), False
+            if row is None:
+                db.execute(
+                    "INSERT INTO operations (operation_id, session_id, scene_epoch, digest, state,"
+                    " outcome, error, job_id, owner_pid, created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, 'running', NULL, NULL, NULL, ?, ?, ?)",
+                    (operation_id, session_id, scene_epoch, digest, pid, now, now),
+                )
+                stored = db.execute(
+                    "SELECT * FROM operations WHERE operation_id = ?", (operation_id,)
+                ).fetchone()
+                return OperationClaim(OperationRecord._from_row(stored), True, False)
+
+            if row["digest"] != digest:
+                raise OperationMismatch(
+                    f"operation {operation_id} was recorded with different arguments"
+                )
+            if session_id is not None and row["session_id"] not in (None, session_id):
+                raise OperationMismatch(
+                    f"operation {operation_id} belongs to session {row['session_id']}"
+                )
+            if (
+                scene_epoch is not None
+                and row["scene_epoch"] is not None
+                and row["scene_epoch"] != scene_epoch
+            ):
+                raise SceneReplaced(
+                    f"operation {operation_id} was recorded against an earlier scene",
+                    recorded_epoch=int(row["scene_epoch"]),
+                    current_epoch=scene_epoch,
+                )
+            if row["state"] != "running":
+                return OperationClaim(OperationRecord._from_row(row), False, False)
+
+            owner_live = process_is_alive(row["owner_pid"]) if row["owner_pid"] else False
+            if owner_live and _age(now, row["updated_at"]) <= lease_s:
+                # Somebody else is on it. The outcome is not known yet.
+                return OperationClaim(OperationRecord._from_row(row), False, True)
             db.execute(
-                "INSERT INTO operations (operation_id, session_id, scene_epoch, digest, state,"
-                " outcome, error, job_id, created_at, updated_at)"
-                " VALUES (?, ?, ?, ?, 'running', NULL, NULL, NULL, ?, ?)",
-                (operation_id, session_id, scene_epoch, digest, now, now),
+                "UPDATE operations SET owner_pid = ?, updated_at = ? WHERE operation_id = ?",
+                (pid, now, operation_id),
             )
-            row = db.execute(
+            taken = db.execute(
                 "SELECT * FROM operations WHERE operation_id = ?", (operation_id,)
             ).fetchone()
-            return OperationRecord._from_row(row), True
+            return OperationClaim(OperationRecord._from_row(taken), True, True)
+
+    def touch_operation(self, operation_id: str) -> float:
+        """Renew the lease on a receipt that is still being worked on."""
+        now = self._now()
+        with self._txn(write=True) as db:
+            written = db.execute(
+                "UPDATE operations SET updated_at = ? WHERE operation_id = ?", (now, operation_id)
+            )
+            if written.rowcount == 0:
+                raise UnknownRecord(f"no operation {operation_id}")
+        return now
 
     def finish_operation(
         self,
@@ -749,7 +1123,7 @@ class Store:
             written = db.execute(
                 "UPDATE operations SET state = ?, outcome = ?, error = ?, job_id = ?,"
                 " updated_at = ? WHERE operation_id = ?",
-                (state, _dump(outcome), _dump(error), job_id, _now(), operation_id),
+                (state, _dump(outcome), _dump(error), job_id, self._now(), operation_id),
             )
             if written.rowcount == 0:
                 raise UnknownRecord(f"no operation {operation_id}")
@@ -761,14 +1135,12 @@ class Store:
 
     def get_operation(self, operation_id: str) -> OperationRecord | None:
         """One receipt by id."""
-        row = self._conn.execute(
-            "SELECT * FROM operations WHERE operation_id = ?", (operation_id,)
-        ).fetchone()
+        row = self._read_one("SELECT * FROM operations WHERE operation_id = ?", (operation_id,))
         return None if row is None else OperationRecord._from_row(row)
 
     def prune_operations(self, max_age_s: float) -> int:
         """Drop receipts older than the retention window. Returns the count."""
-        cutoff = _now() - max_age_s
+        cutoff = self._now() - max_age_s
         with self._txn(write=True) as db:
             return db.execute("DELETE FROM operations WHERE updated_at < ?", (cutoff,)).rowcount
 
@@ -784,17 +1156,31 @@ class Store:
         weight: str = "light",
         scene: Any = None,
         progress: Any = None,
+        worker_pid: int | None = None,
     ) -> JobRecord:
         """Record an accepted job, including the scene identity it consumes."""
         if state not in JOB_STATES:
             raise ValueError(f"unknown job state: {state}")
-        now = _now()
+        now = self._now()
         with self._txn(write=True) as db:
             db.execute(
                 "INSERT INTO jobs (job_id, session_id, kind, state, weight, progress, outputs,"
-                " error, scene, created_at, updated_at, finished_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, NULL)",
-                (job_id, session_id, kind, state, weight, _dump(progress), _dump(scene), now, now),
+                " error, scene, cancel_requested, worker_pid, heartbeat_at, created_at,"
+                " updated_at, finished_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0, ?, ?, ?, ?, NULL)",
+                (
+                    job_id,
+                    session_id,
+                    kind,
+                    state,
+                    weight,
+                    _dump(progress),
+                    _dump(scene),
+                    worker_pid,
+                    now,
+                    now,
+                    now,
+                ),
             )
             return JobRecord._from_row(
                 db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
@@ -808,11 +1194,12 @@ class Store:
         progress: Any = None,
         outputs: Any = None,
         error: Any = None,
+        worker_pid: int | None = None,
     ) -> JobRecord:
         """Write progress, outputs so far or a final state."""
         if state is not None and state not in JOB_STATES:
             raise ValueError(f"unknown job state: {state}")
-        now = _now()
+        now = self._now()
         with self._txn(write=True) as db:
             row = db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
             if row is None:
@@ -820,13 +1207,15 @@ class Store:
             new_state = state or row["state"]
             finished = now if new_state in JOB_FINAL_STATES else row["finished_at"]
             db.execute(
-                "UPDATE jobs SET state = ?, progress = ?, outputs = ?, error = ?, updated_at = ?,"
-                " finished_at = ? WHERE job_id = ?",
+                "UPDATE jobs SET state = ?, progress = ?, outputs = ?, error = ?, worker_pid = ?,"
+                " heartbeat_at = ?, updated_at = ?, finished_at = ? WHERE job_id = ?",
                 (
                     new_state,
                     _dump(progress) if progress is not None else row["progress"],
                     _dump(outputs) if outputs is not None else row["outputs"],
                     _dump(error) if error is not None else row["error"],
+                    row["worker_pid"] if worker_pid is None else worker_pid,
+                    now,
                     now,
                     finished,
                     job_id,
@@ -836,9 +1225,56 @@ class Store:
                 db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
             )
 
+    def touch_job(self, job_id: str, *, worker_pid: int | None = None) -> float:
+        """Heartbeat from whoever is running the job."""
+        now = self._now()
+        with self._txn(write=True) as db:
+            row = db.execute("SELECT worker_pid FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if row is None:
+                raise UnknownRecord(f"no job {job_id}")
+            db.execute(
+                "UPDATE jobs SET heartbeat_at = ?, worker_pid = ? WHERE job_id = ?",
+                (now, row["worker_pid"] if worker_pid is None else worker_pid, job_id),
+            )
+        return now
+
+    def request_job_cancel(self, job_id: str) -> JobRecord:
+        """Ask for a job to stop. Whoever runs it reads the flag and acts."""
+        with self._txn(write=True) as db:
+            written = db.execute(
+                "UPDATE jobs SET cancel_requested = 1, updated_at = ? WHERE job_id = ?",
+                (self._now(), job_id),
+            )
+            if written.rowcount == 0:
+                raise UnknownRecord(f"no job {job_id}")
+            return JobRecord._from_row(
+                db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            )
+
+    def stale_jobs(self, max_silence_s: float) -> list[JobRecord]:
+        """Unfinished jobs whose runner is gone or has said nothing for a while.
+
+        These are the candidates for `lost`. The caller decides, because only
+        it knows whether the outputs written so far are worth keeping.
+        """
+        now = self._now()
+        rows = self._read_all(
+            f"SELECT * FROM jobs WHERE state IN ({', '.join('?' * len(JOB_LIVE_STATES))})"
+            " ORDER BY created_at",
+            JOB_LIVE_STATES,
+        )
+        stale = []
+        for row in rows:
+            record = JobRecord._from_row(row)
+            runner_gone = record.worker_pid is not None and not process_is_alive(record.worker_pid)
+            silent = _age(now, record.heartbeat_at) >= max_silence_s
+            if runner_gone or silent:
+                stale.append(record)
+        return stale
+
     def get_job(self, job_id: str) -> JobRecord | None:
         """One job by id."""
-        row = self._conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        row = self._read_one("SELECT * FROM jobs WHERE job_id = ?", (job_id,))
         return None if row is None else JobRecord._from_row(row)
 
     def list_jobs(
@@ -862,11 +1298,11 @@ class Store:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY created_at DESC LIMIT ?"
         args.append(limit)
-        return [JobRecord._from_row(row) for row in self._conn.execute(sql, args)]
+        return [JobRecord._from_row(row) for row in self._read_all(sql, args)]
 
     def prune_jobs(self, max_age_s: float) -> int:
         """Drop job rows older than the retention window. Returns the count."""
-        cutoff = _now() - max_age_s
+        cutoff = self._now() - max_age_s
         with self._txn(write=True) as db:
             return db.execute("DELETE FROM jobs WHERE updated_at < ?", (cutoff,)).rowcount
 
@@ -897,17 +1333,30 @@ class Store:
             db.execute(
                 "INSERT INTO versions (kind, name, hip_family, version, run_id, created_at)"
                 " VALUES (?, ?, ?, ?, ?, ?)",
-                (kind, name, hip_family, version, run_id, _now()),
+                (kind, name, hip_family, version, run_id, self._now()),
             )
         return version
 
+    def attach_version_run(
+        self, *, kind: str, name: str, hip_family: str, version: int, run_id: str
+    ) -> None:
+        """Point a version at its run, for a number taken before the run existed."""
+        with self._txn(write=True) as db:
+            written = db.execute(
+                "UPDATE versions SET run_id = ? WHERE kind = ? AND name = ? AND hip_family = ?"
+                " AND version = ?",
+                (run_id, kind, name, hip_family, version),
+            )
+            if written.rowcount == 0:
+                raise UnknownRecord(f"no version {version} for {kind} {name}")
+
     def latest_version(self, *, kind: str, name: str, hip_family: str) -> int:
         """Highest number handed out so far, or 0 when there is none."""
-        row = self._conn.execute(
+        row = self._read_one(
             "SELECT MAX(version) AS top FROM versions WHERE kind = ? AND name = ? AND"
             " hip_family = ?",
             (kind, name, hip_family),
-        ).fetchone()
+        )
         return int(row["top"] or 0)
 
     # -- runs -------------------------------------------------------------
@@ -943,7 +1392,7 @@ class Store:
                     job_id,
                     _dump(paths),
                     _dump(scene),
-                    _now(),
+                    self._now(),
                 ),
             )
             return RunRecord._from_row(
@@ -952,7 +1401,7 @@ class Store:
 
     def get_run(self, run_id: str) -> RunRecord | None:
         """One run by id."""
-        row = self._conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        row = self._read_one("SELECT * FROM runs WHERE run_id = ?", (run_id,))
         return None if row is None else RunRecord._from_row(row)
 
     def list_runs(self, *, kind: str | None = None, limit: int = 50) -> list[RunRecord]:
@@ -964,7 +1413,7 @@ class Store:
             args.append(kind)
         sql += " ORDER BY created_at DESC LIMIT ?"
         args.append(limit)
-        return [RunRecord._from_row(row) for row in self._conn.execute(sql, args)]
+        return [RunRecord._from_row(row) for row in self._read_all(sql, args)]
 
     # -- readable exports -------------------------------------------------
 
@@ -1001,6 +1450,15 @@ def _export_dict(record: Any, times: Mapping[str, str]) -> dict[str, Any]:
     for field, label in times.items():
         data[f"{label}_utc"] = _iso(data.get(field))
     return data
+
+
+def _settle(given: Any, stored: Any) -> Any:
+    """None keeps what is stored, `CLEAR` empties it, anything else replaces it."""
+    if given is None:
+        return stored
+    if isinstance(given, _Clear):
+        return None
+    return given
 
 
 def _first_free_alias(template: str, taken: Iterable[str]) -> str:
