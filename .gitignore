@@ -1,0 +1,25 @@
+# Local working material. Never commit.
+.context/
+plan/
+plans/
+assets/
+
+# Agent and editor state
+.claude/
+.agent/
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Houdini
+backup/
+*.hip.bak
+*_bak*.hip*
