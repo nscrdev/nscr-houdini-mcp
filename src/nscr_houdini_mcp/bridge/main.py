@@ -1,0 +1,78 @@
+"""Start a bridge in this Houdini process and hold the process open.
+
+Run with hython:
+
+    hython -m nscr_houdini_mcp.bridge.main --home <folder>
+
+The process stays alive until its input closes or the word `stop` arrives on
+it. Tying the lifetime to the input means a launcher that dies takes its
+worker with it, instead of leaving a Houdini running with nobody to talk to.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from nscr_houdini_mcp.bridge.app import DEFAULT_HEARTBEAT_S, Bridge, BridgeConfig
+from nscr_houdini_mcp.bridge.net import DEFAULT_PORT_RANGE
+
+STOP_WORD = "stop"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="nscr-houdini-mcp bridge",
+        description="Run the Houdini side bridge until told to stop.",
+    )
+    parser.add_argument("--home", type=Path, help="state folder, for the store and session files")
+    parser.add_argument("--alias", help="fixed name for this session")
+    parser.add_argument("--alias-template", help="name pattern containing {n}")
+    parser.add_argument("--kind", choices=("gui", "hython"), help="override the session kind")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT_RANGE[0])
+    parser.add_argument("--max-port", type=int, default=DEFAULT_PORT_RANGE[1])
+    parser.add_argument("--heartbeat", type=float, default=DEFAULT_HEARTBEAT_S)
+    parser.add_argument(
+        "--skip-loopback-check",
+        action="store_true",
+        help="do not prove the port is unreachable from this machine's own addresses",
+    )
+    return parser
+
+
+def wait_for_stop(stream) -> None:
+    """Block until the word `stop` arrives or the input closes."""
+    while True:
+        line = stream.readline()
+        if not line or line.strip().lower() == STOP_WORD:
+            return
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    config = BridgeConfig(
+        home=args.home,
+        port_range=(args.port, args.max_port),
+        alias=args.alias,
+        alias_template=args.alias_template,
+        kind=args.kind,
+        heartbeat_s=args.heartbeat,
+        verify_loopback=not args.skip_loopback_check,
+    )
+    bridge = Bridge(config)
+    record = bridge.start()
+    # The token is not printed here and never is. Whoever may read the session
+    # file may read the token.
+    print(f"bridge {record.alias} {record.session_id} on port {bridge.port}", flush=True)
+    try:
+        wait_for_stop(sys.stdin)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        bridge.stop()
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - the process entry point
+    raise SystemExit(main())
