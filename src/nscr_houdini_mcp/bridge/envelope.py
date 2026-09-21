@@ -4,6 +4,9 @@ Nothing here imports `hou` or the web server. A request arrives as plain data,
 is checked against the rules below, and leaves as a `Reply`: an HTTP status and
 a payload the transport only has to serialise.
 
+The envelope never carries a secret. Proof of who is calling lives in the
+signing headers, so there is nothing here worth catching.
+
 Two payload shapes and nothing else. A call that ran has `ok` true and its
 `data`. A call that did not has `ok` false and one error object with a code, a
 message and optional details. The full code table and the argument rewriting
@@ -13,22 +16,22 @@ codes the envelope itself can produce.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
-
-# The header the server's own client sends. The envelope may carry the token
-# instead, for a caller that cannot set headers.
-TOKEN_HEADER = "x-nscr-mcp-token"
 
 # Headers no non-browser client sends. Their presence means a web page is
 # calling, and a web page has no business here.
 BROWSER_HEADERS = ("origin", "referer")
 
 ENVELOPE_FIELDS = frozenset(
-    {"token", "session_id", "scene_epoch", "operation_id", "tool", "arguments"}
+    {"session_id", "scene_epoch", "operation_id", "tool", "arguments", "wait_s"}
 )
+
+# How long a call may wait for the session to be free. Zero means answer now.
+MAX_WAIT_S = 50.0
 
 MAX_TOOL_NAME = 128
 
@@ -57,10 +60,10 @@ class Envelope:
 
     tool: str
     arguments: Mapping[str, Any] = field(default_factory=dict)
-    token: str | None = None
     session_id: str | None = None
     scene_epoch: int | None = None
     operation_id: str | None = None
+    wait_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -110,11 +113,22 @@ def parse_envelope(payload: Any) -> Envelope:
     return Envelope(
         tool=tool,
         arguments=dict(arguments),
-        token=_text(payload.get("token"), "token"),
         session_id=_text(payload.get("session_id"), "session_id"),
         scene_epoch=scene_epoch,
         operation_id=_text(payload.get("operation_id"), "operation_id"),
+        wait_s=_wait(payload.get("wait_s")),
     )
+
+
+def _wait(value: Any) -> float | None:
+    """How long this call may wait, checked against the allowed range."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise EnvelopeError("wait_s must be a number")
+    if value != value or value < 0 or value > MAX_WAIT_S:
+        raise EnvelopeError(f"wait_s must be between 0 and {MAX_WAIT_S:g}")
+    return float(value)
 
 
 def _text(value: Any, name: str) -> str | None:
@@ -147,3 +161,62 @@ def error_payload(
     if details:
         error["details"] = dict(details)
     return {"ok": False, "error": error}
+
+
+# How deeply a request body may nest. An envelope needs a handful of levels;
+# thousands is not a request, and a parser handed thousands can take the whole
+# process down with it before it ever returns.
+MAX_DEPTH = 32
+
+
+def load_json(raw: bytes, *, max_depth: int = MAX_DEPTH) -> Any:
+    """Decode a request body, refusing one that nests too deeply.
+
+    The depth is counted before the parser sees the text, because the parser
+    follows the nesting as it goes and a body nested thousands deep can end
+    the process rather than raise. Brackets inside strings are skipped, so a
+    piece of code sent as an argument counts for nothing.
+    """
+    if not isinstance(raw, (bytes, bytearray)):
+        raise EnvelopeError("the body must be bytes")
+    depth = json_depth(raw)
+    if depth > max_depth:
+        raise EnvelopeError(
+            f"the body nests more than {max_depth} deep",
+            code="BODY_REFUSED",
+            depth=depth,
+            max_depth=max_depth,
+        )
+    try:
+        text = bytes(raw).decode("utf-8")
+    except UnicodeDecodeError:
+        raise EnvelopeError("the body is not utf-8") from None
+    try:
+        return json.loads(text)
+    except ValueError as error:
+        raise EnvelopeError(f"the body is not JSON: {error}") from None
+
+
+def json_depth(raw: bytes) -> int:
+    """How deeply a JSON text nests, counting only brackets outside strings."""
+    depth = 0
+    deepest = 0
+    in_string = False
+    escaped = False
+    for byte in bytes(raw):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:  # backslash
+                escaped = True
+            elif byte == 0x22:  # quote
+                in_string = False
+            continue
+        if byte == 0x22:
+            in_string = True
+        elif byte in (0x5B, 0x7B):  # [ {
+            depth += 1
+            deepest = max(deepest, depth)
+        elif byte in (0x5D, 0x7D):  # ] }
+            depth -= 1
+    return deepest
