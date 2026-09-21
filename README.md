@@ -66,8 +66,15 @@ nscr-houdini-mcp
 ### The Houdini side
 
 `nscr_houdini_mcp.bridge` runs inside Houdini's own Python. It serves two
-endpoints on loopback behind a per session token, registers the session in the
-coordination store and takes it out again when the process quits.
+endpoints on loopback, registers the session in the coordination store and
+takes it out again when the process quits.
+
+The token is never sent. Each request is signed with it and each answer is
+signed back, so nothing on the port learns anything it could use again, and a
+caller can tell the bridge from something that took its port after a crash. A
+request is also refused if it carries `Origin` or `Referer`, names a host
+other than this bridge, is not JSON, is over the size cap, or nests too deeply
+for an envelope.
 
 Start one in a headless Houdini:
 

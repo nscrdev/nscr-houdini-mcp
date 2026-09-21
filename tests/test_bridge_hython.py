@@ -2,20 +2,22 @@
 
 Skipped, not failed, when there is no Houdini on this machine, which is the
 case on the build machines. One hython at a time, started here and stopped
-here.
+here, and never the one a person is working in.
 """
 
 from __future__ import annotations
 
+import socket
+import urllib.parse
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 from nscr_houdini_mcp import store as store_module
-from nscr_houdini_mcp.bridge import client, net, registry, security
+from nscr_houdini_mcp.bridge import client, net, registry, security, signing
 from nscr_houdini_mcp.bridge.launcher import HythonBridge, hython_available
+from nscr_houdini_mcp.bridge.serving import CALL_PATH, HEALTH_PATH, JSON_TYPE
 
 pytestmark = [
     pytest.mark.houdini,
@@ -24,6 +26,8 @@ pytestmark = [
 
 # Its own range, so a bridge started by hand keeps the port it has.
 PORT_RANGE = (18300, 18349)
+
+FORM_TYPE = "application/x-www-form-urlencoded"
 
 
 @pytest.fixture(scope="module")
@@ -66,41 +70,134 @@ def test_a_call_runs_a_tool(bridge: HythonBridge) -> None:
     assert answer.payload["operation_id"] == "op-1"
 
 
-@pytest.mark.parametrize("token", [None, "wrong"])
-def test_no_token_and_a_wrong_token_are_refused(bridge: HythonBridge, token: Any) -> None:
-    answer = client.post(
-        bridge.port,
-        "mcp.call",
-        arguments={"envelope": {"tool": "bridge.ping"}},
-        token=token,
-    )
+# Nothing gets in without a signature
+
+
+def test_an_unsigned_request_is_refused(bridge: HythonBridge) -> None:
+    for path in (HEALTH_PATH, CALL_PATH):
+        answer = client.request(bridge.port, path, body=b"{}")
+        assert answer.status == 401
+        assert answer.payload["error"]["code"] == "UNAUTHORIZED"
+
+
+def test_a_signature_made_with_another_token_is_refused(bridge: HythonBridge) -> None:
+    wrong = bridge.session._replace(token=security.mint_token())
+    answer = client.post(wrong, HEALTH_PATH, {}, verify=False)
     assert answer.status == 401
-    assert answer.payload["error"]["code"] == "UNAUTHORIZED"
-    assert bridge.token not in str(answer.payload)
 
 
-def test_health_is_refused_without_the_token(bridge: HythonBridge) -> None:
-    assert client.post(bridge.port, "mcp.health").status == 401
+def test_the_same_signed_request_cannot_be_sent_twice(bridge: HythonBridge) -> None:
+    session = bridge.session
+    body = b"{}"
+    headers = signing.sign_request(
+        session.token,
+        method="POST",
+        path=HEALTH_PATH,
+        session_id=session.session_id,
+        body=body,
+    )
+    first = client.request(bridge.port, HEALTH_PATH, body=body, headers=headers)
+    second = client.request(bridge.port, HEALTH_PATH, body=body, headers=headers)
+    assert first.status == 200
+    assert second.status == 401
 
 
 @pytest.mark.parametrize("header", ["Origin", "Referer"])
 def test_a_request_from_a_page_is_refused(bridge: HythonBridge, header: str) -> None:
     answer = client.post(
-        bridge.port,
-        "mcp.health",
-        token=bridge.token,
-        headers={header: "http://evil.example"},
+        bridge.session, HEALTH_PATH, {}, headers={header: "http://evil.example"}, verify=False
     )
     assert answer.status == 403
     assert answer.payload["error"]["code"] == "FORBIDDEN"
     assert not [name for name in answer.headers if name.startswith("access-control-allow")]
 
 
+def test_another_host_is_refused_even_when_signed(bridge: HythonBridge) -> None:
+    answer = client.post(
+        bridge.session, HEALTH_PATH, {}, headers={"Host": "evil.example:1"}, verify=False
+    )
+    assert answer.status == 403
+
+
+def test_a_form_post_is_refused(bridge: HythonBridge) -> None:
+    answer = client.request(bridge.port, CALL_PATH, body=b"json=%5B%5D", content_type=FORM_TYPE)
+    assert answer.status in (401, 415)
+
+
+# The shapes that used to end the process
+
+
+def test_the_nesting_bomb_does_not_end_the_process(bridge: HythonBridge) -> None:
+    """The body that killed a Houdini through the built in route.
+
+    Sent three ways: to the route that used to exist, and to both of the
+    bridge's own paths. The process must answer normally afterwards.
+    """
+    bomb = b"[" * 5000 + b"]" * 5000
+    form = urllib.parse.urlencode({"json": "[" * 5000 + "]" * 5000}).encode("utf-8")
+
+    old_route = client.request(bridge.port, "/api", body=form, content_type=FORM_TYPE)
+    assert old_route.status == 404, "the built in route must not exist on this server"
+    assert bridge.health().status == 200
+
+    for path in (HEALTH_PATH, CALL_PATH):
+        unsigned = client.request(bridge.port, path, body=bomb)
+        assert unsigned.status == 401
+        assert bridge.health().status == 200
+
+    signed = client.post(bridge.session, CALL_PATH, {"tool": "bridge.ping"})
+    assert signed.status == 200
+
+    session = bridge.session
+    headers = signing.sign_request(
+        session.token, method="POST", path=CALL_PATH, session_id=session.session_id, body=bomb
+    )
+    answer = client.request(bridge.port, CALL_PATH, body=bomb, headers=headers)
+    assert answer.status == 400
+    assert answer.payload["error"]["code"] == "BODY_REFUSED"
+    assert bridge.health().status == 200
+    assert bridge.process.poll() is None
+
+
+def test_a_very_large_body_does_not_end_the_process(bridge: HythonBridge) -> None:
+    big = b"x" * (50 * 1024 * 1024)
+    try:
+        answer = client.request(bridge.port, CALL_PATH, body=big, timeout_s=60.0)
+        assert answer.status in (401, 413)
+    except client.BridgeUnreachable:
+        # The server may close the connection on an oversized body rather than
+        # answer it. Either is fine as long as the process lives.
+        pass
+    assert bridge.process.poll() is None
+    assert bridge.health().status == 200
+
+
+def test_a_body_that_never_arrives_does_not_stop_the_bridge(bridge: HythonBridge) -> None:
+    """A request that promises a body and then sends nothing."""
+    stalled = socket.create_connection((net.LOOPBACK, bridge.port), timeout=10.0)
+    try:
+        stalled.sendall(
+            f"POST {CALL_PATH} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{bridge.port}\r\n"
+            f"Content-Type: {JSON_TYPE}\r\n"
+            "Content-Length: 1048576\r\n\r\n".encode()
+        )
+        stalled.sendall(b"{")
+        assert bridge.health().status == 200
+        assert bridge.call("bridge.ping").status == 200
+    finally:
+        stalled.close()
+    assert bridge.process.poll() is None
+    assert bridge.health().status == 200
+
+
+# What the port and the files give away
+
+
 def test_the_port_answers_on_loopback_alone(bridge: HythonBridge) -> None:
     assert net.can_connect(net.LOOPBACK, bridge.port) is True
-    assert net.reachable_from_outside(bridge.port) == []
-    # Stronger than a connection attempt: a bind that succeeds proves nothing
-    # is listening there, and a firewall cannot flatter the result.
+    proof = net.prove_loopback_only(bridge.port)
+    assert proof.private is True
     assert net.addresses_holding_port(bridge.port) == []
 
 
@@ -116,7 +213,7 @@ def test_the_socket_listing_agrees(bridge: HythonBridge) -> None:
         pytest.skip("no socket listing available to this user")
     assert listings, "the port is not in the socket listing"
     for address in listings:
-        assert address.startswith("127.") or address == "::1", address
+        assert net.is_loopback(address), address
 
 
 def test_no_answer_carries_a_cross_origin_header_or_names_the_build(
@@ -129,19 +226,32 @@ def test_no_answer_carries_a_cross_origin_header_or_names_the_build(
     assert "22.0" not in server, server
 
 
+def test_every_answer_is_signed_so_a_squatter_cannot_pass_for_the_bridge(
+    bridge: HythonBridge,
+) -> None:
+    answer = bridge.health()
+    assert signing.SIGNATURE_HEADER in answer.headers
+    impostor = bridge.session._replace(token=security.mint_token())
+    with pytest.raises(client.BridgeNotAuthentic):
+        client.health(impostor)
+
+
 def test_the_session_file_is_private_and_holds_the_token(bridge: HythonBridge, home: Path) -> None:
     path = registry.entry_path(home, bridge.session_id)
     assert security.is_private(path)
     entry = registry.read_entry(path)
-    assert entry["token"] == bridge.token
+    assert entry["token"] == bridge.session.token
     assert entry["kind"] == "hython"
     assert entry["houdini_version"]
+    assert entry["pid"] == bridge.process.pid
+    assert registry.entry_is_live(entry) is not False
 
 
 def test_the_session_is_in_the_store_and_goes_when_the_process_quits(
     bridge: HythonBridge, home: Path
 ) -> None:
     store_path = home / store_module.STORE_FILE_NAME
+    session = bridge.session
     with store_module.Store(store_path) as store:
         live = store.resolve_session(bridge.session_id)
         assert live is not None
@@ -156,7 +266,7 @@ def test_the_session_is_in_the_store_and_goes_when_the_process_quits(
         assert store.get_session(bridge.session_id).state == "gone"
     assert registry.list_entries(home) == []
     with pytest.raises(client.BridgeUnreachable):
-        client.post(bridge.port, "mcp.health", token=bridge.token, timeout_s=5.0)
+        client.health(session, timeout_s=5.0)
 
 
 def _listening_addresses(port: int) -> list[str] | None:
