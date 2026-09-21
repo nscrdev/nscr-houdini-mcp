@@ -63,6 +63,30 @@ Run the server on stdio:
 nscr-houdini-mcp
 ```
 
+### The Houdini side
+
+`nscr_houdini_mcp.bridge` runs inside Houdini's own Python. It serves two
+endpoints on loopback behind a per session token, registers the session in the
+coordination store and takes it out again when the process quits.
+
+Start one in a headless Houdini:
+
+```sh
+hython -m nscr_houdini_mcp.bridge.main --home <state folder>
+```
+
+It stops when its input closes, or on the word `stop`.
+
+For a session with an interface, copy `houdini/packages/nscr_houdini_mcp.json`
+into a Houdini packages folder and replace the two paths in it. Installing the
+package opens no port: `houdini/scripts/456.py` starts a bridge only when
+`NSCR_MCP_AUTOSTART` is `1`.
+
+Tests marked `houdini` need a Houdini on the machine and skip when there is
+none, so `pytest -q` is complete everywhere. Run only those with `pytest -m
+houdini`, or skip them with `pytest -m "not houdini"`. The bridge is found
+through `NSCR_MCP_HYTHON`, then `HFS`, then the usual install folder.
+
 ## License
 
 MIT

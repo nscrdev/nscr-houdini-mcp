@@ -20,6 +20,9 @@ nscr-houdini-mcp = "nscr_houdini_mcp.cli:main"
 dev = [
     "pytest>=8",
     "ruff>=0.6",
+    # Only for the integration check that reads which addresses a port listens
+    # on. The tests that use it skip when it is not installed.
+    "psutil>=6",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -34,3 +37,6 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "houdini: needs a Houdini install on this machine, skipped when there is none",
+]
