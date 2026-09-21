@@ -150,12 +150,13 @@ class HythonBridge:
         return int(self._entry()["port"])
 
     @property
-    def token(self) -> str:
-        return str(self._entry()["token"])
-
-    @property
     def session_id(self) -> str:
         return str(self._entry()["session_id"])
+
+    @property
+    def session(self) -> client.Session:
+        """What a caller needs to sign a request to this bridge."""
+        return client.Session.from_entry(self._entry())
 
     def start(self, *, timeout_s: float = START_TIMEOUT_S) -> dict[str, Any]:
         """Start hython and wait until its session file is on disk."""
@@ -269,7 +270,7 @@ class HythonBridge:
         raise BridgeStartFailed(f"no bridge after {timeout_s} seconds")
 
     def health(self, **rest: Any) -> client.Answer:
-        return client.health(self.port, token=self.token, **rest)
+        return client.health(self.session, **rest)
 
     def call(self, tool: str, **rest: Any) -> client.Answer:
-        return client.call(self.port, tool, token=self.token, **rest)
+        return client.call(self.session, tool, **rest)

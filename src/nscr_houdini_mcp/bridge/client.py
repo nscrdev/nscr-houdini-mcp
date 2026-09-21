@@ -1,9 +1,18 @@
 """The smallest client that can talk to a bridge.
 
-The web server takes one POST to `/api` with a form field holding
-`[name, args, kwargs]`. This wraps that, adds the token header, and hands back
-the status with the decoded body. It sends no `Origin` and no `Referer`, which
-is what lets the bridge refuse anything that does.
+It posts JSON to one of the bridge's two paths and reads JSON back. Three
+things it will not do:
+
+- It never sends the token. Each request carries a signature made with it, so
+  whatever is on the port learns nothing it could use again.
+- It never trusts an answer it cannot check. Every reply is signed with the
+  same token, and a reply that does not match is treated as coming from
+  something other than the bridge.
+- It never talks to a session whose process has gone. A session file outlives
+  a crash, and the port in it is free for anything to take.
+
+It sends no `Origin` and no `Referer`, which is what lets the bridge refuse
+anything that does.
 
 Standard library only: the same module is imported inside Houdini.
 """
@@ -12,13 +21,14 @@ from __future__ import annotations
 
 import json
 import urllib.error
-import urllib.parse
 import urllib.request
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, NamedTuple
 
-from nscr_houdini_mcp.bridge.envelope import TOKEN_HEADER
+from nscr_houdini_mcp.bridge import registry, signing
 from nscr_houdini_mcp.bridge.net import LOOPBACK
+from nscr_houdini_mcp.bridge.serving import CALL_PATH, HEALTH_PATH, JSON_TYPE
 
 DEFAULT_TIMEOUT_S = 10.0
 
@@ -27,61 +37,134 @@ class BridgeUnreachable(Exception):
     """Nothing answered on that port."""
 
 
+class BridgeNotAuthentic(Exception):
+    """Something answered, but it could not prove it is the bridge."""
+
+
+class SessionGone(Exception):
+    """The process that owned this session file is not there any more."""
+
+
 class Answer(NamedTuple):
-    """One answer: the status, the decoded body and the response headers."""
+    """One answer: the status, the decoded body, the headers and the bytes.
+
+    The bytes are kept because the signature is over exactly what arrived, and
+    re-encoding the decoded body would not give the same text back.
+    """
 
     status: int
     payload: Any
     headers: dict[str, str]
+    raw: bytes = b""
 
 
-def post(
+class Session(NamedTuple):
+    """Where one bridge is and what proves a request came from its owner."""
+
+    session_id: str
+    token: str
+    port: int
+    address: str = LOOPBACK
+
+    @classmethod
+    def from_entry(cls, entry: Mapping[str, Any]) -> Session:
+        return cls(
+            session_id=str(entry["session_id"]),
+            token=str(entry["token"]),
+            port=int(entry["port"]),
+            address=str(entry.get("address") or LOOPBACK),
+        )
+
+    @classmethod
+    def open(cls, home: Path, handle: str) -> Session:
+        """Find a live session by id or alias, or say it is gone."""
+        entry = registry.find_entry(Path(home), handle)
+        if entry is None:
+            raise SessionGone(f"no live session {handle}")
+        return cls.from_entry(entry)
+
+
+def request(
     port: int,
-    function: str,
+    path: str,
     *,
-    arguments: Mapping[str, Any] | None = None,
-    token: str | None = None,
+    body: bytes = b"",
     headers: Mapping[str, str] | None = None,
+    content_type: str = JSON_TYPE,
     address: str = LOOPBACK,
     timeout_s: float = DEFAULT_TIMEOUT_S,
+    method: str = "POST",
 ) -> Answer:
-    """Call one registered function."""
-    body = urllib.parse.urlencode(
-        {"json": json.dumps([function, [], dict(arguments or {})])}
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        f"http://{address}:{port}/api",
+    """Send one request exactly as given, signing nothing and checking nothing.
+
+    This is the low level way in, for probing a port. Ordinary work goes
+    through `post`, which signs what it sends and checks what comes back.
+    """
+    built = urllib.request.Request(
+        f"http://{address}:{port}{path}",
         data=body,
-        method="POST",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method=method,
+        headers={"Content-Type": content_type},
     )
-    if token is not None:
-        request.add_header(TOKEN_HEADER, token)
     for name, value in (headers or {}).items():
-        request.add_header(name, value)
+        built.add_header(name, value)
     try:
-        with urllib.request.urlopen(request, timeout=timeout_s) as answer:  # noqa: S310
-            return Answer(answer.status, _decode(answer.read()), _headers(answer))
+        with urllib.request.urlopen(built, timeout=timeout_s) as answer:  # noqa: S310
+            raw = answer.read()
+            return Answer(answer.status, _decode(raw), _headers(answer), raw)
     except urllib.error.HTTPError as error:
-        return Answer(error.code, _decode(error.read()), _headers(error))
+        raw = error.read()
+        return Answer(error.code, _decode(raw), _headers(error), raw)
     except (urllib.error.URLError, OSError) as error:
         raise BridgeUnreachable(f"{address}:{port} did not answer: {error}") from error
 
 
-def health(port: int, *, token: str, **rest: Any) -> Answer:
+def post(
+    session: Session,
+    path: str,
+    payload: Mapping[str, Any] | None = None,
+    *,
+    headers: Mapping[str, str] | None = None,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+    verify: bool = True,
+) -> Answer:
+    """Send one signed request and check that the bridge signed the answer."""
+    body = json.dumps(payload if payload is not None else {}).encode("utf-8")
+    signed = signing.sign_request(
+        session.token,
+        method="POST",
+        path=path,
+        session_id=session.session_id,
+        body=body,
+    )
+    signed.update(headers or {})
+    answer = request(
+        session.port,
+        path,
+        body=body,
+        headers=signed,
+        address=session.address,
+        timeout_s=timeout_s,
+    )
+    if verify:
+        _check_answer(session, signed[signing.NONCE_HEADER], answer)
+    return answer
+
+
+def health(session: Session, **rest: Any) -> Answer:
     """Ask a bridge whether it is alive."""
-    return post(port, "mcp.health", token=token, **rest)
+    return post(session, HEALTH_PATH, {}, **rest)
 
 
 def call(
-    port: int,
+    session: Session,
     tool: str,
     *,
-    token: str,
     arguments: Mapping[str, Any] | None = None,
     session_id: str | None = None,
     scene_epoch: int | None = None,
     operation_id: str | None = None,
+    wait_s: float | None = None,
     **rest: Any,
 ) -> Answer:
     """Send one request envelope."""
@@ -92,7 +175,21 @@ def call(
         envelope["scene_epoch"] = scene_epoch
     if operation_id is not None:
         envelope["operation_id"] = operation_id
-    return post(port, "mcp.call", arguments={"envelope": envelope}, token=token, **rest)
+    if wait_s is not None:
+        envelope["wait_s"] = wait_s
+    return post(session, CALL_PATH, envelope, **rest)
+
+
+def _check_answer(session: Session, nonce: str, answer: Answer) -> None:
+    """Refuse an answer that the holder of the token did not sign."""
+    given = answer.headers.get(signing.SIGNATURE_HEADER)
+    if not given:
+        raise BridgeNotAuthentic(f"{session.address}:{session.port} signed no answer")
+    expected = signing.response_signature(
+        session.token, nonce=nonce, status=answer.status, body=answer.raw
+    )
+    if not signing.equal(given, expected):
+        raise BridgeNotAuthentic(f"{session.address}:{session.port} is not this session")
 
 
 def _headers(answer: Any) -> dict[str, str]:

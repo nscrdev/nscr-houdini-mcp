@@ -4,6 +4,8 @@ Importable by Houdini's own Python with nothing but the standard library and
 what Houdini ships. It may use the coordination store from this package, and
 nothing else from it: the server process and the bridge are separate programs
 that meet over loopback HTTP and the store file.
+
+A bridge is always driven from another process, never from its own.
 """
 
 from __future__ import annotations
