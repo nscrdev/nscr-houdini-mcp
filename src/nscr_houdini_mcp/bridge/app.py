@@ -4,24 +4,34 @@ It starts a web server on loopback, mints a token, registers the session in
 the coordination store and in a private file, keeps a heartbeat going, and
 takes all of that down again when the process quits.
 
-Two endpoints:
+Two endpoints, both on paths of the bridge's own:
 
-- `mcp.health` answers from values held in memory. It reads no scene, touches
-  no `hou`, takes no lock and opens no file, so it still answers while the
-  session is busy.
-- `mcp.call` takes one request envelope and dispatches it to a tool, one call
-  at a time in the whole process.
+- `/nscr-mcp/health` answers from values held in memory. It reads no scene,
+  touches no `hou`, takes no lock and opens no file, so it still answers while
+  the session is busy.
+- `/nscr-mcp/call` takes one request envelope and dispatches it to a tool, one
+  call at a time in the whole process.
 
-One at a time is not a preference. Two handler threads working the object
-model at once was measured wedging the process for good: no exception, no
-crash, full CPU and no answers ever again. So every tool runs under one
-process wide lock, and nothing here offers a way around it.
+What every request meets, in this order, before anything is parsed:
+
+1. `Origin` or `Referer` present: refused. Only a browser sends those.
+2. The address the request arrived on must be loopback. Anything else and the
+   bridge refuses the request and shuts itself down.
+3. `Host` must name this bridge's own loopback address and port.
+4. The body must be JSON, and no larger than the configured cap.
+5. The request must carry a signature made with this session's token.
+6. Only then is the body decoded, with a nesting limit.
+
+One call at a time is not a preference. Two handler threads working the object
+model at once ends the process for good: no exception, no crash, full CPU and
+no answers ever again. So every tool runs under one process wide lock, and
+nothing here offers a way around it.
 
 For the same reason, nothing drives a bridge from inside its own process. The
 caller is always another process.
 
-What is deliberately not here: the queue with its own ordering, the wait and
-timeout policy, the undo group, the receipt table and the full error code
+What is deliberately not here: the queue with its own ordering, the full wait
+and timeout policy, the undo group, the receipt table and the full error code
 table. Those sit on top of this dispatch point.
 """
 
@@ -33,18 +43,19 @@ import re
 import secrets
 import threading
 import time
-from collections.abc import Mapping
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from nscr_houdini_mcp import store as store_module
-from nscr_houdini_mcp.bridge import host, registry
+from nscr_houdini_mcp.bridge import host, liveness, registry, signing
 from nscr_houdini_mcp.bridge.envelope import (
-    TOKEN_HEADER,
+    MAX_DEPTH,
     EnvelopeError,
     Reply,
     error_payload,
+    load_json,
     ok_payload,
     parse_envelope,
 )
@@ -52,23 +63,38 @@ from nscr_houdini_mcp.bridge.handlers import ToolRegistry, UnknownTool, default_
 from nscr_houdini_mcp.bridge.net import (
     DEFAULT_PORT_RANGE,
     LOOPBACK,
+    is_loopback,
     pick_port,
     port_is_free,
-    reachable_from_outside,
+    prove_loopback_only,
 )
 from nscr_houdini_mcp.bridge.security import (
     browser_header,
+    check_home,
+    host_allowed,
     mint_token,
-    token_matches,
 )
-from nscr_houdini_mcp.bridge.serving import Backend, HwebserverBackend
+from nscr_houdini_mcp.bridge.serving import (
+    CALL_PATH,
+    HEALTH_PATH,
+    JSON_TYPE,
+    Backend,
+    HwebserverBackend,
+    RawReply,
+    RawRequest,
+)
 
 SESSION_ID_BYTES = 16
 
 DEFAULT_HEARTBEAT_S = 10.0
 
-# How long a call may wait for the one at a time lock before it is turned away.
+# How long a call waits for the one at a time lock when it names no wait of
+# its own. A call may ask for less, including none at all.
 DEFAULT_DISPATCH_WAIT_S = 30.0
+
+# The largest request body the bridge will read. An envelope is small; this is
+# room for a long piece of code as an argument and nothing more.
+DEFAULT_MAX_BODY_BYTES = 1024 * 1024
 
 # How many ports to try when the server refuses the one it was handed. The
 # range is walked here because the run call has no port range argument of its
@@ -92,6 +118,8 @@ UNTITLED_ALIAS = "scene-{n}"
 
 ALIAS_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
+LOG_DIR_NAME = "logs"
+
 
 class BridgeError(Exception):
     """The bridge could not start, or could not start safely."""
@@ -110,6 +138,8 @@ class BridgeConfig:
     kind: str | None = None
     heartbeat_s: float = DEFAULT_HEARTBEAT_S
     dispatch_wait_s: float = DEFAULT_DISPATCH_WAIT_S
+    max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
+    max_depth: int = MAX_DEPTH
     server_name: str = "nscr_mcp_bridge"
     in_background: bool = True
     verify_loopback: bool = True
@@ -128,6 +158,7 @@ class Bridge:
     ) -> None:
         self.config = config or BridgeConfig()
         self.home = Path(self.config.home) if self.config.home else store_module.default_home()
+        check_home(self.home)
         self.store_path = (
             Path(self.config.store_path)
             if self.config.store_path
@@ -137,13 +168,16 @@ class Bridge:
         self.kind = self.config.kind or host.session_kind()
         self.facts = dict(self.config.facts) if self.config.facts else host.describe()
         self.pid = os.getpid()
+        self.pid_start = liveness.process_start_stamp()
         self.session_id = secrets.token_hex(SESSION_ID_BYTES)
         self.scene_epoch = 0
         self.alias: str | None = None
         self.port: int | None = None
         self.started_at: float | None = None
+        self.privacy: dict[str, Any] | None = None
 
         self._token = mint_token()
+        self._verifier = signing.Verifier(self._token, self.session_id)
         self._backend = backend
         self._own_backend = backend is None
         self._lock = threading.Lock()
@@ -156,7 +190,7 @@ class Bridge:
         self._remove_quit_hook = None
         self.problems: list[str] = []
 
-    # -- lifetime ---------------------------------------------------------
+    # Lifetime
 
     def start(self) -> store_module.SessionRecord:
         """Start the server, prove it is private, then announce the session."""
@@ -167,14 +201,17 @@ class Bridge:
             self._backend = backend
             self.port = port
 
-            if self.config.verify_loopback:
-                reachable = reachable_from_outside(port)
-                if reachable:
-                    backend.stop()
-                    self.port = None
-                    raise BridgeError(
-                        f"port {port} answered on {', '.join(reachable)}, not loopback alone"
-                    )
+            proof = prove_loopback_only(port)
+            self.privacy = proof.as_dict()
+            if self.config.verify_loopback and not proof.private:
+                backend.stop()
+                self.port = None
+                raise BridgeError(
+                    f"port {port} is held or answered on {', '.join(proof.reachable)},"
+                    " not loopback alone"
+                )
+            if not proof.proven:
+                self._note(f"the port could not be proven private: {proof.note}")
 
             self.started_at = time.time()
             self._heartbeat_at = self.started_at
@@ -239,45 +276,57 @@ class Bridge:
     def running(self) -> bool:
         return self._running
 
-    # -- endpoints --------------------------------------------------------
+    # Endpoints
 
-    def health(self, headers: Mapping[str, str], payload: Mapping[str, Any]) -> Reply:
-        """Liveness, from memory. No scene, no `hou`, no disk."""
-        refused = self._refuse(headers, payload)
+    def handle_health(self, request: RawRequest) -> RawReply:
+        """Liveness, from memory. No scene, no `hou`, no lock, no disk."""
+        refused = self._front(request)
         if refused is not None:
             return refused
         now = time.time()
-        return Reply(
-            200,
-            ok_payload(
-                {
-                    "status": "ok",
-                    "session_id": self.session_id,
-                    "alias": self.alias,
-                    "kind": self.kind,
-                    "pid": self.pid,
-                    "port": self.port,
-                    "scene_epoch": self.scene_epoch,
-                    "started_at": self.started_at,
-                    "heartbeat_age_s": round(max(0.0, now - self._heartbeat_at), 3),
-                    "busy": self._busy_since is not None,
-                    "current_op": self._current_tool,
-                    "current_op_elapsed_s": self._elapsed_s(),
-                    "tools": self.tools.names(),
-                }
+        return self._answer(
+            request,
+            Reply(
+                200,
+                ok_payload(
+                    {
+                        "status": "ok",
+                        "session_id": self.session_id,
+                        "alias": self.alias,
+                        "kind": self.kind,
+                        "pid": self.pid,
+                        "port": self.port,
+                        "scene_epoch": self.scene_epoch,
+                        "started_at": self.started_at,
+                        "heartbeat_age_s": round(max(0.0, now - self._heartbeat_at), 3),
+                        "busy": self._busy_since is not None,
+                        "current_op": self._current_tool,
+                        "current_op_elapsed_s": self._elapsed_s(),
+                        "privacy": self.privacy,
+                        "tools": self.tools.names(),
+                    }
+                ),
             ),
         )
 
-    def call(self, headers: Mapping[str, str], payload: Mapping[str, Any]) -> Reply:
+    def handle_call(self, request: RawRequest) -> RawReply:
         """Dispatch one request envelope to one tool."""
-        refused = self._refuse(headers, payload)
+        refused = self._front(request)
         if refused is not None:
             return refused
         try:
+            payload = load_json(request.body, max_depth=self.config.max_depth)
             envelope = parse_envelope(payload)
         except EnvelopeError as error:
-            return Reply(400, error_payload(error.code, str(error), details=error.details))
+            return self._answer(
+                request, Reply(400, error_payload(error.code, str(error), details=error.details))
+            )
+        return self._answer(request, self._dispatch(envelope))
 
+    # Dispatch
+
+    def _dispatch(self, envelope: Any) -> Reply:
+        """Run one tool under the one at a time lock."""
         trace = {"operation_id": envelope.operation_id, "scene_epoch": envelope.scene_epoch}
         if envelope.session_id is not None and envelope.session_id != self.session_id:
             return Reply(
@@ -286,7 +335,7 @@ class Bridge:
                     **error_payload(
                         "SESSION_UNKNOWN",
                         "this bridge is a different session",
-                        hint="read the session id from mcp.health and call again",
+                        hint="read the session id from the health endpoint and call again",
                         details={"session_id": self.session_id},
                     ),
                     **trace,
@@ -307,8 +356,9 @@ class Bridge:
                 },
             )
 
+        wait_s = self.config.dispatch_wait_s if envelope.wait_s is None else envelope.wait_s
         waited = time.perf_counter()
-        if not _HOUDINI_LOCK.acquire(timeout=max(0.0, self.config.dispatch_wait_s)):
+        if not self._take_lock(wait_s):
             return Reply(
                 200,
                 {
@@ -320,6 +370,7 @@ class Bridge:
                             "current_op": self._current_tool,
                             "elapsed_s": self._elapsed_s(),
                             "waited_s": round(time.perf_counter() - waited, 3),
+                            "wait_s": wait_s,
                         },
                     ),
                     **trace,
@@ -331,13 +382,20 @@ class Bridge:
         try:
             data = handler(envelope.arguments)
         except Exception as error:  # noqa: BLE001 - one failed tool, not a failed bridge
+            # The text of an exception can hold paths and scene contents, so it
+            # goes to the local log and the caller gets the type.
+            self._log(
+                f"tool {envelope.tool} raised: {type(error).__name__}: {error}\n"
+                + "".join(traceback.format_exception(error)[-8:])
+            )
             return Reply(
                 200,
                 {
                     **error_payload(
                         "TOOL_FAILED",
-                        f"{type(error).__name__}: {error}",
-                        details={"tool": envelope.tool},
+                        f"the tool raised {type(error).__name__}",
+                        hint="the bridge log for this session has the detail",
+                        details={"tool": envelope.tool, "exception": type(error).__name__},
                     ),
                     **trace,
                 },
@@ -349,7 +407,75 @@ class Bridge:
         timing_ms = (time.perf_counter() - began) * 1000.0
         return Reply(200, {**ok_payload(data, timing_ms=timing_ms), **trace})
 
-    # -- internals --------------------------------------------------------
+    def _take_lock(self, wait_s: float) -> bool:
+        """Take the one at a time lock, waiting no longer than asked."""
+        if wait_s <= 0:
+            return _HOUDINI_LOCK.acquire(blocking=False)
+        return _HOUDINI_LOCK.acquire(timeout=wait_s)
+
+    # The front of every request
+
+    def _front(self, request: RawRequest) -> RawReply | None:
+        """Turn a request away, or let it through to be read.
+
+        Nothing is parsed here. The refusal bodies say only that the request
+        was refused; the reason goes to the local log.
+        """
+        headers = request.headers
+        offender = browser_header(headers)
+        if offender is not None:
+            return self._refuse(request, 403, "FORBIDDEN", f"requests with {offender} are refused")
+
+        if request.server_address is not None and not is_loopback(request.server_address):
+            # The bind did not do what it was told. Refuse, then close the
+            # door rather than keep serving the network.
+            self._note(f"a request arrived on {request.server_address}, which is not loopback")
+            threading.Thread(target=self.stop, name="nscr-mcp-close", daemon=True).start()
+            return self._refuse(request, 403, "FORBIDDEN", "this port is for loopback only")
+
+        if self.port is not None and not host_allowed(headers, self.port):
+            return self._refuse(request, 403, "FORBIDDEN", "the host is not this bridge")
+
+        if request.method.upper() != "POST":
+            return self._refuse(request, 405, "METHOD_REFUSED", "this endpoint takes POST")
+
+        kind = (request.content_type or headers.get("content-type", "")).split(";")[0].strip()
+        if kind.lower() != JSON_TYPE:
+            return self._refuse(
+                request, 415, "BODY_REFUSED", f"this endpoint takes {JSON_TYPE} only"
+            )
+
+        if len(request.body) > self.config.max_body_bytes:
+            return self._refuse(
+                request,
+                413,
+                "BODY_REFUSED",
+                f"the body is larger than {self.config.max_body_bytes} bytes",
+            )
+
+        try:
+            self._verifier.check(
+                headers, method=request.method, path=request.path, body=request.body
+            )
+        except signing.SignatureRefused as refused:
+            self._log(f"refused a request to {request.path}: {refused.reason}")
+            return self._refuse(request, 401, "UNAUTHORIZED", "the request was not signed for me")
+        return None
+
+    def _refuse(self, request: RawRequest, status: int, code: str, message: str) -> RawReply:
+        return self._answer(request, Reply(status, error_payload(code, message)))
+
+    def _answer(self, request: RawRequest, reply: Reply) -> RawReply:
+        """Sign an answer, so a caller can tell this bridge from a squatter."""
+        raw = RawReply.of(reply)
+        nonce = self._verifier.nonce_of(request.headers)
+        return RawReply(
+            raw.status,
+            raw.body,
+            {signing.SIGNATURE_HEADER: self._verifier.sign_answer(nonce, raw.status, raw.body)},
+        )
+
+    # Internals
 
     def _listen(self) -> tuple[Backend, int]:
         """Take a port in the range, walking it when the server refuses one.
@@ -373,8 +499,9 @@ class Bridge:
                 f"{self.config.server_name}_{attempt}" if attempt else self.config.server_name
             )
             backend.configure(address=self.config.address, port=wanted, max_port=end_port)
-            backend.register("health", self.health)
-            backend.register("call", self.call)
+            backend.set_max_body(self.config.max_body_bytes)
+            backend.register(HEALTH_PATH, self.handle_health)
+            backend.register(CALL_PATH, self.handle_call)
             try:
                 port = backend.start(wanted, in_background=self.config.in_background)
             except Exception as error:  # noqa: BLE001 - a busy port is not a failed bridge
@@ -388,22 +515,6 @@ class Bridge:
             backend.stop()
             raise BridgeError(f"the server took port {port}, outside {self.config.port_range}")
         raise BridgeError(f"no port in {self.config.port_range} could be served: {last}")
-
-    def _refuse(self, headers: Mapping[str, str], payload: Mapping[str, Any]) -> Reply | None:
-        """Turn away a browser or an unauthenticated caller, or let it through.
-
-        The transport authenticates nobody, so this runs at the top of every
-        handler. The refusal bodies say nothing a caller could learn from.
-        """
-        offender = browser_header(headers)
-        if offender is not None:
-            return Reply(403, error_payload("FORBIDDEN", f"requests with {offender} are refused"))
-        presented: Any = headers.get(TOKEN_HEADER)
-        if presented is None and isinstance(payload, Mapping):
-            presented = payload.get("token")
-        if not token_matches(presented, self._token):
-            return Reply(401, error_payload("UNAUTHORIZED", "token missing or wrong"))
-        return None
 
     def _announce(self, port: int) -> store_module.SessionRecord:
         """Take an alias, write the session row, then the private file."""
@@ -420,6 +531,7 @@ class Bridge:
                 capabilities={
                     "houdini_version": self.facts.get("houdini_version"),
                     "hfs": self.facts.get("hfs"),
+                    "privacy": self.privacy,
                 },
             )
         self.alias = record.alias
@@ -430,8 +542,11 @@ class Bridge:
                 "alias": record.alias,
                 "kind": self.kind,
                 "pid": self.pid,
+                "pid_start": self.pid_start,
                 "port": port,
                 "address": self.config.address,
+                "health_path": HEALTH_PATH,
+                "call_path": CALL_PATH,
                 "token": self._token,
                 "scene_epoch": self.scene_epoch,
                 "started_at": self.started_at,
@@ -467,6 +582,22 @@ class Bridge:
         """How long the running call has been running, read without a lock."""
         since = self._busy_since
         return None if since is None else round(max(0.0, time.time() - since), 3)
+
+    def log_path(self) -> Path:
+        """Where this session's detail goes. The token is never written here."""
+        return self.home / LOG_DIR_NAME / f"{self.session_id}.log"
+
+    def _log(self, text: str) -> None:
+        """Append one note to the session log, and never fail over it."""
+        self._note(text.splitlines()[0] if text else "")
+        try:
+            path = self.log_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(f"{stamp} {text}\n")
+        except OSError:
+            pass
 
     def _note(self, problem: str) -> None:
         """Keep the last few problems where a status call can find them."""
