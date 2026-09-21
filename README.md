@@ -69,12 +69,18 @@ nscr-houdini-mcp
 endpoints on loopback, registers the session in the coordination store and
 takes it out again when the process quits.
 
+What the bridge guards against: a web page in a browser on this machine,
+another person with an account on it, and the network. Not the owner's own
+programs. Anything running as the same person can read that person's files,
+token included, and could drive Houdini with or without this.
+
 The token is never sent. Each request is signed with it and each answer is
 signed back, so nothing on the port learns anything it could use again, and a
 caller can tell the bridge from something that took its port after a crash. A
 request is also refused if it carries `Origin` or `Referer`, names a host
 other than this bridge, is not JSON, is over the size cap, or nests too deeply
-for an envelope.
+for an envelope. The bridge registers no built in API route, so the one that
+parses a posted form before any handler runs does not exist on its server.
 
 Start one in a headless Houdini:
 
