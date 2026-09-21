@@ -124,3 +124,43 @@ def test_a_shared_state_folder_is_refused(tmp_path: Path) -> None:
     with pytest.raises(security.InsecureLocation):
         security.check_home(shared)
     security.check_home(tmp_path)
+
+
+def test_a_folder_that_is_not_private_is_not_used_for_a_token(tmp_path: Path) -> None:
+    folder = tmp_path / "sessions"
+    folder.mkdir(mode=0o700)
+    if sys.platform == "win32":
+        pytest.skip("there are no mode bits here")
+    folder.chmod(0o707)
+    with pytest.raises(security.InsecureLocation):
+        security.check_private_dir(folder)
+    # The write path goes through the same check, so nothing lands in it.
+    folder.chmod(0o700)
+    security.write_private(folder / "one.json", "{}")
+    assert (folder / "one.json").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="there are no symbolic links to test here")
+def test_a_link_left_in_place_of_the_new_file_is_not_followed(tmp_path: Path) -> None:
+    target = tmp_path / "elsewhere.txt"
+    target.write_text("untouched", encoding="utf-8")
+    path = tmp_path / "one.json"
+    path.with_name(path.name + ".part").symlink_to(target)
+    security.write_private(path, "mine")
+    assert path.read_text(encoding="utf-8") == "mine"
+    assert target.read_text(encoding="utf-8") == "untouched"
+
+
+def test_a_folder_is_named_private_only_where_that_can_be_shown(tmp_path: Path) -> None:
+    path = security.write_private(tmp_path / "one.json", "{}")
+    assert security.is_private(path) is True
+    assert security.is_private(tmp_path) is False
+    assert security.is_private(tmp_path / "not-there.json") is False
+    if sys.platform != "win32":
+        path.chmod(0o644)
+        assert security.is_private(path) is False
+
+
+def test_a_network_path_is_never_one_of_this_user_s_folders() -> None:
+    assert security.under_user_profile(Path("//server/share/state")) is False
+    assert security.under_user_profile(Path.home() / "state") is True

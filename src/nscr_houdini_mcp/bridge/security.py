@@ -14,13 +14,15 @@ Header rules, in the order a request meets them:
 File rules:
 
 - The token lives in one file that only its owner can read, created with the
-  mode already set, so there is no moment when it is readable by anyone else.
+  mode already set and without following a link, so there is no moment when it
+  is readable by anyone else and nothing can be waiting in its place.
 - The folder holding it is checked after it is made: not a link, owned by this
   user, nothing granted to group or other. A folder that fails is an error,
   not a warning.
-- On Windows there are no mode bits. What protects the file is the per user
-  profile folder it sits in, so a state folder in a shared or synced place is
-  refused outright.
+- On Windows there are no mode bits and nothing here reads an access list.
+  What stands in for both is where the file is: under this user's own profile,
+  on a local disk, not in a shared or synced place. `is_private` says exactly
+  that much on Windows and no more.
 """
 
 from __future__ import annotations
@@ -94,15 +96,58 @@ def host_allowed(headers: Mapping[str, str], port: int) -> bool:
 def check_home(home: Path) -> None:
     """Refuse a state folder that cannot keep a secret.
 
-    On Windows the mode bits do not exist, so the only protection is the per
-    user profile folder. A folder that is shared, synced or on a network path
-    is not that, and a token has no business in one.
+    A folder that is shared, synced or on a network path is not private to one
+    user, and a token has no business in one. On Windows this is most of the
+    protection there is, so a folder outside this user's own profile is
+    refused there as well.
     """
     warning = shared_location_warning(home)
     if warning is not None:
         raise InsecureLocation(
             f"{home} is not a private per user folder, so it cannot hold a token"
         )
+    if sys.platform == "win32" and not under_user_profile(home):
+        raise InsecureLocation(f"{home} is outside this user's own folders")
+
+
+def user_roots() -> list[Path]:
+    """The folders this system treats as belonging to this user alone."""
+    roots = []
+    for name in ("LOCALAPPDATA", "APPDATA", "USERPROFILE"):
+        value = os.environ.get(name)
+        if value:
+            roots.append(Path(value))
+    roots.append(Path.home())
+    settled = []
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except OSError:
+            continue
+        if resolved not in settled:
+            settled.append(resolved)
+    return settled
+
+
+def under_user_profile(path: Path) -> bool:
+    """Whether a path sits inside one of this user's own folders.
+
+    A network path is never one of them, whatever it resolves to.
+    """
+    text = str(path)
+    if text.startswith("\\\\") or text.startswith("//"):
+        return False
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        return False
+    for root in user_roots():
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        return True
+    return False
 
 
 def private_dir(path: Path) -> Path:
@@ -136,22 +181,21 @@ def write_private(path: Path, text: str) -> Path:
     """
     private_dir(path.parent)
     data = text.encode("utf-8")
-    if sys.platform == "win32":
-        # No mode bits. The profile folder is the protection, and `check_home`
-        # has already refused a folder that is not one.
-        temporary = path.with_name(path.name + ".part")
-        temporary.unlink(missing_ok=True)
-        temporary.write_bytes(data)
-        os.replace(temporary, path)
-        return path
     temporary = path.with_name(path.name + ".part")
+    # Whatever is sitting there, including a link pointing somewhere else, is
+    # removed before a new file is created under that name.
     temporary.unlink(missing_ok=True)
-    handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, PRIVATE_FILE_MODE)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_BINARY", 0)
+    handle = os.open(temporary, flags, PRIVATE_FILE_MODE)
     try:
         with os.fdopen(handle, "wb") as stream:
             stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
         if not is_private(temporary):
-            raise InsecureLocation(f"{temporary} was created readable by others")
+            raise InsecureLocation(f"{temporary} is not private to this user")
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -160,12 +204,21 @@ def write_private(path: Path, text: str) -> Path:
 
 
 def is_private(path: Path) -> bool:
-    """Whether a file is readable by its owner alone.
+    """Whether a file is as private as this system lets the bridge make it.
 
-    Always true on Windows, where the folder rather than the file carries the
-    restriction.
+    This is not an access list check on any system.
+
+    On Linux and macOS it reads the file's own bits: a real file, owned by this
+    user, with nothing granted to group or other.
+
+    On Windows there are no such bits, so it answers a weaker question: the
+    file is a real file inside this user's own profile folders, on a local
+    disk rather than a share. Whatever the access list on it says is neither
+    read nor claimed.
     """
+    if not path.exists() or path.is_dir():
+        return False
     if sys.platform == "win32":
-        return True
+        return not os.path.islink(path) and under_user_profile(path.parent)
     stat = path.lstat()
     return not os.path.islink(path) and stat.st_uid == os.getuid() and not stat.st_mode & 0o077
