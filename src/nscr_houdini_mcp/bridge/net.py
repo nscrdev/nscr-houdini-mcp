@@ -1,18 +1,44 @@
 """Picking a port and proving that only loopback can reach it.
 
 The web server binds every interface unless it is told otherwise, so the bind
-address is a setting the bridge must pass and then check. The check is a
-connection attempt from this machine to its own outside addresses: if one of
-them answers on the bridge port, the bind did not do what it was told and the
-bridge stops rather than serving the network.
+address is a setting the bridge must pass and then check.
+
+Two checks, because neither is enough on its own:
+
+- A bind attempt on each of this machine's own outside addresses. A bind that
+  succeeds says nothing is listening there. This is the check the bridge
+  starts on, because a firewall cannot make its answer look better than the
+  truth.
+- A connection attempt to the same addresses, which is what an outside caller
+  would actually do.
+
+What each proves, by system:
+
+- Linux and macOS: no address reuse flag is set on the probe, so binding an
+  address and port that something already holds fails. A bind that succeeds is
+  real evidence that nothing is listening on that address.
+- Windows: a second bind to the same address and port can succeed when the
+  first socket asked for address reuse, and what the web server asked for is
+  not visible from here. So on Windows a clean bind is weaker evidence, and
+  the address each request actually arrived on is the check that settles it.
+
+Neither check can say anything about an address this machine does not have.
+When there is no outside address to test, nothing has been proven, and the
+caller is told that rather than told it passed.
 """
 
 from __future__ import annotations
 
 import socket
+import sys
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import Any
 
 LOOPBACK = "127.0.0.1"
+
+# Names and addresses that mean "this machine, over the loopback interface".
+LOOPBACK_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
 
 # A private range well above the ports Houdini and its help server use.
 DEFAULT_PORT_RANGE = (18100, 18199)
@@ -150,3 +176,70 @@ def addresses_holding_port(port: int, *, addresses: Sequence[str] | None = None)
             except OSError:
                 held.append(address)
     return held
+
+
+def is_loopback(address: str | None) -> bool:
+    """Whether an address is on this machine's loopback interface."""
+    if not address:
+        return False
+    plain = str(address).split("%", 1)[0].strip().strip("[]")
+    return plain.startswith("127.") or plain in ("::1", "0:0:0:0:0:0:0:1")
+
+
+@dataclass(frozen=True)
+class PrivacyProof:
+    """What could be shown about who can reach a port, and what could not."""
+
+    private: bool
+    proven: bool
+    tested: tuple[str, ...]
+    reachable: tuple[str, ...]
+    note: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "private": self.private,
+            "proven": self.proven,
+            "tested": list(self.tested),
+            "reachable": list(self.reachable),
+            "note": self.note,
+        }
+
+
+def prove_loopback_only(port: int, *, addresses: Sequence[str] | None = None) -> PrivacyProof:
+    """Test a port against this machine's own outside addresses.
+
+    `private` false means something answered where nothing should. `proven`
+    false means there was nothing to test against, which is not the same as a
+    pass and is never reported as one.
+    """
+    candidates = tuple(outward_addresses() if addresses is None else addresses)
+    if not candidates:
+        return PrivacyProof(
+            private=True,
+            proven=False,
+            tested=(),
+            reachable=(),
+            note="this machine has no address outside loopback to test against",
+        )
+    held = tuple(addresses_holding_port(port, addresses=candidates))
+    answering = tuple(reachable_from_outside(port, addresses=candidates))
+    busy = tuple(dict.fromkeys(held + answering))
+    if busy:
+        return PrivacyProof(
+            private=False,
+            proven=True,
+            tested=candidates,
+            reachable=busy,
+            note="the port is taken or answering on an address outside loopback",
+        )
+    note = "nothing holds or answers on this machine's outside addresses"
+    if sys.platform == "win32":
+        note += ", though a bind can succeed here beside a socket that asked for reuse"
+    return PrivacyProof(
+        private=True,
+        proven=sys.platform != "win32",
+        tested=candidates,
+        reachable=(),
+        note=note,
+    )
