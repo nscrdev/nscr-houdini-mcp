@@ -794,7 +794,7 @@ class Store:
         if found is not None:
             return found
         row = self._read_one(
-            "SELECT * FROM sessions WHERE alias = ? AND state <> ? ORDER BY started_at DESC",
+            "SELECT * FROM sessions WHERE alias = ? AND state <> ? ORDER BY started_at DESC, rowid DESC",
             (handle, SESSION_GONE),
         )
         return None if row is None else SessionRecord._from_row(row)
@@ -806,7 +806,7 @@ class Store:
         if not include_gone:
             sql += " WHERE state <> ?"
             args = (SESSION_GONE,)
-        sql += " ORDER BY started_at"
+        sql += " ORDER BY started_at, rowid"
         return [SessionRecord._from_row(row) for row in self._read_all(sql, args)]
 
     def touch_session(self, session_id: str, *, state: str | None = None) -> float:
@@ -1002,7 +1002,7 @@ class Store:
         if active_only:
             sql += f" WHERE state IN ({', '.join('?' * len(WORKER_ACTIVE_STATES))})"
             args = WORKER_ACTIVE_STATES
-        sql += " ORDER BY reserved_at"
+        sql += " ORDER BY reserved_at, rowid"
         return [WorkerRecord._from_row(row) for row in self._read_all(sql, args)]
 
     def idle_workers(self, max_idle_s: float) -> list[WorkerRecord]:
@@ -1265,7 +1265,7 @@ class Store:
         now = self._now()
         rows = self._read_all(
             f"SELECT * FROM jobs WHERE state IN ({', '.join('?' * len(JOB_LIVE_STATES))})"
-            " ORDER BY created_at",
+            " ORDER BY created_at, rowid",
             JOB_LIVE_STATES,
         )
         stale = []
@@ -1301,7 +1301,7 @@ class Store:
             args.extend(states)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY created_at DESC LIMIT ?"
+        sql += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
         args.append(limit)
         return [JobRecord._from_row(row) for row in self._read_all(sql, args)]
 
@@ -1416,7 +1416,7 @@ class Store:
         if kind is not None:
             sql += " WHERE kind = ?"
             args.append(kind)
-        sql += " ORDER BY created_at DESC LIMIT ?"
+        sql += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
         args.append(limit)
         return [RunRecord._from_row(row) for row in self._read_all(sql, args)]
 
