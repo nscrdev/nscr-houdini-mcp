@@ -1,0 +1,5 @@
+#!/bin/sh
+# Block staged changes that carry private working material. See hooks/leak_guard.py.
+set -e
+root=$(git rev-parse --show-toplevel)
+exec python3 "$root/hooks/leak_guard.py" --staged

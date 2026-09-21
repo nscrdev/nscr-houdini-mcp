@@ -1,0 +1,5 @@
+#!/bin/sh
+# Block a commit message that carries private working material. See hooks/leak_guard.py.
+set -e
+root=$(git rev-parse --show-toplevel)
+exec python3 "$root/hooks/leak_guard.py" --message "$1"

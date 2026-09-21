@@ -1,0 +1,20 @@
+#!/bin/sh
+# Point this clone at the tracked hooks directory.
+#
+# The hooks need the term list at .context/leak-terms.txt, which is ignored by
+# git and kept only on your own machine. Without it every commit is refused.
+set -e
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+chmod +x hooks/pre-commit hooks/commit-msg hooks/leak_guard.py
+git config core.hooksPath hooks
+
+echo "hooks installed: core.hooksPath = hooks"
+
+if [ ! -f .context/leak-terms.txt ]; then
+  echo
+  echo "warning: .context/leak-terms.txt is missing, so commits will be refused."
+  echo "Create it with one term per line ('#' starts a comment). Never track it."
+fi
