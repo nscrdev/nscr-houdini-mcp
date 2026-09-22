@@ -185,6 +185,10 @@ class Undos:
         self.performed += 1
 
 
+# The longest a held main thread stays held when nothing lets it go.
+HOLD_CAP_S = 30.0
+
+
 class MainThread:
     """A main thread that runs only what is posted to it.
 
@@ -238,6 +242,25 @@ class MainThread:
         somewhere else and then owns the main thread until it ends.
         """
         self.postEventCallback(lambda: time.sleep(seconds))
+
+    def hold(self) -> tuple[threading.Event, threading.Event]:
+        """Hold the main thread until it is let go, and say when it started.
+
+        The same thing `cook` does, without a duration to outrun: a test that
+        has work to do while the main thread is busy waits for the first event
+        before it starts and sets the second when it is done, so a slow
+        machine cannot let the hold end underneath it.
+        """
+        begun = threading.Event()
+        release = threading.Event()
+
+        def held() -> None:
+            begun.set()
+            # Capped, so a test that never lets go still ends.
+            release.wait(HOLD_CAP_S)
+
+        self.postEventCallback(held)
+        return begun, release
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._loop, name="fake-main", daemon=True)

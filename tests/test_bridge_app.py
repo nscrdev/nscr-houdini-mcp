@@ -1171,9 +1171,11 @@ def test_health_reports_the_main_thread_and_answers_under_budget_while_it_is_hel
     bridge, backend = make_bridge(tmp_path, kind="gui", hou=scene.module(), main_thread_stale_s=0.2)
     scene.ui.start()
     bridge.start()
+    begun, release = scene.ui.hold()
     try:
-        scene.ui.cook(1.0)
-        _wait_for(lambda: scene.ui.ran_on != [])
+        # The hold lasts until this test lets it go, so the reads below cannot
+        # outrun it however slow the machine is.
+        assert begun.wait(5.0)
 
         slowest = 0.0
         ages: list[float] = []
@@ -1192,6 +1194,7 @@ def test_health_reports_the_main_thread_and_answers_under_budget_while_it_is_hel
         assert away[-1] is True
         assert away[0] is False
     finally:
+        release.set()
         bridge.stop()
         scene.ui.stop()
 
