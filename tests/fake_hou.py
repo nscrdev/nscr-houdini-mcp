@@ -44,7 +44,14 @@ class PermissionError(Error):  # noqa: A001 - the name is Houdini's
     pass
 
 
-for _kind in (Error, OperationFailed, ObjectWasDeleted, InvalidInput, PermissionError):
+class LoadWarning(Error):
+    """What a load raises when it loaded, with things it could not resolve."""
+
+    def instanceMessage(self) -> str:  # noqa: N802 - the name is Houdini's
+        return str(self)
+
+
+for _kind in (Error, OperationFailed, ObjectWasDeleted, InvalidInput, PermissionError, LoadWarning):
     _as_hou(_kind)
 
 
@@ -316,12 +323,25 @@ class HipFile:
         self._scene = scene
         self._path = path
         self._callbacks: list[Any] = []
+        # What the scene says about itself. A headless session says it has
+        # unsaved changes whatever it has, so that is the default here.
+        self.unsaved = True
+        self.new = False
+        # The text a load warns with, when a test wants one.
+        self.load_warning: str | None = None
+        self.saved: list[str] = []
 
     def path(self) -> str:
         return self._path
 
+    def basename(self) -> str:
+        return self._path.replace("\\", "/").rsplit("/", 1)[-1]
+
+    def isNewFile(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return self.new
+
     def hasUnsavedChanges(self) -> bool:  # noqa: N802 - the name is Houdini's
-        return True
+        return self.unsaved
 
     def addEventCallback(self, callback: Any) -> None:  # noqa: N802 - the name is Houdini's
         self._callbacks.append(callback)
@@ -339,11 +359,16 @@ class HipFile:
         self._scene.empty()
         self._fire(HipFileEventType.BeforeClear, HipFileEventType.AfterClear)
 
-    def load(self, path: str, suppress_save_prompt: bool = False) -> None:
+    def load(
+        self, path: str, suppress_save_prompt: bool = False, ignore_load_warnings: bool = False
+    ) -> None:
         self._fire(HipFileEventType.BeforeLoad, HipFileEventType.BeforeClear)
         self._scene.empty()
         self._path = str(path)
+        self.new = False
         self._fire(HipFileEventType.AfterClear, HipFileEventType.AfterLoad)
+        if self.load_warning and not ignore_load_warnings:
+            raise LoadWarning(self.load_warning)
 
     def fail_load(self, path: str) -> None:
         """A load that clears the old scene and then gives up.
@@ -362,6 +387,8 @@ class HipFile:
     def save(self, path: str | None = None) -> None:
         if path:
             self._path = str(path)
+        self.new = False
+        self.saved.append(self._path)
         self._fire(HipFileEventType.BeforeSave, HipFileEventType.AfterSave)
 
 
@@ -419,4 +446,5 @@ class Scene:
             ObjectWasDeleted=ObjectWasDeleted,
             InvalidInput=InvalidInput,
             PermissionError=PermissionError,
+            LoadWarning=LoadWarning,
         )

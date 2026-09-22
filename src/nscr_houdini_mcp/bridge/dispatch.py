@@ -30,7 +30,9 @@ The lock in the app says one call at a time. This says the rest of it:
   and finishes it with the answer, so the same id sent again is answered from
   the receipt instead of doing the work twice.
 - Every mutating call runs inside one undo group, on the main thread where
-  there is one, and a failure rolls the group's graph edits back.
+  there is one, and a failure rolls the group's graph edits back. A change
+  Houdini cannot undo, such as loading a scene, runs without a group and its
+  reply says so.
 - Every error carries a code from the table, and no exception text.
 
 Cancelling is a request, not a stop. `bridge.cancel` sets a flag on the call
@@ -603,7 +605,7 @@ class Dispatcher:
             # session may have loaded another scene while it waited: the paths
             # in its arguments would then mean something else entirely.
             self._still_the_same_scene(carried)
-            if not tool.mutating or self._hou is None:
+            if not tool.mutating or not tool.undoable or self._hou is None:
                 return tool.run(arguments, context)
             outcome = run_in_undo_group(
                 lambda: tool.run(arguments, context),
@@ -656,12 +658,14 @@ class Dispatcher:
         if converted.lossy:
             payload["lossy"] = True
             payload["cut"] = converted.cut
-        if tool.mutating:
+        if tool.mutating and tool.undoable:
             payload["undo"] = {
                 "label": tool.undo_label(),
                 "recorded": running.recorded,
                 "rolled_back": running.rolled_back,
             }
+        elif tool.mutating:
+            payload["undo"] = {"label": tool.undo_label(), "undoable": False}
         return Reply(200, payload)
 
     def _failed(
@@ -674,7 +678,7 @@ class Dispatcher:
             + "".join(traceback.format_exception(error)[-8:])
         )
         coded = map_exception(error, tool=tool.name)
-        if tool.mutating and running is not None:
+        if tool.mutating and tool.undoable and running is not None:
             coded.details.setdefault("rolled_back", running.rolled_back)
             coded.details.setdefault("undo_recorded", running.recorded)
         return self._refuse(coded, trace)

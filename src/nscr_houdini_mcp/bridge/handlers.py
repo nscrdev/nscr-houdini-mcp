@@ -37,6 +37,10 @@ class Tool:
     # Whether it changes the scene: it then runs inside one undo group. In a
     # graphical session every tool runs on the main thread regardless.
     mutating: bool = False
+    # Whether its change can be undone. A change that cannot, such as loading
+    # a scene or writing a file, still takes a receipt, but no undo group is
+    # opened around it and the reply says there is nothing to undo.
+    undoable: bool = True
     # The argument names it takes. `None` means it takes whatever it is given.
     arguments: tuple[str, ...] | None = None
     required: tuple[str, ...] = ()
@@ -71,6 +75,7 @@ class ToolRegistry:
         handler: ToolHandler,
         *,
         mutating: bool = False,
+        undoable: bool = True,
         arguments: Sequence[str] | None = None,
         required: Sequence[str] = (),
         context: bool = False,
@@ -85,6 +90,7 @@ class ToolRegistry:
             name=name,
             handler=handler,
             mutating=mutating,
+            undoable=undoable,
             arguments=None if arguments is None else tuple(arguments),
             required=tuple(required),
             context=context,
@@ -160,9 +166,41 @@ def default_registry(*, selfcheck: bool = False) -> ToolRegistry:
     registry.add(
         "scene.info",
         tool_module.scene_info,
-        arguments=(),
+        arguments=("dependencies",),
         context=True,
         summary="what is open, and how big it is",
+    )
+    registry.add(
+        "scene.open",
+        tool_module.scene_open,
+        mutating=True,
+        undoable=False,
+        arguments=("path", "discard_unsaved"),
+        required=("path",),
+        context=True,
+        label="open scene",
+        summary="load a scene file and say what it could not find",
+    )
+    registry.add(
+        "scene.save",
+        tool_module.scene_save,
+        mutating=True,
+        undoable=False,
+        arguments=(),
+        context=True,
+        label="save scene",
+        summary="save the scene where it already is",
+    )
+    registry.add(
+        "scene.save_as",
+        tool_module.scene_save_as,
+        mutating=True,
+        undoable=False,
+        arguments=("path",),
+        required=("path",),
+        context=True,
+        label="save scene as",
+        summary="save the scene to a new file, never over one that is there",
     )
     registry.add(
         "node.create",

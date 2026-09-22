@@ -231,7 +231,7 @@ def test_a_name_that_is_not_a_tool_comes_back_with_the_closest_one(
     answer = bridge.call("scene.inf")
     error = answer.payload["error"]
     assert error["code"] == "UNKNOWN_TOOL"
-    assert error["details"]["did_you_mean"] == ["scene.info"]
+    assert error["details"]["did_you_mean"][0] == "scene.info"
 
 
 def test_waiting_calls_are_served_in_the_order_they_arrived(bridge: HythonBridge) -> None:

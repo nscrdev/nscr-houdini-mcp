@@ -1,10 +1,14 @@
 """The first tools that touch a scene.
 
-Two real ones and one for exercising the rules around them. They are bridge
-level tools, named the way `bridge.ping` is named. The tool surface a client
-sees is a separate, smaller set built on top of these.
+They are bridge level tools, named the way `bridge.ping` is named. The tool
+surface a client sees is a separate, smaller set built on top of these.
 
-- `scene.info` reads. It cooks nothing and changes nothing.
+- `scene.info` reads. It cooks nothing and changes nothing. Asked for, it
+  also says which files and assets the scene points at that are not there.
+- `scene.open`, `scene.save` and `scene.save_as` change which file the
+  session holds or write it. None of them can be undone, so they run without
+  an undo group and say so. A load replaces the scene, which moves the scene
+  epoch; a save does not.
 - `bridge.capabilities` reads facts about the process rather than the scene:
   the build, the license, the renderers that are really installed and the ways
   this session can make a picture. The pool records the answer beside the
@@ -20,6 +24,8 @@ sees is a separate, smaller set built on top of these.
 
 from __future__ import annotations
 
+import os
+import re
 import sys
 import time
 from collections.abc import Mapping
@@ -50,6 +56,32 @@ MAX_CREATES = 64
 
 # How long the self check sleeps between looks at the cancel flag.
 SLICE_S = 0.05
+
+# What a scene file may end in: full, non commercial and limited commercial.
+HIP_SUFFIXES = (".hip", ".hipnc", ".hiplc")
+
+# Bounds on the dependency report, so a scene with thousands of references
+# answers in bounded time and size. A report that hit one says so.
+MAX_REFERENCES = 2000
+MAX_REPORTED = 200
+MAX_NODES_SCANNED = 50000
+MAX_WARNING_LINES = 50
+
+# What a load warning says about a node type this build does not have, and
+# about an asset whose library could not be found.
+_BAD_TYPE = re.compile(r"Bad node type found:\s*(\S+)\s+in\s+(\S+?)\.?\s*$")
+_INCOMPLETE = re.compile(r'"(/[^"]+)"\s+using incomplete asset definition')
+
+# A frame in a file name, which makes one reference a sequence of files.
+_FRAME_VARIABLE = re.compile(r"\$\{?(F\d*|FF|SF|T)\}?")
+
+# Values a file parameter can hold that are not places on disk.
+_NOT_ON_DISK = ("op:", "opdef:", "oplib:", "temp:", "http:", "https:")
+
+UNDO_NOTE = "a scene file change cannot be undone"
+
+# The words Houdini puts on a node whose asset library was not found.
+STUB_WARNING = "incomplete asset definition"
 
 
 @dataclass(frozen=True)
@@ -86,6 +118,27 @@ def scene_info(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, 
     frame the artist sees.
     """
     hou = _houdini(context)
+    info = {
+        "hip_path": _quiet(hou.hipFile.path),
+        "hip_name": _quiet(lambda: hou.hipFile.basename()),
+        "untitled": _quiet(lambda: hou.hipFile.isNewFile()),
+        "houdini_version": _quiet(hou.applicationVersionString),
+        "frame": _quiet(hou.frame),
+        "fps": _quiet(hou.fps),
+        "frame_range": _range(hou),
+        "nodes": _counts(hou),
+        "undo_entries": _undo_entries(hou),
+        "unsaved": _unsaved(hou, context),
+        "scene_epoch": context.scene_epoch,
+        "session_id": context.session_id,
+        "kind": context.kind,
+    }
+    if arguments.get("dependencies"):
+        info["dependencies"] = dependencies(hou)
+    return info
+
+
+def _counts(hou: Any) -> dict[str, int]:
     counts: dict[str, int] = {}
     for path in CONTEXTS:
         node = _quiet(lambda path=path: hou.node(path))
@@ -93,19 +146,7 @@ def scene_info(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, 
             children = _quiet(node.children)
             if children is not None:
                 counts[path] = len(children)
-    return {
-        "hip_path": _quiet(hou.hipFile.path),
-        "houdini_version": _quiet(hou.applicationVersionString),
-        "frame": _quiet(hou.frame),
-        "fps": _quiet(hou.fps),
-        "frame_range": _range(hou),
-        "nodes": counts,
-        "undo_entries": _undo_entries(hou),
-        "unsaved": _unsaved(hou, context),
-        "scene_epoch": context.scene_epoch,
-        "session_id": context.session_id,
-        "kind": context.kind,
-    }
+    return counts
 
 
 def capabilities(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, Any]:
@@ -207,6 +248,257 @@ def _undo_entries(hou: Any) -> int | None:
 def _range(hou: Any) -> list[float] | None:
     frames = _quiet(lambda: hou.playbar.frameRange())
     return None if frames is None else [float(value) for value in frames]
+
+
+# Section: what a scene points at
+
+
+def dependencies(hou: Any, warning: str = "") -> dict[str, Any]:
+    """What the scene needs that this machine does not have.
+
+    Three lists. Node types the scene names that this build has no
+    definition for, which only a load reports, because such a node is never
+    made. Assets whose library was not found, which leaves the node on a
+    stub definition that has no parameters. And file references that point
+    at nothing on disk.
+
+    A file reference counts only when it is read and was set by somebody: a
+    parameter at its default and every output driver are passed over, because
+    an output that is not written yet is not missing. A reference with a
+    frame in it counts as there when the file for the current frame, or for
+    the first or last frame of the range, is there.
+    """
+    types, named, lines = _read_warning(warning)
+    assets, truncated = _incomplete_assets(hou)
+    for path in named:
+        if path not in {asset["node"] for asset in assets}:
+            node = _ask(hou, "node", path)
+            node_type = _ask(node, "type") if node is not None else None
+            assets.append({"node": path, "type": _ask(node_type, "name") if node_type else None})
+    missing, checked, cut = _missing_files(hou)
+    return {
+        "unresolved_types": types[:MAX_REPORTED],
+        "missing_hdas": assets[:MAX_REPORTED],
+        "missing_files": missing,
+        "load_warnings": lines,
+        "references_checked": checked,
+        "truncated": truncated or cut or len(types) > MAX_REPORTED,
+    }
+
+
+def _read_warning(text: str) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """The node types a load warning names, the asset nodes, and its lines."""
+    types: list[dict[str, Any]] = []
+    assets: list[str] = []
+    lines: list[str] = []
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        # The first line only repeats which file was loading.
+        if not line or line.startswith("Error loading:"):
+            continue
+        if line.startswith("Warning:"):
+            line = line[len("Warning:") :].strip()
+        bad = _BAD_TYPE.search(line)
+        if bad:
+            types.append({"type": bad.group(1), "parent": bad.group(2)})
+        stub = _INCOMPLETE.search(line)
+        if stub:
+            assets.append(stub.group(1))
+        if len(lines) < MAX_WARNING_LINES:
+            lines.append(line)
+    return types, assets, lines
+
+
+def _incomplete_assets(hou: Any) -> tuple[list[dict[str, Any]], bool]:
+    """Nodes whose asset definition is a stub, because its library is missing.
+
+    Houdini puts a warning on such a node saying the definition is
+    incomplete, and the node has no parameters of its own. Only a node whose
+    type has an asset definition is asked, and each type once however many
+    nodes use it.
+    """
+    root = _quiet(lambda: hou.node("/"))
+    if root is None:
+        return [], False
+    nodes = _quiet(lambda: root.allSubChildren(recurse_in_locked_nodes=False)) or ()
+    verdicts: dict[str, bool] = {}
+    found: list[dict[str, Any]] = []
+    for index, node in enumerate(nodes):
+        if index >= MAX_NODES_SCANNED or len(found) >= MAX_REPORTED:
+            return found, True
+        node_type = _ask(node, "type")
+        if node_type is None:
+            continue
+        key = str(_ask(node_type, "nameWithCategory") or _ask(node_type, "name"))
+        if key not in verdicts:
+            verdicts[key] = _is_stub(node, node_type)
+        if verdicts[key]:
+            found.append({"node": node.path(), "type": _ask(node_type, "name")})
+    return found, False
+
+
+def _is_stub(node: Any, node_type: Any) -> bool:
+    if _ask(node_type, "definition") is None:
+        return False
+    warnings = _ask(node, "warnings") or ()
+    return any(STUB_WARNING in str(warning) for warning in warnings)
+
+
+def _missing_files(hou: Any) -> tuple[list[dict[str, Any]], int, bool]:
+    """File references that point at nothing, how many were read, and whether
+    the read stopped at a bound."""
+    references = _ask(hou, "fileReferences") or ()
+    frames = _frames_to_try(hou)
+    missing: list[dict[str, Any]] = []
+    checked = 0
+    for parm, raw in references:
+        if checked >= MAX_REFERENCES or len(missing) >= MAX_REPORTED:
+            return missing, checked, True
+        checked += 1
+        if parm is not None and _not_a_read(parm):
+            continue
+        values = [value for value in _values(hou, parm, raw, frames) if _on_disk(value)]
+        if not values or any(os.path.exists(value) for value in values):
+            continue
+        missing.append({"parm": None if parm is None else _ask(parm, "path"), "path": values[0]})
+    return missing, checked, False
+
+
+def _not_a_read(parm: Any) -> bool:
+    if _ask(parm, "isAtDefault"):
+        return True
+    category = _quiet(lambda: parm.node().type().category().name())
+    return category == "Driver"
+
+
+def _values(hou: Any, parm: Any, raw: Any, frames: list[float]) -> list[str]:
+    """The paths one reference stands for: one, or one per frame tried."""
+    if parm is None:
+        value = _quiet(lambda: hou.expandString(str(raw)))
+        return [str(value)] if value else []
+    if _FRAME_VARIABLE.search(str(raw or "")):
+        found = [_quiet(lambda frame=frame: parm.evalAsStringAtFrame(frame)) for frame in frames]
+        return [str(value) for value in found if value]
+    value = _ask(parm, "evalAsString")
+    return [str(value)] if value else []
+
+
+def _frames_to_try(hou: Any) -> list[float]:
+    frames = [_ask(hou, "frame")]
+    frames.extend(_range(hou) or [])
+    return [float(frame) for frame in frames if frame is not None]
+
+
+def _on_disk(value: str) -> bool:
+    """Whether a value names a file on disk that can be looked for."""
+    text = value.strip()
+    if not text or text.startswith(_NOT_ON_DISK) or "$" in text:
+        return False
+    return os.path.isabs(text)
+
+
+# Section: the scene file
+
+
+def scene_open(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, Any]:
+    """Load a scene file and report what it points at that is not there.
+
+    A graphical session with changes that are not saved is refused unless the
+    call says to throw them away, because a load that loses somebody's work
+    without asking is worse than one more round trip. A worker's scene is the
+    caller's own, and a headless session cannot tell a saved scene from an
+    edited one anyway, so a worker is never refused for it.
+
+    A load that finds problems still loads. What it could not resolve comes
+    back as data, not as an error.
+    """
+    hou = _houdini(context)
+    path = _hip_path(arguments["path"])
+    if not os.path.isfile(path):
+        raise BridgeError(
+            "FILE_NOT_FOUND",
+            "there is no scene file at that path",
+            {"suffix": Path(path).suffix},
+            hint="check the path, or list the folder, then open a file that is there",
+        )
+    unsaved = _unsaved(hou, context)
+    discard = bool(arguments.get("discard_unsaved"))
+    if unsaved and not discard:
+        raise BridgeError(
+            "UNSAVED_CHANGES",
+            "the scene open in this session has changes that are not saved",
+            {"hip_name": _quiet(lambda: hou.hipFile.basename())},
+            hint="save the scene first, or pass discard_unsaved true to throw the changes away",
+        )
+    warning = ""
+    try:
+        hou.hipFile.load(path, suppress_save_prompt=True, ignore_load_warnings=False)
+    except Exception as error:  # noqa: BLE001 - a warning is data, anything else goes on up
+        if type(error).__name__ != "LoadWarning":
+            raise
+        warning = _warning_text(error)
+    return {
+        "hip_path": _quiet(hou.hipFile.path),
+        "hip_name": _quiet(lambda: hou.hipFile.basename()),
+        "nodes": _counts(hou),
+        "discarded_unsaved": bool(unsaved) if unsaved is not None else None,
+        "dependencies": dependencies(hou, warning),
+        "undo": UNDO_NOTE,
+    }
+
+
+def _warning_text(error: BaseException) -> str:
+    message = _quiet(error.instanceMessage) if hasattr(error, "instanceMessage") else None
+    return str(message if message else error)
+
+
+def scene_save(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, Any]:
+    """Save the scene over its own file. A scene with no file is refused."""
+    hou = _houdini(context)
+    if _quiet(lambda: hou.hipFile.isNewFile()):
+        raise BridgeError(
+            "SCENE_UNTITLED",
+            "the scene has never been saved, so it has no file to save over",
+            hint="use save_increment, which picks a new versioned file for it",
+        )
+    hou.hipFile.save()
+    path = _quiet(hou.hipFile.path)
+    return {"hip_path": path, "bytes": _size(path), "undo": UNDO_NOTE}
+
+
+def scene_save_as(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, Any]:
+    """Save the scene to a new file. A file that is there is never written over.
+
+    The session holds the new file from here on, as it would after a save as
+    in the interface. The scene is the same scene, so the epoch stays.
+    """
+    hou = _houdini(context)
+    path = _hip_path(arguments["path"])
+    if not os.path.isabs(path):
+        raise BridgeError("BAD_ARGUMENTS", "a scene file path has to be absolute")
+    if os.path.lexists(path):
+        raise BridgeError(
+            "FILE_EXISTS",
+            "a file is already at that path",
+            {"suffix": Path(path).suffix},
+            hint="ask for the next version rather than writing over this one",
+        )
+    if not os.path.isdir(os.path.dirname(path)):
+        raise BridgeError(
+            "FILE_NOT_FOUND",
+            "the folder for that scene file is not there",
+            hint="create the folder first, or save somewhere that is there",
+        )
+    hou.hipFile.save(path)
+    saved = _quiet(hou.hipFile.path)
+    return {"hip_path": saved, "bytes": _size(path), "undo": UNDO_NOTE}
+
+
+def _size(path: Any) -> int | None:
+    try:
+        return os.path.getsize(str(path))
+    except (OSError, TypeError):
+        return None
 
 
 # Section: mutations
@@ -332,11 +624,11 @@ def _scene_moves(hou: Any, arguments: Mapping[str, Any]) -> dict[str, Any]:
 
 def _hip_path(value: Any) -> str:
     """One scene file path, refused unless it names a scene file."""
-    text = str(value)
-    if not text.endswith(".hip") and not text.endswith(".hipnc"):
+    text = os.path.expanduser(str(value))
+    if not text.lower().endswith(HIP_SUFFIXES):
         raise BridgeError(
             "BAD_ARGUMENTS",
-            "a scene file path has to end in .hip or .hipnc",
+            "a scene file path has to end in .hip, .hipnc or .hiplc",
             {"suffix": Path(text).suffix},
         )
     return text
@@ -420,6 +712,11 @@ def _number(value: Any, name: str, cap: float) -> float:
 
 def _is_hou_error(error: BaseException) -> bool:
     return type(error).__module__.split(".")[0] == "hou"
+
+
+def _ask(owner: Any, method: str, *args: Any) -> Any:
+    """Call one method of a Houdini object, or nothing when it is not there."""
+    return _quiet(lambda: getattr(owner, method)(*args))
 
 
 def _quiet(read: Any) -> Any:

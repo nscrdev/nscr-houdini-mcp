@@ -748,7 +748,7 @@ def test_a_name_that_is_not_a_tool_comes_back_with_the_closest_ones() -> None:
     reply = dispatcher().dispatch(call("scene.inf"))
     error = reply.payload["error"]
     assert error["code"] == "UNKNOWN_TOOL"
-    assert error["details"]["did_you_mean"] == ["scene.info"]
+    assert error["details"]["did_you_mean"][0] == "scene.info"
 
 
 def test_an_argument_name_that_is_not_the_tools_comes_back_with_the_closest_ones() -> None:

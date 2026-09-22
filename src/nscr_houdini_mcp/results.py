@@ -50,6 +50,11 @@ SERVER_CODES: dict[str, str] = {
     "CONFIG_INVALID": "the config file could not be used",
     "SPILL_FAILED": "the result was too large to return and could not be written out",
     "RESULT_NOT_JSON": "the tool produced a value that cannot be sent as JSON",
+    "POOL_FULL": "the worker pool has no room for another worker",
+    "HYTHON_NOT_FOUND": "no hython to start a worker with",
+    "WORKER_START_FAILED": "hython started but no bridge came up in it",
+    "NOT_A_WORKER": "that session is not a worker the pool started",
+    "OUTPUT_REFUSED": "no output path could be made for this",
 }
 
 CODES: dict[str, str] = {**BRIDGE_CODES, **SERVER_CODES}
@@ -87,6 +92,15 @@ HINTS: dict[str, str] = {
     "CONFIG_INVALID": "fix the key named in the details, then call again",
     "SPILL_FAILED": "free space in the spill folder, or narrow the request",
     "RESULT_NOT_JSON": "the tool is at fault; report it with the tool name",
+    "POOL_FULL": "use a worker that is running, stop one you are done with, or raise pool_cap",
+    "HYTHON_NOT_FOUND": "name hython or houdini_build in config, then start again",
+    "WORKER_START_FAILED": "read the worker log named in the details, then start again",
+    "NOT_A_WORKER": "close a Houdini with a user interface yourself; stop only workers here",
+    "OUTPUT_REFUSED": "fix the output conventions named in the details, then call again",
+    "FILE_NOT_FOUND": "check the path and use one that is there",
+    "FILE_EXISTS": "ask for the next version rather than writing over this one",
+    "UNSAVED_CHANGES": "save the scene first, or pass discard_unsaved true to drop the changes",
+    "SCENE_UNTITLED": "use save_increment, which picks a versioned file for the scene",
 }
 
 # The largest result whose text block repeats the whole JSON. Larger ones get a
