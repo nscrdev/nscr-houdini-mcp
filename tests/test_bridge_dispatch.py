@@ -893,6 +893,51 @@ def test_houdini_values_become_something_json_can_hold(scene: Scene) -> None:
     }
 
 
+def test_houdini_22_values_are_read_the_way_that_build_offers_them(scene: Scene) -> None:
+    node = scene.node("/obj")
+    geo = node.createNode("geo")
+    converted = encoding.convert(
+        {
+            "tuple": geo.parmTuple("t"),
+            "type": geo.type(),
+            "vector": Vector3(1, 2, 3),
+        }
+    )
+    assert converted.value == {"tuple": f"{geo.path()}/t", "type": "geo", "vector": [1.0, 2.0, 3.0]}
+    assert converted.lossy is False
+
+
+def test_a_set_keeps_its_members_and_a_float_that_is_not_one_is_marked() -> None:
+    converted = encoding.convert({"set": {2, 1}, "mixed": {1, "a"}, "nan": float("nan")})
+    assert converted.value["set"] == [1, 2]
+    assert sorted(map(str, converted.value["mixed"])) == ["1", "a"]
+    assert converted.value["nan"] == "nan"
+    assert converted.cut == ["data.nan"]
+
+
+def test_a_scalar_with_a_shape_is_the_scalar() -> None:
+    class Scalar:
+        shape = ()
+
+        def tolist(self) -> float:
+            return 2.5
+
+    assert encoding.convert(Scalar()).value == 2.5
+
+
+def test_a_huge_collection_is_read_only_as_far_as_its_cap() -> None:
+    converted = encoding.convert({"r": range(10**12), "m": {n: n for n in range(300)}})
+    assert len(converted.value["r"]) == encoding.MAX_ITEMS
+    assert len(converted.value["m"]) == encoding.MAX_KEYS
+    assert converted.cut == ["data.r", "data.m"]
+
+
+def test_text_utf8_cannot_carry_is_escaped_and_marked() -> None:
+    converted = encoding.convert({"k\udcff": "v\ud800"})
+    assert converted.value == {"k\\udcff": "v\\ud800"}
+    assert converted.lossy is True
+
+
 class Array:
     """An array as the encoder reads one: a shape and a `tolist`."""
 

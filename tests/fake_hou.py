@@ -19,9 +19,16 @@ from types import SimpleNamespace
 from typing import Any
 
 
-def _as_hou(kind: type) -> type:
-    """Make a class look as though it came from `hou`, which is how it is read."""
+def _as_hou(kind: type, name: str | None = None) -> type:
+    """Make a class look as though it came from `hou`, which is how it is read.
+
+    `name` is the class name a real Houdini 22 gives the same thing, where the
+    stand in's own name is not it.
+    """
     kind.__module__ = "hou"
+    if name is not None:
+        kind.__name__ = name
+        kind.__qualname__ = name
     return kind
 
 
@@ -57,14 +64,19 @@ for _kind in (Error, OperationFailed, ObjectWasDeleted, InvalidInput, Permission
 
 
 class Vector3:
+    """A vector reads as a sequence, and has no `asTuple`, as in Houdini 22."""
+
     def __init__(self, *values: float) -> None:
         self._values = tuple(float(value) for value in values)
 
     def __iter__(self) -> Any:
         return iter(self._values)
 
-    def asTuple(self) -> tuple[float, ...]:  # noqa: N802 - the name is Houdini's
-        return self._values
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __getitem__(self, index: int) -> float:
+        return self._values[index]
 
 
 class Matrix4:
@@ -647,12 +659,18 @@ def _category(parent: Node | None) -> str:
 
 _as_hou(Parm)
 _as_hou(ParmTuple)
-_as_hou(NodeType)
-_as_hou(Node)
+# The names a real session gives them: a node of any context is a subclass
+# whose name ends in `Node`, and its type one whose name ends in `NodeType`.
+_as_hou(NodeType, "OpNodeType")
+_as_hou(Node, "OpNode")
 
 
 class Undos:
-    """An undo stack that collapses a group into one entry, as Houdini does."""
+    """An undo stack that collapses a group into one entry, as Houdini does.
+
+    As in Houdini, the labels come newest first, and an undo asked for inside
+    an open group is refused.
+    """
 
     def __init__(self) -> None:
         self.labels: list[tuple[str, list[Any]]] = []
@@ -677,9 +695,11 @@ class Undos:
             self._pending.append(undo)
 
     def undoLabels(self) -> list[str]:  # noqa: N802 - the name is Houdini's
-        return [label for label, _ in self.labels]
+        return [label for label, _ in reversed(self.labels)]
 
     def performUndo(self) -> None:  # noqa: N802 - the name is Houdini's
+        if self._pending is not None:
+            raise OperationFailed("Cannot undo within an undo group")
         if not self.labels:
             raise OperationFailed("nothing to undo")
         _, actions = self.labels.pop()

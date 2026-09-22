@@ -372,7 +372,8 @@ def test_each_call_is_one_undo_entry_under_its_label(bench: Bench, scene: Scene)
     assert body["undo_label"] == "three boxes"
     assert scene.undos.undoLabels() == ["three boxes"]
     ok(python(bench, code="hou.node('/obj').createNode('null')", operation_id="op-7"))
-    assert scene.undos.undoLabels()[-1] == "hou_python op-7"
+    # Newest first, as Houdini lists them.
+    assert scene.undos.undoLabels()[0] == "hou_python op-7"
 
 
 def test_a_call_that_names_no_id_is_labelled_with_the_one_it_was_given(bench: Bench) -> None:
