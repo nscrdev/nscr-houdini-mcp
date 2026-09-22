@@ -2,8 +2,9 @@
 
 A client starts the server over stdio the way any client does, and the server
 starts a hython worker through the pool and runs code in it. Nothing is stood
-in for. The one call made past the server is the lost reply, which needs the
-bridge's hook for holding an answer back and so goes to the worker directly.
+in for. A reply is lost the way it is lost in use: the client gives up and its
+server goes away while the code still runs, and a second server, with a
+default namespace of its own, sends the same call again.
 
 Skipped, not failed, when there is no Houdini on this machine. House rules as
 in the other checks that start a Houdini: one worker at a time (the pool cap in
@@ -168,27 +169,39 @@ def test_printing_past_max_chars_spills_the_whole(place: dict[str, Any]) -> None
     assert json.loads(spill.read_text(encoding="utf-8"))["stdout"] == printed
 
 
-def test_a_lost_reply_is_sent_again_and_makes_one_node_not_two(place: dict[str, Any]) -> None:
+def test_a_lost_reply_sent_again_by_another_server_makes_one_node_not_two(
+    place: dict[str, Any],
+) -> None:
     before = children(place)
-    session = client.Session.open(place["home"], place["worker"]["session_id"])
     operation_id = client.new_operation_id()
-    answer = client.call(
-        session,
-        "python.run",
-        arguments={
-            "code": "result = hou.node('/obj').createNode('geo').path()",
-            "namespace": "lost",
-            "undo_label": f"hou_python {operation_id}",
-            "drop_reply": True,
-        },
-        operation_id=operation_id,
-        wait_s=10.0,
-        http_timeout_s=GIVE_UP_S,
+    code = "import time\ntime.sleep(4)\nresult = hou.node('/obj').createNode('geo').path()"
+    call = {"code": code, "operation_id": operation_id}
+    # The first server sends the call, its client gives up, and the server
+    # goes away with it. The code is still running in the worker.
+    assert asyncio.run(_abandon(place, ("hou_python", call), give_up_s=GIVE_UP_S)) is None
+    # A second server has a default namespace of its own; the call names none.
+    retried, own = run(
+        place,
+        ("hou_python", {**call, "wait_s": 30}),
+        ("hou_python", {"code": "result = 1"}),
     )
-    assert answer.payload["ok"] is True, answer.payload
-    assert answer.payload["replayed"] is True
-    assert answer.payload["data"]["result"].startswith("/obj/geo")
+    body = ok(retried)
+    assert body["result"].startswith("/obj/geo")
+    assert body["namespace"].startswith("c_")
+    assert body["namespace"] != ok(own)["namespace"]
+    assert body["trace"]["operation_id"] == operation_id
     assert children(place) == before + 1
+
+
+async def _abandon(place: dict[str, Any], call: tuple[str, dict], *, give_up_s: float) -> Any:
+    """Send one call and give up on it, taking the server down on the way out."""
+    async with Client(
+        server_params(place), mode="auto", read_timeout_seconds=READ_TIMEOUT_S
+    ) as connected:
+        try:
+            return await asyncio.wait_for(connected.call_tool(*call), give_up_s)
+        except TimeoutError:
+            return None
 
 
 def test_an_epoch_from_before_an_open_is_refused_and_outputs_follow_the_scene(
@@ -218,23 +231,60 @@ def test_an_epoch_from_before_an_open_is_refused_and_outputs_follow_the_scene(
     assert folder.is_dir()
 
 
-def test_code_past_its_timeout_answers_and_the_session_comes_back(place: dict[str, Any]) -> None:
-    code = "import time\ntime.sleep(5)\nresult = 'slept'"
-    operation_id = client.new_operation_id()
-    slow, during, after, fetched = run(
+def test_code_past_its_timeout_answers_and_a_queued_retry_gets_its_answer(
+    place: dict[str, Any],
+) -> None:
+    code = "import time\ntime.sleep(5)\nruns = globals().get('runs', 0) + 1\nresult = runs"
+    call = {"code": code, "namespace": "slow", "operation_id": client.new_operation_id()}
+    operation_id = call["operation_id"]
+    slow, fetched, counted, after = run(
         place,
-        ("hou_python", {"code": code, "timeout_s": 1, "operation_id": operation_id}),
+        ("hou_python", {**call, "timeout_s": 1}),
+        # Sent while the code still runs: it queues behind it and gets the
+        # answer the code came to, never a receipt that still says running.
+        ("hou_python", {**call, "wait_s": 20}),
+        ("hou_python", {"code": "result = runs", "namespace": "slow"}),
         ("hou_ping", {"wait_s": 0}),
-        ("hou_ping", {"wait_s": 20}),
-        ("hou_python", {"code": code, "operation_id": operation_id}),
     )
     error = refused(slow)
     assert error["code"] == "TIMEOUT"
     assert error["details"]["still_running"] is True
     assert error["details"]["operation_id"] == operation_id
-    assert ok(during)["health"]["busy"] is True
-    assert ok(during)["health"]["current_op"] == "python.run"
-    assert ok(during)["call"]["code"] == "SESSION_BUSY"
+    assert ok(fetched)["result"] == 1
+    assert ok(counted)["result"] == 1
     assert ok(after)["call"]["ok"] is True
-    # The answer the code came to is kept under the same operation id.
-    assert ok(fetched)["result"] == "slept"
+    assert ok(after)["health"]["busy"] is False
+
+
+def test_surrogates_and_code_that_will_not_compile_come_back_as_data(
+    place: dict[str, Any],
+) -> None:
+    printed, deep = run(
+        place,
+        ("hou_python", {"code": "print('a\\udcff')\nresult = ['b\\ud800']"}),
+        ("hou_python", {"code": "x = " + "-" * 100_000 + "1"}),
+    )
+    body = ok(printed)
+    assert body["stdout_tail"] == "a\\udcff\n"
+    assert body["result"] == ["b\\ud800"]
+    assert body["lossy"] is True
+    assert deep.is_error is True
+    assert deep.structured_content["error"]["type"] in ("RecursionError", "MemoryError")
+
+
+def test_a_log_handler_from_one_call_writes_into_the_next(place: dict[str, Any]) -> None:
+    make = (
+        "import logging, io, sys\n"
+        "log = logging.getLogger('nscr_python_check')\n"
+        "log.propagate = False\n"
+        "log.addHandler(logging.StreamHandler())\n"
+        "log.warning('one')\n"
+        "sys.stdout = io.StringIO()"
+    )
+    first, second = run(
+        place,
+        ("hou_python", {"code": make, "namespace": "logs"}),
+        ("hou_python", {"code": "log.warning('two')\nprint('three')", "namespace": "logs"}),
+    )
+    assert ok(first)["stdout_tail"] == "one\n"
+    assert ok(second)["stdout_tail"] == "two\nthree\n"
