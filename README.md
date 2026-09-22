@@ -125,10 +125,42 @@ hython -m nscr_houdini_mcp.bridge.main --home <state folder>
 
 It stops when its input closes, or on the word `stop`.
 
-For a session with an interface, copy `houdini/packages/nscr_houdini_mcp.json`
-into a Houdini packages folder and replace the two paths in it. Installing the
-package opens no port: `houdini/scripts/456.py` starts a bridge only when
-`NSCR_MCP_AUTOSTART` is `1`.
+### Installing the Houdini side
+
+One command writes the Houdini package that puts this on a session's path:
+
+```sh
+nscr-houdini-mcp bridge install                  # for Houdini 22.0
+nscr-houdini-mcp bridge install --houdini-version 22.0 --dry-run
+nscr-houdini-mcp bridge install --autostart      # every Houdini opens a port
+nscr-houdini-mcp bridge uninstall
+nscr-houdini-mcp bridge status
+nscr-houdini-mcp bridge snippet
+```
+
+It writes one file, `nscr_houdini_mcp.json`, into the packages folder of your
+Houdini preferences: `~/Library/Preferences/houdini/<version>/packages` on
+macOS, `Documents\houdini<version>\packages` on Windows, `~/houdini<version>`
+on Linux, or inside `HOUDINI_USER_PREF_DIR` when that is set. The file points
+`HOUDINI_PATH` at this project's `houdini/` folder and `PYTHONPATH` at its
+`src/`, both worked out from where this copy is running, so there is nothing
+to edit by hand. Every file it writes carries a marker: a package of the same
+name that this did not write is reported and left exactly as it is, and
+`uninstall` takes away only its own.
+
+Installing opens no port. Auto start is off unless you ask for it with
+`--autostart`, which sets `NSCR_MCP_AUTOSTART` to `1` in the package.
+
+`bridge status` lists the sessions running now with their ids, names, ports,
+scenes and whether each is busy, asks each one whether it is healthy, and says
+which Houdini versions have the package and where Houdini is installed.
+
+To start a bridge inside a Houdini that is already open, paste what `bridge
+snippet` prints into its Python shell. It works out the source path as it
+prints, so the lines run as they stand.
+
+`houdini/packages/nscr_houdini_mcp.json` is the same file as a template, for
+anyone who would rather place it themselves.
 
 Tests marked `houdini` need a Houdini on the machine and skip when there is
 none, so `pytest -q` is complete everywhere. Run only those with `pytest -m
