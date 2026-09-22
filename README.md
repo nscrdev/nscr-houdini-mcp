@@ -184,6 +184,41 @@ prints, so the lines run as they stand.
 `houdini/packages/nscr_houdini_mcp.json` is the same file as a template, for
 anyone who would rather place it themselves.
 
+### The worker pool
+
+A worker is a headless Houdini of its own with a bridge in it, kept warm so
+the next piece of work does not pay a cold start:
+
+```sh
+nscr-houdini-mcp bridge worker start             # one worker, if there is room
+nscr-houdini-mcp bridge worker start --weight heavy --max-threads 8
+nscr-houdini-mcp bridge worker list
+nscr-houdini-mcp bridge worker reserve w1 --job job-1
+nscr-houdini-mcp bridge worker release w1
+nscr-houdini-mcp bridge worker stop w1
+```
+
+Three workers may run at once by default. The slot is taken in one
+transaction in the coordination store, which counts the workers that are
+still starting, so several servers on one machine cannot hand out the same
+last slot, and `POOL_FULL` is the answer when there is none. A start that
+fails gives its slot straight back. Each reservation also carries a weight,
+and the pool holds a budget of its own, so a heavy job is refused while the
+machine is busy even when a slot is free.
+
+A worker does not belong to the process that started it. It is started
+detached, with its output in `logs/worker-<name>.log` under the state folder,
+and it stays when its server exits, so a client restart does not throw the
+warm pool away. What ends it is its lease: it watches its own row and goes
+when a server asks it to, or when nobody has wanted it for half an hour.
+Routing a call to it renews the lease. `stop` asks first and ends the process
+itself only if the ask was not enough.
+
+Each worker is asked once, when it comes up, what it can do: the build, the
+license it got, the renderers that are really installed, how it can make a
+picture, and that it can be cancelled. The answer is kept beside the worker,
+so another process can pick one without asking it anything.
+
 Tests marked `houdini` need a Houdini on the machine and skip when there is
 none, so `pytest -q` is complete everywhere. Run only those with `pytest -m
 houdini`, or skip them with `pytest -m "not houdini"`. The bridge is found
