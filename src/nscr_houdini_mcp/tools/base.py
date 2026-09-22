@@ -5,7 +5,8 @@ plain dict, an output schema where it has one, and a handler. The handler gets
 a `Call`, which is the only way a tool reaches Houdini. The `Call` settles the
 session once, carries the trace every result echoes, mints the operation id a
 change needs, and passes the caller's `scene_epoch`, `wait_s` and `timeout_s`
-through to the bridge unchanged.
+through to the bridge unchanged. It also carries the server's config, for the
+tools that start processes or place files.
 
 Arguments are checked against the schema before the handler runs, so a
 misspelled name comes back as `BAD_ARGUMENTS` with the nearest real one and
@@ -27,6 +28,7 @@ from mcp_types import ToolAnnotations
 
 from nscr_houdini_mcp.bridge import client
 from nscr_houdini_mcp.bridge.errors import did_you_mean
+from nscr_houdini_mcp.config import Config
 from nscr_houdini_mcp.results import CallError, empty_trace
 from nscr_houdini_mcp.router import Router, Target
 
@@ -73,6 +75,12 @@ OPERATION_ID = {
     "maxLength": OPERATION_ID_MAX,
     "pattern": "^[A-Za-z0-9_-]+$",
     "description": "Send the same id again after a lost reply to get the outcome, not a repeat.",
+}
+
+DETAIL = {
+    "type": "string",
+    "enum": ["summary", "full"],
+    "description": "summary by default; full adds everything else.",
 }
 
 # Described once in the server instructions rather than in every tool.
@@ -190,11 +198,13 @@ class Call:
         router: Router,
         *,
         transport: str = "stdio",
+        config: Config | None = None,
     ) -> None:
         self.spec = spec
         self.arguments = dict(arguments)
         self.router = router
         self.transport = transport
+        self.config = config
         self.trace: dict[str, Any] = empty_trace()
         self._target: Target | None = None
         self._epoch: int | None = self.arguments.get("scene_epoch")
@@ -205,7 +215,10 @@ class Call:
         """The session this call goes to, settled once."""
         if self._target is None:
             self._target = self.router.resolve(self.arguments.get("session"))
+            named = self.trace.get("operation_id")
             self.trace = self._target.trace()
+            if named:
+                self.trace["operation_id"] = named
         return self._target
 
     def health(self) -> dict[str, Any]:
@@ -252,6 +265,17 @@ class Call:
         if operation_id:
             self.trace["operation_id"] = self._operation_id
         return reply
+
+    def operation_id(self) -> str:
+        """The id this call's change goes under: the caller's, or a new one.
+
+        For a change the server makes itself rather than through a bridge
+        call. The trace names it from here on.
+        """
+        if self._operation_id is None:
+            self._operation_id = client.new_operation_id()
+        self.trace["operation_id"] = self._operation_id
+        return self._operation_id
 
     def _next_operation_id(self) -> str:
         if self._operation_id is None:

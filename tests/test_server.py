@@ -133,8 +133,7 @@ def test_the_tool_list_is_fixed_and_the_same_every_time() -> None:
 
 def test_hou_ping_is_listed_read_only_with_plain_schemas() -> None:
     listed, _ = talk(serve(Stage([])))
-    [tool] = listed.tools
-    assert tool.name == "hou_ping"
+    [tool] = [tool for tool in listed.tools if tool.name == "hou_ping"]
     assert tool.annotations is not None
     assert tool.annotations.read_only_hint is True
     assert tool.annotations.idempotent_hint is True
@@ -260,7 +259,7 @@ def test_a_value_out_of_range_is_refused_before_anything_is_sent() -> None:
 def test_an_unknown_tool_offers_the_nearest_name() -> None:
     _, [result] = talk(serve(Stage([])), ("hou_pnig", {}))
     assert result.is_error is True
-    assert result.structured_content["error"]["details"]["did_you_mean"] == ["hou_ping"]
+    assert result.structured_content["error"]["details"]["did_you_mean"][0] == "hou_ping"
 
 
 def test_a_bad_config_is_reported_on_the_call_and_read_again_next_time() -> None:

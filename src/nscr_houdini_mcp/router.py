@@ -39,7 +39,8 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
@@ -267,6 +268,44 @@ class Router:
         if record.kind == "hython":
             self._renew(record.session_id)
         return Target(record, session, houdini_version=facts.get("houdini_version"))
+
+    def reach(self, record: SessionRecord) -> Target:
+        """A target for a row already read, for a look that is not a use.
+
+        Nothing is renewed: listing the sessions is not using a worker, and a
+        client that lists every few seconds must not keep every worker warm.
+        """
+        session, facts = self._client(record, [record])
+        return Target(record, session, houdini_version=facts.get("houdini_version"))
+
+    def records(self, *, include_gone: bool = True) -> list[SessionRecord]:
+        """Every session the store knows, after marking the ones that have gone."""
+        return self._records(include_gone=include_gone)
+
+    @contextmanager
+    def store(self, *, create: bool = False) -> Iterator[Any]:
+        """The coordination store, or nothing when none has been written yet.
+
+        `create` makes one when there is none, for a caller that is about to
+        start the first session itself. Only a store that cannot be opened is
+        `STORE_UNAVAILABLE` here. What the caller does with it raises what it
+        raises.
+        """
+        try:
+            opened = self._open_store(self.store_path)
+            if opened is None and create:
+                opened = store_module.Store(self.store_path)
+        except (store_module.StoreError, sqlite3.Error, OSError) as error:
+            raise CallError(
+                "STORE_UNAVAILABLE",
+                "the coordination store could not be read",
+                details={"exception": type(error).__name__},
+            ) from None
+        if opened is None:
+            yield None
+            return
+        with opened:
+            yield opened
 
     def cached(self) -> list[str]:
         """The session ids a client is kept for."""

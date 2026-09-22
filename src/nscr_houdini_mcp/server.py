@@ -127,7 +127,7 @@ class Runtime:
         call: Call | None = None
         try:
             config, router = self.settings()
-            call = Call(spec, arguments, router, transport=config.transport)
+            call = Call(spec, arguments, router, transport=config.transport, config=config)
             data = spec.handler(call)
             summary = spec.summary(data) if spec.summary else None
             spill = Spill(config.spill_folder, config.spill_over_bytes)
