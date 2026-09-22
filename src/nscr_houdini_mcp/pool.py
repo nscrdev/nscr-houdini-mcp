@@ -172,6 +172,8 @@ class Launched:
     # way to be sure of reaching that process and no other. Nothing when the
     # starter holds no handle.
     kill: Callable[[], None] | None = None
+    # Waits for that same process to end, for up to the seconds given.
+    wait: Callable[[float], Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -392,7 +394,7 @@ def spawn_detached(
         # The child holds its own handle on the file from here on.
         handle.close()
     _STARTED.append(process)
-    return Launched(process.pid, process.poll, process.kill)
+    return Launched(process.pid, process.poll, process.kill, process.wait)
 
 
 def wait_for_entry(
@@ -568,6 +570,14 @@ def end_spawned(launched: Launched, stamp: str | None) -> bool:
             launched.kill()
         except OSError:
             return launched.poll() is not None
+        if launched.wait is not None:
+            # A kill is asked for, not done, and on some systems the process
+            # is still there for a moment after. Only its exit proves it.
+            try:
+                launched.wait(KILL_WAIT_S)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            return launched.poll() is not None
     elif launched.pid == os.getpid():
         return False
     elif not kill_process(launched.pid, stamp):
@@ -575,7 +585,7 @@ def end_spawned(launched: Launched, stamp: str | None) -> bool:
     deadline = time.monotonic() + KILL_WAIT_S
     while time.monotonic() < deadline:
         reap_started()
-        if launched.poll() is not None or same_process(launched.pid, stamp) is False:
+        if launched.poll() is not None or not process_is_alive(launched.pid):
             return True
         time.sleep(0.05)
     return False
