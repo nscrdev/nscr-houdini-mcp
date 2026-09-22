@@ -681,6 +681,7 @@ class Bridge:
                 self.session_id,
                 kind=self.kind,
                 pid=self.pid,
+                pid_start=self.pid_start,
                 alias=self.config.alias,
                 alias_template=None if self.config.alias else self._alias_template(),
                 port=port,

@@ -216,6 +216,40 @@ def test_a_name_held_by_a_session_that_crashed_is_free_again(store: Store) -> No
     assert store.resolve_session("w1").session_id == "s2"
 
 
+def test_a_name_is_not_taken_from_a_session_whose_process_is_still_there(store: Store) -> None:
+    """A pid and the moment it started is the identity, not the pid alone."""
+    stamp = store_module.process_start_stamp(LIVE_PID)
+    store.register_session("s1", kind="hython", pid=LIVE_PID, pid_start=stamp, alias="w1")
+
+    with pytest.raises(AliasInUse):
+        store.register_session("s2", kind="hython", pid=LIVE_PID, alias="w1")
+    assert store.get_session("s1").pid_start == stamp
+
+
+def test_a_pid_that_belongs_to_another_process_now_frees_the_name(store: Store) -> None:
+    """The number is alive, but it is not the process that took the name."""
+    store.register_session(
+        "s1", kind="hython", pid=LIVE_PID, pid_start="a moment that has passed", alias="w1"
+    )
+
+    restarted = store.register_session("s2", kind="hython", pid=LIVE_PID, alias="w1")
+
+    assert restarted.session_id == "s2"
+    assert store.get_session("s1").state == "gone"
+
+
+def test_a_session_from_an_older_file_keeps_its_name_while_its_pid_is_alive(tmp_path) -> None:
+    """A row written before the stamp existed still answers the question."""
+    path = tmp_path / "coord.sqlite"
+    with Store(path) as before:
+        before.register_session("s1", kind="hython", pid=LIVE_PID, alias="w1")
+    with Store(path) as after:
+        assert after.schema_version() == store_module.SCHEMA_VERSION
+        assert after.get_session("s1").pid_start is None
+        with pytest.raises(AliasInUse):
+            after.register_session("s2", kind="hython", pid=LIVE_PID, alias="w1")
+
+
 def test_sessions_whose_process_is_gone_can_be_tidied_up_on_their_own(store: Store) -> None:
     store.register_session("s1", kind="hython", pid=LIVE_PID, alias="w1")
     store.register_session("s2", kind="hython", pid=DEAD_PID, alias="w2")

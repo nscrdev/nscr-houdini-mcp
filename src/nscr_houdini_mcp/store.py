@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -44,7 +45,7 @@ APP_DIR_NAME = "nscr-houdini-mcp"
 HOME_ENV_VAR = "NSCR_MCP_HOME"
 STORE_FILE_NAME = "coord.sqlite"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SESSION_KINDS = frozenset({"gui", "hython"})
 SESSION_STATES = frozenset({"live", "busy", "unresponsive", "crashed", "gone"})
@@ -232,6 +233,113 @@ def _windows_process_is_alive(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
+# How long a process listing may take before the answer is not worth waiting
+# for. A pid is not an identity on its own: numbers are handed out again, so a
+# session file left by a process that crashed can name a pid that belongs to
+# something else by now. A pid and the moment its process started is an
+# identity that holds, and every system will say the second part in some form
+# of its own. `None` means this system would not say, and a caller that gets
+# `None` has learned nothing and must not pretend otherwise.
+PS_TIMEOUT_S = 5.0
+
+
+def process_start_stamp(pid: int | None = None) -> str | None:
+    """When a process started, in whatever form this system reports it."""
+    number = os.getpid() if pid is None else pid
+    if number <= 0:
+        return None
+    if sys.platform == "win32":
+        return _windows_start(number)
+    if sys.platform == "linux":
+        return _linux_start(number)
+    if sys.platform == "darwin":
+        return _ps_start(number)
+    return None
+
+
+def same_process(pid: int | None, stamp: str | None) -> bool | None:
+    """Whether this pid is still the process that recorded that stamp.
+
+    `True` and `False` are answers. `None` says the question could not be
+    settled here, which happens when nothing recorded a stamp or when the
+    system will not give one.
+    """
+    if not process_is_alive(pid):
+        return False
+    if not stamp:
+        return None
+    current = process_start_stamp(pid)
+    if current is None:
+        return None
+    return current == stamp
+
+
+def _linux_start(pid: int) -> str | None:
+    """Field 22 of the process stat file: start time in clock ticks.
+
+    The name of the program sits in brackets and may itself contain brackets
+    and spaces, so the fields are counted from the last closing bracket.
+    """
+    try:
+        text = (
+            open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace")  # noqa: SIM115
+            .read()
+            .strip()
+        )
+    except OSError:
+        return None
+    tail = text.rpartition(")")[2].split()
+    # After the name come state and 19 more fields before start time.
+    if len(tail) < 20:
+        return None
+    return tail[19]
+
+
+def _ps_start(pid: int) -> str | None:
+    """Ask the process listing, which every system of this kind ships."""
+    try:
+        finished = subprocess.run(  # noqa: S603 - a fixed command with a number
+            ["/bin/ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=PS_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    stamp = finished.stdout.strip()
+    return stamp or None
+
+
+def _windows_start(pid: int) -> str | None:
+    """Creation time from the kernel, as a plain number."""
+    import ctypes
+    import ctypes.wintypes
+
+    process_query_limited_information = 0x1000
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return None
+    try:
+        created = ctypes.wintypes.FILETIME()
+        exited = ctypes.wintypes.FILETIME()
+        kernel = ctypes.wintypes.FILETIME()
+        user = ctypes.wintypes.FILETIME()
+        ok = kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(created),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        )
+        if not ok:
+            return None
+        return str((created.dwHighDateTime << 32) | created.dwLowDateTime)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def digest_arguments(payload: Any) -> str:
     """Stable digest of one call's arguments, for operation receipts.
 
@@ -317,6 +425,7 @@ class SessionRecord:
     alias: str
     kind: str
     pid: int
+    pid_start: str | None
     port: int | None
     state: str
     scene_epoch: int
@@ -332,6 +441,7 @@ class SessionRecord:
             alias=row["alias"],
             kind=row["kind"],
             pid=row["pid"],
+            pid_start=row["pid_start"],
             port=row["port"],
             state=row["state"],
             scene_epoch=row["scene_epoch"],
@@ -586,7 +696,12 @@ _SCHEMA_2 = (
     "ALTER TABLE jobs ADD COLUMN heartbeat_at REAL",
 )
 
-MIGRATIONS = (_SCHEMA_1, _SCHEMA_2)
+# A pid on its own is not an identity, so a session records when its process
+# started as well. A row whose pid is alive but started at another moment
+# belongs to a process that took the number over.
+_SCHEMA_3 = ("ALTER TABLE sessions ADD COLUMN pid_start TEXT",)
+
+MIGRATIONS = (_SCHEMA_1, _SCHEMA_2, _SCHEMA_3)
 
 
 class Store:
@@ -725,6 +840,7 @@ class Store:
         *,
         kind: str,
         pid: int,
+        pid_start: str | None = None,
         alias: str | None = None,
         alias_template: str | None = None,
         port: int | None = None,
@@ -739,6 +855,11 @@ class Store:
         containing `{n}` (`"scene-{n}"`, `"w{n}"`) to take the lowest free one.
         A session id is never reused. An alias is free again once its session
         is gone.
+
+        `pid_start` is when the process started, from `process_start_stamp`.
+        With it a row whose pid has been handed to something else is told from
+        one whose process is still there, so a name is freed when its session
+        really has gone and held when it has not.
         """
         if kind not in SESSION_KINDS:
             raise ValueError(f"unknown session kind: {kind}")
@@ -766,14 +887,15 @@ class Store:
                 if row is not None:
                     raise AliasInUse(f"alias {name} belongs to session {row['session_id']}")
             db.execute(
-                "INSERT INTO sessions (session_id, alias, kind, pid, port, state, scene_epoch,"
-                " hip_path, capabilities, started_at, heartbeat_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO sessions (session_id, alias, kind, pid, pid_start, port, state,"
+                " scene_epoch, hip_path, capabilities, started_at, heartbeat_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     session_id,
                     name,
                     kind,
                     pid,
+                    pid_start,
                     port,
                     state,
                     scene_epoch,
@@ -866,11 +988,13 @@ class Store:
 
     def _reclaim_sessions(self, db: sqlite3.Connection, now: float) -> list[str]:
         rows = db.execute(
-            "SELECT session_id, pid FROM sessions WHERE state <> ?", (SESSION_GONE,)
+            "SELECT session_id, pid, pid_start FROM sessions WHERE state <> ?", (SESSION_GONE,)
         ).fetchall()
         reclaimed: list[str] = []
         for row in rows:
-            if process_is_alive(row["pid"]):
+            # `None` means this system would not say which process a pid is,
+            # and a session is never taken from a caller on a guess.
+            if same_process(row["pid"], row["pid_start"]) is not False:
                 continue
             db.execute(
                 "UPDATE sessions SET state = ?, heartbeat_at = ? WHERE session_id = ?",
