@@ -59,6 +59,10 @@ MAX_SPILL_OVER_BYTES = 64 * 1024 * 1024
 
 MAX_POOL_CAP = 16
 
+# Ports a worker may be given. Below this are the ports a system keeps.
+MIN_PORT = 1024
+MAX_PORT = 65535
+
 DEFAULT_SPILL_KEEP_DAYS = 7
 MAX_SPILL_KEEP_DAYS = 365
 
@@ -70,6 +74,7 @@ KEYS = (
     "houdini_build",
     "default_session",
     "pool_cap",
+    "worker_ports",
     "state_home",
     "spill_dir",
     "spill_over_bytes",
@@ -96,6 +101,9 @@ default_session = ""
 
 # How many hython workers may run at once, beside any Houdini you have open.
 pool_cap = {pool.DEFAULT_CAP}
+
+# The first and last port a worker started from here may listen on.
+worker_ports = [{pool.DEFAULT_PORT_RANGE[0]}, {pool.DEFAULT_PORT_RANGE[1]}]
 
 # Where sessions, the coordination store and logs live. Bridges must use the
 # same folder (NSCR_MCP_HOME) or the server will not see them.
@@ -152,6 +160,7 @@ class Config:
     houdini_build: str | None = None
     default_session: str | None = None
     pool_cap: int = pool.DEFAULT_CAP
+    worker_ports: tuple[int, int] = pool.DEFAULT_PORT_RANGE
     state_home: Path = field(default_factory=store_module.default_home)
     spill_dir: Path | None = None
     spill_over_bytes: int = DEFAULT_SPILL_OVER_BYTES
@@ -175,6 +184,7 @@ class Config:
             "houdini_build": self.houdini_build,
             "default_session": self.default_session,
             "pool_cap": self.pool_cap,
+            "worker_ports": list(self.worker_ports),
             "state_home": self.state_home,
             "spill_dir": self.spill_folder,
             "spill_over_bytes": self.spill_over_bytes,
@@ -316,6 +326,19 @@ def _cap(value: Any, key: str, path: Path) -> int:
     return _whole(value, key, path, 1, MAX_POOL_CAP)
 
 
+def _ports(value: Any, key: str, path: Path) -> tuple[int, int]:
+    if not isinstance(value, list) or len(value) != 2:
+        raise ConfigError(
+            f"{key} must be two port numbers, the first and the last, got {_kind(value)}",
+            path=path,
+            key=key,
+        )
+    first, last = (_whole(item, key, path, MIN_PORT, MAX_PORT) for item in value)
+    if first > last:
+        raise ConfigError(f"{key} must list the lower port first", path=path, key=key)
+    return (first, last)
+
+
 def _spill_over(value: Any, key: str, path: Path) -> int:
     return _whole(value, key, path, MIN_SPILL_OVER_BYTES, MAX_SPILL_OVER_BYTES)
 
@@ -344,6 +367,7 @@ _CHECKS = {
     "houdini_build": _build,
     "default_session": _text,
     "pool_cap": _cap,
+    "worker_ports": _ports,
     "state_home": _folder,
     "spill_dir": _private_folder,
     "spill_over_bytes": _spill_over,

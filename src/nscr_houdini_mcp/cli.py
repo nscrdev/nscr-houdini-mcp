@@ -148,8 +148,12 @@ def _add_worker_commands(actions: Any) -> None:
     start.add_argument(
         "--hython", type=Path, default=None, help="the hython to start, from config when left out"
     )
-    start.add_argument("--port", type=int, default=pool.DEFAULT_PORT_RANGE[0])
-    start.add_argument("--max-port", type=int, default=pool.DEFAULT_PORT_RANGE[1])
+    start.add_argument(
+        "--port", type=int, default=None, help="the first port to try, from config when left out"
+    )
+    start.add_argument(
+        "--max-port", type=int, default=None, help="the last port to try, from config when left out"
+    )
     start.add_argument("--job", default=None, help="take the worker for this job at once")
     start.add_argument(
         "--timeout-s",
@@ -294,7 +298,10 @@ def _worker_start(args: argparse.Namespace) -> int:
         weight_budget=args.weight_budget,
         max_threads=args.max_threads,
         hython=hython,
-        port_range=(args.port, args.max_port),
+        port_range=(
+            args.port if args.port is not None else settings.worker_ports[0],
+            args.max_port if args.max_port is not None else settings.worker_ports[1],
+        ),
         start_timeout_s=args.timeout_s,
     )
     try:

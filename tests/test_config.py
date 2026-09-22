@@ -39,6 +39,7 @@ def test_no_file_means_every_default(home: Path) -> None:
     assert config.houdini_build is None
     assert config.default_session is None
     assert config.pool_cap == pool.DEFAULT_CAP
+    assert config.worker_ports == pool.DEFAULT_PORT_RANGE
     assert config.state_home == home
     assert config.spill_folder == home / "spill"
     assert config.spill_over_bytes == DEFAULT_SPILL_OVER_BYTES == 64 * 1024
@@ -51,6 +52,7 @@ def test_the_template_reads_back_as_the_defaults(home: Path) -> None:
     config = load_config()
     assert config.exists is True
     assert config.pool_cap == pool.DEFAULT_CAP
+    assert config.worker_ports == pool.DEFAULT_PORT_RANGE
     assert config.spill_over_bytes == DEFAULT_SPILL_OVER_BYTES
     assert config.hython is None
     assert config.state_home == home
@@ -65,6 +67,7 @@ def test_every_key_is_read(home: Path, tmp_path: Path) -> None:
 houdini_build = "22.0.368"
 default_session = "w1"
 pool_cap = 5
+worker_ports = [18830, 18839]
 state_home = "{state.as_posix()}"
 spill_dir = "{spill.as_posix()}"
 spill_over_bytes = 4096
@@ -75,6 +78,7 @@ transport = "stdio"
     assert config.houdini_build == "22.0.368"
     assert config.default_session == "w1"
     assert config.pool_cap == 5
+    assert config.worker_ports == (18830, 18839)
     assert config.state_home == state
     assert config.spill_folder == spill
     assert config.spill_over_bytes == 4096
@@ -107,6 +111,10 @@ def test_the_config_env_var_names_another_file(
         ('houdini_build = "latest"', "houdini_build", "22.0.368"),
         ('state_home = "relative/place"', "state_home", "absolute path"),
         ("default_session = 3", "default_session", "must be a string"),
+        ("worker_ports = 18100", "worker_ports", "two port numbers"),
+        ("worker_ports = [18100]", "worker_ports", "two port numbers"),
+        ("worker_ports = [80, 90]", "worker_ports", "from 1024 to 65535"),
+        ("worker_ports = [18199, 18100]", "worker_ports", "lower port first"),
     ],
 )
 def test_a_wrong_value_is_refused_with_the_key(home: Path, text: str, key: str, words: str) -> None:
@@ -286,7 +294,8 @@ def test_worker_start_takes_the_state_folder_cap_and_hython_from_config(
     named = tmp_path / "bin" / "hython"
     write(
         home,
-        f'state_home = "{state.as_posix()}"\npool_cap = 2\nhython = "{named.as_posix()}"\n',
+        f'state_home = "{state.as_posix()}"\npool_cap = 2\nhython = "{named.as_posix()}"\n'
+        "worker_ports = [18830, 18839]\n",
     )
     seen: list[pool.PoolConfig] = []
 
@@ -300,9 +309,11 @@ def test_worker_start_takes_the_state_folder_cap_and_hython_from_config(
     assert config.home == state
     assert config.cap == 2
     assert config.hython == named
+    assert config.port_range == (18830, 18839)
     # A flag given on the command line still wins.
-    assert cli.main(["bridge", "worker", "start", "--cap", "1"]) == 1
+    assert cli.main(["bridge", "worker", "start", "--cap", "1", "--port", "18831"]) == 1
     assert seen[1].cap == 1
+    assert seen[1].port_range == (18831, 18839)
 
 
 def test_bridge_status_reads_the_state_folder_from_config(
