@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -187,22 +188,53 @@ class Undos:
 class MainThread:
     """A main thread that runs only what is posted to it.
 
-    `run_until` is the test's event loop. Nothing posted here runs unless a
-    test drains it, which is what makes the marshal visible: work that reaches
-    the main thread has a thread name to prove it.
+    `start` runs the test's event loop. Nothing posted here runs unless that
+    loop or a test drains it, which is what makes the marshal visible: work
+    that reaches the main thread has a thread name to prove it.
+
+    Two things here are modelled on the real build. The object model lock is
+    held by this thread for the whole of every callback it runs, and posting
+    takes that lock, so a post during a cook blocks the thread that posts
+    exactly as it does in Houdini. And a posted callback fires once and there
+    is no call to take it off again, so `removeEventCallback` is absent here
+    the way it is absent there.
     """
 
     def __init__(self) -> None:
         self.posted: queue.Queue[Any] = queue.Queue()
         self.ran_on: list[str] = []
+        self.hom_lock = threading.Lock()
+        # Set to make the loop skip its ticks, which is what playback does to
+        # the event loop callback while posted callbacks still land.
+        self.starve_loop = False
+        self.ticks = 0
+        self._loop_callbacks: list[Any] = []
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     def postEventCallback(self, callback: Any) -> None:  # noqa: N802 - the name is Houdini's
-        self.posted.put(callback)
+        with self.hom_lock:
+            self.posted.put(callback)
 
-    def removeEventCallback(self, callback: Any) -> None:  # noqa: N802 - the name is Houdini's
-        return None
+    def addEventLoopCallback(self, callback: Any) -> None:  # noqa: N802 - the name is Houdini's
+        with self.hom_lock:
+            self._loop_callbacks.append(callback)
+
+    def removeEventLoopCallback(self, callback: Any) -> None:  # noqa: N802 - the name is Houdini's
+        with self.hom_lock:
+            if callback in self._loop_callbacks:
+                self._loop_callbacks.remove(callback)
+
+    def eventLoopCallbacks(self) -> tuple[Any, ...]:  # noqa: N802 - the name is Houdini's
+        return tuple(self._loop_callbacks)
+
+    def cook(self, seconds: float) -> None:
+        """Hold the main thread, and the lock with it, for that long.
+
+        Returns at once: the cook is posted, the way a cook is kicked off from
+        somewhere else and then owns the main thread until it ends.
+        """
+        self.postEventCallback(lambda: time.sleep(seconds))
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._loop, name="fake-main", daemon=True)
@@ -217,11 +249,19 @@ class MainThread:
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
-                callback = self.posted.get(timeout=0.02)
+                callback = self.posted.get(timeout=0.01)
             except queue.Empty:
+                callback = None
+            if callback is not None:
+                with self.hom_lock:
+                    self.ran_on.append(threading.current_thread().name)
+                    callback()
+            if self.starve_loop:
                 continue
-            self.ran_on.append(threading.current_thread().name)
-            callback()
+            with self.hom_lock:
+                self.ticks += 1
+                for loop_callback in list(self._loop_callbacks):
+                    loop_callback()
 
 
 class HipFileEventType:
@@ -341,7 +381,10 @@ class Scene:
             hipFileEventType=HipFileEventType,
             playbar=SimpleNamespace(frameRange=lambda: (1.0, 240.0)),
             applicationVersionString=lambda: "22.0.368",
-            frame=lambda: 1.0,
+            # The frame a thread that is not the main thread reads is not the
+            # frame the session is on, which is why ambient state is only ever
+            # read on the main thread.
+            frame=lambda: 72.0 if threading.current_thread().name == "fake-main" else 1.0,
             fps=lambda: 24.0,
             isUIAvailable=lambda: True,
             Vector3=Vector3,
