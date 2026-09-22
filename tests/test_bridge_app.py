@@ -14,6 +14,7 @@ import pytest
 import support
 from fake_hou import Scene
 from nscr_houdini_mcp import store as store_module
+from nscr_houdini_mcp.bridge import client as client_module
 from nscr_houdini_mcp.bridge import registry, security, signing
 from nscr_houdini_mcp.bridge.app import Bridge, BridgeConfig, BridgeStartError, houdini_lock
 from nscr_houdini_mcp.bridge.handlers import ToolRegistry, default_registry
@@ -1058,6 +1059,105 @@ def test_stopping_a_bridge_that_is_already_stopped_says_nothing_went_wrong(
     bridge.start()
     assert bridge.stop() == []
     assert bridge.stop() == []
+
+
+# Section: proving the port answers
+
+
+def test_a_session_whose_port_answers_says_so_everywhere(tmp_path: Path) -> None:
+    """Health read from inside the process cannot prove the port is served.
+
+    So the session asks its own port the way a caller would, and what it finds
+    goes into health, into the session file and into the store row.
+    """
+    bridge, _ = make_bridge(tmp_path, driver="stdlib", heartbeat_s=3600.0)
+    bridge.start()
+    try:
+        assert bridge.check_transport() is True
+        state = bridge.transport_state()
+        assert state["last_self_check_ok"] is True
+        assert state["last_self_check_age_s"] < 5.0
+
+        entry = registry.find_entry(tmp_path, bridge.session_id)
+        assert entry["last_self_check_ok"] is True
+
+        session = client_module.Session.open(tmp_path, bridge.session_id)
+        assert session.transport_ok is True
+        assert session.deaf() is False
+
+        bridge._round()
+        with store_module.Store(bridge.store_path) as store:
+            record = store.get_session(bridge.session_id)
+        assert record.state == "live"
+        assert record.transport_ok is True
+        assert record.transport_checked_at is not None
+    finally:
+        bridge.stop()
+
+
+def test_a_session_nothing_can_reach_reports_itself_unresponsive(tmp_path: Path) -> None:
+    """The process is fine, the heartbeat is fine, and the port is deaf."""
+    bridge, backend = make_bridge(tmp_path, driver="stdlib", heartbeat_s=3600.0)
+    bridge.start()
+    try:
+        assert bridge.check_transport() is True
+
+        # The server goes away under the bridge, which is what a transport
+        # that has died leaves behind: everything else still works.
+        backend.stop()
+
+        assert bridge.check_transport() is False
+        assert bridge.transport_state()["last_self_check_ok"] is False
+
+        bridge._round()
+        with store_module.Store(bridge.store_path) as store:
+            record = store.get_session(bridge.session_id)
+        assert record.state == "unresponsive"
+        assert record.transport_ok is False
+
+        session = client_module.Session.open(tmp_path, bridge.session_id)
+        assert session.transport_ok is False
+        assert session.deaf() is True
+    finally:
+        bridge.stop()
+
+
+def test_health_carries_the_self_check(tmp_path: Path) -> None:
+    bridge, backend = make_bridge(tmp_path, driver="stdlib", heartbeat_s=3600.0)
+    bridge.start()
+    try:
+        bridge.check_transport()
+        data = body_of(send(bridge, backend, HEALTH_PATH))["data"]
+        assert data["last_self_check_ok"] is True
+        assert data["last_self_check_at"] is not None
+        assert data["last_self_check_age_s"] >= 0.0
+    finally:
+        bridge.stop()
+
+
+def test_a_session_that_has_not_asked_yet_says_nothing_either_way(tmp_path: Path) -> None:
+    """Nothing is not the same as a failure, and is never reported as one."""
+    bridge, backend = make_bridge(tmp_path)
+    bridge.start()
+    try:
+        bridge.transport_ok = None
+        bridge.transport_checked_at = None
+        data = body_of(send(bridge, backend, HEALTH_PATH))["data"]
+        assert data["last_self_check_ok"] is None
+        assert data["last_self_check_age_s"] is None
+        assert client_module.Session("s", "t", 1).deaf() is False
+    finally:
+        bridge.stop()
+
+
+def test_nothing_listening_on_the_port_is_a_failed_check(tmp_path: Path) -> None:
+    """The recording backend serves no socket, and the check says so."""
+    bridge, _ = make_bridge(tmp_path, heartbeat_s=3600.0)
+    bridge.start()
+    try:
+        assert bridge.check_transport() is False
+    finally:
+        bridge.stop()
 
 
 # Section: the main thread of a session with a user interface

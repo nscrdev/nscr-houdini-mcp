@@ -32,6 +32,7 @@ Standard library only: the same module is imported inside Houdini.
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -48,6 +49,10 @@ DEFAULT_TIMEOUT_S = 10.0
 
 # How much longer than the bridge budgets this end waits on the socket.
 SOCKET_MARGIN_S = 10.0
+
+# How old a session's word on its own port may be and still be read as an
+# answer. Past this it has simply not asked lately.
+DEAF_AFTER_S = 60.0
 
 # How long the second send of a lost call waits for its turn. The work the
 # first send started is often still running, and queueing behind it is what
@@ -118,12 +123,21 @@ class Answer(NamedTuple):
 
 
 class Session(NamedTuple):
-    """Where one bridge is and what proves a request came from its owner."""
+    """Where one bridge is and what proves a request came from its owner.
+
+    The last two are what the session last found when it asked its own port
+    for health: whether it answered, and when it asked. A session can be alive
+    and writing heartbeats while nothing can reach it, so a caller that wants
+    to know before it sends has these to read. They are nothing when the
+    session has not checked yet.
+    """
 
     session_id: str
     token: str
     port: int
     address: str = LOOPBACK
+    transport_ok: bool | None = None
+    transport_checked_at: float | None = None
 
     @classmethod
     def from_entry(cls, entry: Mapping[str, Any]) -> Session:
@@ -132,7 +146,19 @@ class Session(NamedTuple):
             token=str(entry["token"]),
             port=int(entry["port"]),
             address=str(entry.get("address") or LOOPBACK),
+            transport_ok=_flag(entry.get("last_self_check_ok")),
+            transport_checked_at=_seconds(entry.get("last_self_check_at")),
         )
+
+    def deaf(self, *, stale_s: float = DEAF_AFTER_S) -> bool:
+        """Whether this session said its own port was not answering.
+
+        A check that is older than `stale_s` is not an answer either way, so it
+        is not read as one: the session may simply not have asked recently.
+        """
+        if self.transport_ok is not False or self.transport_checked_at is None:
+            return False
+        return (time.time() - self.transport_checked_at) <= stale_s
 
     @classmethod
     def open(cls, home: Path, handle: str, *, store_path: Path | None = None) -> Session:
@@ -175,6 +201,18 @@ def _remembered(home: Path, handle: str, store_path: Path | None) -> tuple[str, 
             live_id = None if live is None or live.session_id == handle else live.session_id
             return record.alias, live_id
     except store_module.StoreError:
+        return None
+
+
+def _flag(value: Any) -> bool | None:
+    """A recorded yes, no, or nothing said yet."""
+    return None if value is None else bool(value)
+
+
+def _seconds(value: Any) -> float | None:
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
         return None
 
 

@@ -66,6 +66,7 @@ from typing import Any
 
 from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge import (
+    client,
     host,
     liveness,
     marshal,
@@ -130,6 +131,11 @@ DEFAULT_MAX_BODY_BYTES = 1024 * 1024
 # How long a call has to notice the session is going down before a process
 # that exists only to be this bridge ends itself.
 DEFAULT_SHUTDOWN_GRACE_S = 5.0
+
+# How long the session waits for its own port to answer the self check. Health
+# is answered from memory, so anything near this means the port is not being
+# served at all.
+DEFAULT_SELF_CHECK_TIMEOUT_S = 5.0
 
 # Set in a worker this project starts. The self check tool makes nodes and can
 # park a session for a minute, so it is off unless a process was started to be
@@ -205,6 +211,9 @@ class BridgeConfig:
     # will not stop does not get to keep the process alive for ever.
     owns_process: bool = False
     shutdown_grace_s: float = DEFAULT_SHUTDOWN_GRACE_S
+    # How long the session's own health request may take before the port
+    # counts as not answering.
+    self_check_timeout_s: float = DEFAULT_SELF_CHECK_TIMEOUT_S
     # How long an answer is held when a call asks for it to be dropped.
     drop_reply_s: float = DEFAULT_DROP_REPLY_S
     facts: dict[str, Any] = field(default_factory=dict)
@@ -257,6 +266,10 @@ class Bridge:
         self.port: int | None = None
         self.started_at: float | None = None
         self.privacy: dict[str, Any] | None = None
+        # What the last request this session sent to its own port found.
+        # Nothing until the first one has been sent.
+        self.transport_ok: bool | None = None
+        self.transport_checked_at: float | None = None
 
         self._token = mint_token()
         self._verifier = signing.Verifier(self._token, self.session_id)
@@ -304,6 +317,11 @@ class Bridge:
         self._heartbeat: threading.Thread | None = None
         self._remove_quit_hook = None
         self._entry: dict[str, Any] = {}
+        # One writer at a time for the session file, so two threads updating
+        # different parts of it cannot land one on top of the other.
+        self._entry_lock = threading.Lock()
+        # One self check at a time, so the answer and the file move together.
+        self._transport_lock = threading.Lock()
         self.problems: list[str] = []
 
     # Section: identity
@@ -327,9 +345,7 @@ class Bridge:
         self._log(f"the scene was replaced, epoch {epoch}")
         with self._open_store() as store:
             store.set_scene_epoch(self.session_id, epoch, hip_path=hip_path)
-        if self._entry:
-            self._entry = {**self._entry, "scene_epoch": epoch, "hip_path": hip_path}
-            registry.write_entry(self.home, self._entry)
+        self._write_entry(scene_epoch=epoch, hip_path=hip_path)
 
     # Lifetime
 
@@ -520,6 +536,7 @@ class Bridge:
                         "alias_drift": self.identity.drift(),
                         "started_at": self.started_at,
                         "heartbeat_age_s": round(max(0.0, now - self._heartbeat_at), 3),
+                        **self.transport_state(),
                         "privacy": self.privacy,
                         "tools": self.tools.names(),
                         **self.dispatcher.state(),
@@ -761,6 +778,7 @@ class Bridge:
             "token": self._token,
             "scene_epoch": self.scene_epoch,
             "started_at": self.started_at,
+            **self.transport_state(),
             **self.facts,
         }
         registry.write_entry(self.home, self._entry)
@@ -776,14 +794,103 @@ class Bridge:
         return store_module.Store(self.store_path)
 
     def _beat(self) -> None:
-        """Write a heartbeat until the bridge stops."""
+        """Prove the port answers, then write a heartbeat, until the bridge stops.
+
+        The first round runs at once, so a session says something true about
+        its own port from the moment it is up rather than one interval later.
+        """
         interval = max(1.0, self.config.heartbeat_s)
+        self._round()
         while not self._heartbeat_stop.wait(interval):
+            self._round()
+
+    def _round(self) -> None:
+        """One self check and one heartbeat, neither able to stop the other."""
+        if self._heartbeat_stop.is_set():
+            return
+        self.check_transport()
+        try:
+            with self._open_store() as store:
+                self._heartbeat_at = store.touch_session(
+                    self.session_id,
+                    state=store_module.SESSION_LIVE
+                    if self.transport_ok is not False
+                    else store_module.SESSION_UNRESPONSIVE,
+                    transport_ok=self.transport_ok,
+                    transport_checked_at=self.transport_checked_at,
+                )
+        except Exception as error:  # noqa: BLE001 - a missed beat is not a crash
+            self._note(f"heartbeat: {error}")
+
+    # Section: proving the port answers
+
+    def check_transport(self) -> bool | None:
+        """Send one signed request to this session's own health endpoint.
+
+        A bridge can be alive, writing heartbeats and answering from memory
+        while nothing can reach its port: the thread that serves it can be
+        gone without the process noticing. Health read from inside the process
+        would say everything is fine, so this asks the way a caller would,
+        over the socket, and records what came back.
+
+        Nothing here touches `hou`, and the health endpoint reads no scene, so
+        this answers while the session is busy with a call.
+        """
+        if not self._running or self.port is None:
+            return None
+        session = client.Session(
+            session_id=self.session_id,
+            token=self._token,
+            port=self.port,
+            address=self.config.address,
+        )
+        ok = False
+        try:
+            answer = client.health(session, timeout_s=self.config.self_check_timeout_s)
+            ok = answer.status == 200 and bool(answer.payload.get("ok"))
+        except (client.BridgeUnreachable, client.BridgeNotAuthentic) as error:
+            self._log(f"this session's own port did not answer: {error}")
+        except Exception as error:  # noqa: BLE001 - a failed check is a failed check
+            self._log(f"could not check this session's own port: {type(error).__name__}: {error}")
+        at = time.time()
+        # The file is written before the answer is published, so a reader that
+        # has seen this session say its port answers finds the same in the
+        # file. Two checks at once are kept apart for the same reason.
+        with self._transport_lock:
+            was = self.transport_ok
+            if was is True and not ok:
+                self._log("this session stopped answering on its own port")
+            elif was is False and ok:
+                self._log("this session is answering on its own port again")
+            if was is not ok:
+                self._write_entry(**self._transport_fields(ok, at))
+            self.transport_ok = ok
+            self.transport_checked_at = at
+        return ok
+
+    @staticmethod
+    def _transport_fields(ok: bool | None, at: float | None) -> dict[str, Any]:
+        """One self check, as it is written down."""
+        return {
+            "last_self_check_ok": ok,
+            "last_self_check_at": at,
+            "last_self_check_age_s": None if at is None else round(max(0.0, time.time() - at), 3),
+        }
+
+    def transport_state(self) -> dict[str, Any]:
+        """What the last self check found, for health and for the session file."""
+        return self._transport_fields(self.transport_ok, self.transport_checked_at)
+
+    def _write_entry(self, **changes: Any) -> None:
+        """Write the session file again, with whatever has changed in it."""
+        with self._entry_lock:
+            if not self._entry:
+                return
+            self._entry = {**self._entry, **changes}
             try:
-                with self._open_store() as store:
-                    self._heartbeat_at = store.touch_session(self.session_id)
-            except Exception as error:  # noqa: BLE001 - a missed beat is not a crash
-                self._note(f"heartbeat: {error}")
+                registry.write_entry(self.home, self._entry)
+            except Exception as error:  # noqa: BLE001 - the file is not the session
+                self._note(f"could not write the session file: {error}")
 
     def log_path(self) -> Path:
         """Where this session's detail goes. The token is never written here."""

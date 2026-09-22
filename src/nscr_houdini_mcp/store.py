@@ -45,11 +45,14 @@ APP_DIR_NAME = "nscr-houdini-mcp"
 HOME_ENV_VAR = "NSCR_MCP_HOME"
 STORE_FILE_NAME = "coord.sqlite"
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SESSION_KINDS = frozenset({"gui", "hython"})
 SESSION_STATES = frozenset({"live", "busy", "unresponsive", "crashed", "gone"})
 SESSION_GONE = "gone"
+SESSION_LIVE = "live"
+# The process is there and writing heartbeats, and its port is not answering.
+SESSION_UNRESPONSIVE = "unresponsive"
 
 # States that still hold a slot against the pool cap. A reservation counts from
 # the moment it is made, before hython has started.
@@ -402,6 +405,11 @@ def _load(text: str | None) -> Any:
     return None if text is None else json.loads(text)
 
 
+def _flag(value: Any) -> bool | None:
+    """A column that holds yes, no or nothing yet."""
+    return None if value is None else bool(value)
+
+
 def _age(now: float, then: float | None) -> float:
     """Age in seconds, never negative, so a clock step cannot rewind a lease."""
     if then is None:
@@ -437,6 +445,10 @@ class SessionRecord:
     capabilities: Any
     started_at: float
     heartbeat_at: float
+    # Whether this session's own port answered it, and when it last asked.
+    # Nothing when it has not asked yet.
+    transport_ok: bool | None = None
+    transport_checked_at: float | None = None
 
     @classmethod
     def _from_row(cls, row: sqlite3.Row) -> SessionRecord:
@@ -453,6 +465,8 @@ class SessionRecord:
             capabilities=_load(row["capabilities"]),
             started_at=row["started_at"],
             heartbeat_at=row["heartbeat_at"],
+            transport_ok=_flag(row["transport_ok"]),
+            transport_checked_at=row["transport_checked_at"],
         )
 
 
@@ -734,7 +748,15 @@ _SCHEMA_5 = (
     "ALTER TABLE workers ADD COLUMN lessee_start TEXT",
 )
 
-MIGRATIONS = (_SCHEMA_1, _SCHEMA_2, _SCHEMA_3, _SCHEMA_4, _SCHEMA_5)
+# Whether a session's own port answered it the last time it asked, and when.
+# A session can be alive and writing heartbeats while nothing can reach it, so
+# a heartbeat on its own says only that the process is running.
+_SCHEMA_6 = (
+    "ALTER TABLE sessions ADD COLUMN transport_ok INTEGER",
+    "ALTER TABLE sessions ADD COLUMN transport_checked_at REAL",
+)
+
+MIGRATIONS = (_SCHEMA_1, _SCHEMA_2, _SCHEMA_3, _SCHEMA_4, _SCHEMA_5, _SCHEMA_6)
 
 
 class Store:
@@ -880,7 +902,7 @@ class Store:
         hip_path: str | None = None,
         scene_epoch: int = 0,
         capabilities: Any = None,
-        state: str = "live",
+        state: str = SESSION_LIVE,
     ) -> SessionRecord:
         """Add a session row and settle its alias in the same transaction.
 
@@ -969,23 +991,46 @@ class Store:
         sql += " ORDER BY started_at, rowid"
         return [SessionRecord._from_row(row) for row in self._read_all(sql, args)]
 
-    def touch_session(self, session_id: str, *, state: str | None = None) -> float:
-        """Write a heartbeat, and a new state when one is given."""
+    def touch_session(
+        self,
+        session_id: str,
+        *,
+        state: str | None = None,
+        transport_ok: bool | None = None,
+        transport_checked_at: float | None = None,
+    ) -> float:
+        """Write a heartbeat, and a new state when one is given.
+
+        A session that has checked its own port passes what it found. A
+        heartbeat on its own only says the process is running, so a session
+        whose port stopped answering writes `unresponsive` here and a server
+        reading the row sees that rather than a live session.
+        """
         if state is not None and state not in SESSION_STATES:
             raise ValueError(f"unknown session state: {state}")
         now = self._now()
+        sets = ["heartbeat_at = ?"]
+        values: list[Any] = [now]
+        if state is not None:
+            sets.append("state = ?")
+            values.append(state)
+        if transport_ok is not None:
+            sets.append("transport_ok = ?")
+            values.append(1 if transport_ok else 0)
+            sets.append("transport_checked_at = ?")
+            values.append(now if transport_checked_at is None else transport_checked_at)
+        values.append(session_id)
+        values.append(SESSION_GONE)
         with self._txn(write=True) as db:
-            if state is None:
-                written = db.execute(
-                    "UPDATE sessions SET heartbeat_at = ? WHERE session_id = ?", (now, session_id)
-                )
-            else:
-                written = db.execute(
-                    "UPDATE sessions SET heartbeat_at = ?, state = ? WHERE session_id = ?",
-                    (now, state, session_id),
-                )
+            # A session that has ended stays ended. A beat written by a thread
+            # that had not noticed the session was going would otherwise bring
+            # the row back with nothing behind it.
+            written = db.execute(
+                f"UPDATE sessions SET {', '.join(sets)} WHERE session_id = ? AND state <> ?",
+                tuple(values),
+            )
             if written.rowcount == 0:
-                raise UnknownRecord(f"no session {session_id}")
+                raise UnknownRecord(f"no live session {session_id}")
         return now
 
     def bump_scene_epoch(self, session_id: str, *, hip_path: str | None = None) -> int:

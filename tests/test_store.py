@@ -295,6 +295,29 @@ def test_heartbeat_and_state_move_together(store: Store) -> None:
     assert beat >= started.heartbeat_at
 
 
+def test_a_heartbeat_carries_what_the_session_found_on_its_own_port(store: Store) -> None:
+    """A beating heart says the process is running and nothing more."""
+    store.register_session("s1", kind="gui", pid=1, alias="shot-1")
+    record = store.get_session("s1")
+    assert record.transport_ok is None
+    assert record.transport_checked_at is None
+
+    store.touch_session("s1", transport_ok=True)
+    record = store.get_session("s1")
+    assert record.transport_ok is True
+    assert record.transport_checked_at is not None
+    assert record.state == "live"
+
+    store.touch_session("s1", state="unresponsive", transport_ok=False)
+    record = store.get_session("s1")
+    assert record.transport_ok is False
+    assert record.state == "unresponsive"
+
+    # A beat that says nothing about the port leaves what was there.
+    store.touch_session("s1")
+    assert store.get_session("s1").transport_ok is False
+
+
 def test_scene_epoch_counts_up_and_records_the_new_hip(store: Store) -> None:
     store.register_session("s1", kind="gui", pid=1, alias="shot-1")
     assert store.bump_scene_epoch("s1") == 1

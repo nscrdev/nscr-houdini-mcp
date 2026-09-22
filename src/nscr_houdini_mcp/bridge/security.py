@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 import secrets
 import sys
+import threading
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -178,10 +179,14 @@ def write_private(path: Path, text: str) -> Path:
     The mode is set as the file is created, and the name is created
     exclusively, so nothing can be waiting in place of it. The finished file
     is moved over the old one, so a reader never sees half of it.
+
+    The name it is written under belongs to this writer alone. Two writers
+    sharing one would take each other's file away mid write, and what landed
+    would be whichever of them moved last, holding the other one's contents.
     """
     private_dir(path.parent)
     data = text.encode("utf-8")
-    temporary = path.with_name(path.name + ".part")
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.part")
     # Whatever is sitting there, including a link pointing somewhere else, is
     # removed before a new file is created under that name.
     temporary.unlink(missing_ok=True)

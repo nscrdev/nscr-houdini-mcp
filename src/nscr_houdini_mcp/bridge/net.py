@@ -56,12 +56,21 @@ class PortUnavailable(Exception):
 
 
 def port_is_free(port: int, *, address: str = LOOPBACK) -> bool:
-    """Whether a port can be bound right now.
+    """Whether the server could bind this port right now.
 
-    No address reuse flag: the question is whether the port is free, not
-    whether it can be shared.
+    The probe asks for address reuse exactly where the server does, so the
+    answer is the one the server would get. On Linux and macOS that flag does
+    not let a bind past a socket that is listening, so an answering port is
+    still refused; what it does let past is a port whose old connections are
+    draining, which the server can take and which would otherwise leave a
+    whole range looking full after a busy session.
+
+    On Windows the flag would let the bind past a live listener, so it is not
+    set there and a draining port counts as taken.
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        if sys.platform != "win32":
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             probe.bind((address, port))
         except OSError:
