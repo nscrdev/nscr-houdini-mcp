@@ -509,7 +509,15 @@ class Bridge:
             store.end_session(self.session_id)
 
     def _remove_session_file(self) -> None:
-        registry.remove_entry(self.home, self.session_id)
+        """Forget the file's contents, then take it off disk.
+
+        Both happen under the lock every writer takes, so a self check or a
+        scene event that finishes after this finds nothing to write and cannot
+        put the file of a stopped session back.
+        """
+        with self._entry_lock:
+            self._entry = {}
+            registry.remove_entry(self.home, self.session_id)
 
     def _stop_backend(self) -> None:
         if self._backend is not None:

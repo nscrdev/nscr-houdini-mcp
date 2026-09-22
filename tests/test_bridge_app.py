@@ -204,6 +204,33 @@ def test_stopping_takes_the_session_away_and_can_be_repeated(tmp_path: Path) -> 
         assert store.get_session(bridge.session_id).state == "gone"
 
 
+def test_a_self_check_that_ends_after_stopping_writes_no_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The first self check is held open until the bridge has stopped, so its
+    # answer lands after the session file is gone, every time.
+    checking = threading.Event()
+    stopped = threading.Event()
+
+    def health(*_args: Any, **_kwargs: Any) -> Any:
+        checking.set()
+        stopped.wait(SOCKET_TIMEOUT_S)
+        raise client_module.BridgeUnreachable("nothing answered")
+
+    monkeypatch.setattr(client_module, "health", health)
+    bridge, _ = make_bridge(tmp_path)
+    bridge.start()
+    assert checking.wait(SOCKET_TIMEOUT_S)
+    bridge.stop()
+    stopped.set()
+    assert bridge._heartbeat is not None
+    bridge._heartbeat.join(SOCKET_TIMEOUT_S)
+
+    assert not bridge._heartbeat.is_alive()
+    assert bridge.transport_ok is False
+    assert registry.list_entries(tmp_path) == []
+
+
 def test_a_gui_session_is_named_after_its_scene(tmp_path: Path) -> None:
     bridge, _ = make_bridge(
         tmp_path,
