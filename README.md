@@ -63,7 +63,7 @@ Run the server on stdio:
 nscr-houdini-mcp
 ```
 
-Four tools so far. `hou_ping` says which session a call reaches and that it
+Five tools so far. `hou_ping` says which session a call reaches and that it
 answers. `hou_sessions` lists every session with its state (`live`, `busy`,
 `unresponsive`, `crashed` or `gone`) and starts and stops workers under the
 pool's rules; it never closes a Houdini with a user interface. `hou_scene`
@@ -115,6 +115,41 @@ Every tool that reads takes the same three `detail` levels:
 
 `include` brings single items into a lower level: `wires`, `flags`, `errors`,
 `expressions`, `code`, `notes` or `cook_time`.
+
+`hou_python` runs Python inside a session with the whole `hou` API. What the
+code leaves in a variable named `result` comes back, turned into JSON the way
+every answer is: a node or a parameter as its path, a vector or an array as a
+list, up to the usual caps. Variables stay between calls in a namespace, one
+dict per session and name, seeded with `hou` and `mcp` and nothing else. A
+call that names none uses this server's own, `c_` and an id drawn when the
+server starts; `shared` is the name to use when agents should share. A
+namespace goes when a call passes `reset`, when the session ends, or after a
+day nobody used it. Separate namespaces keep variables apart, never the
+scene: every one of them works on the same node graph.
+
+What the code prints, on either stream, comes back as `stdout_tail`.
+`max_chars` (12,000 unless you say) is the budget for the result and the
+printed text together; what does not fit is counted in `elided_chars` and
+written whole to the spill folder, named in `spill_path`. An exception in the
+code is not a failed call: the result carries `error` with the type, the
+message and the last twenty lines of the traceback, a syntax error its line
+and offset, places on disk taken out, and the client sees it marked as an
+error. The namespace and the scene are left as the code left them.
+
+Every call counts as a change. It runs in one undo group, named `undo_label`
+or `hou_python` and the operation id, takes a receipt under that id and
+follows the same busy, cancel and retry rules as any other change. A call
+that runs past `timeout_s` (a minute unless you say, at most
+`python_timeout_cap_s` from `config.toml`) answers `TIMEOUT` with
+`still_running`; the code carries on, and the same operation id fetches its
+answer once it ends.
+
+`mcp` in every namespace has three things. `mcp.output_path(kind, name, ext)`
+hands out a managed path for this session and scene from the output table
+below, for `render`, `flipbook`, `comp`, `cache`, `usd`, `hip`, `capture` or
+`compare`. `mcp.progress(done, total, message)` leaves a note that health, and
+`hou_ping`, show while the call runs. `mcp.cancelled()` says whether somebody
+asked the call to stop, for a long loop to look at between pieces of work.
 
 ### The Houdini side
 
