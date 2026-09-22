@@ -263,6 +263,25 @@ def test_sessions_whose_process_is_gone_can_be_tidied_up_on_their_own(store: Sto
     assert store.reclaim_sessions() == []
 
 
+def test_a_session_keeps_how_it_ended(store: Store) -> None:
+    store.register_session("s1", kind="hython", pid=LIVE_PID, alias="w1")
+    store.register_session("s2", kind="hython", pid=DEAD_PID, alias="w2")
+    assert store.get_session("s1").ended_as is None
+
+    store.end_session("s1")
+    store.reclaim_sessions()
+    assert store.get_session("s1").ended_as == "gone"
+    assert store.get_session("s2").ended_as == "crashed"
+    assert store.get_session("s2").state == "gone"
+
+    # A stop that had to end the process says it was on purpose, whoever
+    # found the process missing first.
+    store.end_session("s2", how="gone")
+    assert store.get_session("s2").ended_as == "gone"
+    with pytest.raises(ValueError):
+        store.end_session("s1", how="vanished")
+
+
 def test_register_wants_exactly_one_of_alias_or_template(store: Store) -> None:
     with pytest.raises(ValueError):
         store.register_session("s1", kind="gui", pid=1)

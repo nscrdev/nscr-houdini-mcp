@@ -10,6 +10,7 @@ replaced, so nothing here starts a Houdini.
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from nscr_houdini_mcp.config import Config
 from nscr_houdini_mcp.router import Router
 from nscr_houdini_mcp.server import build_server
 from nscr_houdini_mcp.store import SessionRecord, Store, WorkerRecord, process_start_stamp
+from nscr_houdini_mcp.tools import sessions as sessions_tool
 from nscr_houdini_mcp.tools.registry import TOOLS
 from test_router import Sent
 from test_server import talk, text_of
@@ -54,6 +56,9 @@ class Bench:
         )
 
     def open(self, home: Any, handle: str, *, store_path: Any = None) -> client.Session:
+        # As the real one does: every session file whose process has gone is
+        # cleared on the way to the one asked for.
+        registry.live_entries(self.home)
         if handle not in self.reachable:
             raise client.SessionDead(handle)
         return client.Session(session_id=handle, token="token", port=18000)
@@ -91,6 +96,7 @@ class Bench:
         *,
         kind: str = "hython",
         pid: int | None = None,
+        stamp: str | None = None,
         hip_path: str | None = None,
         clock: Any = None,
     ) -> SessionRecord:
@@ -100,7 +106,7 @@ class Bench:
                 session_id,
                 kind=kind,
                 pid=os.getpid() if alive else pid,
-                pid_start=self.stamp if alive else "gone",
+                pid_start=self.stamp if alive else (stamp or "gone"),
                 alias=alias,
                 port=18000,
                 hip_path=hip_path,
@@ -110,7 +116,9 @@ class Bench:
             self.reachable.add(session_id)
         return record
 
-    def worker(self, session_id: str, token: str, *, pid: int | None = None) -> WorkerRecord:
+    def worker(
+        self, session_id: str, token: str, *, pid: int | None = None, stamp: str | None = None
+    ) -> WorkerRecord:
         alive = pid is None
         with self.store() as store:
             store.reserve_worker(cap=8, token=token)
@@ -120,7 +128,7 @@ class Bench:
                 session_id=session_id,
                 owner_pid=os.getpid() if alive else pid,
                 pid=os.getpid() if alive else pid,
-                pid_start=self.stamp if alive else "gone",
+                pid_start=self.stamp if alive else (stamp or "gone"),
                 capabilities=CAPABILITIES,
             )
 
@@ -191,11 +199,16 @@ def test_a_killed_worker_lists_as_crashed_now_and_later(bench: Bench) -> None:
     assert listed(bench)["w1"]["state"] == "crashed"
 
 
-def test_a_gui_session_that_left_its_file_behind_lists_as_crashed(bench: Bench) -> None:
+def test_a_crashed_gui_session_stays_crashed_after_its_file_is_cleared(bench: Bench) -> None:
     bench.session("s-3", "shot-1", kind="gui", pid=DEAD_PID)
     registry.ensure_registry_dir(bench.home)
-    registry.write_entry(bench.home, {"session_id": "s-3", "alias": "shot-1"})
+    entry = {"session_id": "s-3", "alias": "shot-1", "pid": DEAD_PID, "pid_start": "gone"}
+    registry.write_entry(bench.home, entry)
+    # A live session beside it, so the list opens a client and the stand in
+    # clears the crashed session's file the way the real one does.
+    bench.session("s-1", "w1")
     assert listed(bench)["shot-1"]["state"] == "crashed"
+    assert not registry.entry_path(bench.home, "s-3").exists()
     assert listed(bench)["shot-1"]["state"] == "crashed"
 
 
@@ -424,3 +437,27 @@ def test_stopping_an_ended_session_says_it_has_ended(bench: Bench) -> None:
     bench.session("s-1", "w1", pid=DEAD_PID)
     _, [result] = talk(bench.serve(), ("hou_sessions", {"action": "stop", "session": "s-1"}))
     assert result.structured_content["error"]["code"] == "SESSION_DEAD"
+
+
+def test_a_worker_that_had_to_be_ended_lists_as_gone(
+    bench: Bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stand in worker that never looks at its row, so the stop has to end it."""
+    monkeypatch.setattr(sessions_tool, "STOP_GRACE_S", 0.3)
+    launched = pool.spawn_detached(
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+        log=bench.home / "logs" / "stand-in.log",
+    )
+    try:
+        stamp = process_start_stamp(launched.pid)
+        bench.session("s-1", "w1", pid=launched.pid, stamp=stamp)
+        bench.worker("s-1", "wk-1", pid=launched.pid, stamp=stamp)
+        _, [result] = talk(bench.serve(), ("hou_sessions", {"action": "stop", "session": "w1"}))
+        stopped = result.structured_content["stopped"]
+        assert stopped["ended"] is True
+        assert stopped["killed"] is True
+        assert listed(bench)["w1"]["state"] == "gone"
+    finally:
+        if launched.poll() is None:
+            pool.kill_process(launched.pid, process_start_stamp(launched.pid))
+        pool.reap_started()

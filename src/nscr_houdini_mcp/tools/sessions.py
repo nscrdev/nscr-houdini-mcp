@@ -3,12 +3,13 @@
 Four actions.
 
 - `list` reads every session the store knows, with the state it is in now.
-  The store keeps `live`, `unresponsive` and `gone`. The other two are worked
-  out here: `busy` from the session's own health answer, and `crashed` for a
-  session whose process ended without ending its own row, which is the
-  difference between a worker that was stopped and one that was killed. A
-  session that ended in the last hour is still listed, so a caller that just
-  lost one sees what became of it. Listing is not a use: it renews no lease.
+  The store keeps `live` and `unresponsive`, and for an ended session how it
+  ended: `crashed` when its process was found missing, `gone` when it ended
+  its own row or was stopped. That is written the moment the row is marked,
+  because the signs it could be read from later are cleared by the next
+  reader. `busy` comes from the session's own health answer. A session that
+  ended in the last hour is still listed, so a caller that just lost one sees
+  what became of it. Listing is not a use: it renews no lease.
 - `info` is one session in full, with its health.
 - `start` starts a hython worker through the pool, under the config's cap
   and with the config's hython and ports.
@@ -33,7 +34,6 @@ from typing import Any
 
 from nscr_houdini_mcp import pool
 from nscr_houdini_mcp import store as store_module
-from nscr_houdini_mcp.bridge import registry
 from nscr_houdini_mcp.bridge.app import LOG_DIR_NAME
 from nscr_houdini_mcp.config import Config, ConfigError, resolve_hython
 from nscr_houdini_mcp.results import CallError
@@ -50,6 +50,9 @@ from nscr_houdini_mcp.tools.base import (
 )
 
 ACTIONS = ("list", "info", "start", "stop")
+
+# How long a worker asked to stop is given to end itself before it is ended.
+STOP_GRACE_S = pool.DEFAULT_STOP_GRACE_S
 
 # How long an ended session stays in the list, and how many of them at most.
 RECENT_S = 3600.0
@@ -78,7 +81,7 @@ def list_sessions(call: Call) -> dict[str, Any]:
     full = call.arguments.get("detail") == "full"
     router = call.router
     now = time.time()
-    records, before, workers, active = read_rows(router)
+    records, workers, active = read_rows(router)
     rows: list[dict[str, Any]] = []
     ended: list[dict[str, Any]] = []
     for record in records:
@@ -86,7 +89,7 @@ def list_sessions(call: Call) -> dict[str, Any]:
         if record.state == store_module.SESSION_GONE:
             if now - record.heartbeat_at > RECENT_S:
                 continue
-            state = ended_state(record, before.get(record.session_id), worker, router.home)
+            state = ended_state(record)
             ended.append(session_row(record, state, worker, None, None, now=now, full=full))
             continue
         target, health, state = look(router, record)
@@ -117,27 +120,24 @@ def session_info(call: Call) -> dict[str, Any]:
 
 def read_rows(
     router: Router,
-) -> tuple[list[SessionRecord], dict[str, str], dict[str, WorkerRecord], list[WorkerRecord]]:
-    """Every session row, the state each had before this read tidied up, the
-    worker row behind each session, and the workers that hold a slot."""
+) -> tuple[list[SessionRecord], dict[str, WorkerRecord], list[WorkerRecord]]:
+    """Every session row, the worker row behind each session, and the workers
+    that hold a slot, after the store has marked the processes that are gone."""
     # A worker this process started and that has ended stays on the process
     # table until its exit is read, and until then it looks alive.
     pool.reap_started()
     with router.store() as store:
         if store is None:
-            return [], {}, {}, []
+            return [], {}, []
 
         def read() -> Any:
-            before = {r.session_id: r.state for r in store.list_sessions(include_gone=True)}
             store.reclaim_sessions()
             store.reclaim_workers()
-            records = store.list_sessions(include_gone=True)
-            workers = store.list_workers(active_only=False)
-            return records, before, workers
+            return store.list_sessions(include_gone=True), store.list_workers(active_only=False)
 
-        records, before, workers = stored(read)
+        records, workers = stored(read)
     active = [w for w in workers if w.state in store_module.WORKER_ACTIVE_STATES]
-    return records, before, newest_workers(workers), active
+    return records, newest_workers(workers), active
 
 
 def newest_workers(workers: list[WorkerRecord]) -> dict[str, WorkerRecord]:
@@ -149,23 +149,13 @@ def newest_workers(workers: list[WorkerRecord]) -> dict[str, WorkerRecord]:
     return found
 
 
-def ended_state(
-    record: SessionRecord, before: str | None, worker: WorkerRecord | None, home: Path
-) -> str:
-    """`crashed` for a process that ended without ending its row, else `gone`.
+def ended_state(record: SessionRecord) -> str:
+    """How an ended session ended, as the store wrote it when it was marked.
 
-    Three signs of that, any one enough: the row was still open until this
-    read found the process missing; the pool marked the worker failed rather
-    than stopped; or the session file is still on disk, which a clean exit
-    removes.
+    `crashed` when its process was found missing, `gone` when it ended its own
+    row or was stopped. A row written before the store kept this says `gone`.
     """
-    if before is not None and before != store_module.SESSION_GONE:
-        return "crashed"
-    if worker is not None and worker.state == "failed":
-        return "crashed"
-    if registry.entry_path(Path(home), record.session_id).is_file():
-        return "crashed"
-    return store_module.SESSION_GONE
+    return record.ended_as or store_module.SESSION_GONE
 
 
 def look(router: Router, record: SessionRecord) -> tuple[Target | None, dict[str, Any] | None, str]:
@@ -382,11 +372,23 @@ def stop_one(call: Call, store: Any, handle: str) -> dict[str, Any]:
     if worker is None:
         raise not_a_worker(record)
     try:
-        stopped = pool.stop_worker(pool.PoolConfig(home=router.home), store, worker.token)
+        stopped = pool.stop_worker(
+            pool.PoolConfig(home=router.home), store, worker.token, grace_s=STOP_GRACE_S
+        )
     except pool.UnknownWorker:
         raise not_a_worker(record) from None
     except (pool.PoolError, store_module.StoreError, sqlite3.Error) as error:
         raise unavailable(error) from None
+    if stopped.ended:
+        # A worker that had to be ended here never got to end its own row, and
+        # the next reader would find its process missing and call it crashed.
+        # It was stopped on purpose, so the row says so.
+        try:
+            store.end_session(record.session_id, how=store_module.SESSION_GONE)
+        except store_module.UnknownRecord:
+            pass
+        except (store_module.StoreError, sqlite3.Error) as error:
+            raise unavailable(error) from None
     router.forget(record.session_id)
     return {
         "stopped": {

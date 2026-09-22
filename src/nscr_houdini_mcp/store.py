@@ -45,7 +45,7 @@ APP_DIR_NAME = "nscr-houdini-mcp"
 HOME_ENV_VAR = "NSCR_MCP_HOME"
 STORE_FILE_NAME = "coord.sqlite"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SESSION_KINDS = frozenset({"gui", "hython"})
 SESSION_STATES = frozenset({"live", "busy", "unresponsive", "crashed", "gone"})
@@ -53,6 +53,9 @@ SESSION_GONE = "gone"
 SESSION_LIVE = "live"
 # The process is there and writing heartbeats, and its port is not answering.
 SESSION_UNRESPONSIVE = "unresponsive"
+# How a session ended: on its own terms, or with its process found missing.
+SESSION_CRASHED = "crashed"
+SESSION_ENDINGS = frozenset({SESSION_GONE, SESSION_CRASHED})
 
 # States that still hold a slot against the pool cap. A reservation counts from
 # the moment it is made, before hython has started.
@@ -449,6 +452,9 @@ class SessionRecord:
     # Nothing when it has not asked yet.
     transport_ok: bool | None = None
     transport_checked_at: float | None = None
+    # How an ended session ended: `gone` when it ended its own row, `crashed`
+    # when its process was found missing. Nothing while it is running.
+    ended_as: str | None = None
 
     @classmethod
     def _from_row(cls, row: sqlite3.Row) -> SessionRecord:
@@ -467,6 +473,7 @@ class SessionRecord:
             heartbeat_at=row["heartbeat_at"],
             transport_ok=_flag(row["transport_ok"]),
             transport_checked_at=row["transport_checked_at"],
+            ended_as=row["ended_as"],
         )
 
 
@@ -756,7 +763,12 @@ _SCHEMA_6 = (
     "ALTER TABLE sessions ADD COLUMN transport_checked_at REAL",
 )
 
-MIGRATIONS = (_SCHEMA_1, _SCHEMA_2, _SCHEMA_3, _SCHEMA_4, _SCHEMA_5, _SCHEMA_6)
+# How a session ended, written when it is marked ended. The signs it could be
+# read from later, the process and the session file, are gone by then or are
+# cleared by the next reader, so it is kept at the one moment it is known.
+_SCHEMA_7 = ("ALTER TABLE sessions ADD COLUMN ended_as TEXT",)
+
+MIGRATIONS = (_SCHEMA_1, _SCHEMA_2, _SCHEMA_3, _SCHEMA_4, _SCHEMA_5, _SCHEMA_6, _SCHEMA_7)
 
 
 class Store:
@@ -1054,7 +1066,7 @@ class Store:
         return epoch
 
     def reclaim_sessions(self) -> list[str]:
-        """Mark sessions gone whose process is not there any more.
+        """Mark sessions gone whose process is not there any more, as crashed.
 
         A session that crashed cannot end its own row, and its alias would
         otherwise stay taken for good. `register_session` does this for itself,
@@ -1075,8 +1087,9 @@ class Store:
             if same_process(row["pid"], row["pid_start"]) is not False:
                 continue
             db.execute(
-                "UPDATE sessions SET state = ?, heartbeat_at = ? WHERE session_id = ?",
-                (SESSION_GONE, now, row["session_id"]),
+                "UPDATE sessions SET state = ?, ended_as = ?, heartbeat_at = ?"
+                " WHERE session_id = ?",
+                (SESSION_GONE, SESSION_CRASHED, now, row["session_id"]),
             )
             reclaimed.append(row["session_id"])
         return reclaimed
@@ -1097,12 +1110,20 @@ class Store:
                 raise UnknownRecord(f"no session {session_id}")
         return epoch
 
-    def end_session(self, session_id: str) -> None:
-        """Mark a session gone, which frees its alias for a later process."""
+    def end_session(self, session_id: str, *, how: str = SESSION_GONE) -> None:
+        """Mark a session gone, which frees its alias for a later process.
+
+        `how` says how it ended. A session that ends its own row, or one that
+        was stopped on purpose, ended `gone`, even when a reader had already
+        found its process missing and called it `crashed`.
+        """
+        if how not in SESSION_ENDINGS:
+            raise ValueError(f"unknown way to end: {how}")
         with self._txn(write=True) as db:
             written = db.execute(
-                "UPDATE sessions SET state = ?, heartbeat_at = ? WHERE session_id = ?",
-                (SESSION_GONE, self._now(), session_id),
+                "UPDATE sessions SET state = ?, ended_as = ?, heartbeat_at = ?"
+                " WHERE session_id = ?",
+                (SESSION_GONE, how, self._now(), session_id),
             )
             if written.rowcount == 0:
                 raise UnknownRecord(f"no session {session_id}")
