@@ -15,7 +15,7 @@ raise when it read a key that was not there.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from nscr_houdini_mcp.bridge import tools as tool_module
@@ -42,6 +42,10 @@ class Tool:
     required: tuple[str, ...] = ()
     # Whether it is handed the call context as a second argument.
     context: bool = False
+    # Whether it runs without taking the session at all, on the thread that
+    # took the request. Only for tools that touch no scene and no `hou`: they
+    # are the ones that can answer while another call is running.
+    immediate: bool = False
     # What the undo entry is called. The tool name when nothing is given.
     label: str | None = None
     # Its own run budget, when it needs one other than the bridge default.
@@ -70,6 +74,7 @@ class ToolRegistry:
         arguments: Sequence[str] | None = None,
         required: Sequence[str] = (),
         context: bool = False,
+        immediate: bool = False,
         label: str | None = None,
         timeout_s: float | None = None,
         summary: str = "",
@@ -83,6 +88,7 @@ class ToolRegistry:
             arguments=None if arguments is None else tuple(arguments),
             required=tuple(required),
             context=context,
+            immediate=immediate,
             label=label,
             timeout_s=timeout_s,
             summary=summary,
@@ -106,22 +112,18 @@ class ToolRegistry:
         return len(self._tools)
 
 
-@dataclass
-class Call:
-    """One tool call as the dispatch layer passes it around."""
-
-    tool: Tool
-    arguments: Mapping[str, Any] = field(default_factory=dict)
-    context: ToolContext = field(default_factory=ToolContext)
-
-
 def ping(arguments: Mapping[str, Any]) -> dict[str, Any]:
     """Answer without reading the scene. Whatever is sent as `echo` comes back."""
     return {"pong": True, "echo": arguments.get("echo")}
 
 
-def default_registry() -> ToolRegistry:
-    """The tools every bridge starts with."""
+def default_registry(*, selfcheck: bool = False) -> ToolRegistry:
+    """The tools every bridge starts with.
+
+    The self check is left out unless it is asked for. It makes nodes and can
+    park the session for a minute, which is wanted in a worker that was
+    started to be tested against and unwanted in a session somebody is using.
+    """
     registry = ToolRegistry()
     registry.add(
         "bridge.ping",
@@ -129,15 +131,16 @@ def default_registry() -> ToolRegistry:
         arguments=("echo",),
         summary="answer without touching the scene",
     )
-    registry.add(
-        "bridge.selfcheck",
-        tool_module.selfcheck,
-        mutating=True,
-        arguments=("sleep_s", "creates", "fail_at", "parent"),
-        context=True,
-        label="self check",
-        summary="take a while, make nodes, fail where asked",
-    )
+    if selfcheck:
+        registry.add(
+            "bridge.selfcheck",
+            tool_module.selfcheck,
+            mutating=True,
+            arguments=("sleep_s", "creates", "fail_at", "parent"),
+            context=True,
+            label="self check",
+            summary="take a while, make nodes, fail where asked",
+        )
     registry.add(
         "scene.info",
         tool_module.scene_info,

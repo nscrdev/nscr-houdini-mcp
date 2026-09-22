@@ -162,6 +162,36 @@ def test_work_that_outlives_its_timeout_answers_and_carries_on(bridge: HythonBri
     assert bridge.health().payload["data"]["busy"] is False
 
 
+def test_a_running_call_stops_when_it_is_asked_to(bridge: HythonBridge) -> None:
+    answers: list[Any] = []
+    holder = threading.Thread(
+        target=lambda: answers.append(
+            bridge.call("bridge.selfcheck", arguments={"sleep_s": 45.0}, timeout_s=60.0)
+        )
+    )
+    holder.start()
+    try:
+        _until(lambda: bridge.health().payload["data"]["busy"] is True)
+        operation_id = bridge.health().payload["data"]["current_op_id"]
+        asked = bridge.call("bridge.cancel", arguments={"operation_id": operation_id})
+        assert asked.payload["ok"] is True, asked.payload
+        assert asked.payload["data"]["asked"] is True
+    finally:
+        holder.join(120.0)
+
+    reply = answers[0]
+    assert reply.payload["ok"] is True, reply.payload
+    assert reply.payload["data"]["stopped_early"] is True
+    assert reply.payload["data"]["slept_s"] < 45.0
+    assert bridge.health().payload["data"]["busy"] is False
+
+
+def test_the_self_check_is_only_in_a_worker_started_to_be_driven(bridge: HythonBridge) -> None:
+    """It is on here because the launcher asked for it, and off by default."""
+    assert "bridge.selfcheck" in bridge.health().payload["data"]["tools"]
+    assert "bridge.cancel" in bridge.health().payload["data"]["tools"]
+
+
 def test_a_misspelled_argument_name_comes_back_with_the_closest_one(
     bridge: HythonBridge,
 ) -> None:
@@ -247,6 +277,40 @@ def _until(ready: Any, timeout_s: float = 60.0) -> None:
             return
         time.sleep(0.05)
     raise AssertionError("waited too long")
+
+
+def test_a_session_told_to_stop_does_not_wait_for_a_long_call(home: Path) -> None:
+    """A worker of its own, asked to stop while a long call is running.
+
+    The call is asked to stop with the session, so the process goes away in
+    about the time the shutdown allows and not in the time the call asked for.
+    """
+    worker = HythonBridge(home=home, port_range=(18350, 18369), alias="stopper")
+    worker.start()
+    running = threading.Thread(
+        target=lambda: _quietly(
+            lambda: worker.call("bridge.selfcheck", arguments={"sleep_s": 55.0}, timeout_s=60.0)
+        )
+    )
+    running.start()
+    try:
+        _until(lambda: worker.health().payload["data"]["busy"] is True)
+        began = time.monotonic()
+        code = worker.stop()
+        took = time.monotonic() - began
+    finally:
+        running.join(120.0)
+    assert code is not None
+    assert took < 30.0, took
+    assert worker.process.poll() is not None
+
+
+def _quietly(work: Any) -> None:
+    """Run something whose failure is not what the test is about."""
+    try:
+        work()
+    except Exception:  # noqa: BLE001 - the session is going down under it
+        return
 
 
 # Nothing gets in without a signature

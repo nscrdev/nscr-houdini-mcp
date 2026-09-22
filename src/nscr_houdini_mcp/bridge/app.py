@@ -53,6 +53,7 @@ import re
 import secrets
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -109,6 +110,15 @@ DEFAULT_DISPATCH_TIMEOUT_S = DEFAULT_TIMEOUT_S
 # room for a long piece of code as an argument and nothing more.
 DEFAULT_MAX_BODY_BYTES = 1024 * 1024
 
+# How long a call has to notice the session is going down before a process
+# that exists only to be this bridge ends itself.
+DEFAULT_SHUTDOWN_GRACE_S = 5.0
+
+# Set in a worker this project starts. The self check tool makes nodes and can
+# park a session for a minute, so it is off unless a process was started to be
+# tested against, and off in a session with a user interface either way.
+SELFCHECK_ENV_VAR = "NSCR_MCP_SELFCHECK"
+
 # How many ports to try when the server refuses the one it was handed. The
 # range is walked here because the run call has no port range argument of its
 # own, and because a server object that has run once cannot run again.
@@ -117,6 +127,13 @@ START_ATTEMPTS = 5
 # One process, one Houdini, one call at a time. Module level rather than per
 # bridge, because the object model is shared by everything in the process.
 _HOUDINI_LOCK = threading.Lock()
+
+
+def selfcheck_wanted(kind: str) -> bool:
+    """Whether this session should carry the self check tool."""
+    if kind == host.GUI:
+        return False
+    return os.environ.get(SELFCHECK_ENV_VAR, "").strip().lower() not in ("", "0", "false", "no")
 
 
 def houdini_lock() -> threading.Lock:
@@ -157,6 +174,10 @@ class BridgeConfig:
     server_name: str = "nscr_mcp_bridge"
     in_background: bool = True
     verify_loopback: bool = True
+    # Whether this process exists to be this bridge. When it does, a call that
+    # will not stop does not get to keep the process alive for ever.
+    owns_process: bool = False
+    shutdown_grace_s: float = DEFAULT_SHUTDOWN_GRACE_S
     facts: dict[str, Any] = field(default_factory=dict)
 
 
@@ -178,8 +199,13 @@ class Bridge:
             if self.config.store_path
             else self.home / store_module.STORE_FILE_NAME
         )
-        self.tools = tools if tools is not None else default_registry()
-        self.kind = self.config.kind or host.session_kind()
+        self.kind_for_tools = self.config.kind or host.session_kind()
+        self.tools = (
+            tools
+            if tools is not None
+            else default_registry(selfcheck=selfcheck_wanted(self.kind_for_tools))
+        )
+        self.kind = self.kind_for_tools
         self.facts = dict(self.config.facts) if self.config.facts else host.describe()
         self.pid = os.getpid()
         self.pid_start = liveness.process_start_stamp()
@@ -196,6 +222,9 @@ class Bridge:
         self._own_backend = backend is None
         self._lock = threading.Lock()
         self._running = False
+        # Set while the bridge is going down, so a tool that looks at it can
+        # stop early instead of holding the process open.
+        self.stopping = threading.Event()
         # The thread that owns the process runs this while the bridge is up,
         # because a scene edit has to happen on the main thread to be one
         # undo step. A bridge whose owner never runs it still works, and says
@@ -209,6 +238,7 @@ class Bridge:
             scene_epoch=lambda: self.scene_epoch,
             log=self._log,
             main_loop=self.main_loop,
+            stopping=self.stopping,
             wait_s=self.config.dispatch_wait_s,
             timeout_s=self.config.dispatch_timeout_s,
         )
@@ -281,7 +311,9 @@ class Bridge:
             self._running = False
 
         problems: list[str] = []
+        self.stopping.set()
         self._heartbeat_stop.set()
+        self._leave_anyway()
         hook, self._remove_quit_hook = self._remove_quit_hook, None
         for what, step in (
             ("take the quit hook off", hook),
@@ -299,6 +331,31 @@ class Bridge:
         for problem in problems:
             self._log(problem)
         return problems
+
+    def _leave_anyway(self) -> None:
+        """End the process by force if a call will not let go of it.
+
+        Only where the bridge is what the process is for. A call that ignores
+        the stopping flag would otherwise keep a Houdini alive with nobody
+        left to talk to it, which is the thing this whole design is trying not
+        to leave behind. A session somebody is working in is never ended this
+        way: there the call finishes and the bridge goes quiet.
+        """
+        if not self.config.owns_process or self.dispatcher.running is None:
+            return
+        self._log(
+            f"a call is still running at shutdown, ending the process in "
+            f"{self.config.shutdown_grace_s:g} seconds"
+        )
+
+        def end() -> None:
+            time.sleep(self.config.shutdown_grace_s)
+            if self.dispatcher.running is None:
+                return
+            self._log("the call did not stop, ending the process")
+            os._exit(0)
+
+        threading.Thread(target=end, name="nscr-mcp-shutdown", daemon=True).start()
 
     def _end_session_row(self) -> None:
         with self._open_store() as store:
@@ -359,7 +416,13 @@ class Bridge:
         )
 
     def handle_call(self, request: RawRequest) -> RawReply:
-        """Dispatch one request envelope to one tool."""
+        """Dispatch one request envelope to one tool.
+
+        Nothing gets out of here uncaught. A handler that raises gives the web
+        server a 500 the bridge never signed, which a caller is right to read
+        as somebody else sitting on the port. A coded answer is better than
+        that, whatever went wrong.
+        """
         refused = self._front(request)
         if refused is not None:
             return refused
@@ -370,7 +433,27 @@ class Bridge:
             return self._answer(
                 request, Reply(400, error_payload(error.code, str(error), details=error.details))
             )
-        return self._answer(request, self._dispatch(envelope))
+        try:
+            reply = self._dispatch(envelope)
+        except BaseException as error:  # noqa: BLE001 - an unsigned 500 is worse
+            self._log(
+                f"dispatching {envelope.tool} raised: {type(error).__name__}: {error}\n"
+                + "".join(traceback.format_exception(error)[-8:])
+            )
+            reply = Reply(
+                200,
+                {
+                    **error_payload(
+                        "TOOL_FAILED",
+                        "the bridge could not finish this call",
+                        hint="the bridge log for this session has the detail",
+                        details={"tool": envelope.tool, "exception": type(error).__name__},
+                    ),
+                    "operation_id": envelope.operation_id,
+                    "scene_epoch": self.scene_epoch,
+                },
+            )
+        return self._answer(request, reply)
 
     # Dispatch
 
@@ -381,7 +464,7 @@ class Bridge:
                 200,
                 {
                     **error_payload(
-                        "SESSION_UNKNOWN",
+                        "UNKNOWN_SESSION",
                         "this bridge is a different session",
                         hint="read the session id from the health endpoint and call again",
                         details={"session_id": self.session_id},

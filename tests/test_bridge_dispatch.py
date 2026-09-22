@@ -43,7 +43,7 @@ def dispatcher(
     timeout_s: float = 5.0,
 ) -> Dispatcher:
     return Dispatcher(
-        tools if tools is not None else default_registry(),
+        tools if tools is not None else default_registry(selfcheck=True),
         lock=threading.Lock(),
         kind=kind,
         session_id="session-1",
@@ -191,11 +191,103 @@ def test_work_that_outlives_its_timeout_answers_and_keeps_running() -> None:
     assert running.state()["last_op"]["tool"] == "bridge.after"
 
 
+def test_a_run_budget_of_nothing_is_taken_at_its_word() -> None:
+    """Zero means answer now, not fall back to the default."""
+    blocker = Blocker()
+    tools = ToolRegistry()
+    tools.add("bridge.block", blocker)
+    running = dispatcher(tools, timeout_s=600.0)
+    began = time.monotonic()
+    try:
+        reply = running.dispatch(call("bridge.block", timeout_s=0.0))
+        assert time.monotonic() - began < 5.0
+        assert reply.payload["error"]["code"] == "TIMEOUT"
+    finally:
+        blocker.release.set()
+        _until(lambda: running.state()["busy"] is False)
+
+
+def test_work_that_cannot_be_handed_over_gives_the_session_back() -> None:
+    """A session held by nothing is worse than a call that failed."""
+
+    class Refusing:
+        kind = "gui"
+
+        def submit(self, work: Any) -> Any:
+            raise RuntimeError("the interface is going away")
+
+    tools = ToolRegistry()
+    tools.add("bridge.edit", lambda arguments: {"edited": True})
+    running = dispatcher(tools)
+    marshal_choose = marshal.choose_runner
+    try:
+        marshal.choose_runner = lambda *args, **rest: Refusing()
+        reply = running.dispatch(call("bridge.edit", timeout_s=5.0))
+    finally:
+        marshal.choose_runner = marshal_choose
+
+    error = reply.payload["error"]
+    assert error["code"] == "TOOL_FAILED"
+    assert error["details"]["exception"] == "RuntimeError"
+    assert running.state()["busy"] is False
+    # And the session really is free, not just reported free.
+    assert running.dispatch(call("bridge.edit", wait_s=1.0)).payload["ok"] is True
+
+
+def test_a_value_that_will_not_describe_itself_still_comes_back() -> None:
+    """A deleted node raises from its own repr, while the reply is being built."""
+
+    class Deleted:
+        def __repr__(self) -> str:
+            raise RuntimeError("this object was deleted")
+
+    tools = ToolRegistry()
+    tools.add("bridge.gone", lambda arguments: {"node": Deleted()})
+    reply = dispatcher(tools).dispatch(call("bridge.gone", timeout_s=5.0))
+    assert reply.payload["ok"] is True
+    assert reply.payload["data"]["node"] == "<Deleted>"
+    assert reply.payload["lossy"] is True
+
+
+# Section: cancelling
+
+
+def test_a_running_call_can_be_asked_to_stop(scene: Scene) -> None:
+    running = dispatcher(hou=scene.module(), wait_s=10.0)
+    answers: list[Any] = []
+    holder = threading.Thread(
+        target=lambda: answers.append(
+            running.dispatch(call("bridge.selfcheck", arguments={"sleep_s": 30.0}, timeout_s=60.0))
+        )
+    )
+    holder.start()
+    try:
+        _until(lambda: running.state()["busy"] is True)
+        operation_id = running.state()["current_op_id"]
+        asked = running.dispatch(call("bridge.cancel"))
+        assert asked.payload["ok"] is True
+        assert asked.payload["data"]["asked"] is True
+        assert asked.payload["data"]["operation_id"] == operation_id
+    finally:
+        holder.join(30.0)
+
+    reply = answers[0]
+    assert reply.payload["ok"] is True
+    assert reply.payload["data"]["stopped_early"] is True
+    assert reply.payload["data"]["slept_s"] < 30.0
+
+
+def test_cancelling_names_what_it_did_not_cancel() -> None:
+    running = dispatcher()
+    assert running.dispatch(call("bridge.cancel")).payload["data"]["asked"] is False
+    assert "bridge.cancel" in running.tools.names()
+
+
 def test_the_wait_budget_and_the_run_budget_are_separate() -> None:
     tools = ToolRegistry()
     tools.add("bridge.slow", lambda arguments: time.sleep(0.4) or {"slow": True})
     running = dispatcher(tools)
-    reply = running.dispatch(call("bridge.slow", wait_s=0.0, timeout_s=10.0))
+    reply = running.dispatch(call("bridge.slow", wait_s=0.5, timeout_s=10.0))
     assert reply.payload["ok"] is True
 
 
@@ -455,7 +547,12 @@ def test_a_coded_error_a_tool_raises_is_carried_with_its_details() -> None:
     [
         ("could not read /Users/somebody/scenes/shot.hip", True),
         (r"could not read C:\Users\somebody\shot.hip", True),
+        ('read "/var/log/houdini.log" once', True),
         ("no node at /obj/geo1/box2", False),
+        # A node path that happens to hold a folder name is the caller's own
+        # subject, and comes back exactly as it went in.
+        ("no node at /obj/tmp/thing", False),
+        ("no node at /usrdata/thing", False),
     ],
 )
 def test_a_reply_never_names_a_place_on_disk(text: str, hidden: bool) -> None:
@@ -519,6 +616,37 @@ def test_a_real_array_is_read_the_same_way() -> None:
     converted = encoding.convert({"points": numpy.arange(3)})
     assert converted.value["points"] == [0, 1, 2]
     assert converted.lossy is False
+
+
+def test_a_mapping_is_capped_in_breadth_and_in_total() -> None:
+    wide = {str(key): key for key in range(100)}
+    converted = encoding.convert(wide, max_keys=4)
+    assert len(converted.value) == 4
+    assert converted.lossy is True
+
+    deep = {"rows": [{"value": index} for index in range(100)]}
+    budgeted = encoding.convert(deep, max_values=10)
+    assert budgeted.lossy is True
+    assert len(budgeted.cut) >= 1
+
+
+def test_a_mapping_that_raises_while_it_is_read_becomes_text() -> None:
+    class Awkward(Mapping):
+        def items(self):
+            raise RuntimeError("gone")
+
+        def __getitem__(self, key: Any) -> Any:
+            raise KeyError(key)
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+    converted = encoding.convert({"thing": Awkward()})
+    assert converted.lossy is True
+    assert isinstance(converted.value["thing"], str)
 
 
 def test_bytes_come_back_as_text_and_are_capped() -> None:

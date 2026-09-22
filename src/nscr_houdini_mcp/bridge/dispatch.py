@@ -16,11 +16,19 @@ The lock in the app says one call at a time. This says the rest of it:
 - Every mutating call runs inside one undo group, on the main thread where
   there is one, and a failure rolls the group's graph edits back.
 - Every error carries a code from the table, and no exception text.
+
+Cancelling is a request, not a stop. `bridge.cancel` sets a flag on the call
+that holds the session, and a tool that polls the flag can return early. A
+tool that does not poll it holds the session until it returns on its own, and
+nothing here will take the session off it: killing work part way through an
+edit is how a scene gets left half built. The tools this project ships poll
+it; anything that runs arbitrary code cannot promise to.
 """
 
 from __future__ import annotations
 
 import secrets
+import threading
 import time
 import traceback
 from collections.abc import Callable, Mapping
@@ -36,9 +44,9 @@ from nscr_houdini_mcp.bridge.tools import ToolContext
 from nscr_houdini_mcp.bridge.undo import run_in_undo_group
 
 # How long a call waits for its turn when it names no wait of its own. Short
-# on purpose: the worst pickup measured on a busy main thread was about a
-# tenth of a second, so a second is a wide margin, and a caller that wants to
-# queue behind a long job says so.
+# on purpose: pickup off a busy main thread runs to about a tenth of a second,
+# so a second is a wide margin, and a caller that wants to queue behind a long
+# job says so.
 DEFAULT_WAIT_S = 1.0
 
 # How long a call waits for work that is already running.
@@ -49,6 +57,9 @@ DEFAULT_TIMEOUT_S = 60.0
 MIN_PICKUP_S = 0.25
 
 OPERATION_ID_BYTES = 8
+
+# The one tool that runs while another call holds the session.
+CANCEL_TOOL = "bridge.cancel"
 
 
 @dataclass
@@ -63,6 +74,7 @@ class Running:
     timed_out: bool = False
     recorded: bool = False
     rolled_back: bool = False
+    cancel: threading.Event = field(default_factory=threading.Event)
 
     def elapsed_s(self) -> float:
         return round(max(0.0, time.monotonic() - self.began), 3)
@@ -73,6 +85,7 @@ class Running:
             "tool": self.tool,
             "elapsed_s": self.elapsed_s(),
             "timed_out": self.timed_out,
+            "cancel_asked": self.cancel.is_set(),
         }
 
 
@@ -90,6 +103,7 @@ class Dispatcher:
         hou: Any | None = None,
         log: Callable[[str], None] | None = None,
         main_loop: marshal.MainLoop | None = None,
+        stopping: threading.Event | None = None,
         wait_s: float = DEFAULT_WAIT_S,
         timeout_s: float = DEFAULT_TIMEOUT_S,
     ) -> None:
@@ -102,9 +116,18 @@ class Dispatcher:
         self._hou = hou if hou is not None else host.houdini()
         self._log = log or (lambda text: None)
         self._main_loop = main_loop
+        self._stopping = stopping or threading.Event()
         self._gate = Gate(lock)
         self._running: Running | None = None
         self._last: dict[str, Any] | None = None
+        if CANCEL_TOOL not in self.tools:
+            self.tools.add(
+                CANCEL_TOOL,
+                self._ask_to_cancel,
+                immediate=True,
+                arguments=("operation_id",),
+                summary="ask the running call to stop",
+            )
 
     # Section: what the rest of the bridge asks
 
@@ -153,8 +176,13 @@ class Dispatcher:
         if bad is not None:
             return self._refuse(bad, trace)
 
+        if tool.immediate:
+            # It takes no session and touches no scene, so it answers while
+            # another call is running. That is the whole point of it.
+            return self._answer_now(tool, envelope.arguments, trace)
+
         wait_s = self.wait_s if envelope.wait_s is None else envelope.wait_s
-        timeout_s = envelope.timeout_s or tool.timeout_s or self.timeout_s
+        timeout_s = _first(envelope.timeout_s, tool.timeout_s, self.timeout_s)
 
         waited = time.monotonic()
         if not self._gate.enter(wait_s=wait_s, skip_if_busy=bool(envelope.skip_if_busy)):
@@ -169,22 +197,41 @@ class Dispatcher:
             scene_epoch=self._scene_epoch(),
             operation_id=operation_id,
             label=tool.undo_label(),
+            cancel=running.cancel,
+            stopping=self._stopping,
         )
 
         work = marshal.Work(lambda: self._work(tool, envelope.arguments, context, running))
         runner = marshal.choose_runner(
             self.kind, mutating=tool.mutating, hou=self._hou, main_loop=self._main_loop
         )
-        runner.submit(work)
+        try:
+            runner.submit(work)
 
-        pickup_s = max(MIN_PICKUP_S, wait_s - (time.monotonic() - waited))
-        if not work.started.wait(pickup_s) and work.cancel():
-            self._release(running)
-            return self._busy(
+            pickup_s = max(MIN_PICKUP_S, wait_s - (time.monotonic() - waited))
+            if not work.started.wait(pickup_s) and work.cancel():
+                self._release(running)
+                return self._busy(
+                    trace,
+                    waited=waited,
+                    wait_s=wait_s,
+                    cause="main thread busy",
+                )
+        except BaseException as error:  # noqa: BLE001 - a session held for ever is worse
+            # Handing the work over can fail: a user interface being torn down
+            # refuses a posted callback. The session goes back rather than
+            # staying busy with nothing running in it.
+            self._log(f"could not hand {tool.name} over: {type(error).__name__}: {error}")
+            if work.cancel():
+                self._release(running)
+            return self._refuse(
+                BridgeError(
+                    "TOOL_FAILED",
+                    "the session could not take the work",
+                    {"tool": tool.name, "exception": type(error).__name__},
+                    hint="ask health whether this session is still there",
+                ),
                 trace,
-                waited=waited,
-                wait_s=wait_s,
-                cause="main thread busy",
             )
 
         if not work.finished.wait(timeout_s):
@@ -208,6 +255,49 @@ class Dispatcher:
             )
 
         return self._answer(tool, work, running, trace)
+
+    def _answer_now(
+        self, tool: Tool, arguments: Mapping[str, Any], trace: Mapping[str, Any]
+    ) -> Reply:
+        """Run a tool that takes no session, here on the calling thread."""
+        began = time.monotonic()
+        try:
+            data = tool.run(arguments, ToolContext(kind=self.kind, session_id=self.session_id))
+        except BaseException as error:  # noqa: BLE001 - one failed tool, not a failed bridge
+            return self._failed(tool, error, None, trace)
+        converted = encoding.convert(data)
+        payload = {
+            **ok_payload(converted.value, timing_ms=(time.monotonic() - began) * 1000.0),
+            **trace,
+        }
+        if converted.lossy:
+            payload["lossy"] = True
+            payload["cut"] = converted.cut
+        return Reply(200, payload)
+
+    def _ask_to_cancel(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        """Ask the call that holds the session to stop.
+
+        It is a flag, not a stop. A tool that polls it returns early; one that
+        does not runs to the end, and the answer says so.
+        """
+        running = self._running
+        if running is None:
+            return {"asked": False, "reason": "nothing is running"}
+        wanted = arguments.get("operation_id")
+        if wanted and str(wanted) != running.operation_id:
+            return {
+                "asked": False,
+                "reason": "that call is not the one running",
+                "current_op_id": running.operation_id,
+            }
+        running.cancel.set()
+        return {
+            "asked": True,
+            "operation_id": running.operation_id,
+            "tool": running.tool,
+            "note": "a tool that does not poll the flag runs to the end",
+        }
 
     # Section: running the work
 
@@ -265,7 +355,9 @@ class Dispatcher:
             }
         return Reply(200, payload)
 
-    def _failed(self, tool: Tool, error: BaseException, running: Running, trace: dict) -> Reply:
+    def _failed(
+        self, tool: Tool, error: BaseException, running: Running | None, trace: Mapping[str, Any]
+    ) -> Reply:
         # The text of an exception can hold paths and scene contents, so it
         # goes to the local log and the caller gets a code and a type.
         self._log(
@@ -273,7 +365,7 @@ class Dispatcher:
             + "".join(traceback.format_exception(error)[-8:])
         )
         coded = map_exception(error, tool=tool.name)
-        if tool.mutating:
+        if tool.mutating and running is not None:
             coded.details.setdefault("rolled_back", running.rolled_back)
             coded.details.setdefault("undo_recorded", running.recorded)
         return self._refuse(coded, trace)
@@ -343,6 +435,14 @@ def _check_arguments(tool: Tool, arguments: Mapping[str, Any]) -> BridgeError | 
             hint="send every required argument",
         )
     return None
+
+
+def _first(*values: float | None) -> float:
+    """The first budget that was actually given. A zero is a value, not a gap."""
+    for value in values:
+        if value is not None:
+            return float(value)
+    return DEFAULT_TIMEOUT_S
 
 
 def _new_operation_id() -> str:

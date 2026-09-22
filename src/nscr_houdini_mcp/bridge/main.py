@@ -65,23 +65,23 @@ def main(argv: list[str] | None = None) -> int:
         kind=args.kind,
         heartbeat_s=args.heartbeat,
         verify_loopback=not args.skip_loopback_check,
+        owns_process=True,
     )
     bridge = Bridge(config)
     record = bridge.start()
     # The token is not printed here and never is. Whoever may read the session
     # file may read the token.
     print(f"bridge {record.alias} {record.session_id} on port {bridge.port}", flush=True)
-    stop = threading.Event()
     watcher = threading.Thread(
-        target=_watch, args=(sys.stdin, stop), name="nscr-mcp-stdin", daemon=True
+        target=_watch, args=(sys.stdin, bridge.stopping), name="nscr-mcp-stdin", daemon=True
     )
     watcher.start()
     try:
-        bridge.main_loop.run_until(stop)
+        bridge.main_loop.run_until(bridge.stopping)
     except KeyboardInterrupt:
         pass
     finally:
-        stop.set()
+        bridge.stopping.set()
         bridge.stop()
     return 0
 

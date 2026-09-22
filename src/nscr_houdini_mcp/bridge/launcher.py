@@ -18,7 +18,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from nscr_houdini_mcp.bridge import client, registry
+from nscr_houdini_mcp.bridge import app, client, registry
 from nscr_houdini_mcp.bridge.main import STOP_WORD
 from nscr_houdini_mcp.bridge.net import DEFAULT_PORT_RANGE
 from nscr_houdini_mcp.store import HOME_ENV_VAR
@@ -249,6 +249,9 @@ class HythonBridge:
             source_root if not existing else os.pathsep.join([source_root, existing])
         )
         environment[HOME_ENV_VAR] = str(self.home)
+        # A worker started from here exists to be driven and tested, so it
+        # carries the self check tool. Nothing else turns it on.
+        environment[app.SELFCHECK_ENV_VAR] = "1"
         return environment
 
     def _wait_for_entry(self, timeout_s: float) -> dict[str, Any]:

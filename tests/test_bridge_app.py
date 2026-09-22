@@ -430,13 +430,41 @@ def test_another_session_id_and_an_unknown_tool_fail_without_failing_the_call(
     try:
         wrong = send(bridge, backend, CALL_PATH, envelope(session_id="somebody-else"))
         assert wrong.status == 200
-        assert body_of(wrong)["error"]["code"] == "SESSION_UNKNOWN"
+        assert body_of(wrong)["error"]["code"] == "UNKNOWN_SESSION"
         assert body_of(wrong)["error"]["details"]["session_id"] == bridge.session_id
 
         unknown = send(bridge, backend, CALL_PATH, envelope(tool="nothing.here"))
         assert unknown.status == 200
         assert body_of(unknown)["error"]["code"] == "UNKNOWN_TOOL"
         assert body_of(unknown)["error"]["details"]["tools"] == bridge.tools.names()
+    finally:
+        bridge.stop()
+
+
+def test_a_bridge_that_breaks_below_the_tool_still_signs_a_coded_answer(tmp_path: Path) -> None:
+    """Nothing leaves this endpoint unsigned.
+
+    An unsigned 500 from the web server is what a caller is meant to read as
+    somebody else sitting on the port, so a bridge that breaks says so in its
+    own words, with its own signature on it.
+    """
+    bridge, backend = make_bridge(tmp_path)
+    bridge.start()
+    try:
+
+        def explode(envelope: Any) -> Any:
+            raise RuntimeError("the floor gave way in /Users/somebody/scenes")
+
+        bridge.dispatcher.dispatch = explode
+        reply = send(bridge, backend, CALL_PATH, envelope())
+        assert reply.status == 200
+        body = body_of(reply)
+        assert body["error"]["code"] == "TOOL_FAILED"
+        assert body["error"]["details"]["exception"] == "RuntimeError"
+        assert "somebody" not in reply.body.decode("utf-8")
+        assert signing.SIGNATURE_HEADER in reply.headers
+        assert "the floor gave way" in bridge.log_path().read_text(encoding="utf-8")
+        assert bridge.running is True
     finally:
         bridge.stop()
 
