@@ -5,7 +5,8 @@ starts it. The `bridge` group is for a person at a terminal: it puts the
 Houdini package in place, takes it away again, says what is running, and
 prints the few lines that start a bridge inside a Houdini that is already
 open. The `worker` commands under it drive the pool of hython workers: start
-one, stop one, list what is there, and take or hand back a warm worker.
+one, stop one, list what is there, and take or hand back a warm worker. The
+`config` group writes the server's config file and shows what it resolves to.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from nscr_houdini_mcp import config as config_module
 from nscr_houdini_mcp import install as install_module
 from nscr_houdini_mcp import pool
 from nscr_houdini_mcp import store as store_module
@@ -95,7 +97,23 @@ def build_parser() -> argparse.ArgumentParser:
     snippet.set_defaults(handler=_snippet)
 
     _add_worker_commands(actions)
+    _add_config_commands(commands)
     return parser
+
+
+def _add_config_commands(commands: Any) -> None:
+    """The commands for the server's own config file."""
+    config = commands.add_parser("config", help="the server's config file")
+    actions = config.add_subparsers(dest="config_action", required=True)
+
+    show = actions.add_parser("show", help="every setting, where it came from, and which hython")
+    show.add_argument("--path", type=Path, default=None, help="the config file to read")
+    show.set_defaults(handler=_config_show)
+
+    init = actions.add_parser("init", help="write a commented config file with the defaults")
+    init.add_argument("--path", type=Path, default=None, help="where to write it")
+    init.add_argument("--force", action="store_true", help="replace a file that is there")
+    init.set_defaults(handler=_config_init)
 
 
 def _add_worker_commands(actions: Any) -> None:
@@ -333,6 +351,38 @@ def _worker_release(args: argparse.Namespace) -> int:
         print(str(error))
         return 1
     print(f"{record.alias} is back in the pool")
+    return 0
+
+
+# Section: the config commands
+
+
+def _config_show(args: argparse.Namespace) -> int:
+    path = args.path or config_module.config_path()
+    try:
+        config = config_module.load_config(path)
+    except config_module.ConfigError as error:
+        print(f"config {path}")
+        where = f" ({error.key})" if error.key else ""
+        print(f"  invalid{where}: {error.message}")
+        return 1
+    print(f"config {config.path}{'' if config.exists else '  (not there, defaults in use)'}")
+    for key, value in config.shown().items():
+        source = "file" if key in config.from_file else "default"
+        shown = "-" if value is None else value
+        print(f"  {key} = {shown}  ({source})")
+    print(f"  hython in use: {config_module.describe_hython(config)}")
+    return 0
+
+
+def _config_init(args: argparse.Namespace) -> int:
+    path = args.path or config_module.config_path()
+    try:
+        written = config_module.write_template(path, force=args.force)
+    except FileExistsError as error:
+        print(str(error))
+        return 1
+    print(f"wrote {written}")
     return 0
 
 
