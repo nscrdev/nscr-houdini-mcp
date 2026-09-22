@@ -8,6 +8,7 @@ on:
 jobs:
   check:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -23,7 +24,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -e ".[dev]" pytest-timeout
 
       - name: Lint
         run: |
@@ -34,7 +35,7 @@ jobs:
         run: python scripts/lint_client_names.py
 
       - name: Tests
-        run: pytest -q
+        run: pytest -q --timeout 120
 
       - name: Tool list token estimate
         run: python scripts/tools_list_cost.py
