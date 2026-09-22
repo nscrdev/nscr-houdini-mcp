@@ -129,6 +129,9 @@ class Identity:
         self._load_began: float | None = None
         self._counted_the_clear = False
         self._remove_watch: Callable[[], None] | None = None
+        # Read by the scene callback on the main thread. Cleared by `unwatch`
+        # from whichever thread is stopping the bridge, which calls no `hou`.
+        self._watching = False
 
     # Section: handles
 
@@ -299,6 +302,11 @@ class Identity:
             return None
 
         def on_event(event_type: Any = None, *_rest: Any) -> None:
+            if not self._watching:
+                # Told to stop. Taking the callback off is a `hou` call, and
+                # this is the main thread, which is the only place it is free.
+                remove()
+                return
             try:
                 if event_type == before_load:
                     self._load_began = time.monotonic()
@@ -318,23 +326,30 @@ class Identity:
             except Exception as error:  # noqa: BLE001 - never raise into Houdini's event loop
                 self._log(f"scene event: {type(error).__name__}: {error}")
 
-        try:
-            hou.hipFile.addEventCallback(on_event)
-        except Exception as error:  # noqa: BLE001 - no watch is better than no bridge
-            self._log(f"could not watch the scene: {type(error).__name__}: {error}")
-            return None
-
         def remove() -> None:
             try:
                 hou.hipFile.removeEventCallback(on_event)
             except Exception:  # noqa: BLE001 - the session may already be tearing down
                 pass
 
+        try:
+            hou.hipFile.addEventCallback(on_event)
+        except Exception as error:  # noqa: BLE001 - no watch is better than no bridge
+            self._log(f"could not watch the scene: {type(error).__name__}: {error}")
+            return None
+
+        self._watching = True
         self._remove_watch = remove
         return remove
 
     def unwatch(self) -> None:
-        """Stop following scene changes. Safe when nothing was ever watched."""
-        remove, self._remove_watch = self._remove_watch, None
-        if remove is not None:
-            remove()
+        """Stop following scene changes, without calling into `hou` here.
+
+        Taking the callback off waits on the object model lock from any thread
+        but the main one, and the main thread holds that lock for the whole of
+        a cook. So this only sets a flag: the callback reads it on its next
+        scene event and takes itself off from the main thread. Until then it
+        does nothing at all.
+        """
+        self._watching = False
+        self._remove_watch = None

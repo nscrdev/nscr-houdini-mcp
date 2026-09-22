@@ -250,6 +250,7 @@ class Bridge:
             kind=self.kind,
             hip_path=self.facts.get("hip_path"),
             tracks_hip=self.kind == host.GUI and not self.config.alias,
+            hou=self._hou,
             on_change=self._scene_replaced,
             log=self._log,
         )
@@ -384,7 +385,7 @@ class Bridge:
         )
         self._heartbeat.start()
         atexit.register(self.stop)
-        self._remove_quit_hook = host.install_quit_hook(self.stop)
+        self._remove_quit_hook = host.install_quit_hook(self.stop, hou=self._hou)
         # From here the session follows its own scene: the first summary is
         # taken now, and the epoch moves whenever the scene is replaced.
         self.identity.refresh()

@@ -1110,7 +1110,54 @@ def test_a_gui_bridge_installs_the_pulse_at_start_and_removes_it_at_stop(
         scene.ui.cook(0.3)
         _wait_for(lambda: scene.ui.ran_on != [])
         assert bridge.stop() == []
-        assert scene.ui.eventLoopCallbacks() == ()
+        # Stopping says nothing to Houdini. The callback takes itself off the
+        # next time the main thread runs it.
+        assert bridge.pulse.installed is False
+        _wait_for(lambda: scene.ui.eventLoopCallbacks() == ())
+    finally:
+        scene.ui.stop()
+
+
+def test_stopping_during_a_cook_returns_at_once_and_says_nothing_to_houdini(
+    tmp_path: Path,
+) -> None:
+    """Nothing on the stop path waits for the object model lock.
+
+    Every `hou` call stopping would make is a wait for a cook to end, so the
+    stop sets flags instead and the callbacks take themselves off from the
+    main thread when it is free again.
+    """
+    scene = Scene()
+    bridge, _ = make_bridge(tmp_path, kind="gui", hou=scene.module())
+    scene.ui.start()
+    bridge.start()
+    try:
+        scene_callbacks = len(scene.hipFile._callbacks)
+        assert scene_callbacks >= 1
+        assert len(scene.ui.eventLoopCallbacks()) == 1
+
+        scene.ui.cook(3.0)
+        _wait_for(lambda: scene.ui.ran_on != [])
+
+        began = time.monotonic()
+        assert bridge.stop() == []
+        assert time.monotonic() - began < 1.0
+
+        # Nothing was taken off yet, and nothing fires while the cook runs.
+        assert bridge.pulse.installed is False
+        assert bridge.pulse.registered is True
+        before = scene.ui.ticks
+
+        # Once the cook ends the callbacks take themselves off, and the pulse
+        # stamps nothing after that.
+        _wait_for(lambda: scene.ui.eventLoopCallbacks() == (), timeout_s=15.0)
+        assert bridge.pulse.registered is False
+        assert bridge.pulse.age_s() is None
+        assert scene.ui.ticks > before
+
+        scene.hipFile.clear()
+        _wait_for(lambda: len(scene.hipFile._callbacks) == 0, timeout_s=15.0)
+        assert bridge.scene_epoch == 0
     finally:
         scene.ui.stop()
 

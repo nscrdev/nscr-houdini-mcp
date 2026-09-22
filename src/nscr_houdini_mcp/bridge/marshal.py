@@ -255,6 +255,7 @@ class Pulse:
         self._at: float | None = None
         self._installed_at: float | None = None
         self._hou: Any | None = None
+        self._retired = False
         # The runner sets this to its drain, so a tick is also a pickup.
         self.on_tick: Callable[[], None] | None = None
 
@@ -285,6 +286,11 @@ class Pulse:
     def installed(self) -> bool:
         return self._installed_at is not None
 
+    @property
+    def registered(self) -> bool:
+        """Whether the callback is still on the main thread's list."""
+        return self._hou is not None
+
     def install(self, hou: Any) -> None:
         """Start watching the main thread.
 
@@ -293,31 +299,54 @@ class Pulse:
         is idle. Never on a thread that is answering a request. A failure
         leaves the pulse uninstalled, in which case it never says the main
         thread is away and the pickup budget alone bounds a call.
+
+        A pulse that was told to stop but whose callback has not yet come off
+        is taken back rather than registered twice.
         """
         if self._installed_at is not None:
             return
-        hou.ui.addEventLoopCallback(self._tick)
-        self._hou = hou
+        self._retired = False
+        if self._hou is None:
+            hou.ui.addEventLoopCallback(self._tick)
+            self._hou = hou
         self._installed_at = self._clock()
 
     def uninstall(self) -> None:
-        """Stop watching, once, whatever state the session is in."""
-        hou, self._hou = self._hou, None
+        """Stop watching, without calling into `hou` from this thread.
+
+        Taking the callback off is itself a `hou` call, and any thread but the
+        main one waits on the object model lock to make it, which the main
+        thread holds for the whole of a cook. So stopping only sets a flag:
+        from here the pulse reports nothing, and the next tick takes the
+        callback off from the main thread, where that call costs nothing.
+
+        A session that never ticks again leaves one callback that does nothing
+        but take itself off, and the process is going anyway.
+        """
+        self._retired = True
         self._installed_at = None
         self._at = None
+
+    def _tick(self, *_rest: Any) -> None:
+        """One visit from the main thread."""
+        if self._retired:
+            self._retire()
+            return
+        self.mark()
+        tick = self.on_tick
+        if tick is not None:
+            tick()
+
+    def _retire(self) -> None:
+        """Take the callback off, on the main thread, and never fire again."""
+        hou, self._hou = self._hou, None
+        self.on_tick = None
         if hou is None:
             return
         try:
             hou.ui.removeEventLoopCallback(self._tick)
         except Exception as error:  # noqa: BLE001 - the session may already be tearing down
             self._log(f"could not stop watching the main thread: {type(error).__name__}: {error}")
-
-    def _tick(self, *_rest: Any) -> None:
-        """One visit from the main thread."""
-        self.mark()
-        tick = self.on_tick
-        if tick is not None:
-            tick()
 
     def state(self) -> dict[str, Any]:
         age = self.age_s()

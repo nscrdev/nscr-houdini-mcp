@@ -203,7 +203,10 @@ class MainThread:
     def __init__(self) -> None:
         self.posted: queue.Queue[Any] = queue.Queue()
         self.ran_on: list[str] = []
-        self.hom_lock = threading.Lock()
+        # Recursive, because Houdini's object model lock is: the thread that
+        # holds it can call back into `hou`, which is what lets a callback
+        # take itself off while the main thread is running it.
+        self.hom_lock = threading.RLock()
         # Set to make the loop skip its ticks, which is what playback does to
         # the event loop callback while posted callbacks still land.
         self.starve_loop = False

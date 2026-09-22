@@ -7,6 +7,7 @@ package is imported by tests and by the server process, and neither has it.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -52,14 +53,20 @@ def describe() -> dict[str, Any]:
     return facts
 
 
-def install_quit_hook(callback: Callable[[], None]) -> Callable[[], None] | None:
+def install_quit_hook(
+    callback: Callable[[], None], *, hou: Any | None = None
+) -> Callable[[], None] | None:
     """Run a callback when Houdini is about to quit.
 
     Returns the way to take the hook off again, or nothing when this Houdini
     has no such event. A session that quits some other way is still cleaned up
     by the interpreter exit hook.
+
+    Taking the hook off never calls into `hou` from the thread that asks: see
+    `remove` below.
     """
-    hou = houdini()
+    if hou is None:
+        hou = houdini()
     if hou is None:
         return None
     try:
@@ -67,7 +74,17 @@ def install_quit_hook(callback: Callable[[], None]) -> Callable[[], None] | None
     except AttributeError:
         return None
 
+    retired = threading.Event()
+
     def on_event(event_type, *_rest):
+        if retired.is_set():
+            # Told to go. This is the main thread, which is the only place
+            # taking the callback off does not wait for a cook to end.
+            try:
+                hou.hipFile.removeEventCallback(on_event)
+            except Exception:  # noqa: BLE001 - the session may already be tearing down
+                pass
+            return
         if event_type == before_quit:
             callback()
 
@@ -77,9 +94,7 @@ def install_quit_hook(callback: Callable[[], None]) -> Callable[[], None] | None
         return None
 
     def remove() -> None:
-        try:
-            hou.hipFile.removeEventCallback(on_event)
-        except Exception:  # noqa: BLE001 - the session may already be tearing down
-            pass
+        """Set the flag and return. Never calls into `hou` from this thread."""
+        retired.set()
 
     return remove

@@ -289,6 +289,56 @@ def test_a_pulse_installed_while_the_main_thread_is_away_counts_from_the_install
         pulse.uninstall()
 
 
+def test_stopping_the_pulse_calls_nothing_and_the_tick_takes_itself_off(
+    scene: Scene,
+) -> None:
+    """Stopping is a flag. The callback comes off on the main thread."""
+    module = scene.module()
+    pulse = marshal.Pulse(stale_s=2.0)
+    ticked: list[int] = []
+    pulse.on_tick = lambda: ticked.append(1)
+    pulse.install(module)
+    scene.ui.start()
+    try:
+        _until(lambda: ticked != [])
+
+        # A cook holds the object model lock, and stopping still returns now.
+        scene.ui.cook(1.0)
+        _until(lambda: scene.ui.ran_on != [])
+        began = time.monotonic()
+        pulse.uninstall()
+        assert time.monotonic() - began < 1.0
+
+        assert pulse.installed is False
+        assert pulse.age_s() is None
+        assert pulse.away() is False
+        assert pulse.registered is True
+
+        _until(lambda: scene.ui.eventLoopCallbacks() == (), timeout_s=15.0)
+        assert pulse.registered is False
+        seen = len(ticked)
+        _until(lambda: scene.ui.ticks > 0)
+        assert len(ticked) == seen, "the pulse ticked after it was stopped"
+        assert pulse.age_s() is None
+    finally:
+        pulse.uninstall()
+        scene.ui.stop()
+
+
+def test_a_pulse_can_be_taken_back_before_its_callback_comes_off(scene: Scene) -> None:
+    """Installing again while the old callback waits does not register twice."""
+    module = scene.module()
+    pulse = marshal.Pulse(stale_s=2.0)
+    pulse.install(module)
+    pulse.uninstall()
+    pulse.install(module)
+    try:
+        assert len(scene.ui.eventLoopCallbacks()) == 1
+        assert pulse.installed is True
+    finally:
+        pulse.uninstall()
+
+
 def test_a_pulse_that_could_not_install_never_says_away() -> None:
     pulse = marshal.Pulse(stale_s=0.01)
     assert pulse.installed is False
