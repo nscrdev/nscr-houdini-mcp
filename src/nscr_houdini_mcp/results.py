@@ -165,7 +165,7 @@ class CallError(Exception):
         details = error.get("details")
         details = dict(details) if isinstance(details, Mapping) else {}
         if payload.get("scene") is not None:
-            details["scene"] = payload["scene"]
+            details[SCENE_KEY] = payload["scene"]
         return cls(
             code,
             str(error.get("message") or CODES.get(code, "the call failed")),
@@ -174,6 +174,9 @@ class CallError(Exception):
             trace={key: payload[key] for key in TRACE_KEYS if payload.get(key) is not None},
         )
 
+
+# Where the scene summary beside a refusal is carried in the details.
+SCENE_KEY = "scene"
 
 # What a reply says about who answered it, copied into every result.
 TRACE_KEYS = ("session_id", "alias", "scene_epoch", "operation_id", "warnings")
@@ -219,12 +222,21 @@ def error_result(error: CallError, trace: Mapping[str, Any] | None = None) -> Ca
 
 
 def redacted(error: CallError) -> CallError:
-    """The same error with every place on disk in it replaced with a marker."""
+    """The same error with every place on disk in it replaced with a marker.
+
+    The scene summary a session hands back beside a refusal is not part of
+    the error. It is what the caller needs to go on after `SCENE_REPLACED`,
+    its scene file included, so it is carried as the session gave it.
+    """
+    details = {key: value for key, value in error.details.items() if key != SCENE_KEY}
+    details = redact(details)
+    if SCENE_KEY in error.details:
+        details[SCENE_KEY] = error.details[SCENE_KEY]
     return CallError(
         error.code,
         hide_paths(error.message),
         hint=hide_paths(error.hint) if error.hint else None,
-        details=redact(error.details),
+        details=details,
         trace=error.trace,
     )
 

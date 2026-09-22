@@ -75,6 +75,26 @@ def test_an_error_carries_no_place_on_disk() -> None:
     assert error.message.startswith("/Users/somebody")
 
 
+def test_the_scene_summary_beside_a_refusal_keeps_its_scene_file() -> None:
+    """After SCENE_REPLACED the caller needs the new scene's file to go on."""
+    error = CallError.from_reply(
+        {
+            "ok": False,
+            "error": {
+                "code": "SCENE_REPLACED",
+                "message": "the scene changed under the call",
+                "details": {"was": "/Users/somebody/old.hip"},
+            },
+            "scene": {"hip_path": "/Users/somebody/shots/new.hip", "scene_epoch": 3},
+            "session_id": "s-1",
+            "scene_epoch": 3,
+        }
+    )
+    body = error_result(error, TRACE).structured_content["error"]
+    assert body["details"]["scene"]["hip_path"] == "/Users/somebody/shots/new.hip"
+    assert body["details"]["was"] == "<path>"
+
+
 @pytest.mark.parametrize("code", sorted(BRIDGE_CODES))
 def test_every_bridge_refusal_becomes_the_same_code(code: str) -> None:
     payload = {
