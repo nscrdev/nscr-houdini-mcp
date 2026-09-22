@@ -499,20 +499,29 @@ def test_the_version_floor_reads_the_scenes_own_name() -> None:
     assert outputs.hip_version_floor(None) == 0
 
 
-def test_an_output_folder_that_links_outside_the_root_is_refused(
+def test_a_linked_output_folder_is_written_through(
     store: Store, scene: Path, tmp_path: Path
 ) -> None:
-    outside = tmp_path / "outside"
-    outside.mkdir()
+    """A render folder that is a link to a bigger disk is a normal setup."""
+    bigger = tmp_path / "bigger_disk"
+    bigger.mkdir()
     try:
-        (scene.parent / "linked").symlink_to(outside, target_is_directory=True)
+        (scene.parent / "linked").symlink_to(bigger, target_is_directory=True)
     except (OSError, NotImplementedError):
         pytest.skip("this system will not make a link here")
     table = replace(outputs.DEFAULT_CONVENTIONS_TABLE, output_root="$HIP/linked")
-    with pytest.raises(outputs.ConventionError) as caught:
+    made = outputs.allocate(store, "hip", hip_path=scene, when=WHEN, conventions=table)
+    assert made.path == (scene.parent / "linked" / "shot_v001.hip").as_posix()
+    assert (bigger / "shot_v001.hip.claim").exists()
+
+
+def test_a_path_that_climbs_out_of_the_root_is_refused(store: Store, scene: Path) -> None:
+    table = replace(
+        outputs.DEFAULT_CONVENTIONS_TABLE,
+        grammar=dict(outputs.DEFAULT_GRAMMAR, hip="<output_root>/../<name>_v<ver>.<ext>"),
+    )
+    with pytest.raises(outputs.ConventionError):
         outputs.allocate(store, "hip", hip_path=scene, when=WHEN, conventions=table)
-    assert "through a link" in str(caught.value)
-    assert list(outside.iterdir()) == []
 
 
 def test_an_output_that_is_itself_a_link_is_never_written_through(

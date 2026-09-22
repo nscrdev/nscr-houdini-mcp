@@ -356,9 +356,6 @@ class OutputPlan:
     is_directory: bool = False
     warnings: tuple[str, ...] = ()
     tokens: Mapping[str, str] = field(default_factory=dict)
-    # The folder the root starts from: the scene folder, the scratch folder or
-    # the job. Nothing this plan writes may really be outside it.
-    anchor: str = ""
 
     def as_record(self) -> dict[str, Any]:
         """The path part of a run record, readable on its own.
@@ -651,12 +648,6 @@ def plan_path(
 
     temp_dir = _temp_dir(scratch_root) if unsaved else None
     root = _normalize(expand(root_template, hip_dir=hip_dir, temp_dir=temp_dir))
-    started = _ROOT_START.match(root_template)
-    anchor = (
-        _normalize(expand(f"${started.group(1)}", hip_dir=hip_dir, temp_dir=temp_dir))
-        if started
-        else root
-    )
     frozen = _normalize(expand(literal, hip_dir=hip_dir, temp_dir=temp_dir))
     if not _inside(root, frozen):
         raise ConventionError(f"{frozen} would leave the output root {root}")
@@ -691,7 +682,6 @@ def plan_path(
         is_directory=is_directory,
         warnings=tuple(warnings),
         tokens=dict(common, name=chosen),
-        anchor=anchor,
     )
 
 
@@ -1045,24 +1035,12 @@ def _versions_on_disk(kind: str, probe: OutputPlan, table: Conventions) -> int:
 
 
 def _check_real_place(plan: OutputPlan) -> None:
-    """Refuse a place that a link on disk would send outside the output root.
+    """Refuse an output that is itself a link: nothing is written through one.
 
-    The containment check on the path is done on its text. A folder under the
-    scene folder can be a link to anywhere, so the real place of the output's
-    folder is checked against the real place of the folder the root starts
-    from, the scene folder for `$HIP`, before anything is created. An output
-    that is itself a link is never written through.
+    A linked folder on the way is fine, and common: `$HIP/render` pointing at
+    a bigger disk is a normal setup. The path is kept under the root by the
+    check on its text, which refuses any `..` that would climb out.
     """
-    root = os.path.normcase(os.path.realpath(plan.anchor or plan.root))
-    folder = os.path.normcase(os.path.realpath(plan.directory))
-    try:
-        inside = os.path.commonpath([root, folder]) == root
-    except ValueError:
-        inside = False
-    if not inside:
-        raise ConventionError(
-            f"{plan.directory} leads outside the output root {plan.root} through a link"
-        )
     target = plan.path.rstrip("/")
     if os.path.islink(target):
         raise ConventionError(f"{target} is a link, and an output is never written through one")
