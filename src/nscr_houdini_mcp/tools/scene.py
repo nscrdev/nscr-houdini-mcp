@@ -176,9 +176,9 @@ def save_increment(call: Call) -> dict[str, Any]:
         if pending is not None and "result" in pending:
             return {**pending["result"], "replayed": True}
         if pending is None:
-            info = dict(call.bridge("scene.info").get("data") or {})
-            hip = None if info.get("untitled") else info.get("hip_path")
             try:
+                info = dict(call.bridge("scene.info").get("data") or {})
+                hip = None if info.get("untitled") else info.get("hip_path")
                 plan = planned(allocate(call, store, hip, target.session_id, operation_id))
             except BaseException:
                 stored(lambda: store.drop_operation(key))
@@ -274,9 +274,9 @@ def keep(store: Any, key: str, plan: Mapping[str, Any], error: CallError) -> Non
 def undo_plan(store: Any, plan: Mapping[str, Any]) -> None:
     """Take back a version whose save definitely did not happen.
 
-    Its claim and its record beside the scene describe a file that is not
-    there. The number keeps its place in the sequence, with no run on it. A
-    file that is there after all is left alone, and so is its record.
+    Its claim, its record beside the scene and its run record describe a file
+    that is not there. The number keeps its place in the sequence, with no run
+    on it. A file that is there after all is left alone, and so is its record.
     """
     path = Path(str(plan["path"]))
     if path.exists():
@@ -285,6 +285,7 @@ def undo_plan(store: Any, plan: Mapping[str, Any]) -> None:
     if plan.get("sidecar"):
         Path(str(plan["sidecar"])).unlink(missing_ok=True)
     try:
+        store.drop_run(plan["run_id"])
         store.disown_version(
             kind="hip",
             name=plan["name"],

@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from nscr_houdini_mcp import outputs
+from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.store import Store
 
 WHEN = datetime(2026, 9, 21, 14, 30, 5)
@@ -651,3 +652,16 @@ def test_versions_are_never_handed_out_twice_across_processes(tmp_path: Path) ->
     for report in collected:
         assert Path(report["folder"]).is_dir()
         assert Path(report["sidecar"]).is_file()
+
+
+def test_a_place_whose_run_could_not_be_recorded_is_given_back(
+    store: Store, scene: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(*args, **rest):
+        raise store_module.StoreError("the disk is full")
+
+    monkeypatch.setattr(store, "create_run", refuse)
+    with pytest.raises(store_module.StoreError):
+        outputs.allocate(store, "hip", hip_path=scene, when=WHEN, run_id="run-lost")
+    assert list(scene.parent.glob("*.claim")) == []
+    assert version_rows(Path(store.path)) == [(2, None), (3, None)]

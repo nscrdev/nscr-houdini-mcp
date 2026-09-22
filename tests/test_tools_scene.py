@@ -407,3 +407,73 @@ def test_bad_output_conventions_are_named_without_a_place_on_disk(
     assert ".agent/outputs.toml beside the scene" in error["details"]["conventions"]
     assert "conventions file" in error["hint"]
     assert sent_tools(bench) == ["scene.info", "bridge.capabilities"]
+
+
+def test_a_save_that_could_not_read_the_scene_frees_its_id(bench: Bench, project: Path) -> None:
+    current = project / "shot.hip"
+    current.write_bytes(b"scene")
+    lost = scene(
+        bench,
+        client.BridgeUnreachable("nothing answered"),
+        action="save_increment",
+        operation_id="inc-4",
+    )
+    assert lost.structured_content["error"]["code"] == "SESSION_UNREACHABLE"
+    with bench.store() as store:
+        assert store.get_operation("inc-4:increment") is None
+    again = scene(
+        bench,
+        info(current),
+        COMMERCIAL,
+        saved(str(project / "shot_v001.hip")),
+        action="save_increment",
+        operation_id="inc-4",
+    )
+    assert not again.is_error, text_of(again)
+    assert again.structured_content["version"] == 1
+
+
+def run_rows(bench: Bench) -> list[Any]:
+    with bench.store() as store:
+        return store._read_all("SELECT run_id FROM runs WHERE kind = 'hip'")
+
+
+def test_retrying_a_failed_save_leaks_no_claim_and_no_run(bench: Bench, project: Path) -> None:
+    current = project / "shot.hip"
+    current.write_bytes(b"scene")
+    first = scene(
+        bench,
+        info(current),
+        COMMERCIAL,
+        refusal("FILE_EXISTS", "a file is already at that path"),
+        action="save_increment",
+        operation_id="inc-5",
+    )
+    assert first.structured_content["error"]["code"] == "FILE_EXISTS"
+    assert run_rows(bench) == []
+    # The session kept its own receipt for that id, so it refuses the new path.
+    again = scene(
+        bench,
+        info(current),
+        COMMERCIAL,
+        refusal("OPERATION_MISMATCH", "the same operation id arrived with different arguments"),
+        action="save_increment",
+        operation_id="inc-5",
+    )
+    assert again.structured_content["error"]["code"] == "OPERATION_MISMATCH"
+    assert list(project.glob("*.claim")) == []
+    assert list(project.glob("*_run.json")) == []
+    assert run_rows(bench) == []
+
+    fresh = scene(
+        bench,
+        info(current),
+        COMMERCIAL,
+        saved(str(project / "shot_v003.hip")),
+        action="save_increment",
+        operation_id="inc-6",
+    )
+    assert not fresh.is_error, text_of(fresh)
+    assert fresh.structured_content["version"] == 3
+    assert [row["run_id"] for row in run_rows(bench)] == ["run-inc-6"]
+    assert list(project.glob("*.claim")) == []

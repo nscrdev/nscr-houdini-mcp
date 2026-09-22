@@ -332,6 +332,9 @@ class HipFile:
         self.saved: list[str] = []
         # Whether a save writes a file, for the checks that look at the disk.
         self.writes_files = False
+        # What a save raises, when a test wants it to fail part way.
+        self.save_error: BaseException | None = None
+        self.recent: list[bool] = []
 
     def path(self) -> str:
         return self._path
@@ -388,7 +391,13 @@ class HipFile:
     def merge(self, path: str) -> None:
         self._fire(HipFileEventType.BeforeMerge, HipFileEventType.AfterMerge)
 
-    def save(self, path: str | None = None) -> None:
+    def save(self, path: str | None = None, save_to_recent_files: bool = True) -> None:
+        if self.save_error is not None:
+            if path and self.writes_files:
+                with open(path, "wb") as partial:
+                    partial.write(b"half a sce")
+            raise self.save_error
+        self.recent.append(save_to_recent_files)
         if path:
             self._path = str(path)
         self.new = False
@@ -399,8 +408,10 @@ class HipFile:
         self._fire(HipFileEventType.BeforeSave, HipFileEventType.AfterSave)
 
     def setName(self, path: str) -> None:  # noqa: N802 - the name is Houdini's
+        # A bare untitled name makes the scene untitled again, as it does in
+        # Houdini; anything else names a file.
+        self.new = str(path) == "untitled.hip"
         self._path = str(path)
-        self.new = False
 
 
 class Scene:

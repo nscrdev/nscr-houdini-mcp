@@ -1839,6 +1839,11 @@ class Store:
                 db.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             )
 
+    def drop_run(self, run_id: str) -> bool:
+        """Take off the record of a run whose output was never written."""
+        with self._txn(write=True) as db:
+            return db.execute("DELETE FROM runs WHERE run_id = ?", (run_id,)).rowcount > 0
+
     def get_run(self, run_id: str) -> RunRecord | None:
         """One run by id."""
         row = self._read_one("SELECT * FROM runs WHERE run_id = ?", (run_id,))

@@ -24,6 +24,7 @@ surface a client sees is a separate, smaller set built on top of these.
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import sys
@@ -88,6 +89,26 @@ LICENSE_SUFFIX = {
     "education": ".hipnc",
     "indie": ".hiplc",
 }
+
+# The name Houdini gives a scene that has never been saved. Setting it gives
+# the session back its untitled state.
+UNTITLED_NAME = "untitled.hip"
+
+# How old a private save file has to be before it is taken as left behind.
+PRIVATE_KEEP_S = 3600.0
+
+# Errors from a hard link that mean the file system has none, rather than
+# that something went wrong with this file.
+NO_LINKS = frozenset(
+    code
+    for code in (
+        getattr(errno, name, None) for name in ("EPERM", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EXDEV")
+    )
+    if code is not None
+)
+WINDOWS_NO_LINKS = frozenset({1, 50})
+
+_TRAILING_VERSION = re.compile(r"[._-]v\d+$", re.IGNORECASE)
 
 # The words Houdini puts on a node whose asset library was not found.
 STUB_WARNING = "incomplete asset definition"
@@ -514,19 +535,21 @@ def scene_save_as(arguments: Mapping[str, Any], context: ToolContext) -> dict[st
         )
     stem, suffix = os.path.splitext(path)
     private = f"{stem}.part{os.getpid()}{suffix}"
+    _sweep_private(folder, os.path.basename(stem), suffix)
     if os.path.isfile(private) and not os.path.islink(private):
-        # Left by an attempt that stopped between the write and the publish.
+        # Left by an attempt of this process that stopped before it published.
         os.remove(private)
-    before = None if _ask(hou.hipFile, "isNewFile") else _ask(hou.hipFile, "path")
-    hou.hipFile.save(private)
+    # What to give the session back if this does not work out: the file it
+    # held, or for a scene that never had one, Houdini's own untitled name,
+    # which makes it untitled again.
+    was_untitled = bool(_ask(hou.hipFile, "isNewFile"))
+    before = UNTITLED_NAME if was_untitled else _ask(hou.hipFile, "path")
     try:
+        _save_privately(hou, private)
         warnings = _publish(private, path)
     except BaseException:
         _discard(private)
-        if before:
-            # The session goes back to the file it held. A scene that had no
-            # file keeps the private name rather than a made up one.
-            _ask(hou.hipFile, "setName", before)
+        _ask(hou.hipFile, "setName", before or UNTITLED_NAME)
         raise
     hou.hipFile.setName(path)
     return {
@@ -537,21 +560,90 @@ def scene_save_as(arguments: Mapping[str, Any], context: ToolContext) -> dict[st
     }
 
 
+def _save_privately(hou: Any, private: str) -> None:
+    """Write the scene under its private name, kept out of the recent files."""
+    try:
+        hou.hipFile.save(private, save_to_recent_files=False)
+    except TypeError:
+        # A build without the keyword.
+        hou.hipFile.save(private)
+
+
+def _sweep_private(folder: str, stem: str, suffix: str) -> None:
+    """Remove private files of this scene family left by an attempt that died.
+
+    Only files older than an hour are taken, so a save running in another
+    process right now is never touched.
+    """
+    family = _TRAILING_VERSION.sub("", stem)
+    pattern = re.compile(
+        rf"^{re.escape(family)}(?:[._-]v\d+)?\.part\d+{re.escape(suffix)}$", re.IGNORECASE
+    )
+    cutoff = time.time() - PRIVATE_KEEP_S
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return
+    for name in names:
+        if not pattern.match(name):
+            continue
+        found = os.path.join(folder, name)
+        try:
+            if not os.path.islink(found) and os.path.getmtime(found) < cutoff:
+                os.remove(found)
+        except OSError:
+            continue
+
+
 def _publish(private: str, path: str) -> list[str]:
-    """Give a written file its name, only if nothing has that name yet."""
+    """Give a written file its name, only if nothing has that name yet.
+
+    A hard link does that in one step. Where the file system cannot link, the
+    name is taken first with an exclusive create, or on Windows by a rename,
+    which refuses a name that is there. Any other failure is the save's own.
+    """
     try:
         os.link(private, path)
     except FileExistsError:
         raise _file_exists(path) from None
-    except OSError:
-        # This file system has no hard links. The look and the write are two
-        # steps then, which is what it was before there was a better way.
-        if os.path.lexists(path):
-            raise _file_exists(path) from None
-        os.replace(private, path)
-        return ["this folder cannot link files, so the check and the write were two steps"]
+    except OSError as error:
+        if not links_unsupported(error):
+            raise BridgeError(
+                "TOOL_FAILED",
+                "the scene was written but could not be given its name",
+                {"errno": errno.errorcode.get(error.errno or 0, error.errno)},
+                hint="check the space and the permissions of the folder, then save again",
+            ) from None
+        _publish_without_links(private, path)
+        return ["this folder cannot link files, so the file was published by a rename"]
     _discard(private)
     return []
+
+
+def _publish_without_links(private: str, path: str) -> None:
+    if sys.platform == "win32":
+        try:
+            os.rename(private, path)
+        except FileExistsError:
+            raise _file_exists(path) from None
+        return
+    try:
+        placeholder = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        raise _file_exists(path) from None
+    os.close(placeholder)
+    try:
+        os.replace(private, path)
+    except OSError:
+        _discard(path)
+        raise
+
+
+def links_unsupported(error: OSError) -> bool:
+    """Whether an error from a hard link means this file system has none."""
+    if getattr(error, "winerror", None) in WINDOWS_NO_LINKS:
+        return True
+    return error.errno in NO_LINKS
 
 
 def _discard(path: str) -> None:

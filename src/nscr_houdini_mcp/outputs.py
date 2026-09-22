@@ -896,23 +896,55 @@ def allocate(
         above=above,
     )
 
-    store.create_run(
-        run,
-        kind=kind,
-        name=plan.name,
-        hip_family=plan.hip_family,
-        version=plan.version,
-        session_id=session_id,
-        source_node=node_path,
-        job_id=job_id,
-        paths=plan.as_record(),
-        scene={
-            "hip_path": None if hip_path is None else str(hip_path),
-            "unsaved_hip": plan.unsaved_hip,
-        },
-    )
-    write_export(store.run_export(run), plan.sidecar)
+    try:
+        store.create_run(
+            run,
+            kind=kind,
+            name=plan.name,
+            hip_family=plan.hip_family,
+            version=plan.version,
+            session_id=session_id,
+            source_node=node_path,
+            job_id=job_id,
+            paths=plan.as_record(),
+            scene={
+                "hip_path": None if hip_path is None else str(hip_path),
+                "unsaved_hip": plan.unsaved_hip,
+            },
+        )
+        write_export(store.run_export(run), plan.sidecar)
+    except BaseException:
+        # The place was claimed for a run that could not be recorded, so it
+        # goes back rather than staying claimed by nobody.
+        release(store, plan)
+        raise
     return replace(plan, source_node=node_path)
+
+
+def release(store: Store, plan: OutputPlan) -> None:
+    """Give back a place that was claimed and never written.
+
+    The claim file and the record beside the output go, the run's record goes,
+    and the number keeps its place in the sequence with no run on it. A file
+    kind whose output is there after all is left alone. Version folders are
+    left too: an empty folder costs nothing and is the guard that keeps the
+    number from being written twice.
+    """
+    if not plan.version_dir and not plan.is_directory and Path(plan.path).exists():
+        return
+    for leftover in (f"{plan.path}{CLAIM_SUFFIX}", plan.sidecar):
+        try:
+            Path(leftover).unlink(missing_ok=True)
+        except OSError:
+            pass
+    try:
+        store.drop_run(plan.run_id)
+        if plan.version is not None:
+            store.disown_version(
+                kind=plan.kind, name=plan.name, hip_family=plan.hip_family, version=plan.version
+            )
+    except store_module.StoreError:
+        pass
 
 
 def _claim(

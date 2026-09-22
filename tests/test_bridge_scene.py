@@ -9,7 +9,10 @@ stack, and that a save never writes over a file.
 
 from __future__ import annotations
 
+import errno
+import os
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -243,8 +246,8 @@ def test_a_file_that_appears_during_the_save_is_not_written_over(
     path = tmp_path / "shot_v003.hip"
     save = scene.hipFile.save
 
-    def racing(name: str | None = None) -> None:
-        save(name)
+    def racing(name: str | None = None, **rest: Any) -> None:
+        save(name, **rest)
         path.write_bytes(b"somebody else's scene")
 
     scene.hipFile.save = racing  # type: ignore[method-assign]
@@ -256,19 +259,115 @@ def test_a_file_that_appears_during_the_save_is_not_written_over(
     assert scene.hipFile.path() == "/Users/somebody/scenes/example.hip"
 
 
-def test_a_folder_that_cannot_link_publishes_in_two_steps_and_says_so(
-    scene: Scene, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def no_links(source: str, target: str) -> None:
-        raise OSError("this file system has no hard links")
+def failing_link(number: int, winerror: int | None = None) -> Any:
+    def link(source: str, target: str) -> None:
+        error = OSError(number, os.strerror(number))
+        if winerror is not None:
+            error.winerror = winerror  # type: ignore[attr-defined]
+        raise error
 
-    monkeypatch.setattr(tools.os, "link", no_links)
+    return link
+
+
+@pytest.mark.parametrize("name", ["EPERM", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EXDEV"])
+def test_a_folder_that_cannot_link_publishes_by_a_rename_and_says_so(
+    scene: Scene, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    if not hasattr(errno, name):
+        pytest.skip(f"{name} is not an error this system has")
+    monkeypatch.setattr(tools.os, "link", failing_link(getattr(errno, name)))
     scene.hipFile.writes_files = True
     path = tmp_path / "shot_v003.hip"
     data = tools.scene_save_as({"path": str(path)}, context(scene))
     assert path.read_bytes() == b"a scene"
-    assert data["warnings"] and "two steps" in data["warnings"][0]
+    assert data["warnings"] and "cannot link" in data["warnings"][0]
     assert sorted(item.name for item in tmp_path.iterdir()) == ["shot_v003.hip"]
+
+
+@pytest.mark.parametrize("name", ["ENOSPC", "EACCES", "ENOENT", "EIO"])
+def test_any_other_link_failure_is_the_saves_own_failure(
+    scene: Scene, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    monkeypatch.setattr(tools.os, "link", failing_link(getattr(errno, name)))
+    scene.hipFile.writes_files = True
+    path = tmp_path / "shot_v003.hip"
+    error = refused(lambda: tools.scene_save_as({"path": str(path)}, context(scene)))
+    assert error.code == "TOOL_FAILED"
+    assert error.details["errno"] == name
+    assert list(tmp_path.iterdir()) == []
+    assert scene.hipFile.path() == "/Users/somebody/scenes/example.hip"
+
+
+def test_windows_says_it_cannot_link_in_its_own_numbers() -> None:
+    unsupported = OSError(errno.EINVAL, "not supported")
+    unsupported.winerror = 50  # type: ignore[attr-defined]
+    assert tools.links_unsupported(unsupported) is True
+    assert tools.links_unsupported(OSError(errno.ENOSPC, "full")) is False
+
+
+def test_the_rename_never_writes_over_a_file_that_appeared(
+    scene: Scene, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tools.os, "link", failing_link(errno.EPERM))
+    scene.hipFile.writes_files = True
+    path = tmp_path / "shot_v003.hip"
+    save = scene.hipFile.save
+
+    def racing(name: str | None = None, **rest: Any) -> None:
+        save(name, **rest)
+        path.write_bytes(b"somebody else's scene")
+
+    scene.hipFile.save = racing  # type: ignore[method-assign]
+    error = refused(lambda: tools.scene_save_as({"path": str(path)}, context(scene)))
+    assert error.code == "FILE_EXISTS"
+    assert path.read_bytes() == b"somebody else's scene"
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["shot_v003.hip"]
+
+
+def test_a_save_that_fails_part_way_leaves_no_file_and_the_name_it_had(
+    scene: Scene, tmp_path: Path
+) -> None:
+    scene.hipFile.writes_files = True
+    scene.hipFile.save_error = OSError(errno.ENOSPC, "no space left")
+    with pytest.raises(OSError):
+        tools.scene_save_as({"path": str(tmp_path / "shot_v003.hip")}, context(scene))
+    assert list(tmp_path.iterdir()) == []
+    assert scene.hipFile.path() == "/Users/somebody/scenes/example.hip"
+
+
+def test_an_untitled_scene_whose_save_failed_is_untitled_again(
+    scene: Scene, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tools.os, "link", failing_link(errno.EIO))
+    scene.hipFile.writes_files = True
+    scene.hipFile.new = True
+    target = str(tmp_path / "untitled_v001.hip")
+    refused(lambda: tools.scene_save_as({"path": target}, context(scene)))
+    assert scene.hipFile.isNewFile() is True
+    assert ".part" not in scene.hipFile.path()
+    assert tools.scene_info({}, context(scene))["untitled"] is True
+
+
+def test_the_private_save_stays_out_of_the_recent_files(scene: Scene, tmp_path: Path) -> None:
+    scene.hipFile.writes_files = True
+    tools.scene_save_as({"path": str(tmp_path / "shot_v003.hip")}, context(scene))
+    assert scene.hipFile.recent == [False]
+
+
+def test_private_files_left_by_an_attempt_that_died_are_swept(scene: Scene, tmp_path: Path) -> None:
+    scene.hipFile.writes_files = True
+    old = time.time() - 2 * tools.PRIVATE_KEEP_S
+    stale = tmp_path / "shot_v002.part4242.hip"
+    fresh = tmp_path / "shot_v003.part4343.hip"
+    other = tmp_path / "prop_v001.part4242.hip"
+    for left in (stale, fresh, other):
+        left.write_bytes(b"left")
+        os.utime(left, (old, old))
+    os.utime(fresh, None)
+    tools.scene_save_as({"path": str(tmp_path / "shot_v004.hip")}, context(scene))
+    assert not stale.exists()
+    assert fresh.exists()
+    assert other.exists()
 
 
 def licensed(scene: Scene, name: str) -> Any:
