@@ -109,7 +109,7 @@ def test_the_config_env_var_names_another_file(
         ("pool_cap = true", "pool_cap", "whole number"),
         ("spill_over_bytes = 10", "spill_over_bytes", "from 1024"),
         ("spill_keep_days = 0", "spill_keep_days", "from 1 to 365"),
-        ("python_timeout_cap_s = 0", "python_timeout_cap_s", "from 1 to 86400"),
+        ("python_timeout_cap_s = 0", "python_timeout_cap_s", "from 1 to 3600"),
         ("spill_dir = '//server/share/spill'", "spill_dir", "cannot hold private results"),
         ('transport = "http"', "transport", "one of stdio"),
         ('houdini_build = "latest"', "houdini_build", "22.0.368"),

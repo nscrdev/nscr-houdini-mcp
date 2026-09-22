@@ -69,7 +69,7 @@ MAX_SPILL_KEEP_DAYS = 365
 # The longest `hou_python` waits for its code before it answers `TIMEOUT`,
 # whatever a call asks for. The code itself is never stopped.
 DEFAULT_PYTHON_TIMEOUT_CAP_S = 3600
-MAX_PYTHON_TIMEOUT_CAP_S = 86400
+MAX_PYTHON_TIMEOUT_CAP_S = 3600
 
 _BUILD = re.compile(r"^\d+\.\d+(\.\d+)*$")
 
