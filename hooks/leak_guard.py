@@ -46,6 +46,10 @@ SKIP_SUFFIXES = {
 }
 
 
+# Joined at load time so this file does not match its own rule.
+FIXED_TERMS = ("Co-Authored" + "-By", "Generated " + "with", "nore" + "ply@")
+
+
 def fail(message: str) -> int:
     print(f"leak guard: {message}", file=sys.stderr)
     return 1
@@ -68,7 +72,8 @@ def load_terms(root: Path) -> tuple[list[str], re.Pattern[str]] | None:
     except (OSError, UnicodeDecodeError):
         return None
 
-    terms: list[str] = []
+    # Credit lines are refused everywhere, whatever the list says.
+    terms: list[str] = list(FIXED_TERMS)
     for line in raw.splitlines():
         line = line.split("#", 1)[0].strip().strip("\r")
         if line:
