@@ -455,6 +455,58 @@ def test_a_read_during_a_blocking_cook_is_refused_the_same_way(scene: Scene, gui
     assert reply.payload["error"]["details"]["cause"] == "main thread busy"
 
 
+def test_a_call_that_will_not_wait_is_refused_inside_its_own_promise(
+    scene: Scene, gui: Any
+) -> None:
+    """A cook younger than the stale limit still refuses a skipping caller.
+
+    The stale limit is seconds long, and a caller that asked to be skipped
+    wants an answer now, so the short skip threshold is what it is judged by
+    instead of a pickup budget it would have to sit through.
+    """
+    scene.ui.start()
+    running = gui(scene, wait_s=1.0, stale_s=5.0)
+    scene.ui.cook(2.0)
+    _until(lambda: scene.ui.ran_on != [])
+    # The main thread has been away for far less than the stale limit.
+    _until(lambda: running._pulse.age_s() > running.skip_stale_s)
+    assert running._pulse.away() is False
+
+    began = time.monotonic()
+    reply = running.dispatch(call("scene.info", skip_if_busy=True))
+    took = time.monotonic() - began
+
+    assert took < 0.1, f"a skipping call took {took:.3f} s"
+    error = reply.payload["error"]
+    assert error["code"] == "SESSION_BUSY"
+    assert error["details"]["cause"] == "main thread busy"
+    assert error["details"]["picked_up"] is False
+    assert scene.node("/obj") is not None
+
+
+def test_a_call_that_will_not_wait_is_refused_when_work_is_already_queued(
+    scene: Scene, gui: Any
+) -> None:
+    """Queued work means the main thread is spoken for, whatever the pulse says."""
+    running = gui(scene, wait_s=1.0, stale_s=5.0, start_poster=False)
+    running._main_thread.submit(marshal.Work(lambda: None))
+    assert running._main_thread.pending == 1
+
+    began = time.monotonic()
+    reply = running.dispatch(call("scene.info", skip_if_busy=True))
+    assert time.monotonic() - began < 0.1
+    assert reply.payload["error"]["code"] == "SESSION_BUSY"
+    assert reply.payload["error"]["details"]["cause"] == "main thread busy"
+
+
+def test_a_call_that_will_not_wait_still_runs_on_a_free_session(scene: Scene, gui: Any) -> None:
+    scene.ui.start()
+    running = gui(scene, wait_s=1.0, stale_s=5.0)
+    _until(lambda: scene.ui.ticks > 1)
+    reply = running.dispatch(call("scene.info", skip_if_busy=True))
+    assert reply.payload["ok"] is True
+
+
 def test_a_stale_main_thread_is_refused_before_anything_is_posted(scene: Scene, gui: Any) -> None:
     now = [100.0]
     running = gui(scene, wait_s=1.0, stale_s=2.0, clock=lambda: now[0])

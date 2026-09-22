@@ -454,6 +454,11 @@ class MainThreadRunner:
         if poster is not None:
             poster.join(0.1)
 
+    @property
+    def pending(self) -> int:
+        """How much work the main thread has not taken yet. Takes no `hou`."""
+        return len(self._queue)
+
     def submit(self, work: Work) -> Work:
         if self._closed.is_set():
             work.reject(Rejected("the session is stopping"))

@@ -18,7 +18,11 @@ The lock in the app says one call at a time. This says the rest of it:
   the operation id. Nothing is interrupted: the work carries on holding the
   session, health reports it, and calls behind it wait or are told the session
   is busy.
-- `skip_if_busy` answers at once rather than queueing at all.
+- `skip_if_busy` answers at once rather than queueing at all. At once means
+  inside a tenth of a second: such a call is refused when anything holds or
+  waits for the session, when work is already queued for the main thread, or
+  when the main thread has not run our code for longer than a tick. It is
+  never held for a pickup budget to run out.
 - A call that carries a scene epoch older than this session's is refused with
   `SCENE_REPLACED` and a summary of the scene there is now, before any tool
   runs. The paths in it belong to a scene that has been thrown away.
@@ -69,6 +73,13 @@ DEFAULT_TIMEOUT_S = 60.0
 # The shortest the pickup wait can be, so a call with no wait at all still
 # gives the thread that runs the work a moment to take it.
 MIN_PICKUP_S = 0.25
+
+# How long the main thread may have been away before a call that will not wait
+# at all is told the session is busy. A caller that asked to be skipped wants
+# an answer now, so this is far shorter than the stale limit a waiting call is
+# judged by: anything longer than a tick means the answer would not be
+# immediate, which is the one thing that caller asked for.
+DEFAULT_SKIP_STALE_S = 0.1
 
 OPERATION_ID_BYTES = 8
 
@@ -126,12 +137,14 @@ class Dispatcher:
         stopping: threading.Event | None = None,
         wait_s: float = DEFAULT_WAIT_S,
         timeout_s: float = DEFAULT_TIMEOUT_S,
+        skip_stale_s: float = DEFAULT_SKIP_STALE_S,
     ) -> None:
         self.tools = tools
         self.kind = kind
         self.session_id = session_id
         self.wait_s = wait_s
         self.timeout_s = timeout_s
+        self.skip_stale_s = skip_stale_s
         self.identity = identity or Identity(session_id=session_id, kind=kind)
         self.receipts = receipts or receipt_module.Receipts(None)
         self._hou = hou if hou is not None else host.houdini()
@@ -198,6 +211,26 @@ class Dispatcher:
             return None
         return age if age > max(pulse.stale_s, wait_s) else None
 
+    def _main_thread_slow(self) -> float | None:
+        """Whether a call that will not wait would have to wait after all.
+
+        Two things say it would: work already queued for the main thread, and
+        a main thread that has not run our code for longer than a tick. The
+        stale limit a waiting call is judged by is seconds long, which is the
+        right answer for a caller that will wait and the wrong one for a
+        caller that asked to be skipped instead.
+        """
+        runner = self._main_thread
+        if runner is not None and runner.pending:
+            return self._pulse_age() or 0.0
+        pulse = self._pulse
+        if pulse is None:
+            return None
+        age = pulse.age_s()
+        if age is None:
+            return None
+        return age if age > self.skip_stale_s else None
+
     def _pulse_age(self) -> float | None:
         if self._pulse is None:
             return None
@@ -263,9 +296,11 @@ class Dispatcher:
 
         waited = time.monotonic()
         if envelope.skip_if_busy:
-            # A main thread that is away is as busy as a session another call
-            # holds, and saying so costs one float read.
-            idle = self._main_thread_away(0.0)
+            # A main thread that is away, or one with work already queued for
+            # it, is as busy as a session another call holds. Both cost a read
+            # of a number held in memory, which is what keeps this answer
+            # inside the hundred milliseconds the caller was promised.
+            idle = self._main_thread_slow()
             if idle is not None:
                 return self._busy(
                     trace,
