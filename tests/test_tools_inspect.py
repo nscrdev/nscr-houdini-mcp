@@ -9,7 +9,10 @@ cover.
 
 from __future__ import annotations
 
+import base64
+import json
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -17,13 +20,13 @@ from typing import Any
 
 import pytest
 
-from fake_hou import Item, Node, Scene
+from fake_hou import Item, Node, ObjectWasDeleted, Scene
 from nscr_houdini_mcp.bridge import client, tools
 from nscr_houdini_mcp.bridge.dispatch import Dispatcher
 from nscr_houdini_mcp.bridge.envelope import Envelope
 from nscr_houdini_mcp.bridge.handlers import default_registry
 from nscr_houdini_mcp.bridge.identity import Identity
-from nscr_houdini_mcp.tools.inspect import make_token
+from nscr_houdini_mcp.tools.inspect import make_token, query_of
 from test_server import talk, text_of
 from test_tools_sessions import Bench
 
@@ -233,7 +236,8 @@ def test_a_tree_pages_after_the_last_path_it_returned(bench: Bench, nodes: dict)
     whole = paths(ok(inspect(bench, path="/obj", depth=2)))
     first = ok(inspect(bench, path="/obj", depth=2, limit=3))
     assert paths(first) == whole[:3]
-    assert first["total"] == len(whole)
+    # A page that stopped early does not know how many rows there are in all.
+    assert "total" not in first
     second = ok(inspect(bench, path="/obj", depth=2, limit=3, page=first["next_page"]))
     third = ok(inspect(bench, path="/obj", depth=2, limit=3, page=second["next_page"]))
     assert paths(first) + paths(second) + paths(third) == whole
@@ -268,18 +272,59 @@ def test_a_page_token_for_another_mode_is_refused(bench: Bench, nodes: dict) -> 
     assert "next_page" in refused["hint"]
 
 
+def test_a_page_token_for_another_query_is_refused(bench: Bench, nodes: dict) -> None:
+    first = ok(inspect(bench, path="/obj/geo1", limit=2))
+    for other in ({"path": "/obj"}, {"path": "/obj/geo1", "detail": "full"}):
+        refused = error(inspect(bench, limit=2, page=first["next_page"], **other))
+        assert refused["code"] == "BAD_CURSOR"
+    # The same query spelled with a trailing slash is the same query.
+    assert ok(inspect(bench, path="/obj/geo1/", limit=2, page=first["next_page"]))["rows"]
+
+
+def raw_token(body: Any) -> str:
+    text = body if isinstance(body, str) else json.dumps(body, separators=(",", ":"))
+    return base64.urlsafe_b64encode(text.encode()).decode().rstrip("=")
+
+
+def fields(**changed: Any) -> dict[str, Any]:
+    body = {"v": 1, "m": "tree", "s": "s-1", "e": 0, "k": "/obj", "d": "", "q": QUERY}
+    body.update(changed)
+    return {key: value for key, value in body.items() if value is not ...}
+
+
+QUERY = query_of("tree", {}, None)
+
+
 @pytest.mark.parametrize(
     "page",
     [
         "not a token",
-        make_token(mode="tree", session_id="s-other", epoch=0, last="/obj", digest=""),
-        make_token(mode="tree", session_id="s-1", epoch=0, last="obj", digest=""),
+        "@@@@",
+        make_token(mode="tree", session_id="s-other", epoch=0, last="/obj", mark="", query=QUERY),
+        raw_token(fields(k="obj")),
+        raw_token(fields(v=True)),
+        raw_token(fields(e=True)),
+        raw_token(fields(e="0")),
+        raw_token(fields(e=...)),
+        raw_token(fields(d=...)),
+        raw_token(fields(extra=1)),
+        raw_token(fields(s="x" * 200)),
+        raw_token("[" * 700 + "]" * 700),
+        raw_token("[" * 20000),
+        "A" * 1025,
+        raw_token([1, 2]),
     ],
 )
 def test_a_page_token_that_is_not_ours_is_refused(bench: Bench, nodes: dict, page: str) -> None:
-    refused = error(inspect(bench, page=page))
-    assert refused["code"] == "BAD_CURSOR"
+    result = inspect(bench, page=page)
+    refused = error(result)
+    assert refused["code"] == "BAD_CURSOR", text_of(result)
     assert bench.sent.calls == []
+
+
+def test_a_well_formed_token_of_ours_is_taken(bench: Bench, nodes: dict) -> None:
+    body = ok(inspect(bench, page=raw_token(fields(k="/mat"))))
+    assert paths(body) == ["/obj", "/out", "/stage"]
 
 
 def test_a_big_page_is_carried_whole(bench: Bench, scene: Scene, nodes: dict) -> None:
@@ -351,7 +396,7 @@ def test_a_full_node_read_has_every_parameter_expressions_code_and_user_data(
     translate = by_name(moved["parms"])["t"]
     assert translate["expr"] == {"tx": "$F*2", "ty": 'npoints("../box1")'}
     assert translate["lang"] == "hscript"
-    assert translate["not_cooked"] is True
+    assert translate["not_cooked"] == "calls npoints()"
     assert "v" not in translate
 
 
@@ -424,7 +469,7 @@ def test_parms_keep_the_ones_that_differ_from_their_defaults(bench: Bench, nodes
     [translate] = entry["parms"]
     # Expressions always come with a parameter read, safe or not.
     assert translate["expr"] == {"tx": "$F*2", "ty": 'npoints("../box1")'}
-    assert translate["not_cooked"] is True
+    assert translate["not_cooked"] == "calls npoints()"
     assert body["total"] == 1
 
 
@@ -466,16 +511,14 @@ def test_parms_page_across_a_batch(bench: Bench, nodes: dict) -> None:
         "limit": 2,
     }
     first = ok(inspect(bench, **arguments))
-    assert first["total"] == 5
-    # The first page holds the first two rows, and the path that was not
-    # there, in its place by path.
-    assert [entry["path"] for entry in first["nodes"]] == [
-        "/obj/geo1/attribcreate1",
-        "/obj/geo1/missing",
-    ]
-    assert first["nodes"][1]["error"]["code"] == "NODE_NOT_FOUND"
+    assert first["total"] == 6
+    assert [entry["path"] for entry in first["nodes"]] == ["/obj/geo1/attribcreate1"]
     second = ok(inspect(bench, **arguments, page=first["next_page"]))
     third = ok(inspect(bench, **arguments, page=second["next_page"]))
+    # The path that was not there is an entry of its own, in its place by path.
+    assert [entry["path"] for entry in third["nodes"]] == ["/obj/geo1/box1", "/obj/geo1/missing"]
+    assert third["nodes"][1]["error"]["code"] == "NODE_NOT_FOUND"
+    assert "next_page" not in third
     names = [
         (entry["path"], row["n"])
         for page in (first, second, third)
@@ -489,7 +532,7 @@ def test_parms_page_across_a_batch(bench: Bench, nodes: dict) -> None:
         ("/obj/geo1/box1", "size"),
         ("/obj/geo1/box1", "t"),
     ]
-    assert all("error" not in entry for entry in second["nodes"] + third["nodes"])
+    assert all("error" not in entry for entry in first["nodes"] + second["nodes"])
 
 
 def test_a_string_carries_its_text_and_what_it_expands_to(
@@ -499,7 +542,7 @@ def test_a_string_carries_its_text_and_what_it_expands_to(
     assert row == {"n": "file", "v": "$HIP/geo/x.bgeo", "ev": "/Users/somebody/scenes/geo/x.bgeo"}
     nodes["reader"].parm("file").set('$HIP/`npoints("../box1")`.bgeo')
     [held] = ok(inspect(bench, mode="parms", path="/obj/geo1/file1"))["nodes"][0]["parms"]
-    assert held == {"n": "file", "v": '$HIP/`npoints("../box1")`.bgeo', "not_cooked": True}
+    assert held == {"n": "file", "v": '$HIP/`npoints("../box1")`.bgeo', "not_cooked": "backtick"}
     assert nodes["box"].cooks == 0
     [cooked] = ok(inspect(bench, mode="parms", path="/obj/geo1/file1", evaluate=True))["nodes"][0][
         "parms"
@@ -519,7 +562,7 @@ def test_a_reference_to_a_safe_parameter_is_read_and_one_to_a_cook_is_not(
     rows = by_name(body["nodes"][0]["parms"])
     assert rows["follow"]["v"] == 3.0
     assert rows["follow"]["expr"] == {"follow": 'ch("../transform1/tx") + 1'}
-    assert rows["count"]["not_cooked"] is True
+    assert rows["count"]["not_cooked"] == 'ch("../transform1/ty"): calls npoints()'
     assert nodes["box"].cooks == 0
 
 
@@ -668,3 +711,300 @@ def test_the_tool_is_listed_after_hou_scene_without_a_read_only_hint(bench: Benc
     [tool] = [tool for tool in listed.tools if tool.name == "hou_inspect"]
     # A read that evaluates may cook, so it is not promised to be read only.
     assert tool.annotations is None or tool.annotations.read_only_hint is None
+
+
+# Section: values that could only be had by cooking
+
+
+def risky(nodes: dict[str, Node], scene: Scene) -> dict[str, Any]:
+    """Every way a value can pull on a cook, set up on the stand in."""
+    source = scene.node("/obj").createNode("null", "chopper")
+    source.dirty = True
+    source.cooks = 0
+    nodes["box"].parm("tx").override = source
+    nodes["box"].parm("ty").setKeyframes(
+        [(1.0, "len(hou.node('../OUT').geometry().points())", "python"), (10.0, "2", "python")]
+    )
+    out = nodes["out"]
+    out.addSpareParm("safe", default=1.0)
+    out.addSpareParm("trick").setExpression('ch(strcat("un", "safe")) + 0 * strlen("ch(\'safe\')")')
+    out.addSpareParm("py").setExpression("hou.node('../box1').cook()", "python")
+    out.addSpareParm("chain").setExpression('ch("py") + 1')
+    nodes["reader"].parm("file").set("$NPT/x.bgeo")
+    out.addSpareParm("via", kind="String", default="").setExpression('chs("../file1/file")')
+    return {"source": source}
+
+
+def test_every_value_that_could_cook_is_withheld_and_says_why(
+    bench: Bench, scene: Scene, nodes: dict
+) -> None:
+    source = risky(nodes, scene)["source"]
+    before = cooks(scene)
+    for detail in ("summary", "standard", "full"):
+        ok(inspect(bench, mode="node", paths=["/obj/geo1/box1", "/obj/geo1/OUT"], detail=detail))
+        ok(inspect(bench, path="/obj", depth=3, detail=detail))
+    box = by_name(
+        ok(inspect(bench, mode="parms", path="/obj/geo1/box1", parm_filter="all"))["nodes"][0][
+            "parms"
+        ]
+    )
+    out = by_name(
+        ok(inspect(bench, mode="parms", path="/obj/geo1/OUT", parm_filter="all"))["nodes"][0][
+            "parms"
+        ]
+    )
+    reader = ok(inspect(bench, mode="parms", path="/obj/geo1/file1"))["nodes"][0]["parms"][0]
+    assert cooks(scene) == before
+    risky_parms = ("trick", "py", "chain", "via")
+    assert [nodes["out"].parm(name).evaluations for name in risky_parms] == [0, 0, 0, 0]
+    # A channel operator's export: withheld, and never taken for a default.
+    assert box["t"]["not_cooked"] == "override"
+    assert box["t"]["keys"] is True
+    assert "v" not in box["t"]
+    assert out["trick"]["not_cooked"] == "ch() of a worked out name"
+    assert out["py"]["not_cooked"] == "python"
+    assert out["chain"]["not_cooked"] == 'ch("py"): python'
+    assert out["safe"] == {"n": "safe", "v": 1.0}
+    assert reader == {"n": "file", "v": "$NPT/x.bgeo", "not_cooked": "variable $NPT"}
+    assert out["via"]["not_cooked"] == 'chs("../file1/file"): variable $NPT'
+    assert source.cooks == 0
+
+
+def test_a_parameter_with_keyframes_is_withheld_for_its_keyframes(
+    bench: Bench, scene: Scene, nodes: dict
+) -> None:
+    nodes["box"].parm("ty").setKeyframes([(1.0, "1", "hscript"), (10.0, "5", "hscript")])
+    [row] = [
+        row
+        for row in ok(inspect(bench, mode="parms", path="/obj/geo1/box1"))["nodes"][0]["parms"]
+        if row["n"] == "t"
+    ]
+    assert row == {"n": "t", "not_cooked": "keyframes", "keys": True}
+
+
+def test_with_evaluate_the_same_values_are_read(bench: Bench, scene: Scene, nodes: dict) -> None:
+    source = risky(nodes, scene)["source"]
+    box = by_name(
+        ok(inspect(bench, mode="parms", path="/obj/geo1/box1", evaluate=True, parm_filter="all"))[
+            "nodes"
+        ][0]["parms"]
+    )
+    assert "not_cooked" not in box["t"]
+    assert box["t"]["v"][0] == 0.5
+    assert source.cooks == 1
+
+
+# Section: paging every mode
+
+
+def test_node_entries_are_sorted_and_paged(bench: Bench, nodes: dict) -> None:
+    asked = ["/obj/geo1/file1", "/obj/geo1/box1", "/obj/geo1/OUT", "/obj/geo1/box1/", "/obj/cam1"]
+    first = ok(inspect(bench, mode="node", paths=asked, limit=2))
+    assert [entry["path"] for entry in first["nodes"]] == ["/obj/cam1", "/obj/geo1/OUT"]
+    assert first["total"] == 4
+    second = ok(inspect(bench, mode="node", paths=asked, limit=2, page=first["next_page"]))
+    assert [entry["path"] for entry in second["nodes"]] == ["/obj/geo1/box1", "/obj/geo1/file1"]
+    assert "next_page" not in second
+
+
+def test_a_find_with_a_small_limit_stops_walking_once_the_page_is_full(
+    bench: Bench, scene: Scene, nodes: dict
+) -> None:
+    for index in range(300):
+        nodes["geo"].createNode("null", f"z{index:03d}")
+    scene.listed = 0
+    body = ok(inspect(bench, mode="find", pattern="box*", limit=1))
+    assert paths(body) == ["/obj/geo1/box1"]
+    assert "next_page" in body
+    assert scene.listed < 20
+
+
+def test_a_walk_cut_short_by_the_scan_bound_goes_on_from_where_it_stopped(
+    bench: Bench, nodes: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    whole = paths(ok(inspect(bench, mode="find", pattern="*", limit=100)))
+    monkeypatch.setattr(tools, "MAX_NODES_SCANNED", 3)
+    seen: list[str] = []
+    page = None
+    for _ in range(20):
+        body = ok(
+            inspect(bench, mode="find", pattern="*", limit=100, **({"page": page} if page else {}))
+        )
+        assert body.get("truncated") is True or "next_page" not in body
+        seen.extend(paths(body))
+        page = body.get("next_page")
+        if not page:
+            break
+    assert seen == whole
+
+
+def test_near_misses_for_a_batch_are_gathered_once(
+    bench: Bench, nodes: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gathered: list[str] = []
+    below = tools._NearIndex.below
+
+    def counted(self: Any, above: str, root: Any) -> Any:
+        if above not in self._below:
+            gathered.append(above)
+        return below(self, above, root)
+
+    monkeypatch.setattr(tools._NearIndex, "below", counted)
+    body = ok(inspect(bench, mode="node", paths=[f"/obj/geo1/boxx{index}" for index in range(10)]))
+    assert all(entry["error"]["code"] == "NODE_NOT_FOUND" for entry in body["nodes"])
+    assert gathered == ["/obj/geo1"]
+
+
+def test_near_misses_rank_by_the_last_part_and_look_further_down(
+    bench: Bench, scene: Scene, nodes: dict
+) -> None:
+    for name in ("a1", "a2", "a3", "a4", "a5", "a6"):
+        scene.node("/obj").createNode("null", name)
+    scene.node("/obj").createNode("geo", "mysub").createNode("null", "inner")
+    refused = error(inspect(bench, mode="node", path="/obj/inner"))
+    assert refused["details"]["did_you_mean"] == ["/obj/mysub/inner"]
+
+
+def test_a_multiparm_with_many_instances_is_cut_and_says_so(bench: Bench, nodes: dict) -> None:
+    nodes["make"].parm("numattr").set(250)
+    body = ok(inspect(bench, mode="parms", path="/obj/geo1/attribcreate1", parm_filter="all"))
+    row = by_name(body["nodes"][0]["parms"])["numattr"]
+    assert row["v"] == 250 and row["inst_total"] == 250 and row["truncated"] is True
+    assert len(row["inst"]) == 200
+
+
+def test_a_multiparm_named_on_its_own_pages_through_its_instances(
+    bench: Bench, nodes: dict
+) -> None:
+    nodes["make"].parm("numattr").set(250)
+    arguments = {"mode": "parms", "path": "/obj/geo1/attribcreate1/numattr", "limit": 100}
+    names: list[str] = []
+    starts: list[int] = []
+    page = None
+    for _ in range(5):
+        body = ok(inspect(bench, **arguments, **({"page": page} if page else {})))
+        [row] = body["nodes"][0]["parms"]
+        assert row["v"] == 250 and body["total"] == 250
+        starts.append(row["inst_from"])
+        names.extend(group[0]["n"] for group in row["inst"])
+        page = body.get("next_page")
+        if not page:
+            break
+    assert starts == [1, 101, 201]
+    assert names == [f"name{index}" for index in range(1, 251)]
+
+
+def test_boxes_and_notes_come_whole_up_to_their_own_bound(
+    bench: Bench, nodes: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    geo = nodes["geo"]
+    geo.stickies.extend(Item(geo, f"__stickynote{index}", text="n") for index in range(2, 5))
+    body = ok(inspect(bench, path="/obj/geo1", detail="standard", limit=1))
+    assert len(body["notes"]) == 4 and "notes_truncated" not in body
+    monkeypatch.setattr(tools, "MAX_NETWORK_ITEMS", 2)
+    body = ok(inspect(bench, path="/obj/geo1", detail="standard", limit=1))
+    assert len(body["notes"]) == 2 and body["notes_truncated"] is True
+    assert "boxes_truncated" not in body
+    later = ok(inspect(bench, path="/obj/geo1", detail="standard", limit=1, page=body["next_page"]))
+    assert "notes" not in later
+
+
+# Section: batches
+
+
+def test_a_node_gone_part_way_through_a_parameter_batch_is_one_entry(
+    bench: Bench, nodes: dict
+) -> None:
+    box = nodes["box"]
+    real = box.path
+    calls = {"count": 0}
+
+    def path() -> str:
+        calls["count"] += 1
+        if calls["count"] > 1:
+            raise ObjectWasDeleted("gone")
+        return real()
+
+    box.path = path  # type: ignore[method-assign]
+    body = ok(inspect(bench, mode="parms", paths=["/obj/geo1/box1", "/obj/geo1/transform1"]))
+    entries = {entry["path"]: entry for entry in body["nodes"]}
+    assert entries["/obj/geo1/box1"]["error"]["code"] == "NODE_NOT_FOUND"
+    assert entries["/obj/geo1/transform1"]["parms"][0]["n"] == "t"
+
+
+def test_every_node_asked_for_has_one_entry_and_one_row_per_parameter(
+    bench: Bench, nodes: dict
+) -> None:
+    body = ok(
+        inspect(
+            bench,
+            mode="parms",
+            paths=[
+                "/obj/cam1",
+                "/obj/geo1/box1/tx",
+                "/obj/geo1/box1/ty",
+                "/obj/geo1/box1/t",
+                "/obj/cam1/",
+            ],
+        )
+    )
+    assert body["nodes"] == [
+        {"path": "/obj/cam1", "not_cooked": True, "parms": []},
+        {"path": "/obj/geo1/box1", "not_cooked": True, "parms": [{"n": "t", "v": [0.0, 0.0, 0.0]}]},
+    ]
+
+
+# Section: stopping
+
+
+def test_an_evaluating_tree_stops_between_rows_when_asked(scene: Scene, nodes: dict) -> None:
+    stop = threading.Event()
+    nodes["make"].after_cook = stop.set
+    context = tools.ToolContext(hou=scene.module(), session_id="s-1", cancel=stop)
+    body = tools.inspect({"path": "/obj/geo1", "evaluate": True}, context)
+    assert [row["path"] for row in body["rows"]] == ["/obj/geo1/OUT", "/obj/geo1/attribcreate1"]
+    assert body["stopped"] is True and body["more"] is True
+    assert body["last"] == "/obj/geo1/attribcreate1"
+    assert nodes["wrangle"].cooks == 0 and nodes["reader"].cooks == 0
+
+
+def test_a_read_that_times_out_is_asked_to_stop(scene: Scene, nodes: dict) -> None:
+    through = Through(scene)
+    nodes["box"].after_cook = lambda: time.sleep(0.5)
+    reply = through.dispatcher.dispatch(
+        Envelope(
+            tool="node.inspect",
+            arguments={"mode": "tree", "path": "/obj/geo1", "evaluate": True},
+            timeout_s=0.1,
+        )
+    )
+    assert reply.payload["error"]["code"] == "TIMEOUT"
+    deadline = time.monotonic() + 5.0
+    while through.dispatcher.running is not None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert through.dispatcher.running is None
+    assert nodes["reader"].cooks == 0
+
+
+def test_numbers_an_export_that_has_not_cooked_may_drive_are_withheld(
+    bench: Bench, scene: Scene, nodes: dict
+) -> None:
+    source = scene.node("/obj").createNode("null", "exporter")
+    source.export_flag = True
+    source.cooks = 0
+    nodes["box"].dependents_now = [source]
+    nodes["box"].parm("tx").override = source
+    body = ok(inspect(bench, mode="parms", path="/obj/geo1/box1", parm_filter="all"))
+    rows = by_name(body["nodes"][0]["parms"])
+    # Until the channel operator has cooked, nothing says which numbers it drives.
+    assert rows["size"]["not_cooked"] == "override"
+    assert rows["scale"]["not_cooked"] == "override"
+    assert source.cooks == 0
+    source.cooks = 1
+    nodes["box"].parm("tx").override = None
+    rows = by_name(
+        ok(inspect(bench, mode="parms", path="/obj/geo1/box1", parm_filter="all"))["nodes"][0][
+            "parms"
+        ]
+    )
+    assert rows["size"] == {"n": "size", "v": [2.0, 1.0, 1.0]}

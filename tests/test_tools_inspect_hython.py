@@ -77,6 +77,32 @@ for index in range({filler}):
     geo.createNode("null", "n%02d" % index)
 note = geo.createStickyNote()
 note.setText("the base shape")
+
+# Every way a value can pull on a cook.
+reader = geo.createNode("file", "file1")
+reader.parm("file").set("$NPT/x.bgeo")
+for name in ("safe", "py", "chain", "trick"):
+    out.addSpareParmTuple(hou.FloatParmTemplate(name, name, 1, default_value=(1.0,)))
+out.parm("py").setExpression(
+    "len(hou.node('../box1').geometry().points())", language=hou.exprLanguage.Python
+)
+out.parm("chain").setExpression('ch("py") + 1')
+quoted = "'safe'"
+out.parm("trick").setExpression('ch(strcat("p", "y")) + 0 * strlen("ch(' + quoted + ')")')
+for frame, text in ((1, "len(hou.node('../box1').geometry().points())"), (10, "2")):
+    key = hou.Keyframe()
+    key.setFrame(frame)
+    key.setExpression(text, hou.exprLanguage.Python)
+    move.parm("rx").setKeyframe(key)
+target = hou.node("/obj").createNode("null", "target")
+other = hou.node("/obj").createNode("null", "other")
+other.parm("ty").setExpression('ch("../target/tx")')
+chops = hou.node("/obj").createNode("chopnet", "chops")
+wave = chops.createNode("wave", "wave1")
+wave.parm("amp").setExpression("$F")
+wave.parm("channelname").set("tx")
+wave.parm("export").set("/obj/target")
+wave.setExportFlag(True)
 hou.hipFile.save(sys.argv[1])
 """
 
@@ -155,8 +181,24 @@ def counts(result: Any) -> dict[str, int]:
     return {entry["path"]: entry["cooks"] for entry in ok(result)["nodes"]}
 
 
-WATCHED = ["/obj/geo1/box1", "/obj/geo1/transform1", "/obj/geo1/OUT", "/obj/geo1/attribwrangle1"]
+WATCHED = [
+    "/obj/geo1/box1",
+    "/obj/geo1/transform1",
+    "/obj/geo1/OUT",
+    "/obj/geo1/attribwrangle1",
+    "/obj/geo1/file1",
+    "/obj/chops/wave1",
+    "/obj/target",
+    "/obj/other",
+]
+RISKY = ["/obj/geo1/OUT", "/obj/geo1/transform1", "/obj/geo1/file1", "/obj/target", "/obj/other"]
 COUNT = ("hou_inspect", {"mode": "node", "paths": WATCHED, "include": ["cook_time"]})
+
+
+def rows_of(result: Any) -> dict[str, dict[str, dict[str, Any]]]:
+    return {
+        entry["path"]: {row["n"]: row for row in entry["parms"]} for entry in ok(result)["nodes"]
+    }
 
 
 def test_reads_against_a_real_worker(place: dict[str, Path]) -> None:
@@ -171,22 +213,41 @@ def test_reads_against_a_real_worker(place: dict[str, Path]) -> None:
     session_id = ok(started)["session"]["session_id"]
     assert ok(opened)["hip_path"] == str(hip)
 
-    # Nothing has cooked since the load, and no read without evaluate cooks.
-    summary, tree, full, parms, after = run(
+    # No read without evaluate cooks, at any level, whatever the values hold.
+    summary, tree, standard, full, parms, risky, after = run(
         place,
         ("hou_inspect", {"mode": "node", "paths": WATCHED}),
-        ("hou_inspect", {"path": "/obj/geo1", "detail": "standard"}),
+        ("hou_inspect", {"path": "/obj", "depth": 3, "detail": "standard"}),
+        ("hou_inspect", {"mode": "node", "paths": WATCHED, "detail": "standard"}),
         ("hou_inspect", {"mode": "node", "paths": WATCHED, "detail": "full"}),
         ("hou_inspect", {"mode": "parms", "path": "/obj/geo1/transform1", "parm_filter": "all"}),
+        ("hou_inspect", {"mode": "parms", "paths": RISKY, "parm_filter": "all"}),
         COUNT,
     )
+    ok(standard)
     assert counts(after) == counts(before)
-    assert set(counts(before).values()) == {0}
+    sops = [path for path in WATCHED if path.startswith("/obj/geo1/")]
+    assert {counts(before)[path] for path in sops} == {0}
+    withheld = rows_of(risky)
+    assert withheld["/obj/target"]["t"]["not_cooked"] == "override"
+    assert withheld["/obj/other"]["t"]["not_cooked"] == 'ch("../target/tx"): override'
+    assert withheld["/obj/geo1/OUT"]["py"]["not_cooked"] == "python"
+    assert withheld["/obj/geo1/OUT"]["chain"]["not_cooked"] == 'ch("py"): python'
+    assert withheld["/obj/geo1/OUT"]["trick"]["not_cooked"] == "ch() of a worked out name"
+    assert withheld["/obj/geo1/OUT"]["safe"]["v"] == 1.0
+    assert withheld["/obj/geo1/transform1"]["r"]["not_cooked"] == "keyframes"
+    assert withheld["/obj/geo1/transform1"]["r"]["keys"] is True
+    assert withheld["/obj/geo1/file1"]["file"] == {
+        "n": "file",
+        "v": "$NPT/x.bgeo",
+        "not_cooked": "variable $NPT",
+    }
     entries = {entry["path"]: entry for entry in ok(summary)["nodes"]}
     assert entries["/obj/geo1/OUT"]["not_cooked"] is True
     assert entries["/obj/geo1/OUT"]["in"] == ["/obj/geo1/transform1"]
     assert "display" in entries["/obj/geo1/OUT"]["flags"]
     rows = {row["path"]: row for row in ok(tree)["rows"]}
+    assert "/obj/chops/wave1" in rows
     assert rows["/obj/geo1/box1"]["auto"] is True
     assert rows["/obj/geo1/transform1"]["in"] == ["/obj/geo1/box1"]
     assert ok(tree)["notes"][0]["text"] == "the base shape"
@@ -196,14 +257,14 @@ def test_reads_against_a_real_worker(place: dict[str, Path]) -> None:
     translate = next(row for row in ok(parms)["nodes"][0]["parms"] if row["n"] == "t")
     assert translate["expr"] == {"tx": "$F*2", "ty": 'npoints("../box1")'}
     assert translate["lang"] == "hscript"
-    assert translate["not_cooked"] is True
+    assert translate["not_cooked"] == "calls npoints()"
     assert "v" not in translate
 
     # A tree pages by path, and the pages put together are the whole of it.
     whole = ok(run(place, ("hou_inspect", {"path": "/obj/geo1", "limit": 500}))[0])
     names = [row["path"] for row in whole["rows"]]
     assert names == sorted(names, key=lambda path: path.split("/"))
-    assert len(names) == FILLER + 4
+    assert len(names) == FILLER + 5
     seen: list[str] = []
     page = None
     for _ in range(10):
@@ -242,6 +303,7 @@ def test_reads_against_a_real_worker(place: dict[str, Path]) -> None:
     assert now["/obj/geo1/transform1"] >= 1
     assert now["/obj/geo1/box1"] >= 1
     assert now["/obj/geo1/OUT"] == 0
+    assert now["/obj/chops/wave1"] == counts(before)["/obj/chops/wave1"]
 
     [stopped] = run(place, ("hou_sessions", {"action": "stop", "session": session_id}))
     assert ok(stopped)["stopped"]["ended"] is True

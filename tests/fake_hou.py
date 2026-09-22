@@ -161,6 +161,12 @@ class Parm:
         self._tuple: ParmTuple | None = None
         # How many times an evaluation ran, so a check can see nothing did.
         self.evaluations = 0
+        # A channel operator that drives this parameter, as an export does.
+        # Its value then comes from that node, which a read of it cooks.
+        self.override: Node | None = None
+        # Keyframes as (frame, expression, language). With more than one, the
+        # build will not hand back an expression, as Houdini will not.
+        self.keys: list[tuple[float, str, str]] = []
 
     def name(self) -> str:
         return self._name
@@ -188,24 +194,45 @@ class Parm:
         self._language = language
         self._node.dirty = True
 
+    def setKeyframes(self, keys: list[tuple[float, str, str]]) -> None:  # noqa: N802
+        self.keys = list(keys)
+        self._expression = None
+        self._node.dirty = True
+
     def expression(self) -> str:
+        if len(self.keys) > 1:
+            raise OperationFailed("Parameter must have exactly one keyframe")
         if self._expression is None:
             raise OperationFailed("Parameter is not animated")
         return self._expression
 
     def expressionLanguage(self) -> str:  # noqa: N802 - the name is Houdini's
-        if self._expression is None:
-            raise OperationFailed("Parameter is not animated")
+        self.expression()
         return "exprLanguage.Python" if self._language == "python" else "exprLanguage.Hscript"
+
+    def isOverrideTrackActive(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return self.override is not None
+
+    def keyframes(self) -> list[Any]:
+        # Reading keyframes evaluates them, as it does in Houdini.
+        for _, text, language in self.keys:
+            self._node.scene.run(self._node, text, language)
+        return list(self.keys)
 
     def eval(self) -> Any:
         self.evaluations += 1
+        if self.override is not None:
+            self.override.cook()
+            return 0.5
+        if self.keys:
+            _, text, language = self.keys[0]
+            return self._node.scene.run(self._node, text, language)
         if self._expression is None:
             return self.value
         return self._node.scene.evaluate(self)
 
     def evalAsString(self) -> str:  # noqa: N802 - the name is Houdini's
-        if self._expression is not None:
+        if self._expression is not None or self.keys or self.override is not None:
             return str(self.eval())
         self.evaluations += 1
         return self._node.scene.expand(str(self.value), self._node)
@@ -224,7 +251,9 @@ class Parm:
     def isAtDefault(  # noqa: N802 - the name is Houdini's
         self, compare_temporary_defaults: bool = True, compare_expressions: bool = True
     ) -> bool:
-        return self._expression is None and self.value == self.default
+        # An exported channel leaves the parameter at its default, as it does
+        # in Houdini: the value the export writes is not the parameter's own.
+        return self._expression is None and not self.keys and self.value == self.default
 
     def isMultiParmInstance(self) -> bool:  # noqa: N802 - the name is Houdini's
         return self._instance_of is not None
@@ -420,6 +449,13 @@ class Node:
         self.boxes: list[Item] = []
         self.stickies: list[Item] = []
         self.locked_asset = False
+        # Called after each cook, for a check that needs something to happen
+        # in the middle of a read.
+        self.after_cook: Any = None
+        # The nodes that depend on this one, and whether this one exports
+        # channels, which only a channel operator does.
+        self.dependents_now: list[Node] = []
+        self.export_flag = False
 
     def name(self) -> str:
         return self._name
@@ -433,6 +469,7 @@ class Node:
         return f"{self._parent.path()}/{self._name}"
 
     def children(self) -> tuple[Node, ...]:
+        self._scene.listed += 1
         return tuple(self._children)
 
     def allSubChildren(  # noqa: N802 - the name is Houdini's
@@ -515,6 +552,8 @@ class Node:
             self.cooks += 1
             self.dirty = False
             self.errors_now = list(self.fails_with)
+            if self.after_cook is not None:
+                self.after_cook()
         if self.errors_now:
             raise OperationFailed("the node has errors")
 
@@ -534,6 +573,12 @@ class Node:
 
     def isLockedHDA(self) -> bool:  # noqa: N802 - the name is Houdini's
         return self.locked_asset
+
+    def dependents(self, include_children: bool = True) -> tuple[Node, ...]:
+        return tuple(self.dependents_now)
+
+    def isExportFlagSet(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return self.export_flag
 
     def setInput(self, index: int, source: Node | None, output: int = 0) -> None:  # noqa: N802
         if source is None:
@@ -872,6 +917,8 @@ class Scene:
         self.types = types
         self.undos = Undos()
         self.ui = MainThread()
+        # How many times any node was asked for its children.
+        self.listed = 0
         self.root = Node(self, "", "root", None)
         self._counts: dict[str, int] = {}
         # What a person has selected in the interface.
@@ -945,7 +992,9 @@ class Scene:
         """A string as Houdini expands it: variables, and backticks evaluated."""
         text = re.sub(r"`([^`]*)`", lambda match: str(self.run(node, match.group(1))), text)
         folder = self.hipFile.path().replace("\\", "/").rsplit("/", 1)[0]
-        return text.replace("$HIP", folder)
+        text = text.replace("$HIP", folder)
+        # A variable that only has a value inside a cook reads as nothing.
+        return re.sub(r"\$\{?[A-Za-z_]\w*\}?", "", text)
 
     def frame(self) -> float:
         return 72.0 if threading.current_thread().name == "fake-main" else 1.0

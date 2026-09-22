@@ -17,7 +17,8 @@ The lock in the app says one call at a time. This says the rest of it:
 - A call that runs out of `timeout_s` gets `TIMEOUT` with `still_running` and
   the operation id. Nothing is interrupted: the work carries on holding the
   session, health reports it, and calls behind it wait or are told the session
-  is busy.
+  is busy. A read that timed out is also asked to stop, the same request
+  `bridge.cancel` makes, since nobody is waiting for its answer.
 - `skip_if_busy` answers at once rather than queueing at all. At once means
   inside a tenth of a second: such a call is refused when anything holds or
   waits for the session, when work is already queued for the main thread, or
@@ -401,6 +402,10 @@ class Dispatcher:
 
         if not work.finished.wait(timeout_s):
             running.timed_out = True
+            if not tool.mutating:
+                # Nobody is waiting for a read any more, so it is asked to
+                # stop at its next look at the flag rather than run on.
+                running.cancel.set()
             if wanted:
                 # The work is still going, so the receipt says so rather than
                 # looking abandoned to the next caller that presents the id,

@@ -35,6 +35,7 @@ import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
@@ -848,6 +849,11 @@ MAX_LIMIT = 2000
 MAX_NEAR = 5
 NEAR_SCAN = 5000
 
+# How many instances of one multiparm a row carries, and how many network
+# boxes and sticky notes a tree carries. Past either, the answer says so.
+MAX_INSTANCES = 200
+MAX_NETWORK_ITEMS = 500
+
 # The flags a row reports, by the name it reports them under and the name the
 # build gives them. A flag a node does not have reads as not set.
 FLAG_NAMES = (
@@ -867,13 +873,20 @@ COOKABLE = frozenset({"Sop", "Object", "Lop", "Cop2", "Cop", "Chop", "Dop"})
 STALE_REASON = "the node, or something it reads, changed after its last cook"
 NO_SELECTION = "no selection outside a GUI"
 
-# Parameter kinds with no value to read, and the ones that hold a list of
-# instances rather than a value.
+# Why a value was left out of a read that may not cook. A reason about an
+# expression names what in it could cook.
+OVERRIDE = "override"
+KEYFRAMES = "keyframes"
+PYTHON = "python"
+BACKTICK = "backtick"
+
+# Parameter kinds with no value to read.
 _NO_VALUE = frozenset({"Button", "FolderSet", "Separator", "Label"})
 
-# What an expression may use and still be read without a cook. Anything else,
-# a Python expression, a backtick, or a variable that reads geometry, is left
-# alone unless the call says it may cook.
+# What an expression or a string may use and still be read without a cook.
+# A variable that only means something inside a cook, such as `$NPT` or
+# `$PT`, reads as nothing outside one, so it is left alone, and so is
+# anything else not named here.
 SAFE_VARIABLES = frozenset(
     {
         "F",
@@ -895,8 +908,14 @@ SAFE_VARIABLES = frozenset(
         "HOME",
         "HFS",
         "HH",
+        "ACTIVETAKE",
+        "EYE",
+        "HOUDINI_TEMP_DIR",
     }
 )
+# `$F4` and its like are the frame, padded.
+_PADDED_FRAME = re.compile(r"F\d+")
+
 CURVE_FUNCTIONS = frozenset(
     {
         "bezier",
@@ -973,14 +992,22 @@ SAFE_FUNCTIONS = CURVE_FUNCTIONS | frozenset(
     }
 )
 # A reference to another parameter is followed, a few steps deep, and is safe
-# when what it points at is.
+# when what it points at is. Only the form with one quoted name is read.
 REFERENCE_FUNCTIONS = frozenset({"ch", "chf", "chs", "chsraw"})
 MAX_REFERENCE_DEPTH = 4
 
-_CALL = re.compile(r"([A-Za-z_]\w*)\s*\(")
+# One HScript token: a quoted string, a variable, a name, a number, or any
+# other single character. A quote that is never closed is a character of its
+# own, which makes the expression unreadable and so not safe.
+_TOKEN = re.compile(
+    r'"(?:[^"\\]|\\.)*"'
+    r"|'(?:[^'\\]|\\.)*'"
+    r"|\$\{?[A-Za-z_]\w*\}?"
+    r"|[A-Za-z_]\w*"
+    r"|\d+\.?\d*(?:[eE][-+]?\d+)?|\.\d+"
+    r"|\S"
+)
 _VARIABLE_NAME = re.compile(r"\$\{?([A-Za-z_]\w*)\}?")
-_LITERAL = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'')
-_REFERENCE = re.compile(r"\b(?:ch|chf|chs|chsraw)\s*\(\s*(\"[^\"]*\"|'[^']*')")
 _CURVE = re.compile(r"\s*(" + "|".join(sorted(CURVE_FUNCTIONS)) + r")\s*\(\s*\)\s*")
 _TRAILING_DIGITS = re.compile(r"\d+$")
 _NOT_A_WORD = re.compile(r"[^a-z0-9]")
@@ -988,13 +1015,16 @@ _NOT_A_WORD = re.compile(r"[^a-z0-9]")
 # How long a text value in user data may be before it is cut.
 MAX_TEXT = 2000
 
+# How a multiparm instance sorts in a page key: its number, padded.
+_INSTANCE_KEY = "{:08d}"
+
 
 def inspect(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, Any]:
     """Read nodes, networks and parameters, one page of rows at a time.
 
     Nothing is cooked unless `evaluate` is set. Without it every value that
-    would pull on a cook is left out and marked, and what a node reports about
-    its last cook is marked when it has never cooked or is out of date.
+    would pull on a cook is left out and says why, and what a node reports
+    about its last cook is marked when it has never cooked or is out of date.
     """
     return _Reader(_houdini(context), context, arguments).run()
 
@@ -1032,6 +1062,8 @@ class _Reader:
         self.batch = bool(arguments.get("batch"))
         self.cooked: set[str] = set()
         self.stopped = False
+        self.near = _NearIndex(hou, MAX_NEAR)
+        self.exports = _Exports()
 
     def wants(self, item: str) -> bool:
         return item in self.items
@@ -1047,82 +1079,132 @@ class _Reader:
         result = reader()
         if self.stopped:
             result["stopped"] = True
+        # What the scene is now, so the next page can tell whether it moved,
+        # and whether the row this page carries on after is still there.
+        result["mark"] = _scene_mark(self.hou)
+        if self.after is not None and self.mode in ("tree", "find", "selection"):
+            if _quiet(lambda: self.hou.node(_text_key(self.after))) is None:
+                result["resume_gone"] = True
         return result
+
+    def should_stop(self) -> bool:
+        if self.context.should_stop():
+            self.stopped = True
+        return self.stopped
 
     # Section: which nodes
 
     def tree(self) -> dict[str, Any]:
-        root = _node_at(self.hou, str(self.arguments.get("path") or "/"))
+        root = self.node_at(str(self.arguments.get("path") or "/"))
         depth = int(_number(self.arguments.get("depth") or 1, "depth", MAX_TREE_DEPTH))
         if depth < 1:
             raise BridgeError("BAD_ARGUMENTS", "depth must be at least 1")
-        found: list[Any] = []
-        networks: list[Any] = []
-        truncated = False
-        stack = [(root, 0)]
-        while stack and not truncated:
-            node, level = stack.pop()
-            if node is not root and _ask(node, "isLockedHDA"):
-                continue
-            children = _quiet(node.children) or ()
-            if children:
-                networks.append(node)
-            for child in children:
-                if len(found) >= MAX_NODES_SCANNED:
-                    truncated = True
-                    break
-                found.append(child)
-                if level + 1 < depth:
-                    stack.append((child, level + 1))
-        result = self.page_of_nodes(found)
-        if self.after is None and self.wants("notes"):
-            result.update(self.network_items(networks))
-        if truncated:
-            result["truncated"] = True
+        result = self.page_of_walk(root, depth, None)
+        if self.after is None and self.wants("notes") and not self.stopped:
+            result.update(self.network_items(root, depth))
         return result
 
     def find(self) -> dict[str, Any]:
-        root = _node_at(self.hou, str(self.arguments.get("path") or "/"))
+        root = self.node_at(str(self.arguments.get("path") or "/"))
         pattern = self.arguments.get("pattern")
         type_glob = self.arguments.get("type")
         if not pattern and not type_glob:
             raise BridgeError("BAD_ARGUMENTS", "find needs pattern, type or both")
-        candidates = (
-            _quiet(lambda: root.allSubChildren(top_down=True, recurse_in_locked_nodes=False)) or ()
-        )
-        found: list[Any] = []
-        truncated = False
-        for index, node in enumerate(candidates):
-            if index >= MAX_NODES_SCANNED:
-                truncated = True
-                break
+
+        def keep(node: Any) -> bool:
             if pattern and not _glob_node(node, str(pattern)):
-                continue
-            if type_glob and not _glob_type(node, str(type_glob)):
-                continue
-            found.append(node)
-        result = self.page_of_nodes(found)
+                return False
+            return not type_glob or _glob_type(node, str(type_glob))
+
+        return self.page_of_walk(root, None, keep)
+
+    def selection(self) -> dict[str, Any]:
+        if self.context.kind != "gui":
+            return {"rows": [], "total": 0, "note": NO_SELECTION}
+        chosen = list(_quiet(self.hou.selectedNodes) or ())
+        keyed = sorted(((_key(node.path()), node) for node in chosen), key=lambda pair: pair[0])
+        start = self.start_of([key for key, _ in keyed])
+        rows: list[dict[str, Any]] = []
+        last = self.after
+        for key, node in keyed[start : start + self.limit]:
+            if self.should_stop():
+                break
+            self.cook(node)
+            rows.append(self.row(node))
+            last = key
+        result: dict[str, Any] = {"rows": rows, "total": len(keyed)}
+        if start + len(rows) < len(keyed):
+            result["more"] = True
+            result["last"] = _text_key(last)
+        return result
+
+    def page_of_walk(self, root: Any, depth: int | None, keep: Any) -> dict[str, Any]:
+        """One page of rows under a node, in path order, from where the last left off.
+
+        The walk goes down in path order and stops as soon as the page is full,
+        so a page after the first never looks at the nodes before it and a walk
+        cut short by the scan bound leaves a clean point to go on from.
+        """
+        found, exhausted, last, truncated = self.walk(root, depth, keep)
+        rows: list[dict[str, Any]] = []
+        for node in found:
+            if self.should_stop():
+                break
+            self.cook(node)
+            rows.append(self.row(node))
+        result: dict[str, Any] = {"rows": rows}
+        if self.stopped:
+            # Carry on after the last row built, whatever the walk had reached.
+            resume = _key(rows[-1]["path"]) if rows else self.after
+            result["more"] = True
+            result["last"] = _text_key(resume)
+            return result
+        if not exhausted:
+            result["more"] = True
+            result["last"] = _text_key(last)
+        elif self.after is None:
+            result["total"] = len(rows)
         if truncated:
             result["truncated"] = True
         return result
 
-    def selection(self) -> dict[str, Any]:
-        if self.context.kind != "gui":
-            return {"rows": [], "total": 0, "digest": _digest([]), "note": NO_SELECTION}
-        return self.page_of_nodes(list(_quiet(self.hou.selectedNodes) or ()))
+    def walk(
+        self, root: Any, depth: int | None, keep: Any
+    ) -> tuple[list[Any], bool, tuple[str, ...] | None, bool]:
+        """The next nodes under a root, in path order, a page's worth.
 
-    def page_of_nodes(self, nodes: list[Any]) -> dict[str, Any]:
-        """One page of rows, sorted by path, starting after the last one seen."""
-        keyed = sorted(((_key(node.path()), node) for node in nodes), key=lambda pair: pair[0])
-        rows: list[dict[str, Any]] = []
-        start = self.start_of([key for key, _ in keyed])
-        for _key_of, node in keyed[start : start + self.limit]:
-            if self.context.should_stop():
-                self.stopped = True
-                break
-            self.cook(node)
-            rows.append(self.row(node))
-        return {"rows": rows, **self.paged([key for key, _ in keyed], start, len(rows))}
+        Siblings are taken in name order and each node before its insides,
+        which is the order the path keys sort in. A subtree wholly before the
+        point a page carries on from is passed over without being opened. The
+        answer is the nodes kept, whether the walk reached the end, the key
+        of the last node looked at, and whether the scan bound cut it short.
+        """
+        found: list[Any] = []
+        stack = [(child, 1) for child in reversed(_sorted_children(root))]
+        last = self.after
+        scanned = 0
+        while stack:
+            if self.should_stop():
+                return found, False, last, False
+            if scanned >= MAX_NODES_SCANNED:
+                return found, False, last, True
+            node, level = stack.pop()
+            key = _key(node.path())
+            descend = (depth is None or level < depth) and not _ask(node, "isLockedHDA")
+            if self.after is not None and key <= self.after:
+                if descend and self.after[: len(key)] == key:
+                    stack.extend((child, level + 1) for child in reversed(_sorted_children(node)))
+                continue
+            scanned += 1
+            last = key
+            if descend:
+                stack.extend((child, level + 1) for child in reversed(_sorted_children(node)))
+            if keep is not None and not keep(node):
+                continue
+            found.append(node)
+            if len(found) >= self.limit:
+                return found, not stack, last, False
+        return found, True, last, False
 
     def start_of(self, keys: list[tuple[str, ...]]) -> int:
         if self.after is None:
@@ -1132,15 +1214,10 @@ class _Reader:
                 return index
         return len(keys)
 
-    def paged(self, keys: list[tuple[str, ...]], start: int, count: int) -> dict[str, Any]:
-        """How many rows matched, and where the next page starts when there is one."""
-        result: dict[str, Any] = {"total": len(keys), "digest": _digest(keys)}
-        if start + count < len(keys):
-            result["more"] = True
-            result["last"] = _text_key(keys[start + count - 1] if count else self.after)
-        return result
-
     # Section: one node
+
+    def node_at(self, path: str) -> Any:
+        return _node_at(self.hou, path, self.near)
 
     def row(self, node: Any) -> dict[str, Any]:
         """One compact row: who the node is, then what the level asks for."""
@@ -1328,53 +1405,65 @@ class _Reader:
         return sum(
             1
             for tuple_ in top
-            if _kind(tuple_) not in _NO_VALUE and not _at_default(tuple_) and _has_value(tuple_)
+            if _kind(tuple_) not in _NO_VALUE and _has_value(tuple_) and not _at_default(tuple_)
         )
 
-    def network_items(self, networks: list[Any]) -> dict[str, Any]:
+    def network_items(self, root: Any, depth: int) -> dict[str, Any]:
+        """The network boxes and sticky notes in the networks a tree reads.
+
+        Complete up to a bound of their own, and on the first page only, with
+        a flag when the bound was reached.
+        """
         boxes: list[dict[str, Any]] = []
         notes: list[dict[str, Any]] = []
-        for network in networks:
+        networks = [(root, 0)]
+        scanned = 0
+        while networks and scanned < MAX_NODES_SCANNED:
+            if len(boxes) > MAX_NETWORK_ITEMS and len(notes) > MAX_NETWORK_ITEMS:
+                break
+            network, level = networks.pop(0)
+            scanned += 1
             for box in _quiet(network.networkBoxes) or ():
-                item: dict[str, Any] = {"path": box.path()}
-                comment = _ask(box, "comment")
-                if comment:
-                    item["comment"] = comment
-                inside = [node.path() for node in _quiet(box.nodes) or ()]
-                if inside:
-                    item["nodes"] = inside
-                if self.full:
-                    item.update(_position(box))
-                    size = _quiet(lambda box=box: list(box.size()))
-                    if size is not None:
-                        item["size"] = [round(float(value), 3) for value in size]
-                boxes.append(item)
+                if len(boxes) > MAX_NETWORK_ITEMS:
+                    break
+                boxes.append(self.box(box))
             for note in _quiet(network.stickyNotes) or ():
+                if len(notes) > MAX_NETWORK_ITEMS:
+                    break
                 notes.append({"path": note.path(), "text": str(_ask(note, "text") or "")})
+            if level + 1 < depth:
+                networks.extend(
+                    (child, level + 1)
+                    for child in _sorted_children(network)
+                    if not _ask(child, "isLockedHDA")
+                )
         found: dict[str, Any] = {}
         if boxes:
-            found["boxes"] = boxes[: self.limit]
+            found["boxes"] = boxes[:MAX_NETWORK_ITEMS]
         if notes:
-            found["notes"] = notes[: self.limit]
+            found["notes"] = notes[:MAX_NETWORK_ITEMS]
+        if len(boxes) > MAX_NETWORK_ITEMS:
+            found["boxes_truncated"] = True
+        if len(notes) > MAX_NETWORK_ITEMS:
+            found["notes_truncated"] = True
         return found
 
-    # Section: several nodes by path
+    def box(self, box: Any) -> dict[str, Any]:
+        item: dict[str, Any] = {"path": box.path()}
+        comment = _ask(box, "comment")
+        if comment:
+            item["comment"] = comment
+        inside = [node.path() for node in _quiet(box.nodes) or ()]
+        if inside:
+            item["nodes"] = inside
+        if self.full:
+            item.update(_position(box))
+            size = _quiet(lambda: list(box.size()))
+            if size is not None:
+                item["size"] = [round(float(value), 3) for value in size]
+        return item
 
-    def nodes(self) -> dict[str, Any]:
-        entries: list[dict[str, Any]] = []
-        for path in self.paths():
-            if self.context.should_stop():
-                self.stopped = True
-                break
-            try:
-                node = _node_at(self.hou, path)
-                self.cook(node)
-                entries.append(self.entry(node))
-            except Exception as error:  # noqa: BLE001 - one bad path is one bad entry
-                if not self.batch:
-                    raise
-                entries.append(_failed_entry(path, error))
-        return {"nodes": entries}
+    # Section: several nodes by path
 
     def paths(self) -> list[str]:
         given = self.arguments.get("paths") or ()
@@ -1382,49 +1471,158 @@ class _Reader:
             raise BridgeError("BAD_ARGUMENTS", "this mode needs paths")
         if len(given) > MAX_BATCH:
             raise BridgeError("BAD_ARGUMENTS", f"at most {MAX_BATCH} paths in one call")
-        return list(dict.fromkeys(str(path) for path in given))
+        return list(dict.fromkeys(_tidy(str(path)) for path in given))
+
+    def nodes(self) -> dict[str, Any]:
+        """Node entries, one per node however it was named, sorted and paged."""
+        items: dict[tuple[str, ...], tuple[str, Any]] = {}
+        for path in self.paths():
+            try:
+                node = self.node_at(path)
+                items.setdefault(_key(node.path()), ("node", node))
+            except Exception as error:  # noqa: BLE001 - one bad path is one bad entry
+                if not self.batch:
+                    raise
+                items.setdefault(_key(path), ("error", _failed_entry(path, error)))
+        keys = sorted(items)
+        start = self.start_of(keys)
+        entries: list[dict[str, Any]] = []
+        last = self.after
+        for key in keys[start : start + self.limit]:
+            if self.should_stop():
+                break
+            kind, payload = items[key]
+            if kind == "error":
+                entries.append(payload)
+            else:
+                try:
+                    self.cook(payload)
+                    entries.append(self.entry(payload))
+                except Exception as error:  # noqa: BLE001 - one bad node is one bad entry
+                    if not self.batch:
+                        raise
+                    entries.append(_failed_entry(_text_key(key), error))
+            last = key
+        result: dict[str, Any] = {"nodes": entries, "total": len(keys)}
+        if start + len(entries) < len(keys):
+            result["more"] = True
+            result["last"] = _text_key(last)
+        return result
 
     # Section: parameters
 
     def parms(self) -> dict[str, Any]:
-        """The parameter tables of one or more nodes, paged across all of them."""
-        failed: list[dict[str, Any]] = []
-        chosen: list[tuple[tuple[str, ...], Any, Any]] = []
+        """Parameter tables of one or more nodes, sorted and paged across all of them.
+
+        Every node asked for has an entry, even when nothing in it passes the
+        filter. A parameter named twice, by its tuple and by a component, is one
+        row. A multiparm named on its own pages through its instances.
+        """
+        wanted: dict[str, dict[str, Any]] = {}
+        items: dict[tuple[str, ...], tuple[str, Any]] = {}
         for path in self.paths():
             try:
-                node, only = _parm_target(self.hou, path)
+                node, only = _parm_target(self.hou, path, self.near)
+                target = wanted.setdefault(
+                    node.path(), {"node": node, "whole": False, "names": set()}
+                )
+                if only is None:
+                    target["whole"] = True
+                else:
+                    target["names"].add(only)
             except Exception as error:  # noqa: BLE001 - one bad path is one bad entry
                 if not self.batch:
                     raise
-                failed.append(_failed_entry(path, error))
-                continue
-            top, children = _parm_tree(node)
-            test, whole = self.parm_test(only)
-            node_key = _key(node.path())
-            for item in self.choose(top, children, test, whole=whole):
-                chosen.append(((*node_key, item[0].name()), node, item))
-        chosen.sort(key=lambda entry: entry[0])
-        keys = [key for key, _, _ in chosen]
+                items.setdefault(_key(path), ("error", _failed_entry(path, error)))
+        for path, target in wanted.items():
+            gathered: dict[tuple[str, ...], tuple[str, Any]] = {}
+            try:
+                self.gather(path, target, gathered)
+            except Exception as error:  # noqa: BLE001 - one bad node is one bad entry
+                if not self.batch:
+                    raise
+                gathered = {_key(path): ("error", _failed_entry(path, error))}
+            items.update(gathered)
+        keys = sorted(items)
         start = self.start_of(keys)
         grouped: dict[str, dict[str, Any]] = {}
+        failed: set[str] = set()
         count = 0
-        for _, node, item in chosen[start : start + self.limit]:
-            if self.context.should_stop():
-                self.stopped = True
+        last = self.after
+        for key in keys[start : start + self.limit]:
+            if self.should_stop():
                 break
-            path = node.path()
-            if path not in grouped:
-                self.cook(node)
-                grouped[path] = {"path": path, **self.marks(node), "parms": []}
-            grouped[path]["parms"].append(self.parm_row(item, expressions=True))
             count += 1
-        result = self.paged(keys, start, count)
-        entries = list(grouped.values())
-        if self.after is None:
-            entries.extend(failed)
-            entries.sort(key=lambda entry: _key(entry["path"]))
-        result["nodes"] = entries
+            last = key
+            kind, payload = items[key]
+            if kind == "error":
+                grouped[payload["path"]] = payload
+                continue
+            path = payload[1]
+            if path in failed:
+                continue
+            try:
+                self.add_to_page(grouped, kind, payload)
+            except Exception as error:  # noqa: BLE001 - one bad node is one bad entry
+                if not self.batch:
+                    raise
+                grouped[path] = _failed_entry(path, error)
+                failed.add(path)
+        result: dict[str, Any] = {"nodes": list(grouped.values()), "total": len(keys)}
+        if start + count < len(keys):
+            result["more"] = True
+            result["last"] = _text_key(last)
         return result
+
+    def gather(
+        self, path: str, target: Mapping[str, Any], items: dict[tuple[str, ...], Any]
+    ) -> None:
+        """The page items one node gives: its rows, its instances, or itself when empty."""
+        node = target["node"]
+        names: set[str] = set(target["names"])
+        node_key = _key(path)
+        top, children = _parm_tree(node)
+        if not target["whole"] and len(names) == 1:
+            only = next(iter(names))
+            tuple_ = next((item for item in top if item.name() == only), None)
+            if tuple_ is not None and _is_multi(tuple_, _kind(tuple_)):
+                groups = children.get(only, {})
+                for index in sorted(groups):
+                    chosen = self.choose(groups[index], children, lambda _: True, whole=True)
+                    key = (*node_key, only, _INSTANCE_KEY.format(index))
+                    items[key] = ("inst", (node, path, tuple_, index, chosen, len(groups)))
+                if not groups:
+                    items[(*node_key, only)] = ("row", (node, path, (tuple_, _kind(tuple_), [])))
+                return
+        if target["whole"]:
+            test, whole = self.parm_test(None)
+        else:
+            test, whole = (lambda _: False), True
+
+        def keeps(tuple_: Any) -> bool:
+            return tuple_.name() in names or bool(test(tuple_))
+
+        chosen = self.choose(top, children, keeps, whole=whole, named=names)
+        for item in chosen:
+            items[(*node_key, item[0].name())] = ("row", (node, path, item))
+        if not chosen:
+            items[node_key] = ("empty", (node, path))
+
+    def add_to_page(self, grouped: dict[str, dict[str, Any]], kind: str, payload: Any) -> None:
+        node, path = payload[0], payload[1]
+        if path not in grouped:
+            self.cook(node)
+            grouped[path] = {"path": path, **self.marks(node), "parms": []}
+        rows = grouped[path]["parms"]
+        if kind == "row":
+            rows.append(self.parm_row(payload[2], expressions=True))
+        elif kind == "inst":
+            _, _, tuple_, index, chosen, total = payload
+            group = [self.parm_row(inner, expressions=True) for inner in chosen]
+            if rows and rows[-1]["n"] == tuple_.name() and "inst_from" in rows[-1]:
+                rows[-1]["inst"].append(group)
+            else:
+                rows.append({"n": tuple_.name(), "v": total, "inst_from": index, "inst": [group]})
 
     def parm_test(self, only: str | None) -> tuple[Any, bool]:
         """Which parameters a read keeps, and whether a kept multiparm keeps all of itself.
@@ -1462,14 +1660,21 @@ class _Reader:
         return [self.parm_row(item, expressions=self.wants("expressions")) for item in chosen]
 
     def choose(
-        self, tuples: Any, children: Mapping[str, Any], test: Any, *, whole: bool = False
+        self,
+        tuples: Any,
+        children: Mapping[str, Any],
+        test: Any,
+        *,
+        whole: bool = False,
+        named: set[str] | None = None,
     ) -> list[Any]:
         """The parameters a test keeps, with the instances of each multiparm.
 
         A multiparm is kept when it passes, or when any of its instances do.
         Its instances are the ones that pass, or all of them when `whole` is
         set and the multiparm itself passed, which is how a glob or a name
-        that picks out a multiparm reads.
+        that picks out a multiparm reads. At most `MAX_INSTANCES` instances
+        are looked at; the row says how many there are.
         """
         chosen: list[Any] = []
         for tuple_ in tuples:
@@ -1481,13 +1686,15 @@ class _Reader:
             instances = None
             if multi:
                 groups = children.get(tuple_.name(), {})
-                inner = (lambda _: True) if hit and whole else test
+                picked_whole = hit and (whole or tuple_.name() in (named or ()))
+                inner = (lambda _: True) if picked_whole else test
                 instances = [
-                    self.choose(groups[index], children, inner, whole=whole)
-                    for index in sorted(groups)
+                    self.choose(groups[index], children, inner, whole=picked_whole)
+                    for index in sorted(groups)[:MAX_INSTANCES]
                 ]
                 if not hit and not any(instances):
                     continue
+                instances = _Instances(instances, len(groups))
             elif not hit:
                 continue
             chosen.append((tuple_, kind, instances))
@@ -1504,13 +1711,17 @@ class _Reader:
         if any(_ask(parm, "isLocked") for parm in parms):
             row["lock"] = True
         if instances is not None:
-            row["v"] = len(instances)
+            total = getattr(instances, "total", len(instances))
+            row["v"] = total
             if kind == "Ramp":
                 row["ramp"] = True
             row["inst"] = [
                 [self.parm_row(inner, expressions=expressions) for inner in group]
                 for group in instances
             ]
+            if total > len(instances):
+                row["inst_total"] = total
+                row["truncated"] = True
             return row
         if kind == "Data":
             row["data"] = True
@@ -1528,27 +1739,38 @@ class _Reader:
         values: list[Any] = []
         written: dict[str, str] = {}
         languages: set[str] = set()
-        withheld = failed = keyed = False
+        withheld: str | None = None
+        failed = keyed = False
         expanded: list[tuple[str, Any]] = []
         for parm in parms:
-            text = _quiet(parm.expression)
+            if not self.evaluate and self.exports.drives(parm):
+                withheld = withheld or OVERRIDE
+                continue
+            text, keys = _expression_of(parm)
+            if keys:
+                keyed = True
+                if not self.evaluate:
+                    withheld = withheld or KEYFRAMES
+                    continue
             if text is not None:
-                written[parm.name()] = str(text)
+                written[parm.name()] = text
                 language = _language(parm)
                 languages.add(language)
-                keyed = keyed or bool(_CURVE.fullmatch(str(text)))
-                if not self.evaluate and not _safe_expression(parm, str(text), language, 0):
-                    withheld = True
-                    continue
-            value = _value(parm, kind, template, evaluated=text is not None)
+                keyed = keyed or bool(_CURVE.fullmatch(text))
+                if not self.evaluate:
+                    problem = _expression_problem(parm, text, language, 0, self.exports)
+                    if problem:
+                        withheld = withheld or problem
+                        continue
+            value = _value(parm, kind, template, evaluated=text is not None or keys)
             if value is _FAILED:
                 failed = True
                 continue
             values.append(value)
-            if kind == "String" and text is None:
+            if kind == "String" and text is None and not keys:
                 expanded.append((str(value), self.expanded(parm, str(value))))
         if withheld:
-            row["not_cooked"] = True
+            row["not_cooked"] = withheld
         elif failed:
             row["failed"] = True
         else:
@@ -1558,10 +1780,10 @@ class _Reader:
             row["lang"] = "python" if "python" in languages else "hscript"
         if keyed:
             row["keys"] = True
-        found = [value for _, value in expanded]
-        if any(value is _WITHHELD for value in found):
-            row["not_cooked"] = True
-        elif any(value is not None for value in found):
+        held = next((value.reason for _, value in expanded if isinstance(value, _Held)), None)
+        if held and not withheld:
+            row["not_cooked"] = held
+        elif any(value is not None for _, value in expanded) and not held:
             texts = [raw if value is None else value for raw, value in expanded]
             row["ev"] = texts[0] if len(texts) == 1 else texts
         return row
@@ -1570,8 +1792,10 @@ class _Reader:
         """A string as Houdini expands it, when that differs and is safe to ask."""
         if "$" not in raw and "`" not in raw:
             return None
-        if "`" in raw and not self.evaluate:
-            return _WITHHELD
+        if not self.evaluate:
+            problem = _string_problem(raw)
+            if problem:
+                return _Held(problem)
         value = _ask(parm, "evalAsString")
         return None if value is None or value == raw else str(value)
 
@@ -1579,7 +1803,21 @@ class _Reader:
 # Section: reading helpers for inspect
 
 _FAILED = object()
-_WITHHELD = object()
+
+
+class _Held:
+    """A value left out, and why."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+
+class _Instances(list):
+    """The instances of a multiparm a row carries, and how many there are."""
+
+    def __init__(self, groups: list[Any], total: int) -> None:
+        super().__init__(groups)
+        self.total = total
 
 
 def _choice(value: Any, allowed: tuple[str, ...], name: str, default: str) -> str:
@@ -1603,13 +1841,31 @@ def _text_key(key: tuple[str, ...] | None) -> str:
     return "/" + "/".join(key or ())
 
 
-def _digest(keys: list[tuple[str, ...]]) -> str:
-    """A short fingerprint of the rows a read matched, to tell pages apart."""
-    text = "\n".join(_text_key(key) for key in keys)
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+def _tidy(path: str) -> str:
+    """A path without a trailing or doubled slash, so one node has one spelling."""
+    return _text_key(_key(path)) if path.startswith("/") else path
 
 
-def _node_at(hou: Any, path: str) -> Any:
+def _sorted_children(node: Any) -> list[Any]:
+    children = list(_quiet(node.children) or ())
+    return sorted(children, key=lambda child: str(_ask(child, "name") or ""))
+
+
+def _scene_mark(hou: Any) -> str:
+    """A short fingerprint of the scene's edit history.
+
+    Every edit that can be undone leaves an entry on the undo stack, and a
+    read leaves none, so the entries change between two pages exactly when
+    the scene was edited in between. An edit made with undo turned off is not
+    seen; the scene epoch and the resume point cover a scene replaced or a
+    row taken away.
+    """
+    labels = _quiet(lambda: list(hou.undos.undoLabels()))
+    text = "\n".join(str(label) for label in labels) if labels is not None else "?"
+    return hashlib.sha256(f"{len(labels or ())}\n{text}".encode()).hexdigest()[:16]
+
+
+def _node_at(hou: Any, path: str, near: _NearIndex | None = None) -> Any:
     """The node at a path, or why there is none.
 
     A path that names a parameter is `PATH_NOT_A_NODE`, which says which node
@@ -1628,15 +1884,16 @@ def _node_at(hou: Any, path: str) -> Any:
             {"path": path, "node": holder, "parm": _ask(parm, "name")},
             hint="read it with mode parms, or ask for the node that holds it",
         )
+    finder = near or _NearIndex(hou, MAX_NEAR)
     raise BridgeError(
         "NODE_NOT_FOUND",
         f"no node at {path}",
-        {"path": path, "did_you_mean": _near(hou, path, limit=MAX_NEAR)},
+        {"path": path, "did_you_mean": finder.near(path)},
         hint="read the tree above it and use a path that is there",
     )
 
 
-def _parm_target(hou: Any, path: str) -> tuple[Any, str | None]:
+def _parm_target(hou: Any, path: str, near: _NearIndex | None = None) -> tuple[Any, str | None]:
     """A node whose table is wanted, or the node and name of one parameter."""
     node = _quiet(lambda: hou.node(path))
     if node is not None:
@@ -1647,7 +1904,7 @@ def _parm_target(hou: Any, path: str) -> tuple[Any, str | None]:
         found = _quiet(lambda: single.tuple()) if single is not None else None
     if found is not None:
         return found.node(), found.name()
-    return _node_at(hou, path), None
+    return _node_at(hou, path, near), None
 
 
 def _failed_entry(path: str, error: BaseException) -> dict[str, Any]:
@@ -1757,17 +2014,42 @@ def _has_value(tuple_: Any) -> bool:
     return kind != "Folder" or _is_multi(tuple_, kind)
 
 
+def _components(tuple_: Any) -> list[Any]:
+    return list(_quiet(lambda: list(tuple_)) or ())
+
+
 def _at_default(tuple_: Any) -> bool:
     """Whether a parameter is at its default, comparing expressions as text.
 
     Comparing values would evaluate an expression, which can cook whatever it
-    reads, so the text of an expression is what is compared.
+    reads, so the text of an expression is what is compared. A parameter a
+    channel operator drives is never at its default, whatever it reads.
     """
+    if any(_quiet(parm.isOverrideTrackActive) for parm in _components(tuple_)):
+        return False
     return bool(_quiet(lambda: tuple_.isAtDefault(compare_expressions=True)))
 
 
 def _animated(tuple_: Any) -> bool:
-    return any(_quiet(parm.expression) is not None for parm in _quiet(lambda: list(tuple_)) or ())
+    for parm in _components(tuple_):
+        text, keys = _expression_of(parm)
+        if text is not None or keys or _quiet(parm.isOverrideTrackActive):
+            return True
+    return False
+
+
+def _expression_of(parm: Any) -> tuple[str | None, bool]:
+    """A parameter's expression, and whether it has keyframes it will not show.
+
+    The build hands back the expression of a parameter with one keyframe and
+    refuses one with more. Reading the keyframes themselves evaluates them,
+    which can cook, so a refusal that is not the plain "not animated" is taken
+    to mean keyframes and nothing more is asked.
+    """
+    try:
+        return str(parm.expression()), False
+    except Exception as error:  # noqa: BLE001 - the refusal is the answer
+        return None, "not animated" not in str(error).lower()
 
 
 def _code_language(tuple_: Any) -> str | None:
@@ -1805,42 +2087,184 @@ def _value(parm: Any, kind: str, template: Any, *, evaluated: bool) -> Any:
     return str(value)
 
 
-def _safe_expression(parm: Any, text: str, language: str, depth: int) -> bool:
-    """Whether evaluating an expression can be done without cooking anything.
-
-    Only an HScript expression made of numbers, the global variables and the
-    functions that read nothing from the scene is safe, plus references to
-    other parameters that are themselves safe, a few steps deep.
-    """
-    if language != "hscript" or depth > MAX_REFERENCE_DEPTH or "`" in text:
-        return False
-    bare = _LITERAL.sub('""', text)
-    calls = _CALL.findall(bare)
-    for name in calls:
-        if name not in SAFE_FUNCTIONS and name not in REFERENCE_FUNCTIONS:
-            return False
-    if any(name not in SAFE_VARIABLES for name in _VARIABLE_NAME.findall(text)):
-        return False
-    references = _REFERENCE.findall(text)
-    if len(references) != sum(1 for name in calls if name in REFERENCE_FUNCTIONS):
-        return False
-    node = _quiet(parm.node)
-    for quoted in references:
-        target = quoted[1:-1]
-        if not target or "$" in target or "`" in target or node is None:
-            return False
-        referenced = _quiet(lambda target=target: node.parm(target))
-        if referenced is None or not _safe_parm(referenced, depth + 1):
-            return False
-    return True
+def _variable_allowed(name: str) -> bool:
+    return name in SAFE_VARIABLES or bool(_PADDED_FRAME.fullmatch(name))
 
 
-def _safe_parm(parm: Any, depth: int) -> bool:
-    text = _quiet(parm.expression)
+def _string_problem(raw: str) -> str | None:
+    """Why expanding a string outside a cook would be wrong, or nothing."""
+    if "`" in raw:
+        return BACKTICK
+    for name in _VARIABLE_NAME.findall(raw):
+        if not _variable_allowed(name):
+            return f"variable ${name}"
+    return None
+
+
+def _parm_problem(parm: Any, depth: int, exports: _Exports) -> str | None:
+    """Why reading a parameter's value could cook, or nothing when it cannot."""
+    if exports.drives(parm):
+        return OVERRIDE
+    text, keys = _expression_of(parm)
+    if keys:
+        return KEYFRAMES
     if text is None:
         raw = _quiet(parm.unexpandedString)
-        return raw is None or "`" not in str(raw)
-    return _safe_expression(parm, str(text), _language(parm), depth)
+        return None if raw is None else _string_problem(str(raw))
+    return _expression_problem(parm, text, _language(parm), depth, exports)
+
+
+def _expression_problem(
+    parm: Any, text: str, language: str, depth: int, exports: _Exports
+) -> str | None:
+    """Why evaluating an expression could cook, or nothing when it cannot.
+
+    Only HScript is read, token by token: numbers, operators, the variables
+    and functions that read nothing from the scene, and references to another
+    parameter written as one quoted name, which are followed a few steps and
+    are as safe as what they reach. A reference is never read out of a
+    string, and one whose target is worked out is refused.
+    """
+    if language != "hscript":
+        return PYTHON
+    if depth > MAX_REFERENCE_DEPTH:
+        return "references too deep"
+    tokens = _TOKEN.findall(text)
+    for index, token in enumerate(tokens):
+        if token == "`":
+            return BACKTICK
+        if token[0] in "\"'":
+            if len(token) < 2 or token[-1] != token[0]:
+                return "unreadable expression"
+            problem = _string_problem(token[1:-1])
+            if problem:
+                return problem
+            continue
+        if token[0] == "$":
+            name = token.strip("${}")
+            if not _variable_allowed(name):
+                return f"variable ${name}"
+            continue
+        if not (token[0].isalpha() or token[0] == "_"):
+            continue
+        called = index + 1 < len(tokens) and tokens[index + 1] == "("
+        if not called:
+            return f"reads {token}"
+        if token in REFERENCE_FUNCTIONS:
+            problem = _reference_problem(parm, token, tokens[index + 2 : index + 4], depth, exports)
+            if problem:
+                return problem
+        elif token not in SAFE_FUNCTIONS:
+            return f"calls {token}()"
+    return None
+
+
+def _reference_problem(
+    parm: Any, function: str, rest: list[str], depth: int, exports: _Exports
+) -> str | None:
+    """Whether one `ch()` and its like reaches only what is safe to read."""
+    if len(rest) != 2 or rest[1] != ")" or rest[0][0] not in "\"'" or len(rest[0]) < 2:
+        return f"{function}() of a worked out name"
+    target = rest[0][1:-1]
+    if not target or any(mark in target for mark in ("$", "`", "\\")):
+        return f"{function}() of a worked out name"
+    node = _quiet(parm.node)
+    referenced = _quiet(lambda: node.parm(target)) if node is not None else None
+    if referenced is None:
+        return f"{function}() of a parameter that is not there"
+    problem = _parm_problem(referenced, depth + 1, exports)
+    return f'{function}("{target}"): {problem}' if problem else None
+
+
+class _Exports:
+    """Which parameters a channel operator's export may drive, found without a cook.
+
+    A parameter an export drives says so once the channel operator has
+    cooked. Before that first cook it does not, yet reading it cooks the
+    channel operator. So a node that an exporting channel operator depends on
+    and that has never cooked has every number on it taken as driven.
+    """
+
+    def __init__(self) -> None:
+        self._waiting: dict[str, bool] = {}
+
+    def drives(self, parm: Any) -> bool:
+        if _quiet(parm.isOverrideTrackActive):
+            return True
+        if _quiet(lambda: parm.parmTemplate().type().name()) == "String":
+            return False
+        node = _quiet(parm.node)
+        if node is None:
+            return False
+        path = str(node.path())
+        if path not in self._waiting:
+            found = _quiet(lambda: node.dependents(include_children=False)) or ()
+            self._waiting[path] = any(
+                _ask(other, "isExportFlagSet") is True and not _ask(other, "cookCount")
+                for other in found
+            )
+        return self._waiting[path]
+
+
+# How alike two names must be to be offered as a near miss.
+NEAR_CUTOFF = 0.5
+
+
+class _NearIndex:
+    """The closest existing paths to ones that are not there.
+
+    The nodes under an ancestor are gathered once, level by level up to a
+    bound, and shared by every path in a batch that falls back to the same
+    ancestor.
+    """
+
+    def __init__(self, hou: Any, limit: int) -> None:
+        self.hou = hou
+        self.limit = limit
+        self._below: dict[str, list[tuple[str, str, int]]] = {}
+
+    def near(self, path: str) -> list[str]:
+        parts = [part for part in str(path).split("/") if part]
+        leaf = parts[-1] if parts else ""
+        while parts:
+            parts.pop()
+            above = "/" + "/".join(parts)
+            found = _quiet(lambda above=above: self.hou.node(above))
+            if found is not None:
+                return self.rank(leaf, self.below(above, found))
+        return []
+
+    def below(self, above: str, root: Any) -> list[tuple[str, str, int]]:
+        if above not in self._below:
+            seen: list[tuple[str, str, int]] = []
+            level = [(child, 1) for child in _quiet(root.children) or ()]
+            while level and len(seen) < NEAR_SCAN:
+                following: list[tuple[Any, int]] = []
+                for node, depth in level:
+                    if len(seen) >= NEAR_SCAN:
+                        break
+                    seen.append((str(_ask(node, "name") or ""), str(node.path()), depth))
+                    if not _ask(node, "isLockedHDA"):
+                        following.extend(
+                            (child, depth + 1) for child in _quiet(node.children) or ()
+                        )
+                level = following
+            self._below[above] = seen
+        return self._below[above]
+
+    def rank(self, leaf: str, candidates: list[tuple[str, str, int]]) -> list[str]:
+        """Candidates whose names are close to the last part, closest first."""
+        if not leaf:
+            return []
+        wanted = leaf.lower()
+        scored = []
+        for name, path, depth in candidates:
+            lowered = name.lower()
+            ratio = SequenceMatcher(None, wanted, lowered).ratio()
+            if ratio >= NEAR_CUTOFF or (wanted and lowered.startswith(wanted)):
+                scored.append((-ratio, depth, path))
+        scored.sort()
+        return [path for _, _, path in scored[: self.limit]]
 
 
 # Section: shared helpers
@@ -1870,44 +2294,8 @@ def _node(hou: Any, path: str) -> Any:
 
 
 def _near(hou: Any, path: str, *, limit: int = MAX_HINTS) -> list[str]:
-    """Paths close to one that is not there, from the deepest parent that is.
-
-    The parent's own children come first. When they give fewer than `limit`,
-    nodes further down whose names are close to the last part of the path
-    follow, so a node asked for one level too high is still found.
-    """
-    parts = [part for part in str(path).split("/") if part]
-    leaf = parts[-1] if parts else ""
-    while parts:
-        parts.pop()
-        above = "/" + "/".join(parts)
-        found = _quiet(lambda above=above: hou.node(above))
-        if found is None:
-            continue
-        children = _quiet(found.children) or ()
-        # Only names that really are close. Three unrelated siblings under a
-        # heading of did you mean is worse than saying nothing.
-        close = did_you_mean(path, [child.path() for child in children], limit=limit)
-        if len(close) < limit and leaf:
-            close.extend(_named_like(found, leaf, limit - len(close), set(close)))
-        return close
-    return []
-
-
-def _named_like(root: Any, name: str, limit: int, skip: set[str]) -> list[str]:
-    """Paths under a node whose last part is close to a name, closest first."""
-    below = _quiet(lambda: root.allSubChildren(recurse_in_locked_nodes=False)) or ()
-    by_name: dict[str, list[str]] = {}
-    for index, node in enumerate(below):
-        if index >= NEAR_SCAN:
-            break
-        by_name.setdefault(str(_ask(node, "name")), []).append(str(node.path()))
-    found: list[str] = []
-    for close in did_you_mean(name, list(by_name), limit=limit):
-        for path in by_name[close]:
-            if path not in skip and len(found) < limit:
-                found.append(path)
-    return found
+    """Paths close to one that is not there, closest first."""
+    return _NearIndex(hou, limit).near(path)
 
 
 def _types(parent: Any, wanted: str) -> list[str]:
