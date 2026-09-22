@@ -539,8 +539,10 @@ class Bridge:
         `main_thread.pulse_age_s` is the number a caller reads to see whether
         the main thread is taking work: it is a float in memory, stamped the
         last time the main thread ran our code, and it climbs while Houdini is
-        cooking. `heartbeat_age_s` answers a different question, whether this
-        bridge is still writing where other processes can see it.
+        cooking. How soon an idle main thread picks work up follows Houdini's
+        own event loop, and a sleeping display slows that to about 200 ms.
+        `heartbeat_age_s` answers a different question, whether this bridge is
+        still writing where other processes can see it.
         """
         refused = self._front(request)
         if refused is not None:
