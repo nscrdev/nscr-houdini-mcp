@@ -46,8 +46,21 @@ SKIP_SUFFIXES = {
 }
 
 
-# Joined at load time so this file does not match its own rule.
-FIXED_TERMS = ("Co-Authored" + "-By", "Generated " + "with", "nore" + "ply@")
+# Credit lines, refused whatever the term list says. Each one is written as
+# its separate words, so this file does not match its own rule, and the words
+# are joined into a pattern that allows any run of spaces, line breaks and
+# hyphens between them. A line break counts, so a credit line wrapped by an
+# editor is caught as readily as one on a single line.
+FIXED_PHRASES = (
+    ("Co", "Authored", "By"),
+    ("Generated", "with"),
+)
+
+# Fixed terms that are one word and take no separator.
+FIXED_WORDS = ("nore" + "ply@",)
+
+# What may sit between the words of a credit line and still be one.
+BETWEEN_WORDS = r"[-\s]+"
 
 
 def fail(message: str) -> int:
@@ -72,24 +85,30 @@ def load_terms(root: Path) -> tuple[list[str], re.Pattern[str]] | None:
     except (OSError, UnicodeDecodeError):
         return None
 
-    # Credit lines are refused everywhere, whatever the list says.
-    terms: list[str] = list(FIXED_TERMS)
+    terms: list[str] = []
     for line in raw.splitlines():
         line = line.split("#", 1)[0].strip().strip("\r")
         if line:
             terms.append(line)
+    # The list decides whether this guard is armed at all. A file of nothing
+    # but comments is an empty list, and an empty list blocks the commit.
     if not terms:
         return None
 
-    parts = []
-    for term in terms:
-        escaped = re.escape(term)
-        if term[:1].isalnum():
-            escaped = r"(?<!\w)" + escaped
-        if term[-1:].isalnum():
-            escaped = escaped + r"(?!\w)"
-        parts.append(escaped)
+    parts = [_word_pattern(term) for term in terms + list(FIXED_WORDS)]
+    for phrase in FIXED_PHRASES:
+        parts.append(BETWEEN_WORDS.join(_word_pattern(word) for word in phrase))
     return terms, re.compile("|".join(parts), re.IGNORECASE)
+
+
+def _word_pattern(term: str) -> str:
+    """One term, matched on its own rather than inside a longer word."""
+    escaped = re.escape(term)
+    if term[:1].isalnum():
+        escaped = r"(?<!\w)" + escaped
+    if term[-1:].isalnum():
+        escaped = escaped + r"(?!\w)"
+    return escaped
 
 
 def staged_paths(root: Path) -> list[str]:
@@ -108,11 +127,16 @@ def staged_content(path: str) -> str | None:
 
 
 def scan(text: str, pattern: re.Pattern[str], label: str) -> list[str]:
+    """Every match in a file or a message, with the line each one starts on.
+
+    The whole text is searched at once rather than line by line, because a
+    credit line broken across two lines is still a credit line.
+    """
     hits = []
-    for number, line in enumerate(text.splitlines(), start=1):
-        match = pattern.search(line)
-        if match:
-            hits.append(f"{label}:{number}: {match.group(0)}")
+    for match in pattern.finditer(text):
+        number = text.count("\n", 0, match.start()) + 1
+        found = " ".join(match.group(0).split())
+        hits.append(f"{label}:{number}: {found}")
     return hits
 
 
