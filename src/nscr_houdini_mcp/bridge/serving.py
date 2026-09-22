@@ -283,6 +283,13 @@ STOP_WAIT_S = 1.0
 # because no handler ever runs for it.
 BUSY_BODY = b'{"ok":false,"error":{"code":"SERVER_BUSY","message":"too many connections"}}'
 
+# Once the refusal is written the write side is closed and the request nobody
+# wanted is read out for this long. Windows resets a connection that is closed
+# with bytes still unread, and the reset takes the refusal with it before the
+# caller has read it.
+BUSY_LINGER_S = 1.0
+BUSY_LINGER_STEP_S = 0.2
+
 
 class StdlibBackend:
     """A threading HTTP server from the standard library, on loopback.
@@ -619,8 +626,28 @@ def _say_busy(connection: socket.socket) -> None:
     )
     try:
         connection.sendall(head.encode("ascii") + BUSY_BODY)
+        connection.shutdown(socket.SHUT_WR)
     except OSError:
-        pass
+        return
+    _linger(connection)
+
+
+def _linger(connection: socket.socket) -> None:
+    """Read out the request nobody wanted, so closing does not reset it.
+
+    The caller is still sending, or has sent and not yet read. Either way the
+    bytes sit unread on our side, and on Windows that turns the close into a
+    reset the caller sees instead of the refusal. Waiting for the end of what
+    it sent, or for a quiet moment, leaves nothing for the close to throw away.
+    """
+    end = time.monotonic() + BUSY_LINGER_S
+    try:
+        connection.settimeout(BUSY_LINGER_STEP_S)
+        while time.monotonic() < end:
+            if not connection.recv(DRAIN_BYTES):
+                return
+    except OSError:
+        return
 
 
 def make_backend(transport: str, server_name: str) -> Backend:

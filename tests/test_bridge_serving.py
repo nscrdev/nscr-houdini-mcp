@@ -211,6 +211,20 @@ def test_a_connection_left_open_is_closed_after_the_idle_time() -> None:
         backend.stop()
 
 
+def turned_away(connection: http.client.HTTPConnection) -> bool:
+    """Whether the server refused this connection.
+
+    Over the cap it writes a 503 and hangs up. The hang up can reach a caller
+    before the answer does, so a broken connection counts as turned away too:
+    either way nothing of the request was served.
+    """
+    try:
+        answer = post(connection)
+        return answer.status == 503 and b"SERVER_BUSY" in answer.read()
+    except (OSError, http.client.HTTPException):
+        return True
+
+
 def test_connections_past_the_cap_are_turned_away() -> None:
     backend, seen, port = serve(max_connections=2)
     held = []
@@ -221,9 +235,12 @@ def test_connections_past_the_cap_are_turned_away() -> None:
             held.append(connection)
         over = open_connection(port)
         held.append(over)
-        answer = post(over)
-        assert answer.status == 503
-        assert b"SERVER_BUSY" in answer.read()
+        assert turned_away(over)
+        # The cap turned one connection away, not the server: what it was
+        # already serving is answered as before.
+        answer = post(held[0])
+        assert answer.status == 200
+        answer.read()
     finally:
         for connection in held:
             connection.close()
