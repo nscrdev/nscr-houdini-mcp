@@ -57,6 +57,24 @@ def test_every_code_is_an_error_whose_text_stands_alone(code: str) -> None:
     assert body["trace"] == TRACE
 
 
+def test_an_error_carries_no_place_on_disk() -> None:
+    error = CallError(
+        "OUTPUT_REFUSED",
+        "/Users/somebody/shots/.agent/outputs.toml: the file must hold a table",
+        hint="fix C:\\shows\\config.toml",
+        details={"reason": "/home/somebody/hython is not a file", "file": ".agent/outputs.toml"},
+    )
+    result = error_result(error, TRACE)
+    text = text_of(result)
+    assert "somebody" not in text
+    assert "the file must hold a table" in text and "<path>" in text
+    body = result.structured_content["error"]
+    assert "somebody" not in json.dumps(body)
+    assert body["details"]["file"] == ".agent/outputs.toml"
+    # The error the tool raised is not changed on the way out.
+    assert error.message.startswith("/Users/somebody")
+
+
 @pytest.mark.parametrize("code", sorted(BRIDGE_CODES))
 def test_every_bridge_refusal_becomes_the_same_code(code: str) -> None:
     payload = {

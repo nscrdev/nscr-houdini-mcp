@@ -6,6 +6,9 @@ the same JSON, a large one is a line saying where the whole of it went. An
 error's text carries the code, the message, the hint and the details, so it is
 enough to act on without the structured part.
 
+An error never carries a place on disk: the server replaces them with a
+marker the same way the bridge does.
+
 Every result, error or not, carries a `trace`: the session that answered, its
 alias and its scene epoch, and the operation id when the call changed the
 scene. Before a session is chosen these are empty.
@@ -34,7 +37,7 @@ from typing import Any
 from mcp_types import CallToolResult, TextContent
 
 from nscr_houdini_mcp.bridge.errors import CODES as BRIDGE_CODES
-from nscr_houdini_mcp.bridge.errors import hide_paths
+from nscr_houdini_mcp.bridge.errors import hide_paths, redact
 from nscr_houdini_mcp.bridge.security import InsecureLocation, private_dir, write_private
 
 # Codes only the server raises. The bridge's own table is the rest.
@@ -199,12 +202,30 @@ def _strictly(value: Any) -> str:
 
 
 def error_result(error: CallError, trace: Mapping[str, Any] | None = None) -> CallToolResult:
-    """An error the client reads as one, with a text block that stands alone."""
+    """An error the client reads as one, with a text block that stands alone.
+
+    The rule the bridge keeps holds here too: no place on disk leaves in an
+    error. Exception text the server passes on can hold a config file's or a
+    program's full path, so every one is replaced with a marker, and the
+    details name files by a name relative to where they belong.
+    """
+    error = redacted(error)
     body = {"error": error.as_dict(), "trace": dict(trace or empty_trace())}
     return CallToolResult(
         content=[TextContent(type="text", text=error_text(error))],
         structured_content=body,
         is_error=True,
+    )
+
+
+def redacted(error: CallError) -> CallError:
+    """The same error with every place on disk in it replaced with a marker."""
+    return CallError(
+        error.code,
+        hide_paths(error.message),
+        hint=hide_paths(error.hint) if error.hint else None,
+        details=redact(error.details),
+        trace=error.trace,
     )
 
 

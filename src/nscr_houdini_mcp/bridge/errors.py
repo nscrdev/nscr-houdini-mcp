@@ -140,6 +140,11 @@ def hide_paths(text: str) -> str:
     return text
 
 
+def redact(value: Any) -> Any:
+    """Any value with every place on disk in it replaced with a marker."""
+    return _safe_value(value)
+
+
 def _safe_value(value: Any) -> Any:
     if isinstance(value, str):
         return hide_paths(value)

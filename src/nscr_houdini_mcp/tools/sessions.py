@@ -378,7 +378,11 @@ def coded_start_failure(error: Exception, store: Any, config: Config) -> Excepti
             details={"pool": pool_summary(active, config)},
         )
     if isinstance(error, pool.HythonNotFound):
-        return CallError("HYTHON_NOT_FOUND", str(error))
+        return CallError(
+            "HYTHON_NOT_FOUND",
+            str(error),
+            details={"config": ["hython", "houdini_build"], "env": pool.HYTHON_ENV_VAR},
+        )
     if isinstance(error, pool.WorkerStartFailed):
         return CallError(
             "WORKER_START_FAILED",

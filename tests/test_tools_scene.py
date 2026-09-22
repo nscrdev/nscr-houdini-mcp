@@ -391,3 +391,19 @@ def test_a_save_another_server_is_running_under_the_same_id_is_not_run_twice(
     assert bench.sent.calls == []
     with bench.store() as store:
         assert store.latest_version(kind="hip", name="shot", hip_family="shot") == 0
+
+
+def test_bad_output_conventions_are_named_without_a_place_on_disk(
+    bench: Bench, project: Path
+) -> None:
+    current = project / "shot.hip"
+    current.write_bytes(b"scene")
+    (project / ".agent").mkdir()
+    (project / ".agent" / "outputs.toml").write_text("[outputs]\nversion_width = 99\n")
+    result = scene(bench, info(current), COMMERCIAL, action="save_increment")
+    error = result.structured_content["error"]
+    assert error["code"] == "OUTPUT_REFUSED"
+    assert str(project) not in text_of(result)
+    assert ".agent/outputs.toml beside the scene" in error["details"]["conventions"]
+    assert "conventions file" in error["hint"]
+    assert sent_tools(bench) == ["scene.info", "bridge.capabilities"]

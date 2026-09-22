@@ -58,6 +58,12 @@ from nscr_houdini_mcp.tools.base import (
 
 ACTIONS = ("info", "open", "save", "save_increment")
 
+# Where the output conventions come from, named the way a person finds them.
+CONVENTION_FILES = (
+    f"{outputs_module.PROJECT_FILE_NAMES[0]} beside the scene",
+    f"{outputs_module.USER_FILE_NAMES[0]} in the state folder",
+)
+
 _VERSION = re.compile(r"[._-]v(\d+)$", re.IGNORECASE)
 
 # The keys of `scene.info` a summary keeps.
@@ -332,7 +338,13 @@ def allocate(
         raise CallError("OUTPUT_BUSY", str(error), details={"kind": "hip"}) from None
     except outputs_module.OutputError as error:
         raise CallError(
-            "OUTPUT_REFUSED", str(error), details={"kind": "hip", "exception": type(error).__name__}
+            "OUTPUT_REFUSED",
+            str(error),
+            details={
+                "kind": "hip",
+                "exception": type(error).__name__,
+                "conventions": list(CONVENTION_FILES),
+            },
         ) from None
     except (store_module.StoreError, sqlite3.Error) as error:
         raise unavailable(error) from None
