@@ -8,9 +8,9 @@ started keep running, and callbacks that fired during the edit have already
 fired. A reply never claims more than that.
 
 A failed call is rolled back only when the group actually recorded something.
-Measured in a headless session: a group whose body raised before it touched
-the graph added no undo entry at all, so an undo there would have reversed the
-artist's last edit instead of this call's. The reply says which happened.
+A group whose body raises before it touches the graph adds no undo entry, so
+an undo there would reverse the artist's last edit instead of this call's. The
+reply says which happened.
 
 In a graphical session this runs on the main thread. Off it, the group is
 silently not a group: ten creates inside one recorded ten entries.

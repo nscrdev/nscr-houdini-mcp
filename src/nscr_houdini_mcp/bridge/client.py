@@ -176,7 +176,10 @@ def call(
     """Send one request envelope.
 
     `wait_s` and `timeout_s` are the bridge's budgets: how long the call may
-    wait for its turn, and how long it may wait for work that is running.
+    wait for its turn, and how long it may wait for work that is running. A
+    call that names no `wait_s` waits one second and is then told the session
+    is busy, so a caller that means to queue behind a long running call has to
+    ask for a longer wait.
     `http_timeout_s` is how long this end waits on the socket. It defaults to
     a little more than both, because a client that gives up before the bridge
     answers learns nothing and leaves the work running.

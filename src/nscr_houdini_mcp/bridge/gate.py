@@ -71,7 +71,9 @@ class Gate:
 
     @property
     def held(self) -> bool:
-        return self._held
+        """Whether somebody has the session right now."""
+        with self._ready:
+            return self._held
 
     def waiting(self) -> int:
         """How many calls are queued behind the one that holds the session."""

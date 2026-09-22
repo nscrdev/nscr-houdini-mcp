@@ -1,7 +1,7 @@
 """Where a tool's work actually runs.
 
 Anything that changes the scene runs on the process main thread, in every
-session kind. It has to. Measured on this machine:
+session kind. It has to. In Houdini 22, with a user interface and without:
 
 - With a user interface, ten node creates inside one undo group from a handler
   thread added ten undo entries instead of one, and took about 94 ms per node
@@ -16,9 +16,9 @@ The two kinds get there by different routes, because they have different main
 threads to reach.
 
 - With a user interface: `hou.ui.postEventCallback` with a `threading.Event`
-  and a result slot. Not `hdefereval`: measured from a handler thread, the
-  callback took about 17 ms idle and 23 ms during playback, against 53 ms and
-  973 ms. `hdefereval` also does not exist outside a graphical Houdini.
+  and a result slot. Not `hdefereval`: from a handler thread the callback
+  costs about 17 ms idle and 23 ms during playback, against 53 ms and 973 ms
+  for `hdefereval`, which also does not exist outside a graphical Houdini.
 - Headless: the bridge's own main thread runs a small loop and takes work off
   a queue. Where nothing is running that loop, the work falls back to a thread
   of its own and the reply says no undo entry was recorded, rather than
