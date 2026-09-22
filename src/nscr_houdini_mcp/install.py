@@ -248,11 +248,11 @@ def install(
         replaced=exists,
         dry_run=dry_run,
         lines=[
-            f"package     {path}",
-            f"houdini     {version}",
-            f"houdini path {payload}",
-            f"pythonpath  {source}",
-            f"{AUTOSTART_ENV_VAR}  {'1' if autostart else '0'}",
+            f"package       {path}",
+            f"houdini        {version}",
+            f"houdini path   {payload}",
+            f"pythonpath     {source}",
+            f"{AUTOSTART_ENV_VAR}   {'1' if autostart else '0'}",
         ],
     )
 
