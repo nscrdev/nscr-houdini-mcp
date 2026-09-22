@@ -38,6 +38,7 @@ from nscr_houdini_mcp.bridge.app import (
     BridgeConfig,
 )
 from nscr_houdini_mcp.bridge.net import DEFAULT_PORT_RANGE
+from nscr_houdini_mcp.bridge.serving import STDLIB, TRANSPORTS
 
 STOP_WORD = "stop"
 
@@ -67,6 +68,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long a pool worker with no job stays warm before it ends itself",
     )
     parser.add_argument(
+        "--transport",
+        choices=TRANSPORTS,
+        default=STDLIB,
+        help="which web server answers the port",
+    )
+    parser.add_argument(
         "--skip-loopback-check",
         action="store_true",
         help="do not prove the port is unreachable from this machine's own addresses",
@@ -91,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
         alias_template=args.alias_template,
         kind=args.kind,
         heartbeat_s=args.heartbeat,
+        transport=args.transport,
         drop_reply_s=args.drop_reply_s,
         verify_loopback=not args.skip_loopback_check,
         owns_process=True,

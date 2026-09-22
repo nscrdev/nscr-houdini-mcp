@@ -106,10 +106,11 @@ from nscr_houdini_mcp.bridge.serving import (
     CALL_PATH,
     HEALTH_PATH,
     JSON_TYPE,
+    STDLIB,
     Backend,
-    HwebserverBackend,
     RawReply,
     RawRequest,
+    make_backend,
 )
 
 SESSION_ID_BYTES = 16
@@ -194,6 +195,9 @@ class BridgeConfig:
     dispatch_timeout_s: float = DEFAULT_DISPATCH_TIMEOUT_S
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
     max_depth: int = MAX_DEPTH
+    # Which web server answers the port. The standard library one serves
+    # several client connections at once; Houdini's own is the fallback.
+    transport: str = STDLIB
     server_name: str = "nscr_mcp_bridge"
     in_background: bool = True
     verify_loopback: bool = True
@@ -685,10 +689,11 @@ class Bridge:
     def _listen(self) -> tuple[Backend, int]:
         """Take a port in the range, walking it when the server refuses one.
 
-        The run call has no port range argument, and a server object that has
-        run once can never run again, so a refused port means a fresh server
-        object and the next free port. A backend handed in from outside is
-        used as it is: whoever passed it owns it.
+        Houdini's own server has no port range argument on its run call, and a
+        server object that has run once can never run again, so a refused port
+        means a fresh server object and the next free port. The standard
+        library one walks the range itself and takes one attempt. A backend
+        handed in from outside is used as it is: whoever passed it owns it.
         """
         start_port, end_port = self.config.port_range
         taken: set[int] = set()
@@ -700,8 +705,9 @@ class Bridge:
                 is_free=lambda port: port not in taken and port_is_free(port),
             )
             taken.add(wanted)
-            backend = self._backend or HwebserverBackend(
-                f"{self.config.server_name}_{attempt}" if attempt else self.config.server_name
+            backend = self._backend or make_backend(
+                self.config.transport,
+                f"{self.config.server_name}_{attempt}" if attempt else self.config.server_name,
             )
             backend.configure(address=self.config.address, port=wanted, max_port=end_port)
             backend.set_max_body(self.config.max_body_bytes)
