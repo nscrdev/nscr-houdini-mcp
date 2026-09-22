@@ -1,29 +1,39 @@
 """Managed output paths, built from a token table instead of by hand.
 
 No tool takes an output path. The caller names a kind and a name, and this
-module answers with two strings for the same file: the template that goes into
-a parameter, which keeps `$HIP`, `${OS}` and `$F4` unexpanded so a scene still
-works on another machine, and the expanded path for the run, which the server
-uses and freezes in the run record. Freezing matters: a node renamed after a
-run started must not move that run's files.
+module answers with three strings for the same output: the template, which
+keeps `$HIP`, `${OS}` and `$F4` and is what a person reads and edits; the
+parameter value for this run, which is the expanded path, because the server
+owns a run that has started and a node renamed halfway through must not move
+its files; and the same path in the run record, so the record and the scene
+agree.
 
 The grammar is data. Built in defaults come first, then a per user file, then a
 file beside the scene, each one winning key by key over the one before it. A
 template is a string of `<token>` pieces and plain text, so a studio changes a
 layout by editing one line rather than by changing code.
 
+Nothing a file or a caller says may leave the output root. Templates, roots,
+producer levels and extensions are checked when they are read, and the finished
+path is checked against the root before anything is created on disk. A root has
+to start at a Houdini variable, so no machine path is ever written into a scene.
+
 Version numbers come from the coordination store, inside its transaction, and
 the version folder is then created with an exclusive `mkdir`. The number is the
 agreement between processes on one machine and the folder is the last guard
-when a scene folder is shared. Agent artifacts that are not versioned carry the
-run id in the file name, so two captures in the same second are two files.
+when a scene folder is shared. A kind with no folder of its own claims an
+exclusive file beside its output instead. Agent artifacts that are not
+versioned carry the run id in the file name, so two captures in the same second
+are two files.
 
 This module never imports `hou` and never touches Houdini.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import secrets
 import tomllib
@@ -68,6 +78,12 @@ TOKENS = (
     "frame",
     "ext",
 )
+
+# Houdini variables a template may hold, and the only ones this server fills
+# in. `$HIP` and `$HOUDINI_TEMP_DIR` come from the session, `$JOB` from the
+# environment. Anything else is refused when the table is read, so no run ever
+# creates a folder named after a variable nobody expanded.
+ALLOWED_VARIABLES = ("HIP", "HOUDINI_TEMP_DIR", "JOB")
 
 # Renders, flipbooks and comps are dated: a person browses them by the day they
 # were made. Caches, USD layers and hip files are stable under the name, because
@@ -120,18 +136,32 @@ PROJECT_FILE_NAMES = (".agent/outputs.toml", ".agent/outputs.json")
 PROJECT_TABLES = ("outputs", "conventions")
 
 SIDECAR_NAME = "_run.json"
-SCRATCH_DIR_NAME = "scratch"
+CLAIM_SUFFIX = ".claim"
+SCRATCH_ROOT = f"$HOUDINI_TEMP_DIR/{store_module.APP_DIR_NAME}"
 UNTITLED_FAMILY = "untitled"
 
 # A name that already carries something a version tool would read as a version.
 VERSION_IN_NAME = re.compile(r"(?<![A-Za-z0-9])v\d+", re.IGNORECASE)
+
+# Names Windows keeps for devices, whatever the extension is.
+WINDOWS_RESERVED = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{digit}" for digit in range(1, 10)}
+    | {f"LPT{digit}" for digit in range(1, 10)}
+)
+
 _TOKEN = re.compile(r"<([a-z_]+)>")
+_VARIABLE = re.compile(r"\$\{(\w+)\}|\$(\w+)")
+_FRAME_VARIABLE = re.compile(r"^F\d*$")
 _ILLEGAL_IN_NAME = re.compile(r"[^A-Za-z0-9_-]+")
 _TRAILING_VERSION = re.compile(r"[._-]v\d+$", re.IGNORECASE)
 _DRIVE = re.compile(r"^[A-Za-z]:")
+_ROOT_START = re.compile(rf"^\$\{{?({'|'.join(ALLOWED_VARIABLES)})\}}?(/|$)")
+_EXTENSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
-MKDIR_ATTEMPTS = 8
+MKDIR_ATTEMPTS = 16
 RUN_ID_BYTES = 6
+NAME_HASH_LENGTH = 6
 
 # Stands in for the version while the shape of a line is worked out. It is not
 # a legal name character, so it can never come from a name or a date.
@@ -147,11 +177,11 @@ class UnknownKind(OutputError):
 
 
 class ConventionError(OutputError):
-    """A conventions file that cannot be used as written."""
+    """A conventions file, or a path built from one, that cannot be used."""
 
 
 class AllocationFailed(OutputError):
-    """A version folder could not be claimed after several tries."""
+    """A version could not be claimed after several tries."""
 
 
 def new_run_id() -> str:
@@ -163,11 +193,38 @@ def sanitize_name(text: str) -> str:
     """Name reduced to letters, digits, underscore and dash.
 
     Anything else becomes an underscore, because these strings end up in file
-    names on three systems and in Houdini parameters.
+    names on three systems and in Houdini parameters. A name written in another
+    script has nothing left after that, so a short hash of the original is
+    added and two such names stay two names. Device names Windows keeps for
+    itself get a suffix, because a file cannot have one.
     """
-    cleaned = _ILLEGAL_IN_NAME.sub("_", text.strip())
+    raw = text.strip()
+    cleaned = _ILLEGAL_IN_NAME.sub("_", raw)
     cleaned = re.sub(r"_{2,}", "_", cleaned).strip("_")
-    return cleaned or "output"
+    if raw and not cleaned:
+        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:NAME_HASH_LENGTH]
+        cleaned = f"output_{digest}"
+    cleaned = cleaned or "output"
+    if cleaned.split(".")[0].upper() in WINDOWS_RESERVED:
+        cleaned = f"{cleaned}_out"
+    return cleaned
+
+
+def clean_extension(text: str) -> str:
+    """Extension text an output may end in, without its leading dot.
+
+    An extension arrives from a caller as well as from a file, so it is checked
+    rather than trusted: letters, digits, dot, dash and underscore, and nothing
+    that could step out of the folder.
+    """
+    value = str(text).strip()
+    if value.startswith("."):
+        value = value[1:]
+    if not value:
+        return ""
+    if not _EXTENSION.match(value) or ".." in value:
+        raise ConventionError(f"{text!r} is not an extension this can write")
+    return value
 
 
 def split_hip(hip_path: str | Path) -> tuple[str, str]:
@@ -264,13 +321,16 @@ DEFAULT_CONVENTIONS_TABLE = Conventions(
 
 @dataclass(frozen=True)
 class OutputPlan:
-    """One managed output, as a template and as a frozen path."""
+    """One managed output: the line a person reads, and the run's own path."""
 
     kind: str
     name: str
     run_id: str
     template: str
+    parm: str
     path: str
+    root: str
+    under_root: str
     directory: str
     sidecar: str
     hip_family: str
@@ -284,10 +344,19 @@ class OutputPlan:
     tokens: Mapping[str, str] = field(default_factory=dict)
 
     def as_record(self) -> dict[str, Any]:
-        """The path part of a run record, readable on its own."""
+        """The path part of a run record, readable on its own.
+
+        `path`, `directory` and `sidecar` are absolute on the machine that made
+        the run. `under_root` is the same output written from the root, which is
+        what to read when the folder is opened from somewhere else. `template`
+        is the editable line, and `parm` is what the node was set to.
+        """
         return {
             "template": self.template,
+            "parm": self.parm,
             "path": self.path,
+            "root": self.root,
+            "under_root": self.under_root,
             "directory": self.directory,
             "sidecar": self.sidecar,
             "version_dir": self.version_dir,
@@ -308,7 +377,8 @@ def load_conventions(
     """Built in defaults, then the per user file, then the file by the scene.
 
     Later wins, key by key, so a project file that sets one line leaves the
-    rest of the table alone.
+    rest of the table alone. The file beside the scene comes with the scene, so
+    it is read as a suggestion and checked like one.
     """
     root = Path(home) if home is not None else store_module.default_home()
     layers: list[tuple[Path, dict[str, Any]]] = []
@@ -386,11 +456,14 @@ def _merge(layers: list[tuple[Path, dict[str, Any]]]) -> Conventions:
         _check_template(kind, template)
     for key in ("output_root", "cache_root"):
         _check_root(key, str(outputs[key]))
+    _check_producer(str(outputs["producer"]))
+    _check_variables("outputs.frame_token", str(outputs["frame_token"]))
+    clean = {kind: clean_extension(value) for kind, value in extensions.items()}
 
     return Conventions(
         grammar=grammar,
-        extensions={kind: str(value).lstrip(".") for kind, value in extensions.items()},
-        output_root=str(outputs["output_root"]) or "$HIP",
+        extensions=clean,
+        output_root=str(outputs["output_root"]) or str(DEFAULT_OUTPUTS["output_root"]),
         cache_root=str(outputs["cache_root"]),
         producer=str(outputs["producer"]).strip("/"),
         version_width=width,
@@ -443,16 +516,48 @@ def _check_template(kind: str, template: str) -> None:
         raise ConventionError(f"the {kind} template must use forward slashes")
     if template.startswith("/") or _DRIVE.match(template):
         raise ConventionError(f"the {kind} template must not start at a drive or a root")
+    if ".." in template.split("/"):
+        raise ConventionError(f"the {kind} template must stay under its root, so no .. in it")
     unknown = sorted({name for name in _TOKEN.findall(template) if name not in TOKENS})
     if unknown:
         raise ConventionError(f"the {kind} template uses unknown tokens: {', '.join(unknown)}")
+    _check_variables(f"the {kind} template", template)
 
 
 def _check_root(label: str, root: str) -> None:
+    if not root:
+        return
     if "\\" in root:
         raise ConventionError(f"outputs.{label} must use forward slashes")
-    if _DRIVE.match(root):
-        raise ConventionError(f"outputs.{label} must not name a drive, so scenes stay portable")
+    if root.startswith("/") or _DRIVE.match(root):
+        raise ConventionError(
+            f"outputs.{label} must not name a drive or start at a root, so scenes stay portable"
+        )
+    if ".." in root.split("/"):
+        raise ConventionError(f"outputs.{label} must not step out of a folder with ..")
+    if not _ROOT_START.match(root):
+        allowed = ", ".join(f"${name}" for name in ALLOWED_VARIABLES)
+        raise ConventionError(f"outputs.{label} must start at one of {allowed}")
+    _check_variables(f"outputs.{label}", root)
+
+
+def _check_producer(producer: str) -> None:
+    if "\\" in producer:
+        raise ConventionError("outputs.producer must use forward slashes")
+    if producer.startswith("/") or _DRIVE.match(producer):
+        raise ConventionError("outputs.producer is a level under the root, not a root of its own")
+    if ".." in producer.split("/"):
+        raise ConventionError("outputs.producer must stay under the root, so no .. in it")
+    _check_variables("outputs.producer", producer)
+
+
+def _check_variables(label: str, text: str) -> None:
+    """Every `$` in the line has to be one this server knows how to fill in."""
+    for braced, plain in _VARIABLE.findall(text):
+        name = braced or plain
+        if name in ALLOWED_VARIABLES or name == "OS" or _FRAME_VARIABLE.match(name):
+            continue
+        raise ConventionError(f"{label} uses ${name}, which this does not expand")
 
 
 # -- building paths -------------------------------------------------------
@@ -472,12 +577,13 @@ def plan_path(
     when: datetime | None = None,
     scratch_root: str | Path | None = None,
 ) -> OutputPlan:
-    """Work out both strings for one output, without touching the disk.
+    """Work out the line and the path for one output, without touching disk.
 
-    The template keeps Houdini variables, and uses `${OS}` for the name when the
-    name is the node's own, so a rename carries through to the next run. The
-    path is the same line with the scene folder and the name filled in, which is
-    what the run record freezes.
+    The template keeps the Houdini variables and uses `${OS}` for a name that
+    came from the node, which is the line to show a person and the line to put
+    on a node that has no run yet. The parameter value for this run is the
+    expanded path: the server owns a run once it has started, and a rename
+    while a render is going must not send half the frames somewhere else.
     """
     table = conventions or DEFAULT_CONVENTIONS_TABLE
     template = table.template_for(kind)
@@ -487,7 +593,7 @@ def plan_path(
 
     warnings: list[str] = []
     chosen = sanitize_name(name or node_name or kind)
-    from_node = node_name is not None and chosen == sanitize_name(node_name)
+    from_node = name is None and node_name is not None
     if VERSION_IN_NAME.search(chosen):
         warnings.append(
             f"the name {chosen} reads as if it already holds a version, "
@@ -496,14 +602,17 @@ def plan_path(
 
     unsaved = hip_path is None
     if unsaved:
-        root_dir = _scratch_dir(scratch_root, session_id)
+        root_template = f"{SCRATCH_ROOT}/{sanitize_name(session_id or 'session')}"
         warnings.append("the scene has not been saved, so this run goes to a scratch folder")
         hip_stem = UNTITLED_FAMILY
+        hip_dir = None
     else:
-        root_dir, hip_stem = split_hip(hip_path)
+        root_template = table.root_for(kind)
+        hip_dir, hip_stem = split_hip(hip_path)
 
     family = hip_family(hip_path)
     moment = when or datetime.now()
+    extension = clean_extension(ext if ext is not None else table.extension_for(kind))
     common = {
         "kind": kind,
         "producer": table.producer,
@@ -516,36 +625,39 @@ def plan_path(
         "hipname": hip_stem,
         "hipfamily": family,
         "frame": table.frame_token,
-        "ext": (ext if ext is not None else table.extension_for(kind)).lstrip("."),
+        "ext": extension,
+        "output_root": root_template,
+        "cache_root": root_template,
     }
-    root_template = table.root_for(kind)
-    common["output_root"] = root_template
-    common["cache_root"] = root_template
-    parm_tokens = dict(common, name="${OS}" if from_node else chosen)
-    frozen_tokens = dict(common, name=chosen)
+    line = _fill(template, dict(common, name="${OS}" if from_node else chosen))
+    literal = _fill(template, dict(common, name=chosen))
 
-    parm_path = _fill(template, parm_tokens)
-    frozen = expand(_fill(template, frozen_tokens), hip_dir=root_dir)
-    if unsaved:
-        # Nothing is stored in a scene that has no folder yet, so the scratch
-        # root replaces `$HIP` in both strings rather than only in the frozen one.
-        parm_path = expand(parm_path, hip_dir=root_dir)
+    temp_dir = _temp_dir(scratch_root) if unsaved else None
+    root = _normalize(expand(root_template, hip_dir=hip_dir, temp_dir=temp_dir))
+    frozen = _normalize(expand(literal, hip_dir=hip_dir, temp_dir=temp_dir))
+    if not _inside(root, frozen):
+        raise ConventionError(f"{frozen} would leave the output root {root}")
 
     is_directory = template.rstrip().endswith("/")
+    if is_directory:
+        frozen = f"{frozen}/"
     directory = frozen.rstrip("/") if is_directory else _parent(frozen)
-    drop = _version_drop(template, frozen_tokens, is_directory) if versioned else None
+    drop = _version_drop(template, dict(common, name=chosen), is_directory) if versioned else None
     version_dir = None
     if drop is not None:
         parts = frozen.rstrip("/").split("/")
         version_dir = "/".join(parts[: len(parts) - drop])
-    sidecar = _sidecar(frozen, directory, version_dir, is_directory, common["ext"])
+    sidecar = _sidecar(frozen, directory, version_dir, is_directory, extension)
 
     return OutputPlan(
         kind=kind,
         name=chosen,
         run_id=run_id,
-        template=parm_path,
+        template=line,
+        parm=frozen,
         path=frozen,
+        root=root,
+        under_root=frozen[len(root) :].lstrip("/"),
         directory=directory,
         sidecar=sidecar,
         hip_family=family,
@@ -555,24 +667,53 @@ def plan_path(
         unsaved_hip=unsaved,
         is_directory=is_directory,
         warnings=tuple(warnings),
-        tokens=frozen_tokens,
+        tokens=dict(common, name=chosen),
     )
 
 
-def expand(text: str, *, hip_dir: str | Path, frame: int | None = None) -> str:
+def expand(
+    text: str,
+    *,
+    hip_dir: str | Path | None = None,
+    temp_dir: str | Path | None = None,
+    job: str | Path | None = None,
+    frame: int | None = None,
+) -> str:
     """Fill in the Houdini variables this server owns, and nothing else.
 
-    Separators are settled here and nowhere earlier, so the stored template is
-    the same text on every system. Forward slashes are kept, because Houdini
-    and Python both read them on Windows.
+    Only whole names are replaced, so `$HIPNAME` is left for Houdini rather
+    than cut in half. A variable this server knows but cannot answer for is an
+    error, because a folder named after an unexpanded variable is worse than a
+    refusal. Separators are settled here and nowhere earlier, so the stored
+    template is the same text on every system.
     """
-    root = str(hip_dir).replace("\\", "/").rstrip("/")
-    filled = text.replace("${HIP}", root).replace("$HIP", root)
+    values: dict[str, str] = {}
+    if hip_dir is not None:
+        values["HIP"] = _posix(hip_dir)
+    if temp_dir is not None:
+        values["HOUDINI_TEMP_DIR"] = _posix(temp_dir)
+    from_env = job if job is not None else os.environ.get("JOB")
+    if from_env:
+        values["JOB"] = _posix(from_env)
+
+    def one(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2)
+        if name in values:
+            return values[name]
+        if name in ALLOWED_VARIABLES:
+            raise OutputError(f"${name} has no value here, so this path cannot be worked out")
+        return match.group(0)
+
+    filled = _VARIABLE.sub(one, text)
     if frame is not None:
         filled = re.sub(
             r"\$F(\d*)", lambda match: str(frame).zfill(int(match.group(1) or 1)), filled
         )
     return filled
+
+
+def _posix(path: str | Path) -> str:
+    return str(path).replace("\\", "/").rstrip("/")
 
 
 def _fill(template: str, tokens: Mapping[str, str]) -> str:
@@ -592,6 +733,32 @@ def _fill(template: str, tokens: Mapping[str, str]) -> str:
     # that writes a folder rather than a file.
     joined = joined.rstrip(".")
     return f"{joined}/" if trailing else joined
+
+
+def _normalize(path: str) -> str:
+    """Collapse `.` and `..` by reading the text, never by asking the disk."""
+    lead = "/" if path.startswith("/") else ""
+    parts: list[str] = []
+    for part in path.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if parts and parts[-1] != "..":
+                parts.pop()
+            else:
+                parts.append("..")
+            continue
+        parts.append(part)
+    return lead + "/".join(parts)
+
+
+def _inside(root: str, path: str) -> bool:
+    """Whether a finished path is the root or sits under it."""
+    root_parts = [part for part in root.split("/") if part]
+    path_parts = [part for part in path.split("/") if part]
+    if ".." in path_parts or path.startswith("/") != root.startswith("/"):
+        return False
+    return path_parts[: len(root_parts)] == root_parts and len(path_parts) >= len(root_parts)
 
 
 def _parent(path: str) -> str:
@@ -626,10 +793,18 @@ def _sidecar(frozen: str, directory: str, version_dir: str | None, is_dir: bool,
     return f"{directory}/{leaf}{SIDECAR_NAME}"
 
 
-def _scratch_dir(scratch_root: str | Path | None, session_id: str | None) -> str:
-    root = Path(scratch_root) if scratch_root is not None else store_module.default_home()
-    folder = root / SCRATCH_DIR_NAME / sanitize_name(session_id or "session")
-    return folder.as_posix()
+def _temp_dir(scratch_root: str | Path | None) -> str:
+    """Where a scene with no folder of its own writes.
+
+    The template keeps `$HOUDINI_TEMP_DIR`, so a scene saved later carries no
+    trace of this machine. This is only the value it stands for here.
+    """
+    if scratch_root is not None:
+        return _posix(scratch_root)
+    from_env = os.environ.get("HOUDINI_TEMP_DIR")
+    if from_env:
+        return _posix(from_env)
+    return _posix(store_module.default_home() / "temp")
 
 
 # -- allocation -----------------------------------------------------------
@@ -650,13 +825,13 @@ def allocate(
     when: datetime | None = None,
     scratch_root: str | Path | None = None,
 ) -> OutputPlan:
-    """Take a version, claim its folder, record the run and write the sidecar.
+    """Take a version, claim it on disk, record the run and write the sidecar.
 
     The number comes out of the store's transaction and the folder is then
     created with an exclusive `mkdir`. A folder that is already there means
-    another machine wrote it, so the next number is taken instead. What comes
-    back is frozen: a later rename of the node changes the next run, never this
-    one.
+    another machine wrote it, so that number loses this run's name and the next
+    one is tried. What comes back is frozen: a later rename of the node changes
+    the next run, never this one.
     """
     table = conventions or DEFAULT_CONVENTIONS_TABLE
     table.template_for(kind)
@@ -694,14 +869,6 @@ def allocate(
             "unsaved_hip": plan.unsaved_hip,
         },
     )
-    if plan.version is not None:
-        store.attach_version_run(
-            kind=kind,
-            name=plan.name,
-            hip_family=plan.hip_family,
-            version=plan.version,
-            run_id=run,
-        )
     write_export(store.run_export(run), plan.sidecar)
     return replace(plan, source_node=node_path)
 
@@ -720,56 +887,69 @@ def _claim(
     when: datetime | None,
     scratch_root: str | Path | None,
 ) -> OutputPlan:
-    """One plan whose folder on disk is this run's, and nobody else's."""
-    versioned = table.is_versioned(kind)
-    for _ in range(MKDIR_ATTEMPTS if versioned else 1):
-        version = None
-        if versioned:
-            probe = plan_path(
-                kind,
-                run_id=run,
-                name=name,
-                node_name=node_name,
-                hip_path=hip_path,
-                session_id=session_id,
-                version=1,
-                ext=ext,
-                conventions=table,
-                when=when,
-                scratch_root=scratch_root,
-            )
-            version = store.allocate_version(
-                kind=kind, name=probe.name, hip_family=probe.hip_family, run_id=run
-            )
-        plan = plan_path(
-            kind,
-            run_id=run,
-            name=name,
-            node_name=node_name,
-            hip_path=hip_path,
-            session_id=session_id,
-            version=version,
-            ext=ext,
-            conventions=table,
-            when=when,
-            scratch_root=scratch_root,
+    """One plan whose place on disk is this run's, and nobody else's."""
+    options = {
+        "run_id": run,
+        "name": name,
+        "node_name": node_name,
+        "hip_path": hip_path,
+        "session_id": session_id,
+        "ext": ext,
+        "conventions": table,
+        "when": when,
+        "scratch_root": scratch_root,
+    }
+    if not table.is_versioned(kind):
+        plan = plan_path(kind, version=None, **options)
+        Path(plan.directory).mkdir(parents=True, exist_ok=True)
+        return plan
+
+    probe = plan_path(kind, version=1, **options)
+    for _ in range(MKDIR_ATTEMPTS):
+        version = store.allocate_version(
+            kind=kind, name=probe.name, hip_family=probe.hip_family, run_id=run
         )
+        plan = plan_path(kind, version=version, **options)
         if _make_room(plan):
             return plan
-    raise AllocationFailed(f"could not claim a folder for {kind} after {MKDIR_ATTEMPTS} tries")
+        # The number is taken on disk by whoever won, so it keeps its place in
+        # the sequence and only loses this run's name.
+        store.disown_version(
+            kind=kind, name=probe.name, hip_family=probe.hip_family, version=version
+        )
+    raise AllocationFailed(f"could not claim a place for {kind} after {MKDIR_ATTEMPTS} tries")
 
 
 def _make_room(plan: OutputPlan) -> bool:
-    """Create this run's folder, and say whether it was ours to create."""
+    """Take this run's place on disk, and say whether it was free.
+
+    A kind with a version folder claims the folder. A kind whose version lives
+    in the file name claims a small file beside the output, because two
+    machines with their own stores can hand out the same number and only one of
+    them may write it.
+    """
     exclusive = plan.version_dir or (plan.directory if plan.is_directory else None)
-    if exclusive is None:
+    if exclusive is not None:
+        try:
+            Path(exclusive).mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            return False
         Path(plan.directory).mkdir(parents=True, exist_ok=True)
-        # A versioned line without a folder of its own, a hip file among them,
-        # is guarded by the file instead.
-        return plan.version is None or not Path(plan.path).exists()
+        return True
+
+    Path(plan.directory).mkdir(parents=True, exist_ok=True)
+    if plan.version is None:
+        return True
+    if Path(plan.path).exists():
+        return False
+    return _claim_file(f"{plan.path}{CLAIM_SUFFIX}")
+
+
+def _claim_file(path: str) -> bool:
+    """Create a marker file, and say whether this call is the one that made it."""
     try:
-        Path(exclusive).mkdir(parents=True, exist_ok=False)
+        handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
     except FileExistsError:
         return False
-    Path(plan.directory).mkdir(parents=True, exist_ok=True)
+    os.close(handle)
     return True

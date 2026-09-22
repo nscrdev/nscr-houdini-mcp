@@ -12,6 +12,8 @@ import json
 import multiprocessing as mp
 import os
 import queue as queue_module
+import sqlite3
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -96,7 +98,7 @@ def test_agent_artifacts_live_under_the_agent_folder() -> None:
         assert made.run_id in made.path
 
 
-def test_the_name_of_a_node_stays_a_variable_in_the_parameter() -> None:
+def test_the_name_of_a_node_stays_a_variable_in_the_line_a_person_reads() -> None:
     made = plan("render", name=None, node_name="beauty", version=2)
     assert "${OS}" in made.template
     assert "$HIP" in made.template
@@ -104,10 +106,23 @@ def test_the_name_of_a_node_stays_a_variable_in_the_parameter() -> None:
     assert "${OS}" not in made.path
 
 
+def test_the_parameter_for_a_started_run_holds_the_path_and_no_node_name() -> None:
+    """The server owns a run once it starts, so a rename must not move it."""
+    made = plan("render", name=None, node_name="beauty", version=2)
+    assert made.parm == made.path
+    assert "${OS}" not in made.parm
+
+
 def test_a_name_given_by_hand_is_written_out() -> None:
     made = plan("render", name="key_light", node_name="beauty", version=1)
     assert "${OS}" not in made.template
     assert "key_light" in made.template
+
+
+def test_a_name_given_by_hand_stays_written_out_when_it_matches_the_node() -> None:
+    made = plan("render", name="beauty", node_name="beauty", version=1)
+    assert "${OS}" not in made.template
+    assert "20260921_beauty" in made.template
 
 
 def test_a_template_never_holds_a_machine_path() -> None:
@@ -121,9 +136,28 @@ def test_a_frame_token_is_kept_until_something_asks_for_a_frame() -> None:
     assert outputs.expand(made.path, hip_dir="/shots/sq010", frame=12).endswith(".0012.exr")
 
 
+def test_only_whole_variable_names_are_filled_in() -> None:
+    filled = outputs.expand("$HIP/$HIPNAME/${HIP}/x.exr", hip_dir="/shots/sq010")
+    assert filled == "/shots/sq010/$HIPNAME//shots/sq010/x.exr"
+
+
 def test_names_are_reduced_to_safe_characters() -> None:
     assert outputs.sanitize_name("Beauty Pass/2!") == "Beauty_Pass_2"
     assert outputs.sanitize_name("   ") == "output"
+
+
+def test_a_name_windows_keeps_for_itself_is_moved_out_of_the_way() -> None:
+    assert outputs.sanitize_name("CON") == "CON_out"
+    assert outputs.sanitize_name("lpt9") == "lpt9_out"
+    assert outputs.sanitize_name("console") == "console"
+
+
+def test_two_names_in_another_script_stay_two_names() -> None:
+    first = outputs.sanitize_name("煙")
+    second = outputs.sanitize_name("炎")
+    assert first != second
+    assert first.startswith("output_")
+    assert outputs.sanitize_name("煙") == first
 
 
 def test_a_name_that_reads_as_a_version_is_flagged() -> None:
@@ -225,11 +259,25 @@ def test_a_grammar_line_can_be_replaced(home: Path) -> None:
     )
 
 
-def test_caches_can_be_sent_to_another_disk(home: Path) -> None:
+def test_caches_can_be_sent_to_another_disk(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JOB", "/mnt/fast/job")
     write(home / "config.toml", '[outputs]\ncache_root = "$JOB/scratch"\n')
     table = outputs.load_conventions(home=home)
-    assert plan("cache", conventions=table, version=1).template.startswith("$JOB/scratch/geo/")
+    cache = plan("cache", conventions=table, version=1)
+    assert cache.template.startswith("$JOB/scratch/geo/")
+    assert cache.path.startswith("/mnt/fast/job/scratch/geo/")
     assert plan("render", conventions=table, version=1).template.startswith("$HIP/renders/")
+
+
+def test_a_variable_with_no_value_is_said_out_loud(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("JOB", raising=False)
+    write(home / "config.toml", '[outputs]\ncache_root = "$JOB/scratch"\n')
+    table = outputs.load_conventions(home=home)
+    with pytest.raises(outputs.OutputError) as caught:
+        plan("cache", conventions=table, version=1)
+    assert "$JOB" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -241,7 +289,17 @@ def test_caches_can_be_sent_to_another_disk(home: Path) -> None:
         ('[outputs.grammar]\nrender = "<output_root>/<nmae>.exr"\n', "unknown tokens"),
         ('[outputs.grammar]\nrender = "/renders/<name>.exr"\n', "drive or a root"),
         ('[outputs.grammar]\nrender = "<output_root>\\\\r\\\\<name>.exr"\n', "forward slashes"),
+        ('[outputs.grammar]\nrender = "<output_root>/../<name>.exr"\n', "no .. in it"),
+        ('[outputs.grammar]\nrender = "<output_root>/$SHOT/<name>.exr"\n', "$SHOT"),
         ('[outputs]\noutput_root = "C:/renders"\n', "drive"),
+        ('[outputs]\noutput_root = "/tmp/renders"\n', "drive or start at a root"),
+        ('[outputs]\noutput_root = "renders"\n', "must start at one of"),
+        ('[outputs]\noutput_root = "$HIP/../../renders"\n', "step out of a folder"),
+        ('[outputs]\ncache_root = "$SCRATCH/x"\n', "must start at one of"),
+        ('[outputs]\nproducer = "../../../../tmp/x"\n', "no .. in it"),
+        ('[outputs]\nproducer = "/tmp/x"\n', "not a root of its own"),
+        ('[outputs.extensions]\nrender = "../../x"\n', "not an extension"),
+        ('[outputs.extensions]\nrender = "exr;rm -rf"\n', "not an extension"),
         ('[conventions]\noutput_marker_type = ""\n', "node type"),
         ('[conventions]\noutput_marker_enabled = "yes"\n', "true or false"),
         ("[outputs\n", "config.toml"),
@@ -259,6 +317,32 @@ def test_a_project_file_may_only_set_the_two_tables(home: Path, tmp_path: Path) 
     with pytest.raises(outputs.ConventionError) as caught:
         outputs.load_conventions(home=home, hip_path=tmp_path / "scene" / "shot.hip")
     assert "store" in str(caught.value)
+
+
+def test_a_scene_folder_cannot_send_writes_out_of_itself(home: Path, tmp_path: Path) -> None:
+    """A file beside a scene came with the scene, so it is read and checked."""
+    scene_dir = tmp_path / "scene"
+    write(scene_dir / ".agent" / "outputs.toml", '[outputs]\nproducer = "../../../../tmp/x"\n')
+    with pytest.raises(outputs.ConventionError) as caught:
+        outputs.load_conventions(home=home, hip_path=scene_dir / "shot.hip")
+    assert "no .. in it" in str(caught.value)
+
+
+def test_an_extension_from_a_caller_is_checked_too() -> None:
+    with pytest.raises(outputs.ConventionError):
+        plan("render", version=1, ext="../../x")
+    assert plan("render", version=1, ext=".jpg").path.endswith(".jpg")
+
+
+def test_a_path_that_would_leave_the_root_is_refused() -> None:
+    """The last guard, for a table that reached the builder unchecked."""
+    broken = replace(
+        outputs.DEFAULT_CONVENTIONS_TABLE,
+        grammar=dict(outputs.DEFAULT_GRAMMAR, render="<output_root>/../../x/<name>_v<ver>.<ext>"),
+    )
+    with pytest.raises(outputs.ConventionError) as caught:
+        plan("render", version=1, conventions=broken)
+    assert "leave the output root" in str(caught.value)
 
 
 # -- allocation -----------------------------------------------------------
@@ -305,7 +389,11 @@ def test_the_run_record_and_the_sidecar_hold_the_same_run(store: Store, scene: P
     assert sidecar["job_id"] == "job-1"
     assert sidecar["source_node"] == "/obj/geo1/OUT_beauty"
     assert sidecar["paths"]["path"] == made.path
+    assert sidecar["paths"]["parm"] == made.path
     assert sidecar["paths"]["template"] == made.template
+    assert sidecar["paths"]["root"] == scene.parent.as_posix()
+    assert sidecar["paths"]["under_root"] == made.path[len(sidecar["paths"]["root"]) + 1 :]
+    assert sidecar["paths"]["under_root"].startswith("renders/")
     assert sidecar["scene"]["hip_path"] == str(scene)
     assert sidecar["scene"]["unsaved_hip"] is False
     assert sidecar["created_utc"]
@@ -344,7 +432,9 @@ def test_an_unsaved_scene_writes_to_scratch_and_says_so(store: Store, home: Path
         scratch_root=home,
     )
     assert made.unsaved_hip is True
-    assert made.path.startswith((home / "scratch" / "s1").as_posix())
+    assert made.template.startswith("$HOUDINI_TEMP_DIR/nscr-houdini-mcp/s1/")
+    assert made.path.startswith((home / "nscr-houdini-mcp" / "s1").as_posix())
+    assert str(home) not in made.template
     assert any("saved" in line for line in made.warnings)
     assert store.get_run(made.run_id).scene["unsaved_hip"] is True
     assert Path(made.sidecar).is_file()
@@ -371,6 +461,50 @@ def test_a_hip_file_that_is_already_there_takes_the_next_number(store: Store, sc
     second = outputs.allocate(store, "hip", name="shot", hip_path=scene, when=WHEN)
     assert second.version == 3
     assert second.path.endswith("shot_v003.hip")
+
+
+def test_two_stores_over_one_scene_folder_do_not_take_the_same_hip_number(
+    tmp_path: Path, scene: Path
+) -> None:
+    """Two machines keep their own store, so the file on disk settles it."""
+    with Store(tmp_path / "one.sqlite") as one, Store(tmp_path / "two.sqlite") as two:
+        first = outputs.allocate(one, "hip", name="shot", hip_path=scene, when=WHEN)
+        second = outputs.allocate(two, "hip", name="shot", hip_path=scene, when=WHEN)
+    assert first.path != second.path
+    assert first.version == 1
+    # v002 is the scene itself, so the second store steps past it as well.
+    assert second.version == 3
+    for made in (first, second):
+        assert json.loads(Path(made.sidecar).read_text(encoding="utf-8"))["run_id"] == made.run_id
+
+
+def version_rows(path: Path) -> list[tuple]:
+    """Version rows straight from the store file, for what has no reader yet."""
+    with sqlite3.connect(str(path)) as db:
+        return db.execute("SELECT version, run_id FROM versions ORDER BY version").fetchall()
+
+
+def test_folders_left_by_other_machines_cost_no_run_names(tmp_path: Path, scene: Path) -> None:
+    path = tmp_path / "coord.sqlite"
+    with Store(path) as store:
+        for number in range(1, 9):
+            taken = plan("cache", hip_path=scene, version=number)
+            Path(taken.version_dir).mkdir(parents=True)
+        made = outputs.allocate(store, "cache", name="beauty", hip_path=scene, when=WHEN)
+    assert made.version == 9
+    rows = version_rows(path)
+    assert [row[0] for row in rows] == list(range(1, 10))
+    assert [row[1] for row in rows] == [None] * 8 + [made.run_id]
+
+
+def test_a_number_whose_run_never_arrived_loses_its_name(tmp_path: Path) -> None:
+    """A process can stop between taking a number and recording the run."""
+    path = tmp_path / "coord.sqlite"
+    with Store(path) as store:
+        store.allocate_version(kind="cache", name="beauty", hip_family="shot", run_id="run-ghost")
+        assert store.reap_versions(0) == 1
+        assert store.latest_version(kind="cache", name="beauty", hip_family="shot") == 1
+    assert version_rows(path) == [(1, None)]
 
 
 # -- several processes on one store ---------------------------------------
