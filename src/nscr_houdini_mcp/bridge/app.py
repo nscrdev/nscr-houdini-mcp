@@ -311,6 +311,8 @@ class Bridge:
             stopping=self.stopping,
             wait_s=self.config.dispatch_wait_s,
             timeout_s=self.config.dispatch_timeout_s,
+            home=self.home,
+            open_store=self._open_store,
         )
         self._heartbeat_at = 0.0
         self._heartbeat_stop = threading.Event()

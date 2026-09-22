@@ -50,6 +50,7 @@ import secrets
 import threading
 import time
 import traceback
+from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -92,6 +93,10 @@ CANCEL_TOOL = "bridge.cancel"
 # Refusals a caller cannot act on without knowing what the scene is now.
 SCENE_CODES = ("SCENE_REPLACED", "OUTCOME_UNKNOWN")
 
+# How many progress notes the running call keeps for health to show. Only
+# the latest few say anything a caller can use.
+PROGRESS_KEPT = 8
+
 
 @dataclass
 class Running:
@@ -100,24 +105,34 @@ class Running:
     operation_id: str
     tool: str
     mutating: bool
+    # What this call's undo entry is called.
+    label: str = ""
     began: float = field(default_factory=time.monotonic)
     started_at: float = field(default_factory=time.time)
     timed_out: bool = False
     recorded: bool = False
     rolled_back: bool = False
     cancel: threading.Event = field(default_factory=threading.Event)
+    progress: deque = field(default_factory=lambda: deque(maxlen=PROGRESS_KEPT))
 
     def elapsed_s(self) -> float:
         return round(max(0.0, time.monotonic() - self.began), 3)
 
+    def note_progress(self, note: Mapping[str, Any]) -> None:
+        """Keep one progress note from the running tool, with when it came."""
+        self.progress.append({**note, "elapsed_s": self.elapsed_s()})
+
     def as_dict(self) -> dict[str, Any]:
-        return {
+        said = {
             "operation_id": self.operation_id,
             "tool": self.tool,
             "elapsed_s": self.elapsed_s(),
             "timed_out": self.timed_out,
             "cancel_asked": self.cancel.is_set(),
         }
+        if self.progress:
+            said["progress"] = dict(self.progress[-1])
+        return said
 
 
 class Dispatcher:
@@ -141,6 +156,8 @@ class Dispatcher:
         wait_s: float = DEFAULT_WAIT_S,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         skip_stale_s: float = DEFAULT_SKIP_STALE_S,
+        home: Any = None,
+        open_store: Callable[[], Any] | None = None,
     ) -> None:
         self.tools = tools
         self.kind = kind
@@ -156,6 +173,10 @@ class Dispatcher:
         self._main_thread = main_thread
         self._pulse = pulse
         self._stopping = stopping or threading.Event()
+        # The state folder and a way to open the store, for a tool that hands
+        # out managed output paths. A bridge with neither hands out none.
+        self._home = home
+        self._open_store = open_store
         self._gate = Gate(lock)
         self._running: Running | None = None
         self._last: dict[str, Any] | None = None
@@ -186,6 +207,7 @@ class Dispatcher:
             "current_op_id": None if running is None else running.operation_id,
             "current_op_elapsed_s": None if running is None else running.elapsed_s(),
             "current_op_timed_out": False if running is None else running.timed_out,
+            "current_op_progress": None if running is None else list(running.progress),
             "last_op": self._last,
         }
 
@@ -347,7 +369,12 @@ class Dispatcher:
                 picked_up=False,
             )
 
-        running = Running(operation_id=operation_id, tool=tool.name, mutating=tool.mutating)
+        running = Running(
+            operation_id=operation_id,
+            tool=tool.name,
+            mutating=tool.mutating,
+            label=tool.undo_label(envelope.arguments),
+        )
         self._running = running
         context = ToolContext(
             hou=self._hou,
@@ -355,9 +382,12 @@ class Dispatcher:
             session_id=self.session_id,
             scene_epoch=self.identity.scene_epoch,
             operation_id=operation_id,
-            label=tool.undo_label(),
+            label=running.label,
             cancel=running.cancel,
             stopping=self._stopping,
+            progress=running.note_progress,
+            home=self._home,
+            open_store=self._open_store,
         )
 
         work = marshal.Work(lambda: self._work(tool, envelope.arguments, context, running, carried))
@@ -614,7 +644,7 @@ class Dispatcher:
                 return tool.run(arguments, context)
             outcome = run_in_undo_group(
                 lambda: tool.run(arguments, context),
-                label=tool.undo_label(),
+                label=running.label or tool.undo_label(arguments),
                 hou=self._hou,
             )
             running.recorded = outcome.recorded
@@ -663,14 +693,15 @@ class Dispatcher:
         if converted.lossy:
             payload["lossy"] = True
             payload["cut"] = converted.cut
+        label = running.label or tool.undo_label()
         if tool.mutating and tool.undoable:
             payload["undo"] = {
-                "label": tool.undo_label(),
+                "label": label,
                 "recorded": running.recorded,
                 "rolled_back": running.rolled_back,
             }
         elif tool.mutating:
-            payload["undo"] = {"label": tool.undo_label(), "undoable": False}
+            payload["undo"] = {"label": label, "undoable": False}
         return Reply(200, payload)
 
     def _failed(

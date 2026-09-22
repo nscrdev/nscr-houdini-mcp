@@ -23,6 +23,9 @@ from nscr_houdini_mcp.bridge.tools import ToolContext
 
 ToolHandler = Callable[..., Any]
 
+# The longest undo entry name a call may give its own work.
+MAX_LABEL = 200
+
 
 class UnknownTool(KeyError):
     """No tool is registered under that name."""
@@ -52,6 +55,9 @@ class Tool:
     immediate: bool = False
     # What the undo entry is called. The tool name when nothing is given.
     label: str | None = None
+    # The argument that names this call's undo entry, for a tool whose calls
+    # each want a name of their own. The label above when it is not sent.
+    label_argument: str | None = None
     # Its own run budget, when it needs one other than the bridge default.
     timeout_s: float | None = None
     summary: str = ""
@@ -59,7 +65,11 @@ class Tool:
     # caps in `encoding`: a keyword for each cap `encoding.convert` takes.
     caps: Mapping[str, int] | None = None
 
-    def undo_label(self) -> str:
+    def undo_label(self, arguments: Mapping[str, Any] | None = None) -> str:
+        if self.label_argument and arguments:
+            named = arguments.get(self.label_argument)
+            if isinstance(named, str) and named.strip():
+                return named.strip()[:MAX_LABEL]
         return self.label or self.name
 
     def run(self, arguments: Mapping[str, Any], context: ToolContext) -> Any:
@@ -84,6 +94,7 @@ class ToolRegistry:
         context: bool = False,
         immediate: bool = False,
         label: str | None = None,
+        label_argument: str | None = None,
         timeout_s: float | None = None,
         summary: str = "",
         caps: Mapping[str, int] | None = None,
@@ -100,6 +111,7 @@ class ToolRegistry:
             context=context,
             immediate=immediate,
             label=label,
+            label_argument=label_argument,
             timeout_s=timeout_s,
             summary=summary,
             caps=dict(caps) if caps else None,
@@ -143,6 +155,10 @@ INSPECT_ARGUMENTS = (
     "after",
 )
 
+# What `python.run` takes. The server always names the namespace and the undo
+# entry, so a retry under the same operation id sends exactly the same call.
+PYTHON_ARGUMENTS = ("code", "namespace", "reset", "undo_label")
+
 # A page can hold two thousand rows, and a full read of fifty nodes a great
 # many values. The server spills an answer that large to a file rather than
 # cut it, so the bridge carries all of it.
@@ -154,14 +170,22 @@ def ping(arguments: Mapping[str, Any]) -> dict[str, Any]:
     return {"pong": True, "echo": arguments.get("echo")}
 
 
-def default_registry(*, selfcheck: bool = False) -> ToolRegistry:
+def default_registry(
+    *, selfcheck: bool = False, python: tool_module.Namespaces | None = None
+) -> ToolRegistry:
     """The tools every bridge starts with.
 
     The self check is left out unless it is asked for. It makes nodes and can
     park the session for a minute, which is wanted in a worker that was
     started to be tested against and unwanted in a session somebody is using.
+    A session carrying it also lets `python.run` take `drop_reply`, so a lost
+    answer to running code can be tried end to end.
+
+    `python` holds the namespaces `python.run` keeps between calls, one set per
+    bridge. A test hands in its own to move the clock.
     """
     registry = ToolRegistry()
+    namespaces = python if python is not None else tool_module.Namespaces()
     registry.add(
         "bridge.ping",
         ping,
@@ -250,5 +274,16 @@ def default_registry(*, selfcheck: bool = False) -> ToolRegistry:
         context=True,
         summary="read nodes, networks and parameters a page at a time",
         caps=INSPECT_CAPS,
+    )
+    registry.add(
+        "python.run",
+        namespaces.run,
+        mutating=True,
+        arguments=PYTHON_ARGUMENTS + (("drop_reply",) if selfcheck else ()),
+        required=("code", "namespace"),
+        context=True,
+        label="hou_python",
+        label_argument="undo_label",
+        summary="run Python with hou in a namespace kept between calls",
     )
     return registry
