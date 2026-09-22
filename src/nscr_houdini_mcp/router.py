@@ -21,8 +21,15 @@ the session proves dead, unreachable or unable to sign, so the next call reads
 the session afresh. A session id is never reused, so a kept client can only
 ever reach the process it was made for.
 
-Every call to a worker renews the worker's idle lease, as the pool expects of
-any server that routes to one.
+Every call to a worker renews the worker's idle lease, when it is resolved and
+again when its answer comes back, as the pool expects of any server that
+routes to one. Reads count: a worker somebody is reading from is in use, so it
+is kept warm on purpose.
+
+The socket wait. When a call names no `timeout_s`, the bridge gives running
+work its own default of a minute, so this end waits on the socket for the
+queueing time plus that minute plus a margin. Waiting less would read a slow
+answer as a lost one, and a lost change is sent again.
 
 This module never imports `hou`.
 """
@@ -40,6 +47,8 @@ from typing import Any, NoReturn
 from nscr_houdini_mcp import pool
 from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge import client, registry
+from nscr_houdini_mcp.bridge.dispatch import DEFAULT_TIMEOUT_S as BRIDGE_TIMEOUT_S
+from nscr_houdini_mcp.bridge.dispatch import DEFAULT_WAIT_S as BRIDGE_WAIT_S
 from nscr_houdini_mcp.bridge.errors import did_you_mean
 from nscr_houdini_mcp.results import CallError
 from nscr_houdini_mcp.store import SessionRecord
@@ -50,6 +59,9 @@ DEAD_STATES = ("gone", "crashed")
 # How long a health request may take. Health never waits on the scene, so a
 # session that has not answered by then is not going to.
 HEALTH_TIMEOUT_S = 2.0
+
+# How much longer than the bridge's budgets this end waits on the socket.
+SOCKET_MARGIN_S = client.SOCKET_MARGIN_S
 
 # Codes in a reply that mean the kept client no longer fits the session.
 STALE_CLIENT_CODES = frozenset({"SESSION_DEAD", "UNKNOWN_SESSION", "UNAUTHORIZED"})
@@ -62,6 +74,10 @@ class Target:
     record: SessionRecord
     session: client.Session
     houdini_version: str | None = None
+
+    def __repr__(self) -> str:
+        # The client holds the token, so it is never printed.
+        return f"Target(session_id={self.record.session_id!r}, alias={self.record.alias!r})"
 
     @property
     def session_id(self) -> str:
@@ -139,7 +155,9 @@ def _named(
         return _usable(current[0], live)
     if by_alias:
         return _usable(by_alias[0], live)
-    names = sorted({record.alias for record in records} | {r.session_id for r in live})
+    names = sorted(
+        {r.alias for r in records if r.state not in DEAD_STATES} | {r.session_id for r in live}
+    )
     raise CallError(
         "SESSION_UNKNOWN",
         f"no session answers to {handle}",
@@ -237,8 +255,13 @@ class Router:
     # Section: resolution
 
     def resolve(self, handle: str | None) -> Target:
-        """The session a call goes to, with a client that can reach it."""
-        records = self._records()
+        """The session a call goes to, with a client that can reach it.
+
+        Ended sessions are read only when a session is named, which is the one
+        case where telling an ended session from an unknown name matters.
+        """
+        records = self._records(include_gone=bool(handle))
+        self._prune(records)
         record = choose(records, handle, default=self.default_session)
         session, facts = self._client(record, records)
         if record.kind == "hython":
@@ -254,14 +277,21 @@ class Router:
         with self._lock:
             self._clients.pop(session_id, None)
 
-    def _records(self) -> list[SessionRecord]:
+    def _prune(self, records: Sequence[SessionRecord]) -> None:
+        """Drop the kept clients of sessions that are no longer live."""
+        live = {r.session_id for r in records if r.state in LIVE_STATES}
+        with self._lock:
+            for session_id in [key for key in self._clients if key not in live]:
+                del self._clients[session_id]
+
+    def _records(self, *, include_gone: bool = True) -> list[SessionRecord]:
         try:
             store = self._open_store(self.store_path)
             if store is None:
                 return []
             with store:
                 store.reclaim_sessions()
-                return store.list_sessions(include_gone=True)
+                return store.list_sessions(include_gone=include_gone)
         except (store_module.StoreError, sqlite3.Error, OSError) as error:
             raise CallError(
                 "STORE_UNAVAILABLE",
@@ -337,12 +367,19 @@ class Router:
                 operation_id=operation_id,
                 wait_s=wait_s,
                 timeout_s=timeout_s,
+                http_timeout_s=socket_wait(wait_s, timeout_s),
             )
         except client.BridgeUnreachable as error:
             self._lost(target, operation_id, error)
         except client.BridgeNotAuthentic as error:
             self._not_authentic(target, error)
-        return self._reply(target, answer.payload)
+        try:
+            return self._reply(target, answer.payload)
+        finally:
+            # The session answered, so a worker stays warm from this moment,
+            # not from when the call was sent.
+            if target.record.kind == "hython":
+                self._renew(target.session_id)
 
     def health(self, target: Target) -> dict[str, Any]:
         """What the session says about itself. Answers even while it is busy."""
@@ -408,6 +445,13 @@ class Router:
             f"the answer on {target.record.alias}'s port was not signed by it",
             details={"session_id": target.session_id, "alias": target.record.alias},
         ) from error
+
+
+def socket_wait(wait_s: float | None, timeout_s: float | None) -> float:
+    """How long to wait on the socket: every budget the bridge may use, and a margin."""
+    queued = BRIDGE_WAIT_S if wait_s is None else wait_s
+    running = BRIDGE_TIMEOUT_S if timeout_s is None else timeout_s
+    return queued + running + SOCKET_MARGIN_S
 
 
 def session_facts(home: Path, session_id: str) -> dict[str, Any]:

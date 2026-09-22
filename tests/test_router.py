@@ -14,7 +14,7 @@ import pytest
 
 from nscr_houdini_mcp.bridge import client
 from nscr_houdini_mcp.results import CallError
-from nscr_houdini_mcp.router import Router, choose
+from nscr_houdini_mcp.router import SOCKET_MARGIN_S, Router, choose, socket_wait
 from nscr_houdini_mcp.store import SessionRecord
 
 
@@ -50,6 +50,7 @@ class FakeStore:
     def __init__(self, rows: list[SessionRecord]) -> None:
         self.rows = rows
         self.reclaimed = 0
+        self.asked_for_gone: list[bool] = []
 
     def __enter__(self) -> FakeStore:
         return self
@@ -62,6 +63,7 @@ class FakeStore:
         return []
 
     def list_sessions(self, *, include_gone: bool = False) -> list[SessionRecord]:
+        self.asked_for_gone.append(include_gone)
         return [r for r in self.rows if include_gone or r.state != "gone"]
 
 
@@ -373,3 +375,55 @@ def test_a_read_with_no_id_is_not_sent_again(monkeypatch: pytest.MonkeyPatch) ->
         router.call(target, "scene.info")
     assert caught.value.code == "SESSION_UNREACHABLE"
     assert len(posted) == 1
+
+
+def test_a_call_with_no_timeout_waits_on_the_socket_past_the_bridge_default() -> None:
+    send = Sent()
+    router, _, _, _ = router_for([record("s-1", "w1")], send=send)
+    target = router.resolve(None)
+    router.call(target, "node.create", {}, operation_id="op-1")
+    router.call(target, "scene.info", wait_s=20.0, timeout_s=90.0)
+    first, second = send.calls
+    # One second of queueing and a minute of running, the bridge's own
+    # defaults, and a margin: a read that takes 30 s is slow, not lost.
+    assert first["http_timeout_s"] == 1.0 + 60.0 + SOCKET_MARGIN_S
+    assert first["http_timeout_s"] > 60.0
+    assert second["http_timeout_s"] == 20.0 + 90.0 + SOCKET_MARGIN_S
+    assert socket_wait(0.0, None) == 60.0 + SOCKET_MARGIN_S
+
+
+def test_a_worker_lease_is_renewed_again_when_the_answer_comes_back() -> None:
+    refusal = {"ok": False, "error": {"code": "SESSION_BUSY", "message": "busy"}}
+    router, _, _, renewed = router_for([record("s-1", "w1")], send=Sent({"ok": True}, refusal))
+    target = router.resolve(None)
+    assert renewed == ["s-1"]
+    router.call(target, "bridge.ping")
+    assert renewed == ["s-1", "s-1"]
+    with pytest.raises(CallError):
+        router.call(target, "bridge.ping")
+    assert renewed == ["s-1", "s-1", "s-1"]
+
+
+def test_kept_clients_of_sessions_that_ended_are_dropped_on_the_next_resolve() -> None:
+    router, store, _, _ = router_for([record("s-1", "w1"), record("s-2", "w2")])
+    router.resolve("w1")
+    router.resolve("w2")
+    assert sorted(router.cached()) == ["s-1", "s-2"]
+    store.rows = [record("s-1", "w1", state="gone"), record("s-2", "w2")]
+    router.resolve(None)
+    assert router.cached() == ["s-2"]
+
+
+def test_ended_sessions_are_read_only_when_a_session_is_named() -> None:
+    router, store, _, _ = router_for([record("s-1", "w1")])
+    router.resolve(None)
+    router.resolve("w1")
+    assert store.asked_for_gone == [False, True]
+
+
+def test_neither_the_session_nor_the_target_prints_the_token() -> None:
+    router, _, _, _ = router_for([record("s-1", "w1")])
+    target = router.resolve(None)
+    for text in (repr(target), str(target), repr(target.session), f"{target.session}"):
+        assert "token" not in text
+        assert "s-1" in text

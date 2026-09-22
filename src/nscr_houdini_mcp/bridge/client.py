@@ -139,6 +139,10 @@ class Session(NamedTuple):
     transport_ok: bool | None = None
     transport_checked_at: float | None = None
 
+    def __repr__(self) -> str:
+        # The token proves who is calling. It never goes in a log or a traceback.
+        return f"Session(session_id={self.session_id!r}, port={self.port})"
+
     @classmethod
     def from_entry(cls, entry: Mapping[str, Any]) -> Session:
         return cls(
