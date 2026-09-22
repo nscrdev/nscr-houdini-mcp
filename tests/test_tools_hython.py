@@ -201,6 +201,9 @@ def test_sessions_and_scene_files_through_a_real_worker(place: dict[str, Path]) 
     assert one["unsaved_hip"] is True
     kept = Path(one["hip_path"]).read_bytes()
     assert kept and Path(two["hip_path"]).is_file()
+    # Written under a private name and published by a link: nothing else is left.
+    assert list(folder.glob("*.part*")) == []
+    assert list(folder.glob("*.claim")) == []
 
     # Never over a file that is there: one already sits where v003 would go.
     decoy = folder / "untitled_v003.hip"

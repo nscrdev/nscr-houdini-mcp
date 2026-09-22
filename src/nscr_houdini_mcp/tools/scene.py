@@ -20,9 +20,12 @@ Four actions.
 
 None of these can be undone, and every result says so.
 
-A lost reply to `save_increment` is safe to send again with the same
-operation id: the version it took is found under that id and the same save
-is asked for, which the session answers from its receipt.
+`save_increment` claims its operation id in the store before it takes a
+version, so the same id sent twice, from one server or two, takes one version
+at most. A lost reply is safe to send again with the same id: the version it
+took is on the receipt, and the same save is asked for, which the session
+answers from its own receipt. A save that definitely failed takes its version
+back, with the claim and the record it left beside the scene.
 
 This module never imports `hou`.
 """
@@ -38,11 +41,12 @@ from typing import Any
 
 from nscr_houdini_mcp import outputs as outputs_module
 from nscr_houdini_mcp import store as store_module
-from nscr_houdini_mcp.bridge.tools import HIP_SUFFIXES, UNDO_NOTE
+from nscr_houdini_mcp.bridge.tools import HIP_SUFFIXES, LICENSE_SUFFIX, UNDO_NOTE
 from nscr_houdini_mcp.results import CallError
 from nscr_houdini_mcp.tools.base import (
     DETAIL,
     OPERATION_ID,
+    OPERATION_ID_SEPARATOR,
     SESSION,
     TIMEOUT_S,
     WAIT_S,
@@ -53,16 +57,6 @@ from nscr_houdini_mcp.tools.base import (
 )
 
 ACTIONS = ("info", "open", "save", "save_increment")
-
-# The scene suffix each license writes. A license that saves only one kind of
-# file would rename anything else on the way out, so the path is chosen to
-# match. Anything not named here writes `.hip`.
-LICENSE_SUFFIX = {
-    "apprentice": "hipnc",
-    "apprenticehd": "hipnc",
-    "education": "hipnc",
-    "indie": "hiplc",
-}
 
 _VERSION = re.compile(r"[._-]v(\d+)$", re.IGNORECASE)
 
@@ -157,77 +151,185 @@ def save_scene(call: Call) -> dict[str, Any]:
 
 
 def save_increment(call: Call) -> dict[str, Any]:
+    """Save the scene as its next version, once per operation id.
+
+    The id is claimed in the store before any version is taken, so two
+    servers sent the same id cannot both take one. The version the claim took
+    is written on the receipt before the save is asked for, so a save whose
+    reply was lost is asked for again under the same id and the same path,
+    which the session answers from its own receipt.
+    """
     target = call.target()
     operation_id = call.operation_id()
-    run_id = f"run-{operation_id}"
-    home = call.router.home
+    key = f"{operation_id}{OPERATION_ID_SEPARATOR}increment"
+    digest = store_module.digest_arguments(
+        {"action": "save_increment", "session_id": target.session_id}
+    )
     with call.router.store(create=True) as store:
-        run = stored(lambda: store.get_run(run_id))
-    if run is not None:
-        # The same save sent again after a lost reply: the version it took is
-        # the one to ask for, and the session answers from its receipt.
-        paths = run.paths if isinstance(run.paths, Mapping) else {}
-        plan = Replayed(paths, run.version, run_id)
-    else:
-        info = dict(call.bridge("scene.info").get("data") or {})
-        hip = None if info.get("untitled") else info.get("hip_path")
-        plan = allocate(call, home, hip, target.session_id, run_id)
-    reply = call.bridge("scene.save_as", {"path": plan.path}, mutating=True)
-    data = dict(reply.get("data") or {})
-    # The file is there now, and it is its own guard against a second writer.
-    Path(f"{plan.path}{outputs_module.CLAIM_SUFFIX}").unlink(missing_ok=True)
+        pending = claim_increment(store, key, digest)
+        if pending is not None and "result" in pending:
+            return {**pending["result"], "replayed": True}
+        if pending is None:
+            info = dict(call.bridge("scene.info").get("data") or {})
+            hip = None if info.get("untitled") else info.get("hip_path")
+            try:
+                plan = planned(allocate(call, store, hip, target.session_id, operation_id))
+            except BaseException:
+                stored(lambda: store.drop_operation(key))
+                raise
+            stored(lambda: store.finish_operation(key, state="running", outcome={"plan": plan}))
+        else:
+            plan = pending["plan"]
+        try:
+            reply = call.bridge("scene.save_as", {"path": plan["path"]}, mutating=True)
+        except CallError as error:
+            if error.code in INDEFINITE:
+                # The save may have happened. The plan stays on the receipt,
+                # so the same id asks for the same file again.
+                keep(store, key, plan, error)
+            else:
+                undo_plan(store, plan)
+                stored(lambda: store.drop_operation(key))
+            raise
+        data = dict(reply.get("data") or {})
+        # The file is there now, and it is its own guard against a second writer.
+        Path(f"{plan['path']}{outputs_module.CLAIM_SUFFIX}").unlink(missing_ok=True)
+        result = {
+            "hip_path": data.get("hip_path") or plan["path"],
+            "version": plan["version"],
+            "bytes": data.get("bytes"),
+            "template": plan["template"],
+            "sidecar": plan["sidecar"],
+            "run_id": plan["run_id"],
+            "unsaved_hip": plan["unsaved_hip"],
+            "warnings": list(plan["warnings"]) + list(data.get("warnings") or []),
+            "undo": UNDO_NOTE,
+        }
+        stored(lambda: store.finish_operation(key, outcome={"result": result}))
+    return result
+
+
+# Codes after which a save may or may not have happened.
+INDEFINITE = frozenset(
+    {"OUTCOME_UNKNOWN", "SESSION_UNREACHABLE", "TIMEOUT", "REPLY_NOT_AUTHENTIC", "BAD_REPLY"}
+)
+
+
+def claim_increment(store: Any, key: str, digest: str) -> dict[str, Any] | None:
+    """Take the id, or say what an earlier attempt under it got to.
+
+    Nothing when this call is the first. The finished result when it already
+    ran, and the plan when a version was taken and the save may not have
+    happened. `OUTCOME_UNKNOWN` when another call is on it, or when an attempt
+    stopped before it recorded which version it took.
+    """
+    try:
+        claim = store.begin_operation(key, digest)
+    except store_module.OperationMismatch as error:
+        raise CallError("OPERATION_MISMATCH", str(error)) from None
+    except (store_module.StoreError, sqlite3.Error) as error:
+        raise unavailable(error) from None
+    outcome = claim.record.outcome if isinstance(claim.record.outcome, Mapping) else {}
+    if claim.outcome_unknown and not claim.claimed:
+        raise unknown("another call with this operation id is still saving")
+    if "result" in outcome or "plan" in outcome:
+        return dict(outcome)
+    if claim.claimed and not claim.outcome_unknown:
+        return None
+    if claim.claimed:
+        abandon(store, key)
+    raise unknown("an earlier save with this operation id stopped before it said which version")
+
+
+def planned(plan: outputs_module.OutputPlan) -> dict[str, Any]:
+    """What a receipt keeps of a version that was taken."""
     return {
-        "hip_path": data.get("hip_path") or plan.path,
+        "path": plan.path,
         "version": plan.version,
-        "bytes": data.get("bytes"),
+        "name": plan.name,
+        "hip_family": plan.hip_family,
         "template": plan.template,
         "sidecar": plan.sidecar,
-        "run_id": run_id,
+        "run_id": plan.run_id,
         "unsaved_hip": plan.unsaved_hip,
         "warnings": list(plan.warnings),
-        "undo": UNDO_NOTE,
     }
 
 
-class Replayed:
-    """The plan of a save that was already allocated, read back from its run."""
+def keep(store: Any, key: str, plan: Mapping[str, Any], error: CallError) -> None:
+    try:
+        store.finish_operation(
+            key, state="failed", outcome={"plan": dict(plan)}, error={"code": error.code}
+        )
+    except (store_module.StoreError, sqlite3.Error):
+        pass
 
-    def __init__(self, paths: Mapping[str, Any], version: int | None, run_id: str) -> None:
-        self.path = str(paths.get("path") or "")
-        self.version = version
-        self.template = paths.get("template")
-        self.sidecar = paths.get("sidecar")
-        self.unsaved_hip = bool(paths.get("unsaved_hip"))
-        self.warnings = tuple(paths.get("warnings") or ())
-        self.run_id = run_id
-        if not self.path:
-            raise CallError(
-                "OUTPUT_REFUSED",
-                "the save under this operation id has no path on record",
-                details={"run_id": run_id},
-            )
+
+def undo_plan(store: Any, plan: Mapping[str, Any]) -> None:
+    """Take back a version whose save definitely did not happen.
+
+    Its claim and its record beside the scene describe a file that is not
+    there. The number keeps its place in the sequence, with no run on it. A
+    file that is there after all is left alone, and so is its record.
+    """
+    path = Path(str(plan["path"]))
+    if path.exists():
+        return
+    Path(f"{path}{outputs_module.CLAIM_SUFFIX}").unlink(missing_ok=True)
+    if plan.get("sidecar"):
+        Path(str(plan["sidecar"])).unlink(missing_ok=True)
+    try:
+        store.disown_version(
+            kind="hip",
+            name=plan["name"],
+            hip_family=plan["hip_family"],
+            version=plan["version"],
+        )
+    except (store_module.StoreError, sqlite3.Error):
+        pass
+
+
+def abandon(store: Any, key: str) -> None:
+    try:
+        store.finish_operation(
+            key,
+            state=store_module.OPERATION_ABANDONED,
+            error={"reason": "the attempt stopped without recording what it did"},
+        )
+    except (store_module.StoreError, sqlite3.Error):
+        pass
+
+
+def unknown(why: str) -> CallError:
+    return CallError(
+        "OUTCOME_UNKNOWN",
+        why,
+        hint="read the scene info to see which file the session holds, then use a new operation_id",
+    )
 
 
 def allocate(
-    call: Call, home: Path, hip: str | None, session_id: str, run_id: str
+    call: Call, store: Any, hip: str | None, session_id: str, operation_id: str
 ) -> outputs_module.OutputPlan:
     """The next versioned scene path, claimed on disk and recorded."""
+    home = call.router.home
     suffix = hip_suffix(call, hip)
     scratch = None if os.environ.get("HOUDINI_TEMP_DIR") else Path(home) / "temp"
     try:
         conventions = outputs_module.load_conventions(home=home, hip_path=hip)
-        with call.router.store(create=True) as store:
-            return outputs_module.allocate(
-                store,
-                "hip",
-                hip_path=hip,
-                session_id=session_id,
-                run_id=run_id,
-                ext=suffix,
-                conventions=conventions,
-                scratch_root=scratch,
-                above=outputs_module.hip_version_floor(hip),
-            )
+        return outputs_module.allocate(
+            store,
+            "hip",
+            hip_path=hip,
+            session_id=session_id,
+            run_id=f"run-{operation_id}",
+            ext=suffix,
+            conventions=conventions,
+            scratch_root=scratch,
+            above=outputs_module.hip_version_floor(hip),
+        )
+    except outputs_module.AllocationFailed as error:
+        raise CallError("OUTPUT_BUSY", str(error), details={"kind": "hip"}) from None
     except outputs_module.OutputError as error:
         raise CallError(
             "OUTPUT_REFUSED", str(error), details={"kind": "hip", "exception": type(error).__name__}
@@ -236,22 +338,29 @@ def allocate(
         raise unavailable(error) from None
     except OSError as error:
         raise CallError(
-            "OUTPUT_REFUSED",
+            "OUTPUT_UNWRITABLE",
             "the folder for the new scene file could not be made",
             details={"kind": "hip", "exception": type(error).__name__},
         ) from None
 
 
 def hip_suffix(call: Call, hip: str | None) -> str:
-    """The suffix to save with: the scene's own, or the one its license writes."""
+    """The suffix to save with, which is the one Houdini will really write.
+
+    A license that writes one kind of scene file renames anything else, so its
+    suffix wins. Otherwise the scene keeps its own, and a scene with no file
+    gets `.hip`.
+    """
+    reply = call.bridge("bridge.capabilities")
+    data = reply.get("data") or {}
+    name = str(data.get("license") or "").lower().replace(" ", "")
+    if name in LICENSE_SUFFIX:
+        return LICENSE_SUFFIX[name].lstrip(".")
     if hip:
         for suffix in HIP_SUFFIXES:
             if str(hip).lower().endswith(suffix):
                 return suffix.lstrip(".")
-    reply = call.bridge("bridge.capabilities")
-    data = reply.get("data") or {}
-    license_name = str(data.get("license") or "").lower().replace(" ", "")
-    return LICENSE_SUFFIX.get(license_name, "hip")
+    return "hip"
 
 
 def stored(action: Callable[[], Any]) -> Any:

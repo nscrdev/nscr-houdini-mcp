@@ -55,7 +55,9 @@ SERVER_CODES: dict[str, str] = {
     "WORKER_START_FAILED": "hython started but no bridge came up in it",
     "NOT_A_WORKER": "that session is not a worker the pool started",
     "WORKER_BUSY": "that worker is held by a job or running a call",
-    "OUTPUT_REFUSED": "no output path could be made for this",
+    "OUTPUT_REFUSED": "the output conventions do not allow a path for this",
+    "OUTPUT_BUSY": "every version tried was taken by another writer first",
+    "OUTPUT_UNWRITABLE": "the folder for an output could not be made",
 }
 
 CODES: dict[str, str] = {**BRIDGE_CODES, **SERVER_CODES}
@@ -98,7 +100,9 @@ HINTS: dict[str, str] = {
     "WORKER_START_FAILED": "read the worker log named in the details, then start again",
     "NOT_A_WORKER": "close a Houdini with a user interface yourself; stop only workers here",
     "WORKER_BUSY": "wait for the job or call to end, or pass force true to stop it anyway",
-    "OUTPUT_REFUSED": "fix the output conventions named in the details, then call again",
+    "OUTPUT_REFUSED": "fix the conventions file or the folder the message names, then call again",
+    "OUTPUT_BUSY": "call again; another writer is taking versions in the same folder",
+    "OUTPUT_UNWRITABLE": "check that the scene folder is there and writable, then call again",
     "FILE_NOT_FOUND": "check the path and use one that is there",
     "FILE_EXISTS": "ask for the next version rather than writing over this one",
     "UNSAVED_CHANGES": "save the scene first, or pass discard_unsaved true to drop the changes",

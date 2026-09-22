@@ -8,12 +8,15 @@ real Houdini does with the same calls is in the integration tests.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from nscr_houdini_mcp import outputs
+from nscr_houdini_mcp import store as store_module
+from nscr_houdini_mcp.bridge import client
 from nscr_houdini_mcp.bridge.tools import UNDO_NOTE
 from test_router import Sent
 from test_server import talk, text_of
@@ -198,6 +201,9 @@ def test_save_refuses_an_untitled_scene_and_points_at_save_increment(bench: Benc
 # Section: save_increment
 
 
+COMMERCIAL = reply({"license": "Commercial"})
+
+
 def test_save_increment_goes_on_above_the_versions_beside_the_scene(
     bench: Bench, project: Path
 ) -> None:
@@ -205,15 +211,15 @@ def test_save_increment_goes_on_above_the_versions_beside_the_scene(
         (project / name).write_bytes(name.encode())
     current = project / "shot_v002.hip"
     target = project / "shot_v003.hip"
-    result = scene(bench, info(current), saved(str(target)), action="save_increment")
+    result = scene(bench, info(current), COMMERCIAL, saved(str(target)), action="save_increment")
     assert not result.is_error, text_of(result)
     body = result.structured_content
     assert body["version"] == 3
     assert body["hip_path"] == str(target)
     assert body["unsaved_hip"] is False
     assert body["undo"] == UNDO_NOTE
-    assert sent_tools(bench) == ["scene.info", "scene.save_as"]
-    assert bench.sent.calls[1]["arguments"] == {"path": str(target)}
+    assert sent_tools(bench) == ["scene.info", "bridge.capabilities", "scene.save_as"]
+    assert bench.sent.calls[2]["arguments"] == {"path": str(target)}
     # The versions that were there are as they were.
     assert (project / "shot_v001.hip").read_bytes() == b"shot_v001.hip"
     assert (project / "shot_v002.hip").read_bytes() == b"shot_v002.hip"
@@ -226,18 +232,23 @@ def test_save_increment_twice_takes_two_versions(bench: Bench, project: Path) ->
     current = project / "shot.hip"
     current.write_bytes(b"scene")
     first = scene(
-        bench, info(current), saved(str(project / "shot_v001.hip")), action="save_increment"
+        bench,
+        info(current),
+        COMMERCIAL,
+        saved(str(project / "shot_v001.hip")),
+        action="save_increment",
     )
     (project / "shot_v001.hip").write_bytes(b"one")
     second = scene(
         bench,
         info(project / "shot_v001.hip"),
+        COMMERCIAL,
         saved(str(project / "shot_v002.hip")),
         action="save_increment",
     )
     assert first.structured_content["version"] == 1
     assert second.structured_content["version"] == 2
-    assert bench.sent.calls[1]["arguments"] == {"path": str(project / "shot_v002.hip")}
+    assert bench.sent.calls[2]["arguments"] == {"path": str(project / "shot_v002.hip")}
 
 
 def test_save_increment_steps_over_a_place_another_writer_claimed(
@@ -248,19 +259,22 @@ def test_save_increment_steps_over_a_place_another_writer_claimed(
     # Another machine with a store of its own took v001 and has not written it.
     Path(f"{project / 'shot_v001.hip'}{outputs.CLAIM_SUFFIX}").write_bytes(b"")
     result = scene(
-        bench, info(current), saved(str(project / "shot_v002.hip")), action="save_increment"
+        bench,
+        info(current),
+        COMMERCIAL,
+        saved(str(project / "shot_v002.hip")),
+        action="save_increment",
     )
     assert result.structured_content["version"] == 2
-    assert bench.sent.calls[1]["arguments"] == {"path": str(project / "shot_v002.hip")}
+    assert bench.sent.calls[2]["arguments"] == {"path": str(project / "shot_v002.hip")}
 
 
 def test_save_increment_of_an_untitled_scene_goes_to_the_scratch_folder(bench: Bench) -> None:
-    capabilities = reply({"license": "Commercial"})
     expected = bench.home / "temp" / "nscr-houdini-mcp" / "s-1" / "untitled_v001.hip"
     result = scene(
         bench,
         info("/somewhere/untitled.hip", untitled=True),
-        capabilities,
+        COMMERCIAL,
         saved(str(expected)),
         action="save_increment",
     )
@@ -272,31 +286,108 @@ def test_save_increment_of_an_untitled_scene_goes_to_the_scratch_folder(bench: B
     assert sent_tools(bench) == ["scene.info", "bridge.capabilities", "scene.save_as"]
 
 
-def test_an_apprentice_license_saves_its_own_kind_of_file(bench: Bench) -> None:
-    capabilities = reply({"license": "Apprentice"})
+@pytest.mark.parametrize(
+    ("license_name", "hip", "suffix"),
+    [
+        ("Apprentice", "/somewhere/untitled.hip", "hipnc"),
+        ("Indie", "PROJECT/shot.hip", "hiplc"),
+        ("Commercial", "PROJECT/shot.hipnc", "hipnc"),
+    ],
+)
+def test_the_suffix_is_the_one_houdini_will_write(
+    bench: Bench, project: Path, license_name: str, hip: str, suffix: str
+) -> None:
+    """A license that writes one kind of file decides the name before it is claimed."""
+    titled = hip.startswith("PROJECT")
+    path = str(project / hip.split("/", 1)[1]) if titled else hip
+    if titled:
+        Path(path).write_bytes(b"scene")
     result = scene(
         bench,
-        info("/somewhere/untitled.hip", untitled=True),
-        capabilities,
+        info(path, untitled=not titled),
+        reply({"license": license_name}),
         saved("x"),
         action="save_increment",
     )
     assert not result.is_error, text_of(result)
-    assert bench.sent.calls[2]["arguments"]["path"].endswith("untitled_v001.hipnc")
+    asked = bench.sent.calls[2]["arguments"]["path"]
+    assert asked.endswith(f"_v001.{suffix}")
+    assert Path(f"{asked}{outputs.CLAIM_SUFFIX}").exists() is False
 
 
-def test_a_save_increment_sent_again_asks_for_the_same_file(bench: Bench, project: Path) -> None:
+def test_a_save_increment_sent_again_gives_the_first_answer(bench: Bench, project: Path) -> None:
     current = project / "shot.hip"
     current.write_bytes(b"scene")
     target = str(project / "shot_v001.hip")
     first = scene(
-        bench, info(current), saved(target), action="save_increment", operation_id="inc-1"
+        bench,
+        info(current),
+        COMMERCIAL,
+        saved(target),
+        action="save_increment",
+        operation_id="inc-1",
     )
-    # The reply was lost. The same id again takes no new version: it asks the
-    # session for the same save, which the session answers from its receipt.
-    again = scene(bench, saved(target), action="save_increment", operation_id="inc-1")
+    again = scene(bench, action="save_increment", operation_id="inc-1")
     assert not again.is_error, text_of(again)
+    assert again.structured_content["replayed"] is True
     assert again.structured_content["version"] == first.structured_content["version"] == 1
+    assert bench.sent.calls == []
+
+
+def test_a_save_whose_reply_was_lost_asks_for_the_same_file_again(
+    bench: Bench, project: Path
+) -> None:
+    current = project / "shot.hip"
+    current.write_bytes(b"scene")
+    target = str(project / "shot_v001.hip")
+    lost = scene(
+        bench,
+        info(current),
+        COMMERCIAL,
+        client.BridgeUnreachable("the reply never came"),
+        action="save_increment",
+        operation_id="inc-2",
+    )
+    assert lost.structured_content["error"]["code"] == "SESSION_UNREACHABLE"
+    # The claim stays: the save may have happened.
+    assert Path(f"{target}{outputs.CLAIM_SUFFIX}").exists()
+    again = scene(bench, saved(target), action="save_increment", operation_id="inc-2")
+    assert not again.is_error, text_of(again)
+    assert again.structured_content["version"] == 1
     assert sent_tools(bench) == ["scene.save_as"]
     assert bench.sent.calls[0]["arguments"] == {"path": target}
-    assert bench.sent.calls[0]["operation_id"] == "inc-1"
+    assert bench.sent.calls[0]["operation_id"] == "inc-2"
+
+
+def test_a_save_that_definitely_failed_takes_its_version_back(bench: Bench, project: Path) -> None:
+    current = project / "shot.hip"
+    current.write_bytes(b"scene")
+    target = project / "shot_v001.hip"
+    result = scene(
+        bench,
+        info(current),
+        COMMERCIAL,
+        refusal("FILE_EXISTS", "a file is already at that path"),
+        action="save_increment",
+    )
+    assert result.structured_content["error"]["code"] == "FILE_EXISTS"
+    assert not Path(f"{target}{outputs.CLAIM_SUFFIX}").exists()
+    assert list(project.glob("*_run.json")) == []
+    with bench.store() as store:
+        rows = store._read_all("SELECT version, run_id FROM versions WHERE kind = 'hip'")
+    assert [(row["version"], row["run_id"]) for row in rows] == [(1, None)]
+
+
+def test_a_save_another_server_is_running_under_the_same_id_is_not_run_twice(
+    bench: Bench, project: Path
+) -> None:
+    current = project / "shot.hip"
+    current.write_bytes(b"scene")
+    digest = store_module.digest_arguments({"action": "save_increment", "session_id": "s-1"})
+    with bench.store() as store:
+        store.begin_operation("inc-3:increment", digest, owner_pid=os.getppid())
+    result = scene(bench, action="save_increment", operation_id="inc-3")
+    assert result.structured_content["error"]["code"] == "OUTCOME_UNKNOWN"
+    assert bench.sent.calls == []
+    with bench.store() as store:
+        assert store.latest_version(kind="hip", name="shot", hip_family="shot") == 0

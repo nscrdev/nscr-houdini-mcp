@@ -12,6 +12,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -220,25 +221,101 @@ def test_save_as_refuses_a_relative_path(scene: Scene) -> None:
 
 
 def test_save_as_moves_the_session_to_the_new_file(scene: Scene, tmp_path: Path) -> None:
+    scene.hipFile.writes_files = True
     path = tmp_path / "shot_v003.hip"
     data = tools.scene_save_as({"path": str(path)}, context(scene))
-    assert scene.hipFile.saved == [str(path)]
+    # Written under a private name first, then published under the one asked for.
+    [written] = scene.hipFile.saved
+    assert written != str(path)
+    assert Path(written).parent == tmp_path
+    assert not Path(written).exists()
+    assert path.read_bytes() == b"a scene"
     assert scene.hipFile.path() == str(path)
     assert data["hip_path"] == str(path)
+    assert data["bytes"] == len(b"a scene")
+    assert data["warnings"] == []
+
+
+def test_a_file_that_appears_during_the_save_is_not_written_over(
+    scene: Scene, tmp_path: Path
+) -> None:
+    scene.hipFile.writes_files = True
+    path = tmp_path / "shot_v003.hip"
+    save = scene.hipFile.save
+
+    def racing(name: str | None = None) -> None:
+        save(name)
+        path.write_bytes(b"somebody else's scene")
+
+    scene.hipFile.save = racing  # type: ignore[method-assign]
+    error = refused(lambda: tools.scene_save_as({"path": str(path)}, context(scene)))
+    assert error.code == "FILE_EXISTS"
+    assert path.read_bytes() == b"somebody else's scene"
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["shot_v003.hip"]
+    # The session holds the file it held before.
+    assert scene.hipFile.path() == "/Users/somebody/scenes/example.hip"
+
+
+def test_a_folder_that_cannot_link_publishes_in_two_steps_and_says_so(
+    scene: Scene, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_links(source: str, target: str) -> None:
+        raise OSError("this file system has no hard links")
+
+    monkeypatch.setattr(tools.os, "link", no_links)
+    scene.hipFile.writes_files = True
+    path = tmp_path / "shot_v003.hip"
+    data = tools.scene_save_as({"path": str(path)}, context(scene))
+    assert path.read_bytes() == b"a scene"
+    assert data["warnings"] and "two steps" in data["warnings"][0]
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["shot_v003.hip"]
+
+
+def licensed(scene: Scene, name: str) -> Any:
+    module = scene.module()
+    module.licenseCategory = lambda: SimpleNamespace(name=lambda: name)
+    return tools.ToolContext(hou=module, kind="hython", session_id="s-1")
+
+
+def test_a_save_refuses_a_name_the_license_would_not_write(scene: Scene, tmp_path: Path) -> None:
+    scene.hipFile.writes_files = True
+    error = refused(
+        lambda: tools.scene_save_as(
+            {"path": str(tmp_path / "shot_v001.hip")}, licensed(scene, "Apprentice")
+        )
+    )
+    assert error.code == "BAD_ARGUMENTS"
+    assert error.details["license_suffix"] == ".hipnc"
+    data = tools.scene_save_as(
+        {"path": str(tmp_path / "shot_v001.hipnc")}, licensed(scene, "Apprentice")
+    )
+    assert data["hip_path"].endswith("shot_v001.hipnc")
+    assert tools.license_suffix(licensed(scene, "Indie").hou) == ".hiplc"
+    assert tools.license_suffix(licensed(scene, "Commercial").hou) is None
+
+
+def test_a_gui_that_will_not_say_whether_it_has_changes_is_taken_to_have_them(
+    scene: Scene, hip: Path
+) -> None:
+    scene.hipFile.unsaved = None
+    error = refused(lambda: tools.scene_open({"path": str(hip)}, context(scene, "gui")))
+    assert error.code == "UNSAVED_CHANGES"
+    assert scene.hipFile.path() == "/Users/somebody/scenes/example.hip"
 
 
 def test_a_save_sent_twice_under_one_id_is_done_once(scene: Scene, tmp_path: Path) -> None:
+    scene.hipFile.writes_files = True
     running = dispatcher(scene, store_path=tmp_path / "coord.sqlite")
     path = str(tmp_path / "shot_v003.hip")
     first = running.dispatch(
         Envelope(tool="scene.save_as", arguments={"path": path}, operation_id="op-save")
     )
-    # The fake writes no file, so a second real save would not be refused on
-    # its own: the receipt is what answers it.
+    # The file is there now, so a second real save would be refused: the
+    # receipt is what answers the same id with the first answer.
     second = running.dispatch(
         Envelope(tool="scene.save_as", arguments={"path": path}, operation_id="op-save")
     )
-    assert first.payload["ok"] is True
+    assert first.payload["ok"] is True, first.payload
     assert second.payload["ok"] is True
     assert second.payload["data"] == first.payload["data"]
-    assert scene.hipFile.saved == [path]
+    assert len(scene.hipFile.saved) == 1

@@ -330,6 +330,8 @@ class HipFile:
         # The text a load warns with, when a test wants one.
         self.load_warning: str | None = None
         self.saved: list[str] = []
+        # Whether a save writes a file, for the checks that look at the disk.
+        self.writes_files = False
 
     def path(self) -> str:
         return self._path
@@ -341,6 +343,8 @@ class HipFile:
         return self.new
 
     def hasUnsavedChanges(self) -> bool:  # noqa: N802 - the name is Houdini's
+        if self.unsaved is None:
+            raise OperationFailed("this session will not say")
         return self.unsaved
 
     def addEventCallback(self, callback: Any) -> None:  # noqa: N802 - the name is Houdini's
@@ -389,7 +393,14 @@ class HipFile:
             self._path = str(path)
         self.new = False
         self.saved.append(self._path)
+        if self.writes_files:
+            with open(self._path, "wb") as written:
+                written.write(b"a scene")
         self._fire(HipFileEventType.BeforeSave, HipFileEventType.AfterSave)
+
+    def setName(self, path: str) -> None:  # noqa: N802 - the name is Houdini's
+        self._path = str(path)
+        self.new = False
 
 
 class Scene:

@@ -80,6 +80,15 @@ _NOT_ON_DISK = ("op:", "opdef:", "oplib:", "temp:", "http:", "https:")
 
 UNDO_NOTE = "a scene file change cannot be undone"
 
+# The scene suffix each license writes, by the license category's own name.
+# A license not named here writes any of them.
+LICENSE_SUFFIX = {
+    "apprentice": ".hipnc",
+    "apprenticehd": ".hipnc",
+    "education": ".hipnc",
+    "indie": ".hiplc",
+}
+
 # The words Houdini puts on a node whose asset library was not found.
 STUB_WARNING = "incomplete asset definition"
 
@@ -180,7 +189,7 @@ def _build(hou: Any) -> list[int] | None:
 
 def _license(hou: Any) -> str | None:
     """Which kind of license this process got, in the build's own words."""
-    category = _quiet(hou.licenseCategory)
+    category = _ask(hou, "licenseCategory")
     if category is None:
         return None
     return str(_quiet(category.name) or category)
@@ -422,6 +431,10 @@ def scene_open(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, 
             hint="check the path, or list the folder, then open a file that is there",
         )
     unsaved = _unsaved(hou, context)
+    if unsaved is None and context.kind == "gui":
+        # A session with a user interface that will not say is taken to have
+        # changes, because the cost of being wrong is somebody's work.
+        unsaved = True
     discard = bool(arguments.get("discard_unsaved"))
     if unsaved and not discard:
         raise BridgeError(
@@ -469,6 +482,12 @@ def scene_save(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, 
 def scene_save_as(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, Any]:
     """Save the scene to a new file. A file that is there is never written over.
 
+    The scene is written to a private name in the same folder first and then
+    published under the name asked for with a hard link, which fails when
+    anything is at that name, whoever put it there and however late. A file
+    system that cannot link falls back to a look before the write, and the
+    reply says so.
+
     The session holds the new file from here on, as it would after a save as
     in the interface. The scene is the same scene, so the epoch stays.
     """
@@ -477,21 +496,88 @@ def scene_save_as(arguments: Mapping[str, Any], context: ToolContext) -> dict[st
     if not os.path.isabs(path):
         raise BridgeError("BAD_ARGUMENTS", "a scene file path has to be absolute")
     if os.path.lexists(path):
-        raise BridgeError(
-            "FILE_EXISTS",
-            "a file is already at that path",
-            {"suffix": Path(path).suffix},
-            hint="ask for the next version rather than writing over this one",
-        )
-    if not os.path.isdir(os.path.dirname(path)):
+        raise _file_exists(path)
+    folder = os.path.dirname(path)
+    if not os.path.isdir(folder):
         raise BridgeError(
             "FILE_NOT_FOUND",
             "the folder for that scene file is not there",
             hint="create the folder first, or save somewhere that is there",
         )
-    hou.hipFile.save(path)
-    saved = _quiet(hou.hipFile.path)
-    return {"hip_path": saved, "bytes": _size(path), "undo": UNDO_NOTE}
+    wanted = license_suffix(hou)
+    if wanted and not path.lower().endswith(wanted):
+        raise BridgeError(
+            "BAD_ARGUMENTS",
+            f"this license saves scene files as {wanted}, so it would not write that name",
+            {"suffix": Path(path).suffix, "license_suffix": wanted},
+            hint=f"ask for a path ending in {wanted}",
+        )
+    stem, suffix = os.path.splitext(path)
+    private = f"{stem}.part{os.getpid()}{suffix}"
+    if os.path.isfile(private) and not os.path.islink(private):
+        # Left by an attempt that stopped between the write and the publish.
+        os.remove(private)
+    before = None if _ask(hou.hipFile, "isNewFile") else _ask(hou.hipFile, "path")
+    hou.hipFile.save(private)
+    try:
+        warnings = _publish(private, path)
+    except BaseException:
+        _discard(private)
+        if before:
+            # The session goes back to the file it held. A scene that had no
+            # file keeps the private name rather than a made up one.
+            _ask(hou.hipFile, "setName", before)
+        raise
+    hou.hipFile.setName(path)
+    return {
+        "hip_path": _ask(hou.hipFile, "path") or path,
+        "bytes": _size(path),
+        "warnings": warnings,
+        "undo": UNDO_NOTE,
+    }
+
+
+def _publish(private: str, path: str) -> list[str]:
+    """Give a written file its name, only if nothing has that name yet."""
+    try:
+        os.link(private, path)
+    except FileExistsError:
+        raise _file_exists(path) from None
+    except OSError:
+        # This file system has no hard links. The look and the write are two
+        # steps then, which is what it was before there was a better way.
+        if os.path.lexists(path):
+            raise _file_exists(path) from None
+        os.replace(private, path)
+        return ["this folder cannot link files, so the check and the write were two steps"]
+    _discard(private)
+    return []
+
+
+def _discard(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _file_exists(path: str) -> BridgeError:
+    return BridgeError(
+        "FILE_EXISTS",
+        "a file is already at that path",
+        {"suffix": Path(path).suffix},
+        hint="ask for the next version rather than writing over this one",
+    )
+
+
+def license_suffix(hou: Any) -> str | None:
+    """The only scene suffix this license writes, or nothing when it writes any.
+
+    A license that writes one kind of file renames anything else on the way
+    out, so a path is checked against it before a save rather than after.
+    """
+    name = str(_license(hou) or "").lower().replace(" ", "")
+    return LICENSE_SUFFIX.get(name)
 
 
 def _size(path: Any) -> int | None:
