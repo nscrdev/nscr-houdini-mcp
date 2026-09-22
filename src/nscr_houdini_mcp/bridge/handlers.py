@@ -151,6 +151,13 @@ def default_registry(*, selfcheck: bool = False) -> ToolRegistry:
             summary="take a while, make nodes, replace the scene or fail where asked",
         )
     registry.add(
+        "bridge.capabilities",
+        tool_module.capabilities,
+        arguments=(),
+        context=True,
+        summary="what this Houdini can do, read once when it comes up",
+    )
+    registry.add(
         "scene.info",
         tool_module.scene_info,
         arguments=(),

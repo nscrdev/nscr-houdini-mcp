@@ -5,6 +5,10 @@ level tools, named the way `bridge.ping` is named. The tool surface a client
 sees is a separate, smaller set built on top of these.
 
 - `scene.info` reads. It cooks nothing and changes nothing.
+- `bridge.capabilities` reads facts about the process rather than the scene:
+  the build, the license, the renderers that are really installed and the ways
+  this session can make a picture. The pool records the answer beside the
+  worker, so another process can pick a worker without asking it anything.
 - `node.create` mutates, so it runs on the main thread in a graphical session
   and inside one undo group in every session.
 - `bridge.selfcheck` mutates on purpose, and can be asked to take its time, to
@@ -16,6 +20,7 @@ sees is a separate, smaller set built on top of these.
 
 from __future__ import annotations
 
+import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -26,6 +31,17 @@ from nscr_houdini_mcp.bridge.errors import BridgeError, did_you_mean
 
 # The networks a scene summary counts, in the order a person reads them.
 CONTEXTS = ("/obj", "/out", "/stage", "/mat", "/ch", "/shop", "/img", "/tasks")
+
+# The render node types a capability probe looks for. A name that is not
+# registered in this build is simply not reported.
+RENDER_TYPES = (
+    "karma",
+    "ifd",
+    "usdrender_rop",
+    "arnold",
+    "Redshift_ROP",
+    "vray_renderer",
+)
 
 # Bounds on what the self check will do, so a mistyped argument cannot park
 # the session for long or fill a scene.
@@ -86,6 +102,80 @@ def scene_info(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, 
         "session_id": context.session_id,
         "kind": context.kind,
     }
+
+
+def capabilities(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, Any]:
+    """What this session can do, read once when a worker comes up.
+
+    Everything here is a fact about the process, not about a scene, so it is
+    true for as long as the session lives and worth recording where other
+    processes can read it. A fact this build will not give is `None` or an
+    empty list, never a guess.
+    """
+    hou = _houdini(context)
+    return {
+        "houdini_version": _quiet(hou.applicationVersionString),
+        "houdini_build": _build(hou),
+        "hfs": _quiet(lambda: hou.expandString("$HFS")),
+        "gui": context.kind == "gui",
+        "license": _license(hou),
+        "renderers": _renderers(hou),
+        "capture": _capture_routes(hou),
+        "cancellation": True,
+        "max_threads": _quiet(lambda: hou.expandString("$HOUDINI_MAXTHREADS")) or None,
+        "platform": sys.platform,
+    }
+
+
+def _build(hou: Any) -> list[int] | None:
+    """The version as numbers, for a comparison that does not parse text."""
+    parts = _quiet(hou.applicationVersion)
+    return None if parts is None else [int(part) for part in parts]
+
+
+def _license(hou: Any) -> str | None:
+    """Which kind of license this process got, in the build's own words."""
+    category = _quiet(hou.licenseCategory)
+    if category is None:
+        return None
+    return str(_quiet(category.name) or category)
+
+
+def _renderers(hou: Any) -> list[str]:
+    """The renderers this install has, by what is really there.
+
+    Two questions: whether the standalone USD renderer sits beside hython, and
+    which render node types this build knows. A type that is not registered
+    means the renderer is not installed, whatever else is on the machine.
+    """
+    found: list[str] = []
+    hfs = _quiet(lambda: hou.expandString("$HFS"))
+    if hfs:
+        husk = Path(hfs) / "bin" / ("husk.exe" if sys.platform == "win32" else "husk")
+        if husk.is_file():
+            found.append("husk")
+    category = _quiet(hou.ropNodeTypeCategory)
+    if category is None:
+        return found
+    for name in RENDER_TYPES:
+        if _quiet(lambda name=name: hou.nodeType(category, name)) is not None:
+            found.append(name)
+    return found
+
+
+def _capture_routes(hou: Any) -> list[str]:
+    """The ways this session can produce a picture.
+
+    A viewport flipbook needs a user interface, so a worker never has one. The
+    render node route is there whenever the type is registered.
+    """
+    routes: list[str] = []
+    if _quiet(hou.isUIAvailable):
+        routes.append("viewport_flipbook")
+    category = _quiet(hou.ropNodeTypeCategory)
+    if category is not None and _quiet(lambda: hou.nodeType(category, "opengl")) is not None:
+        routes.append("opengl_rop")
+    return routes
 
 
 def _unsaved(hou: Any, context: ToolContext) -> bool | None:
