@@ -29,7 +29,12 @@ The lock in the app says one call at a time. This says the rest of it:
   runs. The paths in it belong to a scene that has been thrown away.
 - A mutating call that carries an operation id takes a receipt before it runs
   and finishes it with the answer, so the same id sent again is answered from
-  the receipt instead of doing the work twice.
+  the receipt instead of doing the work twice. The answer is worked out and
+  the receipt written on the thread that ran the work, before the session is
+  given to the next caller, so a retry queued behind the work always finds
+  the answer rather than a receipt that still says running. While the work
+  runs, however long past its caller's timeout, the receipt's lease is renewed
+  so nobody takes it over.
 - Every mutating call runs inside one undo group, on the main thread where
   there is one, and a failure rolls the group's graph edits back. A change
   Houdini cannot undo, such as loading a scene, runs without a group and its
@@ -97,6 +102,10 @@ SCENE_CODES = ("SCENE_REPLACED", "OUTCOME_UNKNOWN")
 # the latest few say anything a caller can use.
 PROGRESS_KEPT = 8
 
+# How often a running call renews the lease on its receipt. Well inside the
+# store's lease, so a long call is never taken for one that died.
+LEASE_RENEW_S = 60.0
+
 
 @dataclass
 class Running:
@@ -114,6 +123,8 @@ class Running:
     rolled_back: bool = False
     cancel: threading.Event = field(default_factory=threading.Event)
     progress: deque = field(default_factory=lambda: deque(maxlen=PROGRESS_KEPT))
+    # Set once the call has given the session back.
+    ended: threading.Event = field(default_factory=threading.Event)
 
     def elapsed_s(self) -> float:
         return round(max(0.0, time.monotonic() - self.began), 3)
@@ -158,6 +169,7 @@ class Dispatcher:
         skip_stale_s: float = DEFAULT_SKIP_STALE_S,
         home: Any = None,
         open_store: Callable[[], Any] | None = None,
+        lease_renew_s: float = LEASE_RENEW_S,
     ) -> None:
         self.tools = tools
         self.kind = kind
@@ -177,6 +189,7 @@ class Dispatcher:
         # out managed output paths. A bridge with neither hands out none.
         self._home = home
         self._open_store = open_store
+        self._lease_renew_s = lease_renew_s
         self._gate = Gate(lock)
         self._running: Running | None = None
         self._last: dict[str, Any] | None = None
@@ -390,7 +403,11 @@ class Dispatcher:
             open_store=self._open_store,
         )
 
-        work = marshal.Work(lambda: self._work(tool, envelope.arguments, context, running, carried))
+        work = marshal.Work(
+            lambda: self._work(tool, envelope.arguments, context, running, carried, wanted, trace)
+        )
+        if wanted:
+            self._keep_lease(wanted, running)
         runner = marshal.choose_runner(
             self.kind,
             mutating=tool.mutating,
@@ -436,12 +453,8 @@ class Dispatcher:
                 # Nobody is waiting for a read any more, so it is asked to
                 # stop at its next look at the flag rather than run on.
                 running.cancel.set()
-            if wanted:
-                # The work is still going, so the receipt says so rather than
-                # looking abandoned to the next caller that presents the id,
-                # and it is finished with the answer whenever the work ends.
-                self.receipts.touch(wanted)
-                self._record_when_it_ends(wanted, tool, work, running, dict(trace))
+            # The work goes on, renewing its receipt, and writes its answer
+            # there when it ends, before the session is given back.
             return Reply(
                 200,
                 {
@@ -460,36 +473,46 @@ class Dispatcher:
                 },
             )
 
-        reply = self._answer(tool, work, running, trace)
-        if wanted:
-            self.receipts.finish(wanted, reply.payload)
-        return reply
+        return self._finished(tool, work, running, trace, wanted)
 
     # Section: answering
 
-    def _record_when_it_ends(
+    def _finished(
         self,
-        operation_id: str,
         tool: Tool,
         work: marshal.Work,
         running: Running,
         trace: dict[str, Any],
-    ) -> None:
-        """Finish the receipt of a call whose work outlived it.
+        wanted: str | None,
+    ) -> Reply:
+        """The answer the work settled on, with which route reached it."""
+        reply = work.result
+        if work.error is not None or not isinstance(reply, Reply):
+            # The work failed outside the tool, which leaves no answer and no
+            # receipt behind it. Both are made here instead.
+            reply = self._failed(tool, work.error or RuntimeError("no answer"), running, trace)
+            if wanted:
+                self.receipts.finish(wanted, reply.payload)
+            return reply
+        if work.picked_by is not None:
+            # Which route to the main thread reached the work first, so a check
+            # against a real Houdini can tell the two apart.
+            return Reply(reply.status, {**reply.payload, "picked_by": work.picked_by})
+        return reply
 
-        The caller has been told the work goes on. What it ends up doing still
-        belongs under its operation id, so the same id sent again gets the
-        answer rather than being told that nobody knows.
+    def _keep_lease(self, operation_id: str, running: Running) -> None:
+        """Renew the receipt's lease until the call gives the session back.
+
+        A call can run far past its caller's timeout. Without this its receipt
+        would look abandoned to the next caller presenting the id once the
+        store's lease ran out.
         """
 
-        def record() -> None:
-            work.finished.wait()
-            try:
-                self.receipts.finish(operation_id, self._answer(tool, work, running, trace).payload)
-            except Exception as error:  # noqa: BLE001 - a missed receipt is not a failed call
-                self._log(f"could not record {operation_id}: {type(error).__name__}: {error}")
+        def renew() -> None:
+            while not running.ended.wait(self._lease_renew_s):
+                self.receipts.touch(operation_id)
 
-        threading.Thread(target=record, name="nscr-mcp-receipt", daemon=True).start()
+        threading.Thread(target=renew, name="nscr-mcp-lease", daemon=True).start()
 
     def _said(self, trace: Mapping[str, Any]) -> dict[str, Any]:
         """The trace as it is at the moment of answering.
@@ -627,31 +650,49 @@ class Dispatcher:
         context: ToolContext,
         running: Running,
         carried: int | None = None,
-    ) -> Any:
+        wanted: str | None = None,
+        trace: Mapping[str, Any] | None = None,
+    ) -> Reply:
         """The whole of one call, on whichever thread it was given to.
 
         In a session with a user interface that thread is the main thread, for
         a read as much as for a mutation. The undo group is still only for a
         tool that changes the scene.
+
+        The answer is made here, while the session is still held: the value is
+        converted on this thread, where reading a node is safe, and the receipt
+        is written before the next caller can present the same id.
         """
+        began = time.monotonic()
+        value: Any = None
+        error: BaseException | None = None
         try:
-            # The last look at the scene, here on the thread that is about to
-            # touch it. A call can wait a long time for its turn, and the
-            # session may have loaded another scene while it waited: the paths
-            # in its arguments would then mean something else entirely.
-            self._still_the_same_scene(carried)
-            if not tool.mutating or not tool.undoable or self._hou is None:
-                return tool.run(arguments, context)
-            outcome = run_in_undo_group(
-                lambda: tool.run(arguments, context),
-                label=running.label or tool.undo_label(arguments),
-                hou=self._hou,
-            )
-            running.recorded = outcome.recorded
-            running.rolled_back = outcome.rolled_back
-            if outcome.error is not None:
-                raise outcome.error
-            return outcome.value
+            try:
+                # The last look at the scene, here on the thread that is about
+                # to touch it. A call can wait a long time for its turn, and
+                # the session may have loaded another scene while it waited:
+                # the paths in its arguments would then mean something else.
+                self._still_the_same_scene(carried)
+                if not tool.mutating or not tool.undoable or self._hou is None:
+                    value = tool.run(arguments, context)
+                else:
+                    outcome = run_in_undo_group(
+                        lambda: tool.run(arguments, context),
+                        label=running.label or tool.undo_label(arguments),
+                        hou=self._hou,
+                    )
+                    running.recorded = outcome.recorded
+                    running.rolled_back = outcome.rolled_back
+                    if outcome.error is not None:
+                        raise outcome.error
+                    value = outcome.value
+            except BaseException as raised:  # noqa: BLE001 - becomes the coded answer
+                error = raised
+            timing_ms = (time.monotonic() - began) * 1000.0
+            reply = self._settle(tool, value, error, running, dict(trace or {}), timing_ms)
+            if wanted:
+                self.receipts.finish(wanted, reply.payload)
+            return reply
         finally:
             self._release(running)
 
@@ -672,24 +713,26 @@ class Dispatcher:
         if self._running is running:
             self._last = {**running.as_dict(), "finished_at": time.time()}
             self._running = None
+        running.ended.set()
         self._gate.leave()
 
     # Section: answers
 
-    def _answer(self, tool: Tool, work: marshal.Work, running: Running, trace: dict) -> Reply:
-        timing_ms = 0.0
-        if work.started_at is not None and work.finished_at is not None:
-            timing_ms = (work.finished_at - work.started_at) * 1000.0
+    def _settle(
+        self,
+        tool: Tool,
+        value: Any,
+        error: BaseException | None,
+        running: Running,
+        trace: dict[str, Any],
+        timing_ms: float,
+    ) -> Reply:
+        """One call's answer, from what its tool returned or raised."""
+        if error is not None:
+            return self._failed(tool, error, running, trace)
 
-        if work.error is not None:
-            return self._failed(tool, work.error, running, trace)
-
-        converted = encoding.convert(work.result, **(tool.caps or {}))
+        converted = encoding.convert(value, **(tool.caps or {}))
         payload = {**ok_payload(converted.value, timing_ms=timing_ms), **self._said(trace)}
-        if work.picked_by is not None:
-            # Which route to the main thread reached the work first, so a check
-            # against a real Houdini can tell the two apart.
-            payload["picked_by"] = work.picked_by
         if converted.lossy:
             payload["lossy"] = True
             payload["cut"] = converted.cut
@@ -838,8 +881,11 @@ def _digest(tool: Tool, arguments: Mapping[str, Any]) -> str | None:
 
     An argument JSON cannot carry has no stable digest, so the call runs with
     no receipt rather than with one that could match the wrong arguments.
+    Arguments a tool names as filled in by the sender rather than chosen by
+    the caller are left out, so a retry from another sender still matches.
     """
+    kept = {key: value for key, value in arguments.items() if key not in tool.digest_ignores}
     try:
-        return receipt_module.digest_call(tool.name, arguments)
+        return receipt_module.digest_call(tool.name, kept)
     except Exception:  # noqa: BLE001 - no receipt is better than a wrong one
         return None

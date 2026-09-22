@@ -58,6 +58,10 @@ class Tool:
     # The argument that names this call's undo entry, for a tool whose calls
     # each want a name of their own. The label above when it is not sent.
     label_argument: str | None = None
+    # Arguments the receipt digest leaves out: ones the sender fills in for a
+    # caller that named none, which a retry from another sender fills in
+    # differently for the same call.
+    digest_ignores: tuple[str, ...] = ()
     # Its own run budget, when it needs one other than the bridge default.
     timeout_s: float | None = None
     summary: str = ""
@@ -95,6 +99,7 @@ class ToolRegistry:
         immediate: bool = False,
         label: str | None = None,
         label_argument: str | None = None,
+        digest_ignores: Sequence[str] = (),
         timeout_s: float | None = None,
         summary: str = "",
         caps: Mapping[str, int] | None = None,
@@ -112,6 +117,7 @@ class ToolRegistry:
             immediate=immediate,
             label=label,
             label_argument=label_argument,
+            digest_ignores=tuple(digest_ignores),
             timeout_s=timeout_s,
             summary=summary,
             caps=dict(caps) if caps else None,

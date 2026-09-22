@@ -48,11 +48,34 @@ class Clock:
         return self.now
 
 
+class SlowReceipts(receipt_module.Receipts):
+    """Receipts whose answer takes a while to write, as a busy disk makes it.
+
+    It widens the moment between the work ending and its answer being kept,
+    which is where a retry queued behind the work must not be let in.
+    """
+
+    finish_s = 0.0
+
+    def finish(self, operation_id: str, payload: Any) -> None:
+        time.sleep(self.finish_s)
+        super().finish(operation_id, payload)
+
+
 class Through:
     """Sends each call to a real dispatcher, with receipts, over the stand in."""
 
-    def __init__(self, module: Any, home: Path, namespaces: tools.Namespaces) -> None:
+    def __init__(
+        self,
+        module: Any,
+        home: Path,
+        namespaces: tools.Namespaces,
+        *,
+        lease_renew_s: float = 60.0,
+    ) -> None:
         store_path = home / store_module.STORE_FILE_NAME
+        self.namespaces = namespaces
+        self.stopping = threading.Event()
         self.identity = Identity(session_id="s-1", kind="hython", alias="w1", hou=module)
         self.dispatcher = Dispatcher(
             default_registry(python=namespaces),
@@ -60,14 +83,14 @@ class Through:
             kind="hython",
             session_id="s-1",
             identity=self.identity,
-            receipts=receipt_module.Receipts(
-                lambda: store_module.Store(store_path), session_id="s-1"
-            ),
+            receipts=SlowReceipts(lambda: store_module.Store(store_path), session_id="s-1"),
             hou=module,
             wait_s=5.0,
             timeout_s=10.0,
             home=home,
             open_store=lambda: store_module.Store(store_path),
+            stopping=self.stopping,
+            lease_renew_s=lease_renew_s,
         )
         self.calls: list[dict[str, Any]] = []
 
@@ -614,3 +637,51 @@ def test_a_lost_reply_is_sent_again_and_the_code_runs_once(
     finally:
         bridge.stop()
         scene.ui.stop()
+
+
+# Section: a retry queued behind the work
+
+
+def test_a_retry_queued_behind_timed_out_code_gets_the_stored_answer(
+    bench: Bench, module: Any, scene: Scene
+) -> None:
+    code = "hou.gate.wait(10)\nhou.node('/obj').createNode('geo')\nresult = 'finished'"
+    through(bench).dispatcher.receipts.finish_s = 0.5  # type: ignore[attr-defined]
+    late = refused(python(bench, code=code, timeout_s=0.2, operation_id="op-queued"))
+    assert late["code"] == "TIMEOUT"
+    dispatcher = through(bench).dispatcher
+    done: list[Any] = []
+    retry = threading.Thread(
+        target=lambda: done.append(python(bench, code=code, operation_id="op-queued", wait_s=20))
+    )
+    retry.start()
+    support.wait_until(lambda: dispatcher.state()["queued"] == 1, timeout_s=10.0)
+    module.gate.set()
+    retry.join(20.0)
+    body = ok(done[0])
+    assert body["result"] == "finished"
+    assert len(scene.node("/obj").children()) == 1
+
+
+def test_running_code_keeps_its_receipt_lease(tmp_path: Path, module: Any, clock: Clock) -> None:
+    home = tmp_path / "leased"
+    home.mkdir()
+    made = Bench(home)
+    made.session("s-1", "w1")
+    made.sent = Through(  # type: ignore[assignment]
+        module, home, tools.Namespaces(clock=clock), lease_renew_s=0.05
+    )
+    late = refused(python(made, code="hou.gate.wait(10)", timeout_s=0.1, operation_id="op-l"))
+    assert late["code"] == "TIMEOUT"
+    with made.store() as store:
+        first = store.get_operation("op-l").updated_at
+    support.wait_until(lambda: _updated(made, "op-l") > first, timeout_s=10.0)
+    module.gate.set()
+    support.wait_until(lambda: not through(made).dispatcher.state()["busy"], timeout_s=10.0)
+    with made.store() as store:
+        assert store.get_operation("op-l").state == "done"
+
+
+def _updated(bench: Bench, operation_id: str) -> float:
+    with bench.store() as store:
+        return store.get_operation(operation_id).updated_at
