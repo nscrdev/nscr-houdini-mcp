@@ -2,28 +2,23 @@
 
 Children are started with the spawn method, which is the only one available on
 every supported system, so a child imports this module by name and calls the
-function it was given at module level. Children are daemons, every wait has a
-timeout and the runner terminates whatever is left, so a child that hangs or
-dies can never hold up the suite.
+function it was given at module level. The runner that starts them is shared
+with the other files that need a crowd, in `support`.
 """
 
 from __future__ import annotations
 
-import multiprocessing as mp
 import os
-import queue as queue_module
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
+import support
 from nscr_houdini_mcp.store import PoolFull, Store, digest_arguments
 
 RACERS = 6
 OPENERS = 12
-BARRIER_TIMEOUT_S = 30.0
-RESULT_TIMEOUT_S = 60.0
-JOIN_TIMEOUT_S = 30.0
+BARRIER_TIMEOUT_S = support.BARRIER_TIMEOUT_S
 
 # Two of three worker slots are taken before the children start, so there is
 # exactly one left for all of them to fight over.
@@ -83,35 +78,9 @@ def open_fresh(path: str, index: int, barrier, results) -> None:
     results.put(report)
 
 
-def run_children(target: Callable[..., None], count: int, path: Path) -> list[dict]:
+def run_children(target, count: int, path: Path) -> list[dict]:
     """Start `count` spawned children on one store and collect their reports."""
-    context = mp.get_context("spawn")
-    barrier = context.Barrier(count)
-    results = context.Queue()
-    children = [
-        context.Process(target=target, args=(str(path), index, barrier, results), daemon=True)
-        for index in range(count)
-    ]
-    collected: list[dict] = []
-    try:
-        for child in children:
-            child.start()
-        for _ in children:
-            collected.append(results.get(timeout=RESULT_TIMEOUT_S))
-        for child in children:
-            child.join(JOIN_TIMEOUT_S)
-    except queue_module.Empty:
-        pytest.fail(f"only {len(collected)} of {count} children reported back")
-    finally:
-        for child in children:
-            if child.is_alive():
-                child.terminate()
-                child.join(JOIN_TIMEOUT_S)
-
-    failures = [report["error"] for report in collected if report["error"]]
-    assert failures == []
-    collected.sort(key=lambda report: report["index"])
-    return collected
+    return support.run_children(target, count, (str(path),), barrier=True)
 
 
 @pytest.fixture(scope="module")

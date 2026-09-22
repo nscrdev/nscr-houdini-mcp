@@ -13,15 +13,13 @@ looks at a scene file.
 
 Children are started with the spawn method, which is the only one on every
 supported system, so a child imports this module by name and calls the
-function it was given. Children are daemons, every wait has a timeout, and the
-runner ends whatever is left.
+function it was given. The runner that starts them is shared with the other
+files that need a crowd, in `support`.
 """
 
 from __future__ import annotations
 
-import multiprocessing as mp
 import os
-import queue as queue_module
 import sys
 import time
 from collections.abc import Iterator
@@ -29,12 +27,14 @@ from pathlib import Path
 
 import pytest
 
+import support
 from nscr_houdini_mcp import pool
 from nscr_houdini_mcp.bridge import client, registry
 from nscr_houdini_mcp.store import PoolFull, process_is_alive, process_start_stamp
 
 
 def hython_available() -> bool:
+    """What the pool itself finds, which is what these checks start."""
     try:
         pool.hython_path()
     except pool.HythonNotFound:
@@ -48,16 +48,14 @@ pytestmark = [
 ]
 
 # A range of this file's own, away from the one a bridge started by hand uses.
-PORT_RANGE = (18360, 18399)
+PORT_RANGE = support.POOL_PORTS
 
 # Two of three slots are held before the children start, so there is exactly
 # one left for all of them to fight over, and at most one real worker.
 POOL_CAP = 3
 RACERS = 8
 
-BARRIER_TIMEOUT_S = 60.0
-RESULT_TIMEOUT_S = 300.0
-JOIN_TIMEOUT_S = 60.0
+BARRIER_TIMEOUT_S = support.BARRIER_TIMEOUT_S
 
 # Long enough that a worker started for one check is never taken for idle
 # while the check runs.
@@ -100,9 +98,9 @@ def ask_for_a_worker(home: str, hython: str, index: int, barrier, results) -> No
     results.put(report)
 
 
-def start_and_leave(home: str, hython: str, max_idle_s: float, results) -> None:
+def start_and_leave(home: str, hython: str, max_idle_s: float, index, barrier, results) -> None:
     """Start a worker and go away, which is what a client exit looks like."""
-    report: dict[str, object] = {"pid": os.getpid(), "error": None}
+    report: dict[str, object] = {"index": index, "pid": os.getpid(), "error": None}
     try:
         config = config_for(Path(home), max_idle_s=max_idle_s)
         with pool.open_store(home) as store:
@@ -118,31 +116,7 @@ def start_and_leave(home: str, hython: str, max_idle_s: float, results) -> None:
 
 def run_children(target, count: int, args: tuple, *, barrier: bool) -> list[dict]:
     """Start `count` spawned children and collect their reports."""
-    context = mp.get_context("spawn")
-    results = context.Queue()
-    gate = context.Barrier(count) if barrier else None
-    children = []
-    for index in range(count):
-        extra = (index, gate, results) if barrier else (results,)
-        children.append(context.Process(target=target, args=args + extra, daemon=True))
-    collected: list[dict] = []
-    try:
-        for child in children:
-            child.start()
-        for _ in children:
-            collected.append(results.get(timeout=RESULT_TIMEOUT_S))
-        for child in children:
-            child.join(JOIN_TIMEOUT_S)
-    except queue_module.Empty:
-        pytest.fail(f"only {len(collected)} of {count} children reported back")
-    finally:
-        for child in children:
-            if child.is_alive():
-                child.terminate()
-                child.join(JOIN_TIMEOUT_S)
-    failures = [report["error"] for report in collected if report["error"]]
-    assert failures == []
-    return collected
+    return support.run_children(target, count, args, barrier=barrier)
 
 
 # Section: the home every check gets, and the promise to leave nothing running
@@ -153,24 +127,8 @@ def home(tmp_path: Path) -> Iterator[Path]:
     folder = tmp_path / "home"
     folder.mkdir()
     yield folder
-    left = stop_everything(folder)
+    left = support.stop_everything(folder, config_for(folder))
     assert left == [], f"workers were left running: {left}"
-
-
-def stop_everything(home: Path) -> list[str]:
-    """Stop every worker this home knows. Returns the ones that would not go."""
-    if not pool.store_path(home).exists():
-        return []
-    left: list[str] = []
-    with pool.open_store(home) as store:
-        for record in store.list_workers():
-            if record.pid is None:
-                store.release_worker(record.token)
-                continue
-            stopped = pool.stop_worker(config_for(home), store, record.token)
-            if not stopped.ended:
-                left.append(record.alias)
-    return left
 
 
 def health_of(home: Path, session_id: str):
