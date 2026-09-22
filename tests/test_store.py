@@ -31,6 +31,7 @@ from nscr_houdini_mcp.store import (
     shared_location_warning,
     write_export,
 )
+from nscr_houdini_mcp.tools.sessions import ended_state
 
 DEAD_PID = 2**22 - 1  # Above every system's pid range, so never a live process.
 LIVE_PID = os.getpid()  # A pid that is certainly running, on every system.
@@ -252,6 +253,36 @@ def test_a_session_from_an_older_file_keeps_its_name_while_its_pid_is_alive(tmp_
         assert after.get_session("s1").pid_start is None
         with pytest.raises(AliasInUse):
             after.register_session("s2", kind="hython", pid=LIVE_PID, alias="w1")
+
+
+def test_a_file_from_before_sessions_kept_how_they_ended_reads_right(tmp_path) -> None:
+    """A schema 6 file with rows in it, opened by a build at schema 7."""
+    path = tmp_path / "coord.sqlite"
+    raw = sqlite3.connect(str(path))
+    for statements in store_module.MIGRATIONS[:6]:
+        for statement in statements:
+            raw.execute(statement)
+    raw.execute("PRAGMA user_version=6")
+    insert = (
+        "INSERT INTO sessions (session_id, alias, kind, pid, pid_start, port, state,"
+        " scene_epoch, hip_path, capabilities, started_at, heartbeat_at)"
+        " VALUES (?, ?, 'hython', ?, 'then', 18000, ?, 0, NULL, NULL, 1.0, 1.0)"
+    )
+    raw.execute(insert, ("s-old", "w1", DEAD_PID, "gone"))
+    raw.execute(insert, ("s-dead", "w2", DEAD_PID, "live"))
+    raw.commit()
+    raw.close()
+
+    with Store(path) as after:
+        assert after.schema_version() == 7
+        assert after.get_session("s-old").ended_as is None
+        assert after.get_session("s-dead").ended_as is None
+        assert after.reclaim_sessions() == ["s-dead"]
+        assert after.get_session("s-dead").ended_as == "crashed"
+        assert after.get_session("s-old").ended_as is None
+        # A row that ended before the store kept how lists as gone.
+        assert ended_state(after.get_session("s-old")) == "gone"
+        assert ended_state(after.get_session("s-dead")) == "crashed"
 
 
 def test_sessions_whose_process_is_gone_can_be_tidied_up_on_their_own(store: Store) -> None:
