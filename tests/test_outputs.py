@@ -663,6 +663,16 @@ def test_versions_are_never_handed_out_twice_across_processes(tmp_path: Path) ->
         assert Path(report["sidecar"]).is_file()
 
 
+def test_a_run_id_used_twice_keeps_the_first_run_record(store: Store, scene: Path) -> None:
+    first = outputs.allocate(store, "hip", hip_path=scene, when=WHEN, run_id="run-op1")
+    with pytest.raises(store_module.DuplicateRecord):
+        outputs.allocate(store, "hip", hip_path=scene, when=WHEN, run_id="run-op1")
+    kept = store.get_run("run-op1")
+    assert kept is not None
+    assert kept.version == first.version
+    assert list(scene.parent.glob("*.claim")) == [Path(f"{first.path}.claim")]
+
+
 def test_a_place_whose_run_could_not_be_recorded_is_given_back(
     store: Store, scene: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

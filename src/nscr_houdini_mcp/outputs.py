@@ -886,6 +886,7 @@ def allocate(
         above=above,
     )
 
+    recorded = False
     try:
         store.create_run(
             run,
@@ -902,19 +903,22 @@ def allocate(
                 "unsaved_hip": plan.unsaved_hip,
             },
         )
+        recorded = True
         write_export(store.run_export(run), plan.sidecar)
     except BaseException:
         # The place was claimed for a run that could not be recorded, so it
-        # goes back rather than staying claimed by nobody.
-        release(store, plan)
+        # goes back rather than staying claimed by nobody. A run record that
+        # was there already belongs to an earlier call and is kept.
+        release(store, plan, drop_run=recorded)
         raise
     return replace(plan, source_node=node_path)
 
 
-def release(store: Store, plan: OutputPlan) -> None:
+def release(store: Store, plan: OutputPlan, *, drop_run: bool = True) -> None:
     """Give back a place that was claimed and never written.
 
-    The claim file and the record beside the output go, the run's record goes,
+    The claim file and the record beside the output go, the run's record goes
+    unless it was written by an earlier call (drop_run false),
     and the number keeps its place in the sequence with no run on it. A file
     kind whose output is there after all is left alone. Version folders are
     left too: an empty folder costs nothing and is the guard that keeps the
@@ -928,7 +932,8 @@ def release(store: Store, plan: OutputPlan) -> None:
         except OSError:
             pass
     try:
-        store.drop_run(plan.run_id)
+        if drop_run:
+            store.drop_run(plan.run_id)
         if plan.version is not None:
             store.disown_version(
                 kind=plan.kind, name=plan.name, hip_family=plan.hip_family, version=plan.version
