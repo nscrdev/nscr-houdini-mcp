@@ -66,6 +66,11 @@ MAX_PORT = 65535
 DEFAULT_SPILL_KEEP_DAYS = 7
 MAX_SPILL_KEEP_DAYS = 365
 
+# The longest `hou_python` waits for its code before it answers `TIMEOUT`,
+# whatever a call asks for. The code itself is never stopped.
+DEFAULT_PYTHON_TIMEOUT_CAP_S = 3600
+MAX_PYTHON_TIMEOUT_CAP_S = 86400
+
 _BUILD = re.compile(r"^\d+\.\d+(\.\d+)*$")
 
 # Every key the file may hold, in the order `config show` prints them.
@@ -79,6 +84,7 @@ KEYS = (
     "spill_dir",
     "spill_over_bytes",
     "spill_keep_days",
+    "python_timeout_cap_s",
     "transport",
 )
 
@@ -118,6 +124,9 @@ spill_over_bytes = {DEFAULT_SPILL_OVER_BYTES}
 
 # Spilled results older than this many days are removed when the server starts.
 spill_keep_days = {DEFAULT_SPILL_KEEP_DAYS}
+
+# The most seconds hou_python waits for its code, whatever a call asks for.
+python_timeout_cap_s = {DEFAULT_PYTHON_TIMEOUT_CAP_S}
 
 # How clients reach the server. Only "stdio" is served by this build.
 transport = "stdio"
@@ -165,6 +174,7 @@ class Config:
     spill_dir: Path | None = None
     spill_over_bytes: int = DEFAULT_SPILL_OVER_BYTES
     spill_keep_days: int = DEFAULT_SPILL_KEEP_DAYS
+    python_timeout_cap_s: int = DEFAULT_PYTHON_TIMEOUT_CAP_S
     transport: str = TRANSPORTS[0]
     # Which keys the file set. The rest are defaults.
     from_file: frozenset[str] = frozenset()
@@ -189,6 +199,7 @@ class Config:
             "spill_dir": self.spill_folder,
             "spill_over_bytes": self.spill_over_bytes,
             "spill_keep_days": self.spill_keep_days,
+            "python_timeout_cap_s": self.python_timeout_cap_s,
             "transport": self.transport,
         }
         return {key: values[key] for key in KEYS}
@@ -347,6 +358,10 @@ def _keep_days(value: Any, key: str, path: Path) -> int:
     return _whole(value, key, path, 1, MAX_SPILL_KEEP_DAYS)
 
 
+def _python_timeout_cap(value: Any, key: str, path: Path) -> int:
+    return _whole(value, key, path, 1, MAX_PYTHON_TIMEOUT_CAP_S)
+
+
 def _transport(value: Any, key: str, path: Path) -> str | None:
     text = _text(value, key, path)
     if text is not None and text not in TRANSPORTS:
@@ -372,6 +387,7 @@ _CHECKS = {
     "spill_dir": _private_folder,
     "spill_over_bytes": _spill_over,
     "spill_keep_days": _keep_days,
+    "python_timeout_cap_s": _python_timeout_cap,
     "transport": _transport,
 }
 

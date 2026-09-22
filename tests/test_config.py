@@ -44,6 +44,7 @@ def test_no_file_means_every_default(home: Path) -> None:
     assert config.spill_folder == home / "spill"
     assert config.spill_over_bytes == DEFAULT_SPILL_OVER_BYTES == 64 * 1024
     assert config.spill_keep_days == 7
+    assert config.python_timeout_cap_s == 3600
     assert config.transport == "stdio"
 
 
@@ -71,6 +72,7 @@ worker_ports = [18830, 18839]
 state_home = "{state.as_posix()}"
 spill_dir = "{spill.as_posix()}"
 spill_over_bytes = 4096
+python_timeout_cap_s = 120
 transport = "stdio"
 """,
     )
@@ -82,6 +84,7 @@ transport = "stdio"
     assert config.state_home == state
     assert config.spill_folder == spill
     assert config.spill_over_bytes == 4096
+    assert config.python_timeout_cap_s == 120
     assert config.store_path == state / "coord.sqlite"
     assert "pool_cap" in config.from_file
     assert "hython" not in config.from_file
@@ -106,6 +109,7 @@ def test_the_config_env_var_names_another_file(
         ("pool_cap = true", "pool_cap", "whole number"),
         ("spill_over_bytes = 10", "spill_over_bytes", "from 1024"),
         ("spill_keep_days = 0", "spill_keep_days", "from 1 to 365"),
+        ("python_timeout_cap_s = 0", "python_timeout_cap_s", "from 1 to 86400"),
         ("spill_dir = '//server/share/spill'", "spill_dir", "cannot hold private results"),
         ('transport = "http"', "transport", "one of stdio"),
         ('houdini_build = "latest"', "houdini_build", "22.0.368"),
