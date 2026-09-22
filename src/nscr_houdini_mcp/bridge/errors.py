@@ -45,6 +45,8 @@ CODES: dict[str, str] = {
     "UNAUTHORIZED": "the request was not signed for this bridge",
     "FORBIDDEN": "the request came from somewhere this bridge does not answer",
     "METHOD_REFUSED": "that endpoint takes POST",
+    "NOT_FOUND": "this bridge has nothing on that path",
+    "SERVER_BUSY": "too many connections are open to answer another",
 }
 
 # Codes the bridge does not raise yet. They are in the table so the meaning is
