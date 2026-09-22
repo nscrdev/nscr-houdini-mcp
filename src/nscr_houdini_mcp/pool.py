@@ -247,6 +247,21 @@ def worker_env(config: PoolConfig, *, base: Mapping[str, str] | None = None) -> 
     return environment
 
 
+# The processes this one started. A worker outlives whoever started it, but
+# while that starter is still running the worker stays its child, and a child
+# that has ended keeps its number on the process table until somebody reads
+# its exit code. Holding the handles is how a worker that ended stops looking
+# alive to the process that started it.
+_STARTED: list[subprocess.Popen[Any]] = []
+
+
+def reap_started() -> None:
+    """Take the workers this process started and that have ended off the table."""
+    for process in list(_STARTED):
+        if process.poll() is not None:
+            _STARTED.remove(process)
+
+
 def spawn_detached(
     command: Sequence[str], *, log: Path, env: Mapping[str, str] | None = None
 ) -> Launched:
@@ -282,6 +297,7 @@ def spawn_detached(
     finally:
         # The child holds its own handle on the file from here on.
         handle.close()
+    _STARTED.append(process)
     return Launched(process.pid, process.poll)
 
 
@@ -474,19 +490,25 @@ def stop_worker(
     """
     record = find_worker(store, handle)
     store.set_worker_state(record.token, "stopping")
-    deadline = time.monotonic() + grace_s
-    while worker_is_alive(record) and time.monotonic() < deadline:
-        time.sleep(poll_s)
+    _wait_for_the_end(record, grace_s, poll_s)
     killed = False
     if worker_is_alive(record):
         killed = kill_process(int(record.pid or 0))
-        end = time.monotonic() + grace_s
-        while worker_is_alive(record) and time.monotonic() < end:
-            time.sleep(poll_s)
+        _wait_for_the_end(record, grace_s, poll_s)
     if killed and record.session_id:
         registry.remove_entry(Path(config.home), record.session_id)
     stopped = store.release_worker(record.token, state="stopped")
     return Stopped(stopped, killed=killed, ended=not worker_is_alive(record))
+
+
+def _wait_for_the_end(record: WorkerRecord, grace_s: float, poll_s: float) -> None:
+    """Wait for one worker's process to go, for as long as it is allowed."""
+    deadline = time.monotonic() + grace_s
+    while True:
+        reap_started()
+        if not worker_is_alive(record) or time.monotonic() >= deadline:
+            return
+        time.sleep(poll_s)
 
 
 # Section: what a worker watches from inside itself
@@ -575,6 +597,7 @@ def summary(record: WorkerRecord, *, now: float | None = None) -> dict[str, Any]
 
 def list_workers(store: Store, *, now: float | None = None) -> list[dict[str, Any]]:
     """Every live worker, reclaiming the ones whose process has gone first."""
+    reap_started()
     store.reclaim_workers()
     moment = time.time() if now is None else now
     return [summary(record, now=moment) for record in store.list_workers()]
