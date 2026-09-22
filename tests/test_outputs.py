@@ -449,18 +449,14 @@ def test_a_folder_left_by_another_machine_is_never_written_into(store: Store, sc
     assert Path(made.version_dir).is_dir()
 
 
-def test_a_hip_file_that_is_already_there_takes_the_next_number(store: Store, scene: Path) -> None:
-    """A kind with no folder of its own is guarded by the file instead.
-
-    The scene in this test is already `shot_v002.hip`, so the number that would
-    land on it is passed over rather than written.
-    """
+def test_a_hip_file_that_is_already_there_is_never_handed_out(store: Store, scene: Path) -> None:
+    """The scene in this test is already `shot_v002.hip`, so the sequence goes
+    on above it rather than handing out a number that would land on it."""
     first = outputs.allocate(store, "hip", name="shot", hip_path=scene, when=WHEN)
-    assert first.path.endswith("shot_v001.hip")
+    assert first.path.endswith("shot_v003.hip")
     Path(first.path).write_text("scene", encoding="utf-8")
     second = outputs.allocate(store, "hip", name="shot", hip_path=scene, when=WHEN)
-    assert second.version == 3
-    assert second.path.endswith("shot_v003.hip")
+    assert second.version == 4
 
 
 def test_a_hip_family_goes_on_above_the_versions_beside_it(store: Store, scene: Path) -> None:
@@ -468,18 +464,76 @@ def test_a_hip_family_goes_on_above_the_versions_beside_it(store: Store, scene: 
     (scene.parent / "shot_v007.hip").write_text("scene", encoding="utf-8")
     (scene.parent / "shot_v009.hipnc").write_text("scene", encoding="utf-8")
     (scene.parent / "other_v020.hip").write_text("scene", encoding="utf-8")
-    floor = outputs.hip_version_floor(scene)
-    assert floor == 9
-    made = outputs.allocate(store, "hip", hip_path=scene, when=WHEN, above=floor)
+    (scene.parent / "shot_v030.txt").write_text("notes", encoding="utf-8")
+    made = outputs.allocate(store, "hip", hip_path=scene, when=WHEN)
     assert made.version == 10
     assert made.path.endswith("shot_v010.hip")
-    assert outputs.allocate(store, "hip", hip_path=scene, when=WHEN, above=floor).version == 11
+    assert outputs.allocate(store, "hip", hip_path=scene, when=WHEN).version == 11
+
+
+def test_the_versions_counted_are_the_ones_where_the_output_goes(store: Store, scene: Path) -> None:
+    """With the output root in another folder, that folder decides, not the scene's."""
+    elsewhere = scene.parent / "versions"
+    elsewhere.mkdir()
+    for number in range(1, 21):
+        (elsewhere / f"shot_v{number:03d}.hip").write_text("scene", encoding="utf-8")
+    table = replace(outputs.DEFAULT_CONVENTIONS_TABLE, output_root="$HIP/versions")
+    made = outputs.allocate(store, "hip", hip_path=scene, when=WHEN, conventions=table)
+    assert made.version == 21
+    assert made.path == (elsewhere / "shot_v021.hip").as_posix()
+
+
+def test_a_version_folder_kind_goes_on_above_the_folders_there(store: Store, scene: Path) -> None:
+    taken = plan("cache", hip_path=scene, version=1)
+    base = Path(taken.version_dir).parent
+    for number in (1, 2, 17):
+        (base / f"v{number:03d}").mkdir(parents=True)
+    made = outputs.allocate(store, "cache", name="beauty", hip_path=scene, when=WHEN)
+    assert made.version == 18
 
 
 def test_the_version_floor_reads_the_scenes_own_name() -> None:
     assert outputs.hip_version_floor("/nowhere/shot.v012.hip") == 12
     assert outputs.hip_version_floor("/nowhere/shot.hip") == 0
     assert outputs.hip_version_floor(None) == 0
+
+
+def test_an_output_folder_that_links_outside_the_root_is_refused(
+    store: Store, scene: Path, tmp_path: Path
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        (scene.parent / "linked").symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this system will not make a link here")
+    table = replace(outputs.DEFAULT_CONVENTIONS_TABLE, output_root="$HIP/linked")
+    with pytest.raises(outputs.ConventionError) as caught:
+        outputs.allocate(store, "hip", hip_path=scene, when=WHEN, conventions=table)
+    assert "through a link" in str(caught.value)
+    assert list(outside.iterdir()) == []
+
+
+def test_an_output_that_is_itself_a_link_is_never_written_through(
+    scene: Path, tmp_path: Path
+) -> None:
+    made = plan("hip", name="shot", hip_path=scene, version=5)
+    try:
+        Path(made.path).symlink_to(tmp_path / "nowhere.hip")
+    except (OSError, NotImplementedError):
+        pytest.skip("this system will not make a link here")
+    with pytest.raises(outputs.ConventionError) as caught:
+        outputs._check_real_place(made)
+    assert "is a link" in str(caught.value)
+
+
+def test_a_scene_on_a_network_share_keeps_its_share() -> None:
+    made = plan("hip", name="shot", hip_path=r"\\server\share\proj\shot_v001.hip", version=2)
+    assert made.path == "//server/share/proj/shot_v002.hip"
+    assert made.root == "//server/share/proj"
+    assert outputs._normalize("//server/share/a/../b") == "//server/share/b"
+    # Nothing climbs above the share, so such a path fails the containment check.
+    assert outputs._normalize("//server/share/../x") == "//server/share/../x"
 
 
 def test_skipping_versions_never_lowers_the_sequence(store: Store) -> None:
@@ -498,9 +552,10 @@ def test_two_stores_over_one_scene_folder_do_not_take_the_same_hip_number(
         first = outputs.allocate(one, "hip", name="shot", hip_path=scene, when=WHEN)
         second = outputs.allocate(two, "hip", name="shot", hip_path=scene, when=WHEN)
     assert first.path != second.path
-    assert first.version == 1
-    # v002 is the scene itself, so the second store steps past it as well.
-    assert second.version == 3
+    # Both go on above the scene, v002. The first store's claim on v003 is on
+    # disk, so the second store steps past it.
+    assert first.version == 3
+    assert second.version == 4
     for made in (first, second):
         assert json.loads(Path(made.sidecar).read_text(encoding="utf-8"))["run_id"] == made.run_id
 
@@ -519,9 +574,10 @@ def test_folders_left_by_other_machines_cost_no_run_names(tmp_path: Path, scene:
             Path(taken.version_dir).mkdir(parents=True)
         made = outputs.allocate(store, "cache", name="beauty", hip_path=scene, when=WHEN)
     assert made.version == 9
+    # The folders there are counted before any number is taken, so the
+    # sequence skips to them in one step and none of them carries this run.
     rows = version_rows(path)
-    assert [row[0] for row in rows] == list(range(1, 10))
-    assert [row[1] for row in rows] == [None] * 8 + [made.run_id]
+    assert rows == [(8, None), (9, made.run_id)]
 
 
 def test_a_number_whose_run_never_arrived_loses_its_name(tmp_path: Path) -> None:

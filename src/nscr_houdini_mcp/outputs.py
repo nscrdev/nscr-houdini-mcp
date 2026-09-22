@@ -265,28 +265,16 @@ def hip_family(hip_path: str | Path | None) -> str:
 
 
 def hip_version_floor(hip_path: str | Path | None) -> int:
-    """The highest version a scene's family already has in its own folder.
+    """The version a scene's own name carries, such as 3 for `shot_v003.hip`.
 
-    Read from the scene's own name and from the scene files beside it, so a
-    family saved by hand goes on above the last number it used. Only files
-    this grammar would write count: `<family>_v<number>` with a scene suffix.
+    The files already beside the output are read when the version is claimed,
+    from the folder the output goes to, which need not be the scene's own.
     """
     if hip_path is None:
         return 0
-    folder, stem = split_hip(hip_path)
+    _, stem = split_hip(hip_path)
     own = _OWN_VERSION.search(stem)
-    highest = int(own.group(1)) if own else 0
-    family = hip_family(hip_path)
-    pattern = re.compile(rf"^{re.escape(family)}_v(\d+)\.(hip|hipnc|hiplc)$", re.IGNORECASE)
-    try:
-        names = os.listdir(folder)
-    except OSError:
-        return highest
-    for name in names:
-        found = pattern.match(name)
-        if found:
-            highest = max(highest, int(found.group(1)))
-    return highest
+    return int(own.group(1)) if own else 0
 
 
 @dataclass(frozen=True)
@@ -368,6 +356,9 @@ class OutputPlan:
     is_directory: bool = False
     warnings: tuple[str, ...] = ()
     tokens: Mapping[str, str] = field(default_factory=dict)
+    # The folder the root starts from: the scene folder, the scratch folder or
+    # the job. Nothing this plan writes may really be outside it.
+    anchor: str = ""
 
     def as_record(self) -> dict[str, Any]:
         """The path part of a run record, readable on its own.
@@ -660,6 +651,12 @@ def plan_path(
 
     temp_dir = _temp_dir(scratch_root) if unsaved else None
     root = _normalize(expand(root_template, hip_dir=hip_dir, temp_dir=temp_dir))
+    started = _ROOT_START.match(root_template)
+    anchor = (
+        _normalize(expand(f"${started.group(1)}", hip_dir=hip_dir, temp_dir=temp_dir))
+        if started
+        else root
+    )
     frozen = _normalize(expand(literal, hip_dir=hip_dir, temp_dir=temp_dir))
     if not _inside(root, frozen):
         raise ConventionError(f"{frozen} would leave the output root {root}")
@@ -694,6 +691,7 @@ def plan_path(
         is_directory=is_directory,
         warnings=tuple(warnings),
         tokens=dict(common, name=chosen),
+        anchor=anchor,
     )
 
 
@@ -762,10 +760,22 @@ def _fill(template: str, tokens: Mapping[str, str]) -> str:
 
 
 def _normalize(path: str) -> str:
-    """Collapse `.` and `..` by reading the text, never by asking the disk."""
+    """Collapse `.` and `..` by reading the text, never by asking the disk.
+
+    A network path keeps its `//server/share` anchor, and nothing climbs above
+    it: a `..` that would is kept, so the containment check refuses the path.
+    """
+    if path.startswith("//") and not path.startswith("///"):
+        pieces = [part for part in path[2:].split("/") if part]
+        anchor, rest = pieces[:2], pieces[2:]
+        return "//" + "/".join(anchor + _collapse(rest))
     lead = "/" if path.startswith("/") else ""
+    return lead + "/".join(_collapse(path.split("/")))
+
+
+def _collapse(pieces: list[str]) -> list[str]:
     parts: list[str] = []
-    for part in path.split("/"):
+    for part in pieces:
         if part in ("", "."):
             continue
         if part == "..":
@@ -775,7 +785,7 @@ def _normalize(path: str) -> str:
                 parts.append("..")
             continue
         parts.append(part)
-    return lead + "/".join(parts)
+    return parts
 
 
 def _inside(root: str, path: str) -> bool:
@@ -934,13 +944,18 @@ def _claim(
     }
     if not table.is_versioned(kind):
         plan = plan_path(kind, version=None, **options)
+        _check_real_place(plan)
         Path(plan.directory).mkdir(parents=True, exist_ok=True)
         return plan
 
     probe = plan_path(kind, version=1, **options)
-    if above > 0:
+    # Versions already in the folder the output goes to were handed out
+    # somewhere this store never saw. The sequence goes on above them rather
+    # than spending its tries finding each one taken.
+    floor = max(above, _versions_on_disk(kind, probe, table))
+    if floor > 0:
         store.skip_versions_to(
-            kind=kind, name=probe.name, hip_family=probe.hip_family, version=above
+            kind=kind, name=probe.name, hip_family=probe.hip_family, version=floor
         )
     for _ in range(MKDIR_ATTEMPTS):
         version = store.allocate_version(
@@ -957,6 +972,70 @@ def _claim(
     raise AllocationFailed(f"could not claim a place for {kind} after {MKDIR_ATTEMPTS} tries")
 
 
+def _versions_on_disk(kind: str, probe: OutputPlan, table: Conventions) -> int:
+    """The highest version already in the folder a versioned output goes to.
+
+    For a kind with a version folder, the folders beside it; for a kind whose
+    version is in the file name, the files beside it. Only names this line of
+    the grammar would write count. A scene file counts under any of the three
+    scene suffixes, because a license can change which one is written.
+    """
+    marked = _fill(table.template_for(kind), dict(probe.tokens, ver=_VERSION_MARK))
+    segments = marked.rstrip("/").split("/")
+    if probe.version_dir:
+        folder = str(Path(probe.version_dir).parent)
+        below = len(probe.path.rstrip("/").split("/")) - len(probe.version_dir.split("/"))
+        leaf = segments[-1 - below] if below < len(segments) else ""
+        tail = ""
+    else:
+        folder = probe.directory
+        leaf = segments[-1]
+        extension = probe.tokens.get("ext", "")
+        tail = ""
+        if extension and leaf.endswith(f".{extension}"):
+            leaf = leaf[: -(len(extension) + 1)]
+            tail = r"\.(hip|hipnc|hiplc)" if kind == "hip" else re.escape(f".{extension}")
+    if _VERSION_MARK not in leaf:
+        return 0
+    pattern = re.compile(
+        "^" + r"(\d+)".join(re.escape(piece) for piece in leaf.split(_VERSION_MARK)) + tail + "$",
+        re.IGNORECASE,
+    )
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return 0
+    highest = 0
+    for found in (pattern.match(name) for name in names):
+        if found:
+            highest = max(highest, int(found.group(1)))
+    return highest
+
+
+def _check_real_place(plan: OutputPlan) -> None:
+    """Refuse a place that a link on disk would send outside the output root.
+
+    The containment check on the path is done on its text. A folder under the
+    scene folder can be a link to anywhere, so the real place of the output's
+    folder is checked against the real place of the folder the root starts
+    from, the scene folder for `$HIP`, before anything is created. An output
+    that is itself a link is never written through.
+    """
+    root = os.path.normcase(os.path.realpath(plan.anchor or plan.root))
+    folder = os.path.normcase(os.path.realpath(plan.directory))
+    try:
+        inside = os.path.commonpath([root, folder]) == root
+    except ValueError:
+        inside = False
+    if not inside:
+        raise ConventionError(
+            f"{plan.directory} leads outside the output root {plan.root} through a link"
+        )
+    target = plan.path.rstrip("/")
+    if os.path.islink(target):
+        raise ConventionError(f"{target} is a link, and an output is never written through one")
+
+
 def _make_room(plan: OutputPlan) -> bool:
     """Take this run's place on disk, and say whether it was free.
 
@@ -965,6 +1044,7 @@ def _make_room(plan: OutputPlan) -> bool:
     machines with their own stores can hand out the same number and only one of
     them may write it.
     """
+    _check_real_place(plan)
     exclusive = plan.version_dir or (plan.directory if plan.is_directory else None)
     if exclusive is not None:
         try:
