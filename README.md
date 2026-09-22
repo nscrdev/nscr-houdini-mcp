@@ -71,6 +71,8 @@ reads the scene, opens a file and reports what it could not resolve as data,
 saves in place, and saves the next `<name>_v###` without writing over
 anything. A scene open in a user interface with unsaved changes is not
 replaced unless the call says to throw them away.
+Opening a scene runs the code that scene file carries, as Houdini always
+does, so only open files you trust.
 
 ### The Houdini side
 
