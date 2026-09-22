@@ -1701,6 +1701,31 @@ class Store:
             )
         return version
 
+    def skip_versions_to(self, *, kind: str, name: str, hip_family: str, version: int) -> int:
+        """Make sure the next number handed out is above `version`.
+
+        For a sequence that was started somewhere this store never saw, such as
+        scene files saved by hand before the first save through here. The
+        number is taken with no run on it, so it keeps its place and is never
+        handed out. Returns the highest number taken, which may be higher
+        already.
+        """
+        with self._txn(write=True) as db:
+            row = db.execute(
+                "SELECT MAX(version) AS top FROM versions"
+                " WHERE kind = ? AND name = ? AND hip_family = ?",
+                (kind, name, hip_family),
+            ).fetchone()
+            top = int(row["top"] or 0)
+            if top >= version:
+                return top
+            db.execute(
+                "INSERT INTO versions (kind, name, hip_family, version, run_id, created_at)"
+                " VALUES (?, ?, ?, ?, NULL, ?)",
+                (kind, name, hip_family, version, self._now()),
+            )
+        return version
+
     def attach_version_run(
         self, *, kind: str, name: str, hip_family: str, version: int, run_id: str
     ) -> None:

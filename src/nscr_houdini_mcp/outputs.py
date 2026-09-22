@@ -155,6 +155,7 @@ _VARIABLE = re.compile(r"\$\{(\w+)\}|\$(\w+)")
 _FRAME_VARIABLE = re.compile(r"^F\d*$")
 _ILLEGAL_IN_NAME = re.compile(r"[^A-Za-z0-9_-]+")
 _TRAILING_VERSION = re.compile(r"[._-]v\d+$", re.IGNORECASE)
+_OWN_VERSION = re.compile(r"[._-]v(\d+)$", re.IGNORECASE)
 _DRIVE = re.compile(r"^[A-Za-z]:")
 _ROOT_START = re.compile(rf"^\$\{{?({'|'.join(ALLOWED_VARIABLES)})\}}?(/|$)")
 _EXTENSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -261,6 +262,31 @@ def hip_family(hip_path: str | Path | None) -> str:
         return UNTITLED_FAMILY
     _, stem = split_hip(hip_path)
     return sanitize_name(_TRAILING_VERSION.sub("", stem)) if stem else UNTITLED_FAMILY
+
+
+def hip_version_floor(hip_path: str | Path | None) -> int:
+    """The highest version a scene's family already has in its own folder.
+
+    Read from the scene's own name and from the scene files beside it, so a
+    family saved by hand goes on above the last number it used. Only files
+    this grammar would write count: `<family>_v<number>` with a scene suffix.
+    """
+    if hip_path is None:
+        return 0
+    folder, stem = split_hip(hip_path)
+    own = _OWN_VERSION.search(stem)
+    highest = int(own.group(1)) if own else 0
+    family = hip_family(hip_path)
+    pattern = re.compile(rf"^{re.escape(family)}_v(\d+)\.(hip|hipnc|hiplc)$", re.IGNORECASE)
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return highest
+    for name in names:
+        found = pattern.match(name)
+        if found:
+            highest = max(highest, int(found.group(1)))
+    return highest
 
 
 @dataclass(frozen=True)
@@ -824,6 +850,7 @@ def allocate(
     conventions: Conventions | None = None,
     when: datetime | None = None,
     scratch_root: str | Path | None = None,
+    above: int = 0,
 ) -> OutputPlan:
     """Take a version, claim it on disk, record the run and write the sidecar.
 
@@ -832,6 +859,10 @@ def allocate(
     another machine wrote it, so that number loses this run's name and the next
     one is tried. What comes back is frozen: a later rename of the node changes
     the next run, never this one.
+
+    `above` is a number the new version must be higher than, for a sequence
+    that already has versions this store never handed out: a scene saved by
+    hand as `_v007` goes on at `_v008`, not at `_v001`.
     """
     table = conventions or DEFAULT_CONVENTIONS_TABLE
     table.template_for(kind)
@@ -852,6 +883,7 @@ def allocate(
         ext=ext,
         when=when,
         scratch_root=scratch_root,
+        above=above,
     )
 
     store.create_run(
@@ -886,6 +918,7 @@ def _claim(
     ext: str | None,
     when: datetime | None,
     scratch_root: str | Path | None,
+    above: int = 0,
 ) -> OutputPlan:
     """One plan whose place on disk is this run's, and nobody else's."""
     options = {
@@ -905,6 +938,10 @@ def _claim(
         return plan
 
     probe = plan_path(kind, version=1, **options)
+    if above > 0:
+        store.skip_versions_to(
+            kind=kind, name=probe.name, hip_family=probe.hip_family, version=above
+        )
     for _ in range(MKDIR_ATTEMPTS):
         version = store.allocate_version(
             kind=kind, name=probe.name, hip_family=probe.hip_family, run_id=run

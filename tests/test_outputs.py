@@ -463,6 +463,33 @@ def test_a_hip_file_that_is_already_there_takes_the_next_number(store: Store, sc
     assert second.path.endswith("shot_v003.hip")
 
 
+def test_a_hip_family_goes_on_above_the_versions_beside_it(store: Store, scene: Path) -> None:
+    """Versions saved by hand before the first save here are not handed out again."""
+    (scene.parent / "shot_v007.hip").write_text("scene", encoding="utf-8")
+    (scene.parent / "shot_v009.hipnc").write_text("scene", encoding="utf-8")
+    (scene.parent / "other_v020.hip").write_text("scene", encoding="utf-8")
+    floor = outputs.hip_version_floor(scene)
+    assert floor == 9
+    made = outputs.allocate(store, "hip", hip_path=scene, when=WHEN, above=floor)
+    assert made.version == 10
+    assert made.path.endswith("shot_v010.hip")
+    assert outputs.allocate(store, "hip", hip_path=scene, when=WHEN, above=floor).version == 11
+
+
+def test_the_version_floor_reads_the_scenes_own_name() -> None:
+    assert outputs.hip_version_floor("/nowhere/shot.v012.hip") == 12
+    assert outputs.hip_version_floor("/nowhere/shot.hip") == 0
+    assert outputs.hip_version_floor(None) == 0
+
+
+def test_skipping_versions_never_lowers_the_sequence(store: Store) -> None:
+    key = {"kind": "hip", "name": "shot", "hip_family": "shot"}
+    assert store.skip_versions_to(**key, version=4) == 4
+    assert store.allocate_version(**key) == 5
+    assert store.skip_versions_to(**key, version=2) == 5
+    assert store.allocate_version(**key) == 6
+
+
 def test_two_stores_over_one_scene_folder_do_not_take_the_same_hip_number(
     tmp_path: Path, scene: Path
 ) -> None:
