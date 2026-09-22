@@ -11,9 +11,11 @@ alias and its scene epoch, and the operation id when the call changed the
 scene. Before a session is chosen these are empty.
 
 Spill. A result bigger than the configured cap is written to a file in the
-spill folder, one dated folder a day, and the call returns the path, the size,
-a digest and the first part of the text. The file is written so only its owner
-can read it, because a result can hold scene contents.
+spill folder, one dated folder a day, and the call returns the path, the size
+and a digest, with the first part of the text in the text block. The folder and
+the file are made so only their owner can read them, because a result can hold
+scene contents. Files older than the configured number of days are removed when
+the server starts.
 
 This module never imports `hou`.
 """
@@ -23,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import time
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -32,7 +35,7 @@ from mcp_types import CallToolResult, TextContent
 
 from nscr_houdini_mcp.bridge.errors import CODES as BRIDGE_CODES
 from nscr_houdini_mcp.bridge.errors import hide_paths
-from nscr_houdini_mcp.bridge.security import InsecureLocation, write_private
+from nscr_houdini_mcp.bridge.security import InsecureLocation, private_dir, write_private
 
 # Codes only the server raises. The bridge's own table is the rest.
 SERVER_CODES: dict[str, str] = {
@@ -46,6 +49,7 @@ SERVER_CODES: dict[str, str] = {
     "STORE_UNAVAILABLE": "the coordination store could not be read",
     "CONFIG_INVALID": "the config file could not be used",
     "SPILL_FAILED": "the result was too large to return and could not be written out",
+    "RESULT_NOT_JSON": "the tool produced a value that cannot be sent as JSON",
 }
 
 CODES: dict[str, str] = {**BRIDGE_CODES, **SERVER_CODES}
@@ -82,6 +86,7 @@ HINTS: dict[str, str] = {
     "STORE_UNAVAILABLE": "check that the state folder is on a local disk and readable",
     "CONFIG_INVALID": "fix the key named in the details, then call again",
     "SPILL_FAILED": "free space in the spill folder, or narrow the request",
+    "RESULT_NOT_JSON": "the tool is at fault; report it with the tool name",
 }
 
 # The largest result whose text block repeats the whole JSON. Larger ones get a
@@ -156,7 +161,21 @@ def empty_trace() -> dict[str, Any]:
 
 
 def compact(value: Any) -> str:
-    return json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str)
+    """JSON with no spaces. Bytes stand as their size, anything else as text."""
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=_loosely)
+
+
+def _loosely(value: Any) -> str:
+    if isinstance(value, (bytes, bytearray)):
+        return f"<{len(value)} bytes>"
+    return str(value)
+
+
+def _strictly(value: Any) -> str:
+    """Paths and the like read fine as text. Bytes do not: they are refused."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raise TypeError(f"{type(value).__name__} is not JSON")
+    return str(value)
 
 
 def error_result(error: CallError, trace: Mapping[str, Any] | None = None) -> CallToolResult:
@@ -193,14 +212,21 @@ def ok_result(
 ) -> CallToolResult:
     """A result, or the path to it when it is too large to return."""
     body = {**data, "trace": dict(trace)}
-    text = compact(body)
+    try:
+        text = json.dumps(body, separators=(",", ":"), ensure_ascii=False, default=_strictly)
+    except (TypeError, ValueError) as error:
+        raise CallError(
+            "RESULT_NOT_JSON",
+            f"{tool} produced a value that cannot be sent as JSON",
+            details={"tool": tool, "reason": str(error)},
+        ) from None
     if spill is not None and len(text.encode("utf-8")) > spill.over_bytes:
-        body = {"spilled": spill.write(text, tool=tool), "trace": dict(trace)}
-        spilled = body["spilled"]
+        spilled = spill.write(text, tool=tool)
+        body = {"spilled": spilled, "trace": dict(trace)}
         line = (
             f"{tool}: the result is {spilled['bytes']} bytes, over the cap of"
             f" {spill.over_bytes}, so it was written to {spilled['path']}."
-            f" Read that file for all of it. First part:\n{spilled['preview']}"
+            f" Read that file for all of it. First part:\n{text[:PREVIEW_CHARS]}"
         )
         return CallToolResult(
             content=[TextContent(type="text", text=line)], structured_content=body
@@ -231,6 +257,7 @@ class Spill:
         path = day / name
         data = text.encode("utf-8")
         try:
+            private_dir(self.folder)
             write_private(path, text)
         except (OSError, InsecureLocation) as error:
             raise CallError(
@@ -242,8 +269,32 @@ class Spill:
             "path": str(path),
             "bytes": len(data),
             "sha256": hashlib.sha256(data).hexdigest(),
-            "preview": text[:PREVIEW_CHARS],
         }
+
+
+def reap_spill(folder: Path, keep_days: int, *, now: float | None = None) -> int:
+    """Remove spilled results older than `keep_days`, and the day folders left
+    empty. Returns how many files went. Anything it cannot remove stays."""
+    folder = Path(folder)
+    if not folder.is_dir():
+        return 0
+    cutoff = (time.time() if now is None else now) - keep_days * 86400.0
+    removed = 0
+    for day in sorted(folder.iterdir()):
+        if not day.is_dir() or day.is_symlink():
+            continue
+        for item in day.glob("*.json"):
+            try:
+                if item.is_file() and item.stat().st_mtime < cutoff:
+                    item.unlink()
+                    removed += 1
+            except OSError:
+                continue
+        try:
+            day.rmdir()
+        except OSError:
+            pass
+    return removed
 
 
 def _safe_name(tool: str) -> str:

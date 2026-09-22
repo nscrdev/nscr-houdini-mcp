@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -20,6 +23,7 @@ from nscr_houdini_mcp.results import (
     Spill,
     error_result,
     ok_result,
+    reap_spill,
 )
 
 TRACE = {"session_id": "s-1", "alias": "w1", "scene_epoch": 2}
@@ -156,11 +160,59 @@ def test_a_result_over_the_cap_is_written_to_a_dated_file(tmp_path: Path) -> Non
     assert spilled["bytes"] == len(written) > 1024
     assert spilled["sha256"] == hashlib.sha256(written).hexdigest()
     assert json.loads(written.decode("utf-8")) == {**data, "trace": TRACE}
-    assert spilled["preview"] == written.decode("utf-8")[:PREVIEW_CHARS]
+    assert set(spilled) == {"path", "bytes", "sha256"}
 
+    # The preview is for a reader of the text alone, so it is there only.
     text = text_of(result)
     assert str(path) in text
     assert "over the cap of 1024" in text
+    assert text.endswith(written.decode("utf-8")[:PREVIEW_CHARS])
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+def test_the_spill_folder_and_file_are_private(tmp_path: Path) -> None:
+    folder = tmp_path / "spill"
+    spill = Spill(folder, 1024, clock=Moment())
+    path = Path(
+        ok_result({"rows": ["z" * 100] * 20}, TRACE, spill=spill).structured_content["spilled"][
+            "path"
+        ]
+    )
+    for item in (folder, path.parent):
+        assert item.stat().st_mode & 0o777 == 0o700
+    assert path.stat().st_mode & 0o077 == 0
+
+
+def test_bytes_in_a_result_are_refused_not_turned_into_text() -> None:
+    with pytest.raises(CallError) as caught:
+        ok_result({"image": b"\x89PNG"}, TRACE, tool="hou_capture")
+    assert caught.value.code == "RESULT_NOT_JSON"
+    assert "hou_capture" in caught.value.message
+
+
+def test_a_path_in_a_result_reads_as_text() -> None:
+    result = ok_result({"where": Path("a") / "b"}, TRACE)
+    assert result.structured_content["where"] == Path("a") / "b"
+    assert json.loads(text_of(result))["where"] == str(Path("a") / "b")
+
+
+def test_old_spilled_results_are_reaped_and_new_ones_kept(tmp_path: Path) -> None:
+    folder = tmp_path / "spill"
+    old_day = folder / "2026-09-01"
+    new_day = folder / "2026-09-22"
+    old_day.mkdir(parents=True)
+    new_day.mkdir()
+    old = old_day / "old.json"
+    new = new_day / "new.json"
+    other = new_day / "notes.txt"
+    for item in (old, new, other):
+        item.write_text("{}", encoding="utf-8")
+    now = time.time()
+    os.utime(old, (now - 8 * 86400, now - 8 * 86400))
+    assert reap_spill(folder, 7, now=now) == 1
+    assert not old_day.exists()
+    assert new.is_file() and other.is_file()
+    assert reap_spill(tmp_path / "never-made", 7) == 0
 
 
 def test_a_result_at_the_cap_is_returned_as_it_is(tmp_path: Path) -> None:
