@@ -514,20 +514,26 @@ class Bridge:
                     "scene_epoch": self.scene_epoch,
                 },
             )
-        if self._drop_wanted(envelope):
+        if self._drop_wanted(envelope, reply):
             self._hold_back(envelope)
         return self._answer(request, reply)
 
     # Losing an answer on purpose
 
-    def _drop_wanted(self, envelope: Envelope) -> bool:
+    def _drop_wanted(self, envelope: Envelope, reply: Reply) -> bool:
         """Whether this call asked for its answer to go missing.
 
         Only a session carrying the self check tool will do it, which is a
         worker this project started to be driven. A session somebody is
         working in never has it, so nothing a user does can reach this.
+
+        An answer that came from a receipt is never held back: the caller that
+        lost the first one is asking for that answer, and losing it again
+        would leave it nowhere to go.
         """
         if "bridge.selfcheck" not in self.tools:
+            return False
+        if reply.payload.get("replayed"):
             return False
         return bool(envelope.arguments.get(DROP_REPLY_ARG))
 

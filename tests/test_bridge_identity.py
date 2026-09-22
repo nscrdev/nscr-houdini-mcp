@@ -203,7 +203,7 @@ def test_a_call_carrying_an_old_epoch_is_refused_before_the_tool_runs(scene: Sce
     assert error["code"] == "SCENE_REPLACED"
     assert error["details"]["carried_epoch"] == 0
     assert error["details"]["scene_epoch"] == 1
-    assert error["details"]["scene"]["nodes"] == {"/obj": 0, "/out": 0, "/stage": 0, "/mat": 0}
+    assert reply.payload["scene"]["nodes"] == {"/obj": 0, "/out": 0, "/stage": 0, "/mat": 0}
     assert ran == []
 
 

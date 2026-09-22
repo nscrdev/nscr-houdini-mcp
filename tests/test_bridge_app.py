@@ -204,7 +204,7 @@ def test_a_call_written_against_a_scene_that_has_gone_is_refused(tmp_path: Path)
         payload = body_of(reply)
         assert payload["ok"] is False
         assert payload["error"]["code"] == "SCENE_REPLACED"
-        assert payload["error"]["details"]["scene"]["scene_epoch"] == 1
+        assert payload["scene"]["scene_epoch"] == 1
     finally:
         bridge.stop()
 

@@ -21,7 +21,12 @@ import sys
 import threading
 from pathlib import Path
 
-from nscr_houdini_mcp.bridge.app import DEFAULT_HEARTBEAT_S, Bridge, BridgeConfig
+from nscr_houdini_mcp.bridge.app import (
+    DEFAULT_DROP_REPLY_S,
+    DEFAULT_HEARTBEAT_S,
+    Bridge,
+    BridgeConfig,
+)
 from nscr_houdini_mcp.bridge.net import DEFAULT_PORT_RANGE
 
 STOP_WORD = "stop"
@@ -39,6 +44,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT_RANGE[0])
     parser.add_argument("--max-port", type=int, default=DEFAULT_PORT_RANGE[1])
     parser.add_argument("--heartbeat", type=float, default=DEFAULT_HEARTBEAT_S)
+    parser.add_argument(
+        "--drop-reply-s",
+        type=float,
+        default=DEFAULT_DROP_REPLY_S,
+        help="how long an answer is held when a call asks to lose it",
+    )
     parser.add_argument(
         "--skip-loopback-check",
         action="store_true",
@@ -64,6 +75,7 @@ def main(argv: list[str] | None = None) -> int:
         alias_template=args.alias_template,
         kind=args.kind,
         heartbeat_s=args.heartbeat,
+        drop_reply_s=args.drop_reply_s,
         verify_loopback=not args.skip_loopback_check,
         owns_process=True,
     )

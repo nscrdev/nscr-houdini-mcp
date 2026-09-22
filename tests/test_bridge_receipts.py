@@ -194,7 +194,7 @@ def test_an_id_another_caller_is_still_running_is_not_run_again(
     assert error["code"] == "OUTCOME_UNKNOWN"
     assert error["details"]["receipt"]["state"] == "running"
     assert error["details"]["reason"]
-    assert error["details"]["scene"]["scene_epoch"] == 0
+    assert reply.payload["scene"]["scene_epoch"] == 0
     assert counter.calls == []
 
 

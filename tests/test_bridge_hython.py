@@ -32,6 +32,11 @@ PORT_RANGE = (18300, 18349)
 
 FORM_TYPE = "application/x-www-form-urlencoded"
 
+# How long a dropped answer is held, and how long the caller waits for one
+# before it decides the answer is lost. The caller has to give up first.
+HOLD_S = 8.0
+GIVE_UP_S = 2.0
+
 
 @pytest.fixture(scope="module")
 def home(tmp_path_factory: pytest.TempPathFactory) -> Path:
@@ -40,7 +45,9 @@ def home(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 @pytest.fixture(scope="module")
 def bridge(home: Path) -> Iterator[HythonBridge]:
-    started = HythonBridge(home=home, port_range=PORT_RANGE)
+    started = HythonBridge(
+        home=home, port_range=PORT_RANGE, extra_args=["--drop-reply-s", str(HOLD_S)]
+    )
     try:
         started.start()
         yield started
@@ -313,6 +320,113 @@ def _quietly(work: Any) -> None:
         return
 
 
+# A reply that never arrives
+
+
+def test_a_lost_reply_is_answered_from_the_receipt_and_the_work_happens_once(
+    bridge: HythonBridge,
+) -> None:
+    """The call runs, the answer is thrown away, the caller sends it again.
+
+    The scene has to hold one node and not two, and the second send has to
+    come back with what the first one did.
+    """
+    before = scene_info(bridge)
+    operation_id = client.new_operation_id()
+    arguments = {"creates": 1, "drop_reply": True}
+
+    began = time.monotonic()
+    answer = bridge.call(
+        "bridge.selfcheck",
+        arguments=arguments,
+        operation_id=operation_id,
+        http_timeout_s=GIVE_UP_S,
+    )
+    took = time.monotonic() - began
+
+    # The first answer was lost and the second came from the receipt.
+    assert took >= GIVE_UP_S
+    assert answer.payload["ok"] is True, answer.payload
+    assert answer.payload["replayed"] is True
+    assert answer.payload["operation_id"] == operation_id
+    created = answer.payload["data"]["created"]
+    assert len(created) == 1
+
+    after = scene_info(bridge)
+    assert after["nodes"]["/obj"] == before["nodes"]["/obj"] + 1
+
+    # Sending it a third time changes nothing at all.
+    again = bridge.call("bridge.selfcheck", arguments=arguments, operation_id=operation_id)
+    assert again.payload["data"]["created"] == created
+    assert scene_info(bridge)["nodes"]["/obj"] == after["nodes"]["/obj"]
+
+    # The same id with other arguments is a mistake, not a retry.
+    wrong = bridge.call(
+        "bridge.selfcheck", arguments={"creates": 2}, operation_id=operation_id, wait_s=10.0
+    )
+    assert wrong.payload["error"]["code"] == "OPERATION_MISMATCH"
+    assert scene_info(bridge)["nodes"]["/obj"] == after["nodes"]["/obj"]
+
+
+def test_a_call_with_no_operation_id_is_never_sent_again_by_itself(
+    bridge: HythonBridge,
+) -> None:
+    before = scene_info(bridge)
+    with pytest.raises(client.BridgeUnreachable):
+        bridge.call(
+            "bridge.selfcheck",
+            arguments={"creates": 1, "drop_reply": True},
+            http_timeout_s=GIVE_UP_S,
+        )
+    # It ran once, and nothing here tried it again.
+    _until(lambda: bridge.health().payload["data"]["busy"] is False)
+    assert scene_info(bridge)["nodes"]["/obj"] == before["nodes"]["/obj"] + 1
+
+
+# A scene that has been replaced
+
+
+def test_a_call_carrying_an_old_scene_epoch_is_refused_with_the_scene_there_is_now(
+    bridge: HythonBridge, tmp_path: Path
+) -> None:
+    """Both ways a scene goes away: a new scene, and a load over the top."""
+    epoch = scene_info(bridge)["scene_epoch"]
+    bridge.call("bridge.selfcheck", arguments={"creates": 1}, wait_s=10.0)
+
+    cleared = bridge.call("bridge.selfcheck", arguments={"new_scene": True}, wait_s=10.0)
+    assert cleared.payload["ok"] is True, cleared.payload
+    assert cleared.payload["scene_epoch"] == epoch + 1
+
+    refused = bridge.call("scene.info", scene_epoch=epoch)
+    error = refused.payload["error"]
+    assert error["code"] == "SCENE_REPLACED"
+    assert error["details"]["carried_epoch"] == epoch
+    assert error["details"]["scene_epoch"] == epoch + 1
+    summary = refused.payload["scene"]
+    assert summary["nodes"]["/obj"] == 0
+    assert summary["changed"] == "cleared"
+    assert "hip_path" in summary
+
+    # A load of a scene file replaces the scene as well, and counts once.
+    scratch = tmp_path / "scratch.hip"
+    saved = bridge.call(
+        "bridge.selfcheck", arguments={"save_hip": str(scratch)}, wait_s=10.0, timeout_s=120.0
+    )
+    assert saved.payload["ok"] is True, saved.payload
+    loaded = bridge.call(
+        "bridge.selfcheck", arguments={"load_hip": str(scratch)}, wait_s=10.0, timeout_s=120.0
+    )
+    assert loaded.payload["scene_epoch"] == epoch + 2
+
+    stale = bridge.call("scene.info", scene_epoch=epoch + 1)
+    assert stale.payload["error"]["code"] == "SCENE_REPLACED"
+    assert stale.payload["scene"]["changed"] == "loaded"
+    assert scratch.name in stale.payload["scene"]["hip_path"]
+
+    # And a call carrying the epoch there is now goes through.
+    assert bridge.call("scene.info", scene_epoch=epoch + 2).payload["ok"] is True
+
+
 # Nothing gets in without a signature
 
 
@@ -510,6 +624,73 @@ def test_the_session_is_in_the_store_and_goes_when_the_process_quits(
     assert registry.list_entries(home) == []
     with pytest.raises(client.BridgeUnreachable):
         client.health(session, timeout_s=5.0)
+
+
+# Sessions of their own, started after the shared one has gone
+
+
+def test_a_call_to_a_killed_session_never_reaches_the_one_that_replaced_it(
+    home: Path,
+) -> None:
+    """A worker is killed and another starts under the same name.
+
+    A caller holding the old id is refused here, with the id of the session
+    answering to that name now. The new process is never asked.
+    """
+    worker = HythonBridge(home=home, port_range=(18370, 18379), alias="restarter")
+    worker.start()
+    old_id = worker.session_id
+    worker.process.kill()
+    worker.process.wait(timeout=60.0)
+
+    replacement = HythonBridge(home=home, port_range=(18370, 18379), alias="restarter")
+    replacement.start()
+    try:
+        assert replacement.session_id != old_id
+        assert replacement.entry["alias"] == "restarter"
+
+        with pytest.raises(client.SessionDead) as refused:
+            client.Session.open(home, old_id)
+
+        details = refused.value.details()
+        assert details["code"] == "SESSION_DEAD"
+        assert details["alias"] == "restarter"
+        assert details["live_session_id"] == replacement.session_id
+
+        # Nothing was sent, so the new session has run nothing at all.
+        assert replacement.health().payload["data"]["last_op"] is None
+        # And the name now resolves to the new session.
+        assert client.Session.open(home, "restarter").session_id == replacement.session_id
+    finally:
+        replacement.stop()
+    assert worker.process.poll() is not None
+    assert replacement.process.poll() is not None
+
+
+def test_two_sessions_on_the_same_scene_get_different_ids_and_names(home: Path) -> None:
+    """The only check here that runs two Houdinis at once, and needs to."""
+    pattern = ["--alias-template", "probe-{n}"]
+    first = HythonBridge(home=home, port_range=(18380, 18389), extra_args=pattern)
+    second = HythonBridge(home=home, port_range=(18390, 18399), extra_args=pattern)
+    first.start()
+    try:
+        second.start()
+        try:
+            assert first.session_id != second.session_id
+            assert [first.entry["alias"], second.entry["alias"]] == ["probe-1", "probe-2"]
+            assert first.port != second.port
+            for started in (first, second):
+                data = started.health().payload["data"]
+                assert data["status"] == "ok"
+                assert data["session_id"] == started.session_id
+        finally:
+            second.stop()
+    finally:
+        first.stop()
+    assert first.process.poll() is not None
+    assert second.process.poll() is not None
+    assert registry.find_entry(home, "probe-1") is None
+    assert registry.find_entry(home, "probe-2") is None
 
 
 def _listening_addresses(port: int) -> list[str] | None:

@@ -285,7 +285,7 @@ class Dispatcher:
                             "still_running": True,
                         },
                     ),
-                    **trace,
+                    **self._said(trace),
                 },
             )
 
@@ -293,6 +293,17 @@ class Dispatcher:
         if wanted:
             self.receipts.finish(wanted, reply.payload)
         return reply
+
+    # Section: answering
+
+    def _said(self, trace: Mapping[str, Any]) -> dict[str, Any]:
+        """The trace as it is at the moment of answering.
+
+        The session and the epoch are read again here rather than kept from
+        the start of the call, because a call that replaced the scene has to
+        hand back the epoch a caller should use next, not the one it used.
+        """
+        return {**trace, **self.identity.trace()}
 
     # Section: the scene and the receipt
 
@@ -306,14 +317,11 @@ class Dispatcher:
             BridgeError(
                 "SCENE_REPLACED",
                 "this session has replaced its scene since that call was written",
-                {
-                    "carried_epoch": carried,
-                    "scene_epoch": current,
-                    "scene": self.identity.scene(),
-                },
+                {"carried_epoch": carried, "scene_epoch": current},
                 hint="read the scene again, then send the call with the new epoch",
             ),
             trace,
+            scene=True,
         )
 
     def _receipt_reply(
@@ -347,11 +355,11 @@ class Dispatcher:
                     {
                         "recorded_epoch": verdict.recorded_epoch,
                         "scene_epoch": self.identity.scene_epoch,
-                        "scene": self.identity.scene(),
                     },
                     hint="read the scene again and send the call with a new operation id",
                 ),
                 trace,
+                scene=True,
             )
         return self._unknown(verdict, tool, trace)
 
@@ -362,15 +370,11 @@ class Dispatcher:
             BridgeError(
                 "OUTCOME_UNKNOWN",
                 "that operation id may already have changed the scene",
-                {
-                    "tool": tool.name,
-                    "reason": verdict.reason,
-                    "receipt": verdict.state(),
-                    "scene": self.identity.scene(),
-                },
+                {"tool": tool.name, "reason": verdict.reason, "receipt": verdict.state()},
                 hint="read the scene, decide what is already there, then call with a new id",
             ),
             trace,
+            scene=True,
         )
 
     def _answer_now(
@@ -385,7 +389,7 @@ class Dispatcher:
         converted = encoding.convert(data)
         payload = {
             **ok_payload(converted.value, timing_ms=(time.monotonic() - began) * 1000.0),
-            **trace,
+            **self._said(trace),
         }
         if converted.lossy:
             payload["lossy"] = True
@@ -460,7 +464,7 @@ class Dispatcher:
             return self._failed(tool, work.error, running, trace)
 
         converted = encoding.convert(work.result)
-        payload = {**ok_payload(converted.value, timing_ms=timing_ms), **trace}
+        payload = {**ok_payload(converted.value, timing_ms=timing_ms), **self._said(trace)}
         if converted.lossy:
             payload["lossy"] = True
             payload["cut"] = converted.cut
@@ -487,15 +491,24 @@ class Dispatcher:
             coded.details.setdefault("undo_recorded", running.recorded)
         return self._refuse(coded, trace)
 
-    def _refuse(self, error: BridgeError, trace: Mapping[str, Any]) -> Reply:
+    def _refuse(
+        self, error: BridgeError, trace: Mapping[str, Any], *, scene: bool = False
+    ) -> Reply:
+        """One coded refusal, with the scene summary where it helps.
+
+        The summary sits beside the error rather than inside it, because
+        anything inside an error has the places on disk taken out of it and a
+        caller being told its scene has gone needs to know which one is there
+        now.
+        """
         safe = error.safe()
-        return Reply(
-            200,
-            {
-                **error_payload(safe.code, safe.message, hint=safe.hint, details=safe.details),
-                **trace,
-            },
-        )
+        payload = {
+            **error_payload(safe.code, safe.message, hint=safe.hint, details=safe.details),
+            **self._said(trace),
+        }
+        if scene:
+            payload["scene"] = self.identity.scene()
+        return Reply(200, payload)
 
     def _busy(self, trace: Mapping[str, Any], *, waited: float, wait_s: float, cause: str) -> Reply:
         running = self._running
