@@ -26,6 +26,7 @@ from nscr_houdini_mcp.bridge.dispatch import Dispatcher
 from nscr_houdini_mcp.bridge.envelope import Envelope
 from nscr_houdini_mcp.bridge.handlers import default_registry
 from nscr_houdini_mcp.bridge.identity import Identity
+from nscr_houdini_mcp.tools import inspect as inspect_tool
 from nscr_houdini_mcp.tools.inspect import make_token, query_of
 from test_server import talk, text_of
 from test_tools_sessions import Bench
@@ -325,6 +326,20 @@ def test_a_page_token_that_is_not_ours_is_refused(bench: Bench, nodes: dict, pag
 def test_a_well_formed_token_of_ours_is_taken(bench: Bench, nodes: dict) -> None:
     body = ok(inspect(bench, page=raw_token(fields(k="/mat"))))
     assert paths(body) == ["/obj", "/out", "/stage"]
+
+
+def test_the_longest_token_this_server_writes_is_read_back() -> None:
+    longest = inspect_tool.make_token(
+        mode="parms",
+        session_id="s" * inspect_tool.TOKEN_LENGTHS["s"],
+        epoch=10**9,
+        last="/" + "k" * (inspect_tool.TOKEN_LENGTHS["k"] - 1),
+        mark="d" * inspect_tool.TOKEN_LENGTHS["d"],
+        query="q" * inspect_tool.TOKEN_LENGTHS["q"],
+    )
+    assert len(longest) <= inspect_tool.MAX_TOKEN_CHARS
+    body = inspect_tool.decode_token(longest)
+    assert body["k"] == "/" + "k" * (inspect_tool.TOKEN_LENGTHS["k"] - 1)
 
 
 def test_a_big_page_is_carried_whole(bench: Bench, scene: Scene, nodes: dict) -> None:

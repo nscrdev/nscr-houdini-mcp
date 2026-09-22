@@ -88,9 +88,10 @@ from nscr_houdini_mcp.tools.base import (
 BY_PATHS = ("node", "parms")
 
 # What a page token carries, under one short key each, and its version. The
-# token is refused unread when it is longer than a token this server makes.
+# token is refused unread when it is longer than a token this server makes:
+# the longest fields below, as JSON and then base64, stay under this.
 TOKEN_VERSION = 1
-MAX_TOKEN_CHARS = 1024
+MAX_TOKEN_CHARS = 1700
 TOKEN_FIELDS = {
     "v": int,  # the version
     "m": str,  # the mode
