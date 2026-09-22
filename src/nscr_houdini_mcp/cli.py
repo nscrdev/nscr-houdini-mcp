@@ -123,7 +123,9 @@ def _add_worker_commands(actions: Any) -> None:
 
     start = jobs.add_parser("start", help="start one worker, if the pool has room")
     _add_home(start)
-    start.add_argument("--cap", type=int, default=pool.DEFAULT_CAP, help="how many workers may run")
+    start.add_argument(
+        "--cap", type=int, default=None, help="how many workers may run, pool_cap from config"
+    )
     start.add_argument(
         "--weight",
         default=pool.DEFAULT_WEIGHT,
@@ -143,7 +145,9 @@ def _add_worker_commands(actions: Any) -> None:
         help="how long the worker stays warm with no job before it ends itself",
     )
     start.add_argument("--max-threads", type=int, default=None, help="thread cap for this worker")
-    start.add_argument("--hython", type=Path, default=None, help="the hython to start")
+    start.add_argument(
+        "--hython", type=Path, default=None, help="the hython to start, from config when left out"
+    )
     start.add_argument("--port", type=int, default=pool.DEFAULT_PORT_RANGE[0])
     start.add_argument("--max-port", type=int, default=pool.DEFAULT_PORT_RANGE[1])
     start.add_argument("--job", default=None, help="take the worker for this job at once")
@@ -183,7 +187,9 @@ def _add_worker_commands(actions: Any) -> None:
 
 
 def _add_home(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--home", type=Path, default=None, help="state folder to use")
+    parser.add_argument(
+        "--home", type=Path, default=None, help="state folder to use, state_home from config"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -192,7 +198,10 @@ def main(argv: list[str] | None = None) -> int:
     if handler is None:
         run()
         return 0
-    return handler(args)
+    try:
+        return handler(args)
+    except config_module.ConfigError as error:
+        return _config_failed(error)
 
 
 # Section: the bridge commands
@@ -232,7 +241,15 @@ def _uninstall(args: argparse.Namespace) -> int:
 
 
 def _status(args: argparse.Namespace) -> int:
-    home = Path(args.home) if args.home else store_module.default_home()
+    if args.home:
+        home = Path(args.home)
+    else:
+        try:
+            home = config_module.load_config().state_home
+        except config_module.ConfigError as error:
+            # Status still reports, from the usual folder, and says why.
+            print(f"config invalid: {error.message}")
+            home = store_module.default_home()
     print(f"home {home}")
     _print_sessions(home)
     _print_packages(install_module.resolve(override=args.packages_dir))
@@ -247,18 +264,36 @@ def _snippet(_args: argparse.Namespace) -> int:
 # Section: the worker commands
 
 
+def _settings() -> config_module.Config:
+    """The server's config, so these commands and the server agree on the
+    state folder, the cap and the hython. Raises `ConfigError`."""
+    return config_module.load_config()
+
+
 def _home_of(args: argparse.Namespace) -> Path:
-    return Path(args.home) if args.home else store_module.default_home()
+    return Path(args.home) if args.home else _settings().state_home
+
+
+def _config_failed(error: config_module.ConfigError) -> int:
+    where = f" ({error.key})" if error.key else ""
+    print(f"config invalid{where}: {error.message}")
+    print(f"  {error.path}")
+    return 1
 
 
 def _worker_start(args: argparse.Namespace) -> int:
+    try:
+        settings = _settings()
+        hython = args.hython or config_module.resolve_hython(settings)
+    except config_module.ConfigError as error:
+        return _config_failed(error)
     config = pool.PoolConfig(
-        home=_home_of(args),
-        cap=args.cap,
+        home=Path(args.home) if args.home else settings.state_home,
+        cap=args.cap if args.cap is not None else settings.pool_cap,
         max_idle_s=args.max_idle_s,
         weight_budget=args.weight_budget,
         max_threads=args.max_threads,
-        hython=args.hython,
+        hython=hython,
         port_range=(args.port, args.max_port),
         start_timeout_s=args.timeout_s,
     )

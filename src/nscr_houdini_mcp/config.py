@@ -1,10 +1,11 @@
 """The server's own settings, read from one TOML file in the state folder.
 
-Every key is optional. A missing file is the same as an empty one: the server
-runs on the defaults below. A file that is there and wrong is refused whole,
-with the key, what was wrong with it and, for a misspelled key, the nearest
-name, because a setting that is quietly ignored is worse than one that stops
-the server from guessing.
+Every key is optional. A missing file in the state folder is the same as an
+empty one: the server runs on the defaults below. A file named outright, by
+`NSCR_MCP_CONFIG` or on the command line, must be there. A file that is there
+and wrong is refused whole, with the key, what was wrong with it and, for a
+misspelled key, the nearest name, because a setting that is quietly ignored is
+worse than one that stops the server from guessing.
 
 Where the file is. `NSCR_MCP_CONFIG` names it when set. Otherwise it is
 `config.toml` in the state folder, which `NSCR_MCP_HOME` moves. The file's own
@@ -17,6 +18,10 @@ Which hython. `hython` names one outright and wins. `houdini_build` picks an
 install by version, `22.0` for the newest 22.0 build or `22.0.368` for that
 one. With neither, `NSCR_MCP_HYTHON` is read, then the newest install this
 machine has is used.
+
+The same file may hold `[outputs]` and `[conventions]` tables. Those belong to
+the output paths, which check them when they read them, so they are passed
+over here.
 
 This module never imports `hou`.
 """
@@ -35,6 +40,7 @@ from typing import Any
 from nscr_houdini_mcp import install as install_module
 from nscr_houdini_mcp import pool
 from nscr_houdini_mcp import store as store_module
+from nscr_houdini_mcp.bridge.security import InsecureLocation, check_home
 
 CONFIG_ENV_VAR = "NSCR_MCP_CONFIG"
 CONFIG_FILE_NAME = "config.toml"
@@ -44,11 +50,17 @@ SPILL_DIR_NAME = "spill"
 # still reads the same when a second one arrives.
 TRANSPORTS = ("stdio",)
 
+# Tables other parts of the project read from the same file.
+OTHER_TABLES = ("outputs", "conventions")
+
 DEFAULT_SPILL_OVER_BYTES = 64 * 1024
 MIN_SPILL_OVER_BYTES = 1024
 MAX_SPILL_OVER_BYTES = 64 * 1024 * 1024
 
 MAX_POOL_CAP = 16
+
+DEFAULT_SPILL_KEEP_DAYS = 7
+MAX_SPILL_KEEP_DAYS = 365
 
 _BUILD = re.compile(r"^\d+\.\d+(\.\d+)*$")
 
@@ -61,15 +73,17 @@ KEYS = (
     "state_home",
     "spill_dir",
     "spill_over_bytes",
+    "spill_keep_days",
     "transport",
 )
 
 TEMPLATE = f"""\
 # Settings for the nscr-houdini-mcp server. Every key is optional; an empty
-# string or a missing key means the default.
+# string or a missing key means the default. Paths go in single quotes, which
+# TOML reads as written, so a Windows path needs no doubled backslashes.
 
 # The hython that workers start with. Wins over houdini_build.
-hython = ""
+hython = ''
 
 # Pick an install by version instead: "22.0" for the newest 22.0 build, or a
 # full build such as "22.0.368". With neither set, NSCR_MCP_HYTHON is read,
@@ -85,14 +99,17 @@ pool_cap = {pool.DEFAULT_CAP}
 
 # Where sessions, the coordination store and logs live. Bridges must use the
 # same folder (NSCR_MCP_HOME) or the server will not see them.
-state_home = ""
+state_home = ''
 
 # Where results too large to return are written. Default: <state_home>/{SPILL_DIR_NAME}
-spill_dir = ""
+spill_dir = ''
 
 # Results larger than this many bytes are written to a file and returned as
 # the path and a preview.
 spill_over_bytes = {DEFAULT_SPILL_OVER_BYTES}
+
+# Spilled results older than this many days are removed when the server starts.
+spill_keep_days = {DEFAULT_SPILL_KEEP_DAYS}
 
 # How clients reach the server. Only "stdio" is served by this build.
 transport = "stdio"
@@ -109,7 +126,20 @@ class ConfigError(Exception):
         self.key = key
 
     def details(self) -> dict[str, Any]:
-        return {"path": str(self.path) if self.path else None, "key": self.key}
+        """The key and where the file is, told relative to the state folder."""
+        return {"path": shown_path(self.path), "key": self.key}
+
+
+def shown_path(path: Path | None) -> str | None:
+    """A config path as a caller is told it: under the state folder when it is
+    there, otherwise its name alone, so no other place on disk is given away."""
+    if path is None:
+        return None
+    home = store_module.default_home()
+    try:
+        return Path(path).relative_to(home).as_posix()
+    except ValueError:
+        return Path(path).name
 
 
 @dataclass(frozen=True)
@@ -125,6 +155,7 @@ class Config:
     state_home: Path = field(default_factory=store_module.default_home)
     spill_dir: Path | None = None
     spill_over_bytes: int = DEFAULT_SPILL_OVER_BYTES
+    spill_keep_days: int = DEFAULT_SPILL_KEEP_DAYS
     transport: str = TRANSPORTS[0]
     # Which keys the file set. The rest are defaults.
     from_file: frozenset[str] = frozenset()
@@ -137,12 +168,6 @@ class Config:
     def store_path(self) -> Path:
         return self.state_home / store_module.STORE_FILE_NAME
 
-    def pool_config(self, **rest: Any) -> pool.PoolConfig:
-        """The pool settings these values make, with hython resolved as configured."""
-        return pool.PoolConfig(
-            home=self.state_home, cap=self.pool_cap, hython=resolve_hython(self), **rest
-        )
-
     def shown(self) -> dict[str, Any]:
         """Every key with the value in use, for a person to read."""
         values = {
@@ -153,6 +178,7 @@ class Config:
             "state_home": self.state_home,
             "spill_dir": self.spill_folder,
             "spill_over_bytes": self.spill_over_bytes,
+            "spill_keep_days": self.spill_keep_days,
             "transport": self.transport,
         }
         return {key: values[key] for key in KEYS}
@@ -169,25 +195,44 @@ def config_path() -> Path:
 def load_config(path: Path | str | None = None) -> Config:
     """Read the config file, or the defaults when there is none.
 
-    Raises `ConfigError` for a file that cannot be read or holds a wrong value.
+    Raises `ConfigError` for a file that cannot be read or holds a wrong value,
+    and for a file named outright that is not there: whoever named it meant
+    those settings, and running on the defaults instead would hide the mistake.
     """
+    named = path is not None or bool(os.environ.get(CONFIG_ENV_VAR, "").strip())
     where = Path(path).expanduser() if path is not None else config_path()
     if not where.is_file():
+        if named:
+            raise ConfigError(f"the config file named is not there: {where.name}", path=where)
         return Config(path=where)
     try:
         text = where.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError) as error:
-        raise ConfigError(f"could not read the config file: {error}", path=where) from None
+        raise ConfigError(
+            f"could not read the config file ({type(error).__name__})", path=where
+        ) from None
     try:
         raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
-        raise ConfigError(f"the config file is not valid TOML: {error}", path=where) from None
+        raise ConfigError(_toml_message(error), path=where) from None
     return parse_config(raw, path=where)
+
+
+def _toml_message(error: tomllib.TOMLDecodeError) -> str:
+    message = f"the config file is not valid TOML: {error}"
+    text = str(error).lower()
+    if "hex" in text or "escape" in text:
+        # A Windows path in double quotes reads its backslashes as escapes.
+        message += (
+            "; a backslash in double quotes starts an escape, so put paths in single"
+            " quotes or write them with forward slashes"
+        )
+    return message
 
 
 def parse_config(raw: Mapping[str, Any], *, path: Path) -> Config:
     """Check every key of a decoded file and build the settings from it."""
-    unknown = [key for key in raw if key not in KEYS]
+    unknown = [key for key in raw if key not in KEYS and key not in OTHER_TABLES]
     if unknown:
         key = str(unknown[0])
         near = difflib.get_close_matches(key, KEYS, n=1, cutoff=0.5)
@@ -231,6 +276,19 @@ def _folder(value: Any, key: str, path: Path) -> Path | None:
     return folder
 
 
+def _private_folder(value: Any, key: str, path: Path) -> Path | None:
+    """A folder results are written to, which must be this user's own."""
+    folder = _folder(value, key, path)
+    if folder is not None:
+        try:
+            check_home(folder)
+        except InsecureLocation as error:
+            raise ConfigError(
+                f"{key} cannot hold private results: {error}", path=path, key=key
+            ) from None
+    return folder
+
+
 def _hython(value: Any, key: str, path: Path) -> Path | None:
     # Whether the file is there is checked when a worker starts, so a config
     # written before Houdini is installed still loads.
@@ -262,6 +320,10 @@ def _spill_over(value: Any, key: str, path: Path) -> int:
     return _whole(value, key, path, MIN_SPILL_OVER_BYTES, MAX_SPILL_OVER_BYTES)
 
 
+def _keep_days(value: Any, key: str, path: Path) -> int:
+    return _whole(value, key, path, 1, MAX_SPILL_KEEP_DAYS)
+
+
 def _transport(value: Any, key: str, path: Path) -> str | None:
     text = _text(value, key, path)
     if text is not None and text not in TRANSPORTS:
@@ -272,7 +334,7 @@ def _transport(value: Any, key: str, path: Path) -> str | None:
 
 
 def _kind(value: Any) -> str:
-    return {bool: "true or false", int: "a number", float: "a number", str: "a string"}.get(
+    return {bool: "true or false", int: "a number", float: "a decimal", str: "a string"}.get(
         type(value), type(value).__name__
     )
 
@@ -283,8 +345,9 @@ _CHECKS = {
     "default_session": _text,
     "pool_cap": _cap,
     "state_home": _folder,
-    "spill_dir": _folder,
+    "spill_dir": _private_folder,
     "spill_over_bytes": _spill_over,
+    "spill_keep_days": _keep_days,
     "transport": _transport,
 }
 
