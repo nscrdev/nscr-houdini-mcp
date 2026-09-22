@@ -137,12 +137,15 @@ def test_a_blocked_start_leaves_the_handle_usable(tmp_path) -> None:
     """A transaction that never began must not look like one that is open."""
     path = tmp_path / "coord.sqlite"
     with Store(path) as holder, Store(path, busy_timeout_s=0.05) as waiter:
-        waiter.register_session("s1", kind="gui", pid=1, alias="scene-1")
+        waiter.register_session("s1", kind="gui", pid=os.getpid(), alias="scene-1")
         with holder._txn(write=True):
             with pytest.raises(StoreBusy):
-                waiter.register_session("s2", kind="gui", pid=2, alias="scene-2")
+                waiter.register_session("s2", kind="gui", pid=os.getpid(), alias="scene-2")
         # The holder has committed, so the waiter carries on as normal.
-        assert waiter.register_session("s2", kind="gui", pid=2, alias="scene-2").alias == "scene-2"
+        assert (
+            waiter.register_session("s2", kind="gui", pid=os.getpid(), alias="scene-2").alias
+            == "scene-2"
+        )
         assert [s.session_id for s in waiter.list_sessions()] == ["s1", "s2"]
 
 

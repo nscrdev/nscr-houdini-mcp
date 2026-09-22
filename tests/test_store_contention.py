@@ -75,6 +75,9 @@ def open_fresh(path: str, index: int, barrier, results) -> None:
             report["alias"] = store.register_session(
                 f"session-{index}", kind="hython", pid=os.getpid(), alias_template="scene-{n}"
             ).alias
+            # A process that has gone loses its name to the next one, so
+            # nobody leaves until every name has been handed out.
+            barrier.wait(BARRIER_TIMEOUT_S)
     except BaseException as error:
         report["error"] = f"{type(error).__name__}: {error}"
     results.put(report)
