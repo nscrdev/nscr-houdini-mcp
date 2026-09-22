@@ -11,6 +11,7 @@ is in the integration tests.
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import threading
 import time
@@ -30,6 +31,7 @@ from nscr_houdini_mcp.bridge.dispatch import Dispatcher
 from nscr_houdini_mcp.bridge.envelope import Envelope
 from nscr_houdini_mcp.bridge.handlers import default_registry
 from nscr_houdini_mcp.bridge.identity import Identity
+from nscr_houdini_mcp.results import ok_result
 from nscr_houdini_mcp.tools import python as python_tool
 from test_bridge_app import make_bridge
 from test_server import talk, text_of
@@ -437,11 +439,9 @@ def test_an_id_whose_session_died_between_the_work_and_the_receipt_is_unknown(
     bench: Bench, scene: Scene
 ) -> None:
     code = "hou.node('/obj').createNode('geo')"
-    arguments = {
-        "code": code,
-        "namespace": python_tool.DEFAULT_NAMESPACE,
-        "undo_label": "hou_python op-dead",
-    }
+    # The digest is of the arguments the caller chose: the default namespace
+    # the server filled in is not part of it.
+    arguments = {"code": code, "undo_label": "hou_python op-dead"}
     digest = receipt_module.digest_call("python.run", arguments)
     with bench.store() as store:
         store.begin_operation("op-dead", digest, session_id="s-1", scene_epoch=0, owner_pid=1 << 30)
@@ -486,6 +486,9 @@ def test_the_run_budget_defaults_to_a_minute_and_is_capped_by_the_config(
 ) -> None:
     ok(python(bench, code="x = 1"))
     assert sent(bench)[-1]["timeout_s"] == 60.0
+    # Past the cap is lowered to it, never refused.
+    ok(python(bench, code="x = 1", timeout_s=7200))
+    assert sent(bench)[-1]["timeout_s"] == 3600
     bench.config = replace(bench.config, python_timeout_cap_s=5)
     ok(python(bench, code="x = 1", timeout_s=900))
     assert sent(bench)[-1]["timeout_s"] == 5
@@ -529,9 +532,63 @@ def test_a_long_loop_can_see_it_was_asked_to_stop(bench: Bench) -> None:
     assert ok(done[0])["result"] < 1000
 
 
-def test_the_helper_refuses_a_progress_that_is_not_a_number(bench: Bench) -> None:
-    error = raised(python(bench, code="mcp.progress('half')"))["error"]
-    assert error["type"] == "TypeError"
+@pytest.mark.parametrize(
+    ("call", "kind"),
+    [
+        ("mcp.progress('half')", "TypeError"),
+        ("mcp.progress(True)", "TypeError"),
+        ("mcp.progress(float('nan'))", "ValueError"),
+        ("mcp.progress(1, float('inf'))", "ValueError"),
+        ("mcp.progress(10 ** 400)", "ValueError"),
+    ],
+)
+def test_the_helper_refuses_progress_that_is_not_a_finite_number(
+    bench: Bench, call: str, kind: str
+) -> None:
+    error = raised(python(bench, code=call))["error"]
+    assert error["type"] == kind
+    assert through(bench).dispatcher.state()["last_op"].get("progress") is None
+
+
+def test_the_helper_is_cancelled_when_the_session_is_going_down(bench: Bench) -> None:
+    code = (
+        "import time\n"
+        "laps = 0\n"
+        "while not mcp.cancelled() and laps < 1000:\n"
+        "    laps += 1\n"
+        "    time.sleep(0.01)\n"
+        "result = laps"
+    )
+    done: list[Any] = []
+    runner = threading.Thread(target=lambda: done.append(python(bench, code=code)))
+    runner.start()
+    support.wait_until(lambda: through(bench).dispatcher.state()["busy"], timeout_s=10.0)
+    through(bench).stopping.set()
+    runner.join(20.0)
+    assert ok(done[0])["result"] < 1000
+
+
+def test_the_helper_answers_only_its_own_call_on_its_own_thread(bench: Bench) -> None:
+    code = (
+        "import threading\n"
+        "refused = []\n"
+        "def elsewhere():\n"
+        "    try:\n"
+        "        mcp.progress(1)\n"
+        "    except RuntimeError as error:\n"
+        "        refused.append(str(error))\n"
+        "other = threading.Thread(target=elsewhere)\n"
+        "other.start()\n"
+        "other.join()\n"
+        "kept = mcp\n"
+        "result = [refused, hasattr(mcp, '_context'), hasattr(mcp, '__dict__')]"
+    )
+    body = ok(python(bench, code=code, namespace="h"))
+    refused_there, has_context, has_dict = body["result"]
+    assert len(refused_there) == 1 and "thread" in refused_there[0]
+    assert has_context is False and has_dict is False
+    later = "try:\n    kept.progress(1)\nexcept RuntimeError as error:\n    result = str(error)"
+    assert "ended" in ok(python(bench, code=later, namespace="h"))["result"]
 
 
 # Section: managed outputs
@@ -639,7 +696,23 @@ def test_a_lost_reply_is_sent_again_and_the_code_runs_once(
         scene.ui.stop()
 
 
-# Section: a retry queued behind the work
+# Section: a retry from another server, and a retry queued behind the work
+
+
+def test_a_retry_from_a_restarted_server_replays_and_names_the_namespace_it_ran_in(
+    bench: Bench, scene: Scene, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code = "hou.node('/obj').createNode('geo')\nresult = len(hou.node('/obj').children())"
+    first = ok(python(bench, code=code, operation_id="op-restart"))
+    ran_in = first["namespace"]
+    assert sent(bench)[-1]["arguments"]["default_namespace"] == ran_in
+    assert "namespace" not in sent(bench)[-1]["arguments"]
+    # A second server process draws another default namespace.
+    monkeypatch.setattr(python_tool, "DEFAULT_NAMESPACE", "c_restarted")
+    again = ok(python(bench, code=code, operation_id="op-restart"))
+    assert again["result"] == 1
+    assert again["namespace"] == ran_in
+    assert len(scene.node("/obj").children()) == 1
 
 
 def test_a_retry_queued_behind_timed_out_code_gets_the_stored_answer(
@@ -685,3 +758,183 @@ def test_running_code_keeps_its_receipt_lease(tmp_path: Path, module: Any, clock
 def _updated(bench: Bench, operation_id: str) -> float:
     with bench.store() as store:
         return store.get_operation(operation_id).updated_at
+
+
+# Section: what the answer holds
+
+
+def test_the_result_is_read_on_the_thread_that_ran_the_code(bench: Bench) -> None:
+    code = (
+        "import threading\n"
+        "class Points:\n"
+        "    shape = (1,)\n"
+        "    def tolist(self):\n"
+        "        seen.append(threading.get_ident())\n"
+        "        return [1.0]\n"
+        "seen = []\n"
+        "ran_on = threading.get_ident()\n"
+        "result = Points()"
+    )
+    assert ok(python(bench, code=code, namespace="th"))["result"] == [1.0]
+    assert ok(python(bench, code="result = seen == [ran_on]", namespace="th"))["result"] is True
+
+
+def test_text_utf8_cannot_carry_comes_back_escaped_and_marked(bench: Bench) -> None:
+    code = "print('bad \\ud800 text')\nresult = {'k\\udcff': 'v\\udcff'}"
+    body = ok(python(bench, code=code))
+    assert body["stdout_tail"] == "bad \\ud800 text\n"
+    assert body["result"] == {"k\\udcff": "v\\udcff"}
+    assert body["lossy"] is True
+    assert "stdout" in body["cut"]
+    # Replayed from the receipt, it is the same.
+    again = ok(python(bench, code=code, operation_id="op-s"))
+    replay = ok(python(bench, code=code, operation_id="op-s"))
+    assert again["stdout_tail"] == replay["stdout_tail"]
+
+
+def test_a_result_that_holds_a_lone_surrogate_still_goes_out() -> None:
+    result = ok_result({"text": "a\ud800b"}, {"session_id": None})
+    assert "\\ud800" in result.content[0].text
+    assert result.structured_content["text"] == "a\\ud800b"
+
+
+def test_a_huge_collection_is_read_only_as_far_as_its_cap(bench: Bench) -> None:
+    began = time.monotonic()
+    body = ok(python(bench, code="result = range(10 ** 12)", max_chars=200_000))
+    assert time.monotonic() - began < 10.0
+    assert body["result"][:3] == [0, 1, 2] and len(body["result"]) == 1024
+    assert body["lossy"] is True
+
+
+def test_a_long_string_is_cut_in_the_session(bench: Bench) -> None:
+    body = ok(python(bench, code="result = 'x' * 3_000_000", max_chars=1000))
+    assert body["lossy"] is True
+    assert "result" in body["cut"]
+    assert len(body["result"]) == 1000
+    spilled = json.loads(Path(body["spill_path"]).read_text(encoding="utf-8"))
+    assert len(spilled["result"]) == tools.encoding.MAX_CHARS
+
+
+def test_an_answer_past_the_session_bound_is_cut_before_the_receipt(
+    bench: Bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tools, "MAX_ANSWER_CHARS", 1000)
+    body = ok(python(bench, code="result = ['y' * 500] * 5", operation_id="op-big"))
+    assert isinstance(body["result"], str)
+    assert body["result"].startswith('["yyy')
+    assert "result" in body["cut"]
+    assert body["elided_chars"] == len('["' + '","'.join(["y" * 500] * 5) + '"]') - 1000
+    with bench.store() as store:
+        stored = store.get_operation("op-big").outcome
+    assert len(stored["data"]["result"]) == 1000
+
+
+def test_numbers_sets_and_non_finite_floats_keep_what_they_are(bench: Bench) -> None:
+    code = (
+        "class Scalar:\n"
+        "    shape = ()\n"
+        "    def tolist(self):\n"
+        "        return 3\n"
+        "result = {'n': Scalar(), 's': {3, 1, 2}, 'bad': float('nan')}"
+    )
+    body = ok(python(bench, code=code))
+    assert body["result"] == {"n": 3, "s": [1, 2, 3], "bad": "nan"}
+    assert body["cut"] == ["result.bad"]
+
+
+# Section: streams
+
+
+def test_a_log_handler_made_in_one_call_writes_into_the_next(
+    bench: Bench, capsys: pytest.CaptureFixture[str]
+) -> None:
+    make = (
+        "import logging\n"
+        "log = logging.getLogger('nscr_python_check')\n"
+        "log.propagate = False\n"
+        "log.addHandler(logging.StreamHandler())\n"
+        "log.warning('one')"
+    )
+    log = logging.getLogger("nscr_python_check")
+    try:
+        assert ok(python(bench, code=make, namespace="logs"))["stdout_tail"] == "one\n"
+        again = "log.warning('two')"
+        assert ok(python(bench, code=again, namespace="logs"))["stdout_tail"] == "two\n"
+        # Outside a call the same handler writes where it always did.
+        log.warning("outside")
+        assert "outside" in capsys.readouterr().err
+    finally:
+        log.handlers.clear()
+
+
+def test_a_stream_the_code_replaces_never_outlives_the_call(bench: Bench) -> None:
+    before = sys.stdout, sys.stderr
+    code = "import io, sys\nsys.stdout = io.StringIO()\nsys.stderr = io.StringIO()\nprint('hidden')"
+    body = ok(python(bench, code=code))
+    assert body["stdout_tail"] == ""
+    assert (sys.stdout, sys.stderr) == before
+    assert ok(python(bench, code="print('seen')"))["stdout_tail"] == "seen\n"
+
+
+# Section: code that will not compile
+
+
+@pytest.mark.parametrize(
+    ("code", "kinds"),
+    [
+        ("x = " + "-" * 100_000 + "1", ("RecursionError", "MemoryError", "SyntaxError")),
+        ("x = 1\0", ("ValueError", "SyntaxError")),
+    ],
+)
+def test_code_the_compiler_refuses_is_data_not_a_failed_call(
+    bench: Bench, code: str, kinds: tuple[str, ...]
+) -> None:
+    error = raised(python(bench, code=code))["error"]
+    assert error["type"] in kinds
+    assert ok(python(bench, code="result = 1"))["result"] == 1
+
+
+# Section: how many namespaces
+
+
+def test_namespaces_are_capped_and_the_least_recently_used_goes(bench: Bench, clock: Clock) -> None:
+    namespaces = through(bench).namespaces
+    for index in range(tools.MAX_NAMESPACES + 1):
+        clock.now += 1.0
+        ok(python(bench, code=f"mark = {index}", namespace=f"n{index}"))
+    names = [row["name"] for row in namespaces.state()["namespaces"]]
+    assert len(names) == tools.MAX_NAMESPACES
+    assert "n0" not in names and f"n{tools.MAX_NAMESPACES}" in names
+
+
+def test_a_default_namespace_goes_after_an_hour_and_a_named_one_after_a_day(
+    bench: Bench, clock: Clock
+) -> None:
+    ok(python(bench, code="kept = 1"))
+    ok(python(bench, code="kept = 1", namespace="named"))
+    clock.now += tools.DEFAULT_IDLE_S + 1.0
+    # Health sweeps too, with no call arriving.
+    reports = through(bench).dispatcher.tools.reports()
+    assert [row["name"] for row in reports["namespaces"]["namespaces"]] == ["named"]
+    assert reports["namespaces"]["count"] == 1
+    clock.now += tools.NAMED_IDLE_S
+    assert through(bench).dispatcher.tools.reports()["namespaces"]["count"] == 0
+
+
+def test_health_says_how_many_namespaces_and_roughly_how_big(bench: Bench) -> None:
+    ok(python(bench, code="block = 'z' * 100_000", namespace="sized"))
+    [row] = through(bench).namespaces.state()["namespaces"]
+    assert row["name"] == "sized"
+    # hou, mcp, the one variable, and the builtins Python adds.
+    assert row["variables"] == 4
+    assert row["approx_bytes"] >= 100_000
+
+
+def test_a_namespace_with_a_trailing_newline_is_refused_at_both_ends(bench: Bench) -> None:
+    error = refused(python(bench, code="x = 1", namespace="shared\n"))
+    assert error["code"] == "BAD_ARGUMENTS"
+    assert through(bench).calls == []
+    direct = through(bench).dispatcher.dispatch(
+        Envelope(tool="python.run", arguments={"code": "x = 1", "namespace": "shared\n"})
+    )
+    assert direct.payload["error"]["code"] == "BAD_ARGUMENTS"

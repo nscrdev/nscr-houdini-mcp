@@ -3,43 +3,54 @@
 The code runs in a namespace the session keeps between calls, so a variable
 set in one call is there in the next. Each namespace is one dict, seeded with
 `hou` and the `mcp` helper and nothing else, and kept until a call passes
-`reset`, the session ends, or nobody has used it for a day. A call that names
-no namespace gets this server's own, `c_<id>` with an id drawn when the server
-starts, so two agents on two servers never share variables by accident.
-`shared` is the one to name on purpose when they should. Separate namespaces
-keep variables apart and nothing else: every one works on the same scene.
+`reset`, the session ends, or nobody has used it for a while: an hour for a
+caller's default, a day for one named on purpose. A session keeps at most 32,
+the least recently used going first. A call that names no namespace gets this
+server's own, `c_<id>` with an id drawn when the server starts, so two agents
+on two servers never share variables by accident. `shared` is the one to name
+on purpose when they should. Separate namespaces keep variables apart and
+nothing else: every one works on the same scene.
 
-What the code leaves in `result` comes back as `result`, turned into JSON the
-way every answer from a session is: a node or a parameter as its path, a
-vector as its numbers, an array as a list up to the usual caps. What it prints
-to either stream comes back as `stdout_tail`. `max_chars` is the text budget
-for both together. A result over it comes back as the start of its JSON text,
-and whatever does not fit is counted in `elided_chars` and written whole to
-the spill folder, with the file named in `spill_path`.
+What the code leaves in `result` comes back as `result`, turned into JSON on
+the session's own thread the way every answer from a session is: a node or a
+parameter as its path, a vector as its numbers, an array as a list up to the
+usual caps, a lone surrogate as its escape. What it prints to either stream
+comes back as `stdout_tail`. `max_chars` is the text budget for both together.
+A result over it comes back as the start of its JSON text, and whatever does
+not fit is counted in `elided_chars` and written to the spill folder, with the
+file named in `spill_path`. The spill holds what the session kept: the last
+512,000 characters of output and the result as it was encoded, which is
+bounded too. `lossy` and `cut` say where anything was changed or cut.
 
 An exception in the code is not a failed call. The result carries `error`
 with the type, the message and the last lines of the traceback, places on
-disk taken out, and is marked as an error for the client. The namespace is
+disk taken out, and is marked as an error for the client. Code that will not
+compile is the same, with a syntax error's line and offset. The namespace is
 left as it was at the raise, and so is the scene.
 
 Every call counts as a change, whatever the code does: it runs in one undo
 group named `undo_label`, or `hou_python` and the operation id, the caller's
 or the one the trace names, and takes a receipt under that id. The same id
 sent again after a lost reply gets the first answer back and the code does
-not run twice. The same id with other code is `OPERATION_MISMATCH`. A call
+not run twice, from this server or from one started since. The receipt is
+bound to the arguments as the caller sent them: a call that named no
+namespace sends this server's default under a key of its own that the
+receipt leaves out, so the answer it replays names the namespace the code
+really ran in. The same id with other code is `OPERATION_MISMATCH`. A call
 that outruns `timeout_s` answers `TIMEOUT` with `still_running`; the code
 carries on, and the same operation id fetches its answer once it ends.
-`timeout_s` is capped by `python_timeout_cap_s` in the config.
+`timeout_s` above `python_timeout_cap_s` in the config is lowered to it.
 
 The `mcp` helper in every namespace:
 
 - `mcp.output_path(kind, name=None, ext=None)`: a managed path for this
   session and scene, from the output table: render, flipbook, comp, cache,
   usd, hip, capture or compare. Never a path the code makes up.
-- `mcp.progress(done, total=None, message=None)`: a note health shows while
-  the call runs.
-- `mcp.cancelled()`: whether somebody asked this call to stop, for a long
-  loop to look at.
+- `mcp.progress(done, total=None, message=None)`: a note health and
+  `hou_ping` show while the call runs. Finite numbers only.
+- `mcp.cancelled()`: whether the call should stop, for a long loop to look
+  at. It turns true when the session is going down; a tool that asks a call
+  to stop comes with background jobs.
 
 This module never imports `hou`.
 """
@@ -53,7 +64,7 @@ from typing import Any
 
 from nscr_houdini_mcp import config as config_module
 from nscr_houdini_mcp.bridge.dispatch import DEFAULT_TIMEOUT_S
-from nscr_houdini_mcp.results import CallError, Spill, compact
+from nscr_houdini_mcp.results import CallError, Spill, compact, scrub
 from nscr_houdini_mcp.tools.base import (
     OPERATION_ID,
     SESSION,
@@ -77,11 +88,13 @@ SHARED = "shared"
 SERVER_ID = secrets.token_hex(4)
 DEFAULT_NAMESPACE = f"c_{SERVER_ID}"
 
-NAMESPACE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+NAMESPACE_MAX = 64
+NAMESPACE_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
-# The run budget, left without its wording here to keep the tool list small.
-# It means what it means for every other tool.
-RUN_FOR_S = {key: value for key, value in TIMEOUT_S.items() if key != "description"}
+# The run budget, left without its wording or its ceiling here: it means what
+# it means for every other tool, and anything above the config's cap is
+# lowered to the cap rather than refused.
+RUN_FOR_S = {"type": TIMEOUT_S["type"], "minimum": TIMEOUT_S["minimum"]}
 
 LABEL_PREFIX = "hou_python"
 
@@ -89,8 +102,8 @@ LABEL_PREFIX = "hou_python"
 def run_python(call: Call) -> dict[str, Any]:
     arguments = call.arguments
     code = arguments["code"]
-    namespace = arguments.get("namespace") or DEFAULT_NAMESPACE
-    if not NAMESPACE_NAME.match(namespace):
+    named = arguments.get("namespace")
+    if named is not None and not NAMESPACE_NAME.fullmatch(named):
         raise CallError(
             "BAD_ARGUMENTS",
             "namespace must be 1 to 64 letters, digits, dot, dash or underscore",
@@ -114,23 +127,30 @@ def run_python(call: Call) -> dict[str, Any]:
     asked = arguments.get("timeout_s")
     call.arguments["timeout_s"] = min(DEFAULT_TIMEOUT_S if asked is None else float(asked), cap)
 
-    sent: dict[str, Any] = {
-        "code": code,
-        "namespace": namespace,
-        "undo_label": undo_label(arguments, call.operation_id()),
-    }
+    # The arguments as the caller chose them, which is what the receipt is
+    # bound to. The default namespace goes under a key the receipt leaves out.
+    sent: dict[str, Any] = {"code": code}
+    if named is not None:
+        sent["namespace"] = named
+    else:
+        sent["default_namespace"] = DEFAULT_NAMESPACE
+    sent["undo_label"] = undo_label(arguments, call.operation_id())
     if arguments.get("reset"):
         sent["reset"] = True
     reply = call.bridge("python.run", sent, mutating=True)
-    data = dict(reply.get("data") or {})
+    data = scrub(dict(reply.get("data") or {}))
 
     result = data.get("result")
     stdout = str(data.get("stdout") or "")
     dropped = int(data.get("stdout_dropped") or 0)
     error = data.get("error")
+    # A result the session already cut down to its JSON text.
+    as_text = data.get("result_text_chars") is not None
 
-    shown, tail, elided = fit(result, stdout, budget)
+    shown, tail, elided = fit(result, stdout, budget, as_text=as_text)
     elided += dropped
+    if as_text:
+        elided += int(data["result_text_chars"]) - len(str(result))
     said: dict[str, Any] = {"result": shown, "stdout_tail": tail, "elided_chars": elided}
     if elided:
         said.update(spill(call, result=result, stdout=stdout, dropped=dropped, error=error))
@@ -139,11 +159,12 @@ def run_python(call: Call) -> dict[str, Any]:
     said["duration_ms"] = data.get("duration_ms")
     undo = reply.get("undo") if isinstance(reply.get("undo"), Mapping) else {}
     said["undo_label"] = undo.get("label") or sent["undo_label"]
-    said["namespace"] = data.get("namespace") or namespace
+    said["namespace"] = data.get("namespace") or named or DEFAULT_NAMESPACE
     said["scene_epoch"] = call.trace.get("scene_epoch")
-    if reply.get("lossy"):
+    cut = list(data.get("cut") or []) + list(reply.get("cut") or [])
+    if data.get("lossy") or reply.get("lossy"):
         said["lossy"] = True
-        said["cut"] = reply.get("cut")
+        said["cut"] = cut
     return said
 
 
@@ -158,30 +179,34 @@ def undo_label(arguments: Mapping[str, Any], operation_id: str) -> str:
     return given or f"{LABEL_PREFIX} {operation_id}"
 
 
-def fit(result: Any, stdout: str, budget: int) -> tuple[Any, str, int]:
+def fit(result: Any, stdout: str, budget: int, *, as_text: bool = False) -> tuple[Any, str, int]:
     """The result, the end of the output and how much was left out.
 
     The result comes first. One whose JSON text is over the budget comes back
     as the start of that text, and no output fits beside it. Otherwise the
     output gets what is left, from its end, because that is where a run says
-    how it finished.
+    how it finished. `as_text` is for a result the session already turned
+    into the start of its JSON text.
     """
-    text = "" if result is None else compact(result)
-    if len(text) > budget:
-        return text[:budget], "", len(text) - budget + len(stdout)
+    text = str(result) if as_text else ("" if result is None else compact(result))
+    if as_text or len(text) > budget:
+        kept = text[:budget]
+        room = budget - len(kept)
+        tail = stdout[-room:] if room else ""
+        return kept, tail, len(text) - len(kept) + len(stdout) - len(tail)
     room = budget - len(text)
     tail = stdout[-room:] if room else ""
     return result, tail, len(stdout) - len(tail)
 
 
 def spill(call: Call, *, result: Any, stdout: str, dropped: int, error: Any) -> dict[str, Any]:
-    """Write the whole of what did not fit, and say where it went."""
+    """Write what the session kept of what did not fit, and say where it went."""
     if call.config is None:
         return {}
-    whole = {"result": result, "stdout": stdout, "stdout_dropped_chars": dropped, "error": error}
+    kept = {"result": result, "stdout": stdout, "stdout_dropped_chars": dropped, "error": error}
     try:
         written = Spill(call.config.spill_folder, call.config.spill_over_bytes).write(
-            compact(whole), tool="hou_python"
+            compact(kept), tool="hou_python"
         )
     except CallError:
         # The code has run and its receipt is kept, so what did fit still
@@ -210,7 +235,9 @@ def summary_line(data: Mapping[str, Any]) -> str:
         lines.append(f"traceback_tail:\n{error['traceback_tail']}")
     if data.get("elided_chars"):
         where = data.get("spill_path") or "nowhere, the spill folder could not be written"
-        lines.append(f"{data['elided_chars']} characters left out, all of it in {where}")
+        lines.append(
+            f"{data['elided_chars']} characters left out; what the session kept is in {where}"
+        )
     return "\n".join(lines)
 
 
@@ -225,7 +252,7 @@ HOU_PYTHON = ToolSpec(
         {
             "code": {"type": "string"},
             "session": SESSION,
-            "namespace": {"type": "string"},
+            "namespace": {"type": "string", "minLength": 1, "maxLength": NAMESPACE_MAX},
             "reset": {"type": "boolean"},
             "operation_id": OPERATION_ID,
             "scene_epoch": {"type": "integer"},

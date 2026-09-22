@@ -31,7 +31,10 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import linecache
+import math
+import numbers
 import os
 import re
 import sys
@@ -47,6 +50,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
+from nscr_houdini_mcp.bridge import encoding
 from nscr_houdini_mcp.bridge.errors import (
     MAX_HINTS,
     BridgeError,
@@ -2287,12 +2291,27 @@ class _NearIndex:
 
 # Section: running Python
 
-# How long a namespace nobody has used is kept before it is dropped.
-NAMESPACE_IDLE_S = 24 * 60 * 60.0
+# How long a namespace nobody has used is kept. A caller's own default, one
+# per server process, goes after an hour; one named on purpose after a day.
+NAMED_IDLE_S = 24 * 60 * 60.0
+DEFAULT_IDLE_S = 60 * 60.0
+DEFAULT_PREFIX = "c_"
+
+# How many namespaces a session keeps. Past this the least recently used goes.
+MAX_NAMESPACES = 32
 
 # How much of what the code prints is kept, the end of it. The caller is
 # handed a much shorter tail; this is what a spilled result can hold.
 CAPTURE_MAX_CHARS = 512_000
+
+# How much an answer may hold, the result's JSON text and the printed text
+# together, before the result is cut. It bounds what crosses to the server
+# and what a receipt keeps.
+MAX_ANSWER_CHARS = 2_000_000
+
+# The conversion caps for the answer as a whole: the result was converted
+# already, and the printed text is one string of its own.
+PYTHON_CAPS = {"max_values": 50_000, "max_chars": MAX_ANSWER_CHARS}
 
 # How many lines of a traceback come back.
 TRACEBACK_LINES = 20
@@ -2304,13 +2323,15 @@ MAX_MESSAGE = 2000
 # function defined in an older one still runs, its lines just go unquoted.
 SOURCES_KEPT = 64
 
-_NAMESPACE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+# The largest number a progress note may carry, so health stays valid JSON.
+MAX_PROGRESS = 1e15
+
+_NAMESPACE_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
 
 @dataclass
 class _Kept:
     values: dict[str, Any]
-    helper: Helper
     used_at: float
 
 
@@ -2319,88 +2340,131 @@ class Namespaces:
 
     Each is one dict, seeded with `hou` and the `mcp` helper and nothing
     else, and kept until a call resets it, the session ends, or nobody has
-    used it for a day. Separate dicts keep variables apart and nothing more:
-    every namespace works on the same scene.
+    used it for a while: an hour for a caller's default, a day for one named
+    on purpose. At most `MAX_NAMESPACES` are kept, the least recently used
+    going first. Separate dicts keep variables apart and nothing more: every
+    namespace works on the same scene.
 
     The code runs as `python.run`, a change like any other, so it is in one
     undo group, holds the session while it runs and takes a receipt under its
     operation id. What it raises is not a failed call: it comes back as data,
     with the namespace as it was at the raise and the scene as the code left
-    it, so one undo takes the whole call back.
+    it, so one undo in the interface takes the whole call back.
+
+    Everything the answer holds is converted here, on the thread that ran the
+    code, while the session is still held: a node read for its path, an array
+    read for its numbers, never from another thread afterwards.
     """
 
-    def __init__(self, *, clock: Any = time.monotonic, idle_s: float = NAMESPACE_IDLE_S) -> None:
+    def __init__(
+        self,
+        *,
+        clock: Any = time.monotonic,
+        named_idle_s: float = NAMED_IDLE_S,
+        default_idle_s: float = DEFAULT_IDLE_S,
+        most: int = MAX_NAMESPACES,
+    ) -> None:
         self._clock = clock
-        self._idle_s = idle_s
+        self._named_idle_s = named_idle_s
+        self._default_idle_s = default_idle_s
+        self._most = most
         self._kept: dict[str, _Kept] = {}
         self._lock = threading.Lock()
         self._sources: deque[str] = deque()
         self._count = 0
+        self._streams = _Streams()
+
+    def state(self) -> dict[str, Any]:
+        """How many namespaces there are and roughly how big, for health.
+
+        It drops the idle ones first, so a session nobody calls still lets
+        them go. Nothing here reads the scene or calls into `hou`.
+        """
+        with self._lock:
+            self._drop_idle()
+            now = self._clock()
+            rows = [
+                {
+                    "name": name,
+                    "variables": len(kept.values),
+                    "approx_bytes": _rough_size(kept.values),
+                    "idle_s": round(max(0.0, now - kept.used_at), 1),
+                }
+                for name, kept in sorted(self._kept.items())
+            ]
+        return {"count": len(rows), "most": self._most, "namespaces": rows}
 
     def run(self, arguments: Mapping[str, Any], context: ToolContext) -> dict[str, Any]:
         """Run one snippet and say what it left, printed and raised."""
         hou = _houdini(context)
         code = arguments.get("code")
-        name = arguments.get("namespace")
+        # The caller's own name, or the default the sender filled in for a
+        # caller that named none. Only the first is part of the receipt.
+        name = arguments.get("namespace") or arguments.get("default_namespace")
         if not isinstance(code, str):
-            raise BridgeError("BAD_ARGUMENTS", "code must be text")
-        if not isinstance(name, str) or not _NAMESPACE_NAME.match(name):
+            raise BridgeError("BAD_ARGUMENTS", "code must be text", {"argument": "code"})
+        if not isinstance(name, str) or not _NAMESPACE_NAME.fullmatch(name):
             raise BridgeError(
                 "BAD_ARGUMENTS",
                 "namespace must be 1 to 64 letters, digits, dot, dash or underscore",
                 {"argument": "namespace"},
             )
-        kept = self._take(name, reset=bool(arguments.get("reset")), hou=hou)
+        kept = self._take(name, reset=bool(arguments.get("reset")))
         values = kept.values
-        kept.helper._context = context
+        scope = _Scope(
+            owner=threading.get_ident(),
+            ended=threading.Event(),
+            note=context.progress,
+            stopped=context.should_stop,
+            allocate=_allocator(context, hou),
+        )
         # The two names every snippet can count on are put back each time,
         # and a result from an earlier call never passes for this one's.
         values["hou"] = hou
-        values["mcp"] = kept.helper
+        values["mcp"] = Helper(scope)
         values.pop("result", None)
 
-        capture = _Capture(CAPTURE_MAX_CHARS)
+        capture = _Capture(CAPTURE_MAX_CHARS, scope.owner)
         error: dict[str, Any] | None = None
         began = time.monotonic()
         try:
-            compiled = compile(code, self._source_name(code), "exec", dont_inherit=True)
-        except (SyntaxError, ValueError) as raised:
-            error = _syntax_error(raised)
-        else:
-            with capture.installed():
-                try:
-                    exec(compiled, values)
-                except BaseException as raised:  # noqa: BLE001 - the code's own failure is data
-                    error = _raised(raised)
+            try:
+                compiled = compile(code, self._source_name(code), "exec", dont_inherit=True)
+            except Exception as raised:  # noqa: BLE001 - code that will not compile is data too
+                error = _compile_error(raised)
+            else:
+                with self._streams.capturing(capture):
+                    try:
+                        exec(compiled, values)
+                    except BaseException as raised:  # noqa: BLE001 - the code's own failure is data
+                        error = _raised(raised)
+            duration_ms = round((time.monotonic() - began) * 1000.0, 3)
+            return _answer(values.get("result"), capture, error, name, duration_ms)
         finally:
+            scope.ended.set()
             with self._lock:
                 kept.used_at = self._clock()
-        answer: dict[str, Any] = {
-            "result": values.get("result"),
-            "stdout": capture.text(),
-            "stdout_dropped": capture.dropped,
-            "duration_ms": round((time.monotonic() - began) * 1000.0, 3),
-            "namespace": name,
-        }
-        if error is not None:
-            answer["error"] = error
-        return answer
 
-    def _take(self, name: str, *, reset: bool, hou: Any) -> _Kept:
+    def _take(self, name: str, *, reset: bool) -> _Kept:
         with self._lock:
             self._drop_idle()
             kept = self._kept.get(name)
+            if kept is None:
+                while len(self._kept) >= self._most:
+                    oldest = min(self._kept, key=lambda key: self._kept[key].used_at)
+                    del self._kept[oldest]
             if kept is None or reset:
-                helper = Helper()
-                kept = _Kept({"hou": hou, "mcp": helper}, helper, self._clock())
+                kept = _Kept({}, self._clock())
                 self._kept[name] = kept
             kept.used_at = self._clock()
             return kept
 
     def _drop_idle(self) -> None:
         now = self._clock()
-        for name in [key for key, kept in self._kept.items() if now - kept.used_at > self._idle_s]:
-            del self._kept[name]
+        for name, kept in list(self._kept.items()):
+            limit = self._default_idle_s if name.startswith(DEFAULT_PREFIX) else self._named_idle_s
+            if now - kept.used_at > limit:
+                del self._kept[name]
 
     def _source_name(self, code: str) -> str:
         """A name for one snippet, with its lines kept for a traceback to quote."""
@@ -2414,92 +2478,189 @@ class Namespaces:
         return name
 
 
+def _answer(
+    result: Any, capture: _Capture, error: dict[str, Any] | None, name: str, duration_ms: float
+) -> dict[str, Any]:
+    """What one run hands back, as plain data inside the answer's bound."""
+    converted = encoding.convert(result, root="result")
+    stdout = capture.text()
+    cut = list(converted.cut)
+    if capture.cleaned:
+        cut.append("stdout")
+    value = converted.value
+    answer: dict[str, Any] = {}
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    room = max(0, MAX_ANSWER_CHARS - len(stdout))
+    if len(text) > room:
+        # Past the bound the result is its JSON text, cut, so what crosses
+        # to the server and into the receipt stays bounded.
+        value = text[:room]
+        answer["result_text_chars"] = len(text)
+        cut.append("result")
+    answer.update(
+        {
+            "result": value,
+            "stdout": stdout,
+            "stdout_dropped": capture.dropped,
+            "duration_ms": duration_ms,
+            "namespace": name,
+        }
+    )
+    if cut:
+        answer["lossy"] = True
+        answer["cut"] = cut[:16]
+    if error is not None:
+        answer["error"] = error
+    return answer
+
+
+def _rough_size(values: Mapping[str, Any]) -> int:
+    """A rough size of a namespace: each value's own size, not what it holds."""
+    total = 0
+    try:
+        held = list(values.values())
+    except Exception:  # noqa: BLE001 - a dict changing under us is skipped this time
+        return 0
+    for value in held:
+        try:
+            total += sys.getsizeof(value)
+        except Exception:  # noqa: BLE001 - a value that will not say is counted as nothing
+            continue
+    return total
+
+
+@dataclass(frozen=True)
+class _Scope:
+    """What one call's `mcp` may reach, fixed for that call."""
+
+    owner: int
+    ended: threading.Event
+    note: Any
+    stopped: Any
+    allocate: Any
+
+
 class Helper:
-    """The `mcp` object in every namespace.
+    """The `mcp` object in every namespace, made afresh for each call.
 
     `output_path(kind, name, ext)` hands out a managed path for this session
     and scene, from the same table and the same version sequence the server
     uses: render, flipbook, comp, cache, usd, hip, capture or compare.
     `progress(done, total, message)` leaves a note health shows while the
-    call runs. `cancelled()` says whether somebody asked this call to stop,
-    for a long loop to look at between pieces of work.
+    call runs. `cancelled()` says whether the call should stop, for a long
+    loop to look at between pieces of work: it turns true when the session is
+    going down; a tool that asks a call to stop comes with background jobs.
+
+    It answers only while its call runs and only on the thread the call runs
+    on, so a thread the code started cannot report into a later call.
     """
 
-    def __init__(self) -> None:
-        self._context: ToolContext | None = None
+    __slots__ = ("__scope",)
+
+    def __init__(self, scope: _Scope) -> None:
+        self.__scope = scope
 
     def __repr__(self) -> str:
         return "<mcp: output_path(kind, name, ext), progress(done, total, message), cancelled()>"
 
     def output_path(self, kind: str, name: str | None = None, ext: str | None = None) -> str:
+        scope = self.__now()
+        return scope.allocate(
+            str(kind), None if name is None else str(name), None if ext is None else str(ext)
+        )
+
+    def progress(self, done: Any, total: Any = None, message: Any = None) -> None:
+        scope = self.__now()
+        note = {
+            "done": _progress_number(done, "done"),
+            "total": None if total is None else _progress_number(total, "total"),
+            "message": None if message is None else encoding.clean_text(str(message)[:200])[0],
+        }
+        if scope.note is not None:
+            scope.note(note)
+
+    def cancelled(self) -> bool:
+        return bool(self.__now().stopped())
+
+    def __now(self) -> _Scope:
+        scope = self.__scope
+        if scope.ended.is_set():
+            raise RuntimeError("this mcp belongs to a hou_python call that has ended")
+        if threading.get_ident() != scope.owner:
+            raise RuntimeError("mcp only answers on the thread its hou_python call runs on")
+        return scope
+
+
+def _progress_number(value: Any, label: str) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise TypeError(f"{label} must be a number")
+    number: int | float = int(value) if isinstance(value, numbers.Integral) else float(value)
+    if isinstance(number, float) and not math.isfinite(number):
+        raise ValueError(f"{label} must be a finite number")
+    if abs(number) > MAX_PROGRESS:
+        raise ValueError(f"{label} must be within {MAX_PROGRESS:g} of zero")
+    return number
+
+
+def _allocator(context: ToolContext, hou: Any) -> Any:
+    """The one way a call's code gets a managed output path.
+
+    The state folder and the store stay inside this function, out of reach of
+    the object the code holds.
+    """
+    home, open_store, session_id = context.home, context.open_store, context.session_id
+
+    def allocate(kind: str, name: str | None, ext: str | None) -> str:
         from nscr_houdini_mcp import outputs
 
-        context = self._now()
-        if context.home is None or context.open_store is None:
+        if home is None or open_store is None:
             raise RuntimeError("this session keeps no state folder, so it has no output paths")
-        hou = _houdini(context)
         hip = None if _quiet(hou.hipFile.isNewFile) else _quiet(hou.hipFile.path)
         # The same scratch folder the server picks for a scene with no file.
-        scratch = None if os.environ.get("HOUDINI_TEMP_DIR") else Path(context.home) / "temp"
-        conventions = outputs.load_conventions(home=context.home, hip_path=hip)
-        with context.open_store() as store:
+        scratch = None if os.environ.get("HOUDINI_TEMP_DIR") else Path(home) / "temp"
+        conventions = outputs.load_conventions(home=home, hip_path=hip)
+        with open_store() as store:
             plan = outputs.allocate(
                 store,
-                str(kind),
-                name=None if name is None else str(name),
+                kind,
+                name=name,
                 hip_path=hip,
-                session_id=context.session_id or None,
-                ext=None if ext is None else str(ext),
+                session_id=session_id or None,
+                ext=ext,
                 conventions=conventions,
                 scratch_root=scratch,
             )
         return plan.path
 
-    def progress(self, done: float, total: float | None = None, message: str | None = None) -> None:
-        for value, label in ((done, "done"), (total, "total")):
-            number = isinstance(value, (int, float)) and not isinstance(value, bool)
-            if not number and (value is not None or label == "done"):
-                raise TypeError(f"{label} must be a number")
-        note = self._now().progress
-        if note is not None:
-            note(
-                {
-                    "done": done,
-                    "total": total,
-                    "message": None if message is None else str(message)[:200],
-                }
-            )
-
-    def cancelled(self) -> bool:
-        return self._now().should_stop()
-
-    def _now(self) -> ToolContext:
-        if self._context is None:
-            raise RuntimeError("mcp only works inside a hou_python call")
-        return self._context
+    return allocate
 
 
 class _Capture:
-    """What one call's code prints, and nothing any other thread prints.
+    """What one call's code prints, kept from its end, up to a bound.
 
-    `sys.stdout` and `sys.stderr` belong to the whole process, so while the
-    code runs they are swapped for a router that keeps writes from this
-    thread and hands every other thread's straight on to what was there. The
-    end is kept, up to a bound, and what was dropped from the front is counted.
+    It takes writes only while its call runs. Once the call ends it is closed,
+    and a stream that still points at it passes the text on instead.
     """
 
-    def __init__(self, limit: int) -> None:
-        self.owner = threading.get_ident()
+    def __init__(self, limit: int, owner: int) -> None:
+        self.owner = owner
         self.limit = limit
         self.dropped = 0
+        self.cleaned = False
+        self.closed = False
         self._parts: list[str] = []
         self._size = 0
 
-    def add(self, text: str) -> None:
+    def add(self, text: str) -> bool:
+        if self.closed:
+            return False
+        text, changed = encoding.clean_text(text)
+        self.cleaned = self.cleaned or changed
         self._parts.append(text)
         self._size += len(text)
         if self._size > 2 * self.limit:
             self._trim()
+        return True
 
     def text(self) -> str:
         self._trim()
@@ -2513,50 +2674,83 @@ class _Capture:
         self._parts = [whole] if whole else []
         self._size = len(whole)
 
+
+class _Streams:
+    """Where `print` goes while a call runs, and nowhere else.
+
+    `sys.stdout` and `sys.stderr` belong to the whole process. During a call
+    each is swapped for a routing stream over whatever was there, and put back
+    exactly as it was when the call ends, whatever the code did to it. The
+    routing streams live as long as the bridge: a logging handler or wrapper
+    the code made holds one, and each write is sent by the thread it comes
+    from, to the capture of the call running on that thread or else straight
+    on to the stream underneath. Nothing written after a call ends lands in
+    that call's capture.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sinks: dict[int, _Capture] = {}
+        self._routers: dict[int, _Routed] = {}
+
+    def sink(self) -> _Capture | None:
+        return self._sinks.get(threading.get_ident())
+
+    def router(self, stream: Any) -> Any:
+        if isinstance(stream, _Routed) and stream.streams is self:
+            return stream
+        with self._lock:
+            kept = self._routers.get(id(stream))
+            if kept is None or kept.fallback is not stream:
+                kept = _Routed(stream, self)
+                self._routers[id(stream)] = kept
+            return kept
+
     @contextmanager
-    def installed(self) -> Iterator[None]:
+    def capturing(self, capture: _Capture) -> Iterator[None]:
         out, err = sys.stdout, sys.stderr
-        routed_out, routed_err = _Routed(out, self), _Routed(err, self)
-        sys.stdout, sys.stderr = routed_out, routed_err
+        with self._lock:
+            self._sinks[capture.owner] = capture
         try:
+            sys.stdout, sys.stderr = self.router(out), self.router(err)
             yield
         finally:
-            # Code that set streams of its own keeps them.
-            if sys.stdout is routed_out:
-                sys.stdout = out
-            if sys.stderr is routed_err:
-                sys.stderr = err
+            capture.closed = True
+            with self._lock:
+                if self._sinks.get(capture.owner) is capture:
+                    del self._sinks[capture.owner]
+            sys.stdout, sys.stderr = out, err
 
 
 class _Routed:
-    """A stream that keeps one thread's writes and passes on the rest."""
+    """A stream that hands a write to the running call's capture, or passes it on."""
 
-    def __init__(self, fallback: Any, capture: _Capture) -> None:
-        self._fallback = fallback
-        self._capture = capture
+    def __init__(self, fallback: Any, streams: _Streams) -> None:
+        self.fallback = fallback
+        self.streams = streams
 
     def write(self, text: Any) -> int:
         text = str(text)
-        if threading.get_ident() == self._capture.owner:
-            self._capture.add(text)
+        sink = self.streams.sink()
+        if sink is not None and sink.add(text):
             return len(text)
-        if self._fallback is None:
+        if self.fallback is None:
             return len(text)
-        return self._fallback.write(text)
+        return self.fallback.write(text)
 
     def writelines(self, lines: Any) -> None:
         for line in lines:
             self.write(line)
 
     def flush(self) -> None:
-        if threading.get_ident() != self._capture.owner and self._fallback is not None:
-            self._fallback.flush()
+        if self.streams.sink() is None and self.fallback is not None:
+            self.fallback.flush()
 
     def isatty(self) -> bool:
         return False
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._fallback, name)
+        return getattr(self.fallback, name)
 
 
 def _raised(error: BaseException) -> dict[str, Any]:
@@ -2567,21 +2761,28 @@ def _raised(error: BaseException) -> dict[str, Any]:
     lines = "".join(traceback.format_exception(type(error), error, frames)).splitlines()
     return {
         "type": type(error).__name__,
-        "message": hide_paths(_message(error))[:MAX_MESSAGE],
-        "traceback_tail": hide_paths("\n".join(lines[-TRACEBACK_LINES:])),
+        "message": _safe(_message(error))[:MAX_MESSAGE],
+        "traceback_tail": _safe("\n".join(lines[-TRACEBACK_LINES:])),
     }
 
 
-def _syntax_error(error: BaseException) -> dict[str, Any]:
+def _compile_error(error: BaseException) -> dict[str, Any]:
+    """Code that did not compile: a syntax error with its line and offset, or
+    whatever else the compiler raised, such as running out of depth."""
     lines = "".join(traceback.format_exception_only(type(error), error)).splitlines()
     said: dict[str, Any] = {
         "type": type(error).__name__,
-        "message": hide_paths(str(getattr(error, "msg", None) or _message(error)))[:MAX_MESSAGE],
-        "line": getattr(error, "lineno", None),
-        "offset": getattr(error, "offset", None),
-        "traceback_tail": hide_paths("\n".join(lines[-TRACEBACK_LINES:])),
+        "message": _safe(str(getattr(error, "msg", None) or _message(error)))[:MAX_MESSAGE],
     }
+    if isinstance(error, SyntaxError):
+        said["line"] = error.lineno
+        said["offset"] = error.offset
+    said["traceback_tail"] = _safe("\n".join(lines[-TRACEBACK_LINES:]))
     return said
+
+
+def _safe(text: str) -> str:
+    return encoding.clean_text(hide_paths(text))[0]
 
 
 def _message(error: BaseException) -> str:

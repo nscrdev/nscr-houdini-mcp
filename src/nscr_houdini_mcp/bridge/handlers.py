@@ -85,6 +85,21 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
+        self._reports: dict[str, Callable[[], Any]] = {}
+
+    def add_report(self, name: str, report: Callable[[], Any]) -> None:
+        """Something health shows beside the tools: read from memory, never `hou`."""
+        self._reports[name] = report
+
+    def reports(self) -> dict[str, Any]:
+        """Every report, each on its own: one that raises says so and no more."""
+        said: dict[str, Any] = {}
+        for name, report in self._reports.items():
+            try:
+                said[name] = report()
+            except Exception as error:  # noqa: BLE001 - health answers whatever happens
+                said[name] = {"error": type(error).__name__}
+        return said
 
     def add(
         self,
@@ -161,9 +176,11 @@ INSPECT_ARGUMENTS = (
     "after",
 )
 
-# What `python.run` takes. The server always names the namespace and the undo
-# entry, so a retry under the same operation id sends exactly the same call.
-PYTHON_ARGUMENTS = ("code", "namespace", "reset", "undo_label")
+# What `python.run` takes. `namespace` is the caller's own choice and
+# `default_namespace` the one the server fills in when the caller named none.
+# The second is left out of the receipt digest: it changes with every server
+# process, and a retry from a restarted server is still the same call.
+PYTHON_ARGUMENTS = ("code", "namespace", "default_namespace", "reset", "undo_label")
 
 # A page can hold two thousand rows, and a full read of fifty nodes a great
 # many values. The server spills an answer that large to a file rather than
@@ -286,10 +303,13 @@ def default_registry(
         namespaces.run,
         mutating=True,
         arguments=PYTHON_ARGUMENTS + (("drop_reply",) if selfcheck else ()),
-        required=("code", "namespace"),
+        required=("code",),
         context=True,
         label="hou_python",
         label_argument="undo_label",
+        digest_ignores=("default_namespace",),
         summary="run Python with hou in a namespace kept between calls",
+        caps=tool_module.PYTHON_CAPS,
     )
+    registry.add_report("namespaces", namespaces.state)
     return registry

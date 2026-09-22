@@ -578,6 +578,7 @@ class Bridge:
                         **self.transport_state(),
                         "privacy": self.privacy,
                         "tools": self.tools.names(),
+                        **self.tools.reports(),
                         **self.dispatcher.state(),
                     }
                 ),

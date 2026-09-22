@@ -36,6 +36,7 @@ from typing import Any
 
 from mcp_types import CallToolResult, TextContent
 
+from nscr_houdini_mcp.bridge.encoding import clean_text
 from nscr_houdini_mcp.bridge.errors import CODES as BRIDGE_CODES
 from nscr_houdini_mcp.bridge.errors import hide_paths, redact
 from nscr_houdini_mcp.bridge.security import InsecureLocation, private_dir, write_private
@@ -201,6 +202,24 @@ def _loosely(value: Any) -> str:
     return str(value)
 
 
+def scrub(value: Any) -> Any:
+    """The same value with every string made safe to write as UTF-8.
+
+    A lone surrogate, which a file name or a stray escape can carry, cannot be
+    encoded, and a result that holds one would fail after the work was done.
+    It is written as its escape instead. Keys are cleaned the same way.
+    """
+    if isinstance(value, str):
+        return clean_text(value)[0]
+    if isinstance(value, Mapping):
+        return {
+            scrub(key) if isinstance(key, str) else key: scrub(item) for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [scrub(item) for item in value]
+    return value
+
+
 def _strictly(value: Any) -> str:
     """Paths and the like read fine as text. Bytes do not: they are refused."""
     if isinstance(value, (bytes, bytearray, memoryview)):
@@ -284,6 +303,11 @@ def ok_result(
             f"{tool} produced a value that cannot be sent as JSON",
             details={"tool": tool, "reason": str(error)},
         ) from None
+    if clean_text(text)[1]:
+        # Text UTF-8 cannot carry would fail on the way out, after the work
+        # was done. It goes as its escapes instead.
+        body = scrub(body)
+        text = json.dumps(body, separators=(",", ":"), ensure_ascii=False, default=_strictly)
     if spill is not None and len(text.encode("utf-8")) > spill.over_bytes:
         spilled = spill.write(text, tool=tool)
         body = {"spilled": spilled, "trace": dict(trace)}
