@@ -523,3 +523,99 @@ def test_a_start_whose_process_was_ended_frees_its_id(
     _, [again] = talk(bench.serve(), ("hou_sessions", arguments))
     assert not again.is_error, text_of(again)
     assert len(seen) == 1
+
+
+def test_a_gui_whose_main_thread_is_stuck_in_a_cook_lists_as_busy(bench: Bench) -> None:
+    bench.session("s-2", "acc-1", kind="gui")
+    bench.health["s-2"] = {
+        "status": "ok",
+        "busy": False,
+        "main_thread": {"installed": True, "pulse_age_s": 12.5, "away": True},
+    }
+    row = listed(bench)["acc-1"]
+    assert row["state"] == "busy"
+    assert row["main_thread_away_s"] == 12.5
+
+
+def test_a_main_thread_back_within_the_limit_is_not_busy(bench: Bench) -> None:
+    bench.session("s-2", "acc-1", kind="gui")
+    bench.health["s-2"] = {
+        "status": "ok",
+        "busy": False,
+        "main_thread": {"installed": True, "pulse_age_s": 0.2, "away": False},
+    }
+    assert listed(bench)["acc-1"]["state"] == "live"
+
+
+def info_of(bench: Bench, session: str) -> Any:
+    _, [result] = talk(bench.serve(), ("hou_sessions", {"action": "info", "session": session}))
+    return result
+
+
+def test_info_describes_a_crashed_session_instead_of_refusing(bench: Bench) -> None:
+    bench.session("s-1", "w1", pid=DEAD_PID)
+    result = info_of(bench, "w1")
+    assert not result.is_error, text_of(result)
+    assert result.structured_content["session"]["state"] == "crashed"
+    assert result.structured_content["trace"]["session_id"] == "s-1"
+
+
+def test_info_describes_an_unresponsive_session(bench: Bench) -> None:
+    bench.session("s-1", "w1")
+    with bench.store() as store:
+        store.touch_session("s-1", state="unresponsive", transport_ok=False)
+    result = info_of(bench, "s-1")
+    assert not result.is_error, text_of(result)
+    assert result.structured_content["session"]["state"] == "unresponsive"
+
+
+def test_info_renews_no_lease(bench: Bench) -> None:
+    bench.session("s-1", "w1")
+    bench.worker("s-1", "wk-1")
+    with bench.store() as store:
+        leased = store.get_worker("wk-1").leased_at
+    result = info_of(bench, "w1")
+    assert result.structured_content["session"]["state"] == "live"
+    assert bench.renewed == []
+    with bench.store() as store:
+        assert store.get_worker("wk-1").leased_at == leased
+
+
+def test_info_on_a_name_nobody_has_is_unknown(bench: Bench) -> None:
+    bench.session("s-1", "w1")
+    result = info_of(bench, "w7")
+    assert result.structured_content["error"]["code"] == "SESSION_UNKNOWN"
+
+
+def test_stop_refuses_a_worker_a_job_holds_unless_forced(
+    bench: Bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[str] = []
+    monkeypatch.setattr(pool, "stop_worker", fake_stop(bench, seen))
+    bench.session("s-1", "w1")
+    bench.worker("s-1", "wk-1")
+    with bench.store() as store:
+        store.lease_worker("wk-1", job_id="job-7")
+    arguments = {"action": "stop", "session": "w1"}
+    _, [refused, forced] = talk(
+        bench.serve(), ("hou_sessions", arguments), ("hou_sessions", {**arguments, "force": True})
+    )
+    assert refused.structured_content["error"]["code"] == "WORKER_BUSY"
+    assert refused.structured_content["error"]["details"]["job_id"] == "job-7"
+    assert "force" in text_of(refused)
+    assert not forced.is_error, text_of(forced)
+    assert seen == ["wk-1"]
+
+
+def test_stop_refuses_a_worker_that_is_running_a_call(
+    bench: Bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[str] = []
+    monkeypatch.setattr(pool, "stop_worker", fake_stop(bench, seen))
+    bench.session("s-1", "w1")
+    bench.worker("s-1", "wk-1")
+    bench.health["s-1"] = {"status": "ok", "busy": True, "current_op": "bridge.selfcheck"}
+    _, [result] = talk(bench.serve(), ("hou_sessions", {"action": "stop", "session": "w1"}))
+    assert result.structured_content["error"]["code"] == "WORKER_BUSY"
+    assert result.structured_content["error"]["details"]["current_op"] == "bridge.selfcheck"
+    assert seen == []

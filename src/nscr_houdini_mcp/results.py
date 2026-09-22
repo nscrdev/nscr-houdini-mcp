@@ -54,6 +54,7 @@ SERVER_CODES: dict[str, str] = {
     "HYTHON_NOT_FOUND": "no hython to start a worker with",
     "WORKER_START_FAILED": "hython started but no bridge came up in it",
     "NOT_A_WORKER": "that session is not a worker the pool started",
+    "WORKER_BUSY": "that worker is held by a job or running a call",
     "OUTPUT_REFUSED": "no output path could be made for this",
 }
 
@@ -96,6 +97,7 @@ HINTS: dict[str, str] = {
     "HYTHON_NOT_FOUND": "name hython or houdini_build in config, then start again",
     "WORKER_START_FAILED": "read the worker log named in the details, then start again",
     "NOT_A_WORKER": "close a Houdini with a user interface yourself; stop only workers here",
+    "WORKER_BUSY": "wait for the job or call to end, or pass force true to stop it anyway",
     "OUTPUT_REFUSED": "fix the output conventions named in the details, then call again",
     "FILE_NOT_FOUND": "check the path and use one that is there",
     "FILE_EXISTS": "ask for the next version rather than writing over this one",

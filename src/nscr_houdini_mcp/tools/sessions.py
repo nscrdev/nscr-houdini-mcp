@@ -10,11 +10,14 @@ Four actions.
   reader. `busy` comes from the session's own health answer. A session that
   ended in the last hour is still listed, so a caller that just lost one sees
   what became of it. Listing is not a use: it renews no lease.
-- `info` is one session in full, with its health.
+- `info` is one session in full, with its health, whatever state it is in.
+  Like the list, it renews no lease.
 - `start` starts a hython worker through the pool, under the config's cap
   and with the config's hython and ports.
 - `stop` stops a worker the pool started. A Houdini with a user interface is
-  somebody's working session and is never closed from here.
+  somebody's working session and is never closed from here. A worker a job
+  holds, or one running a call, is refused with `WORKER_BUSY` unless the call
+  says `force`.
 
 `start` and `stop` change what runs on the machine, so each takes a receipt
 under its operation id in the store. The same id sent again after a lost reply
@@ -36,10 +39,11 @@ from typing import Any
 
 from nscr_houdini_mcp import pool
 from nscr_houdini_mcp import store as store_module
+from nscr_houdini_mcp.bridge import marshal
 from nscr_houdini_mcp.bridge.app import LOG_DIR_NAME
 from nscr_houdini_mcp.config import Config, ConfigError, resolve_hython
 from nscr_houdini_mcp.results import CallError
-from nscr_houdini_mcp.router import LIVE_STATES, Router, Target, choose
+from nscr_houdini_mcp.router import LIVE_STATES, Router, Target, choose, dead
 from nscr_houdini_mcp.store import SessionRecord, WorkerRecord
 from nscr_houdini_mcp.tools.base import (
     DETAIL,
@@ -104,20 +108,30 @@ def list_sessions(call: Call) -> dict[str, Any]:
 
 
 def session_info(call: Call) -> dict[str, Any]:
-    target = call.target()
-    health = call.health()
-    state = "busy" if health.get("busy") else target.record.state
-    worker = None
-    with call.router.store() as store:
-        if store is not None:
-            worker = stored(lambda: newest_workers(store.list_workers(active_only=False))).get(
-                target.session_id
-            )
-    return {
-        "session": session_row(
-            target.record, state, worker, target, health, now=time.time(), full=True
-        )
-    }
+    """One session in full, whatever state it is in.
+
+    A look, not a use: it renews no lease. A session that has ended or whose
+    port has gone quiet is described, not refused.
+    """
+    router = call.router
+    records, workers, _active = read_rows(router)
+    record = named(records, call.arguments.get("session"), router.default_session)
+    call.trace.update(
+        {
+            "session_id": record.session_id,
+            "alias": record.alias,
+            "scene_epoch": record.scene_epoch,
+        }
+    )
+    if record.state == store_module.SESSION_GONE:
+        target, health, state = None, None, ended_state(record)
+    else:
+        target, health, state = look(router, record)
+    if health and isinstance(health.get("scene_epoch"), int):
+        call.trace["scene_epoch"] = health["scene_epoch"]
+    worker = workers.get(record.session_id)
+    row = session_row(record, state, worker, target, health, now=time.time(), full=True)
+    return {"session": row}
 
 
 def read_rows(
@@ -173,7 +187,32 @@ def look(router: Router, record: SessionRecord) -> tuple[Target | None, dict[str
         if error.code in SILENT_CODES:
             return None, {"error": error.code}, "unresponsive"
         raise
-    return target, health, "busy" if health.get("busy") else "live"
+    return target, health, "busy" if is_busy(health) else "live"
+
+
+def is_busy(health: Mapping[str, Any]) -> bool:
+    """Busy with a call, or with a main thread that has not run our code for
+    longer than the bridge itself allows before it calls a session busy.
+
+    The second is a long cook in a session with a user interface: no call is
+    running, but none would be picked up either.
+    """
+    if health.get("busy"):
+        return True
+    return main_thread_away_s(health) is not None
+
+
+def main_thread_away_s(health: Mapping[str, Any]) -> float | None:
+    """How long the main thread has been away, when that is too long."""
+    thread = health.get("main_thread")
+    if not isinstance(thread, Mapping) or not thread.get("installed"):
+        return None
+    age = thread.get("pulse_age_s")
+    if not isinstance(age, (int, float)):
+        return None
+    if thread.get("away") or age > marshal.DEFAULT_STALE_S:
+        return float(age)
+    return None
 
 
 def session_row(
@@ -201,6 +240,9 @@ def session_row(
     }
     if state == "busy":
         row["current_op"] = health.get("current_op")
+        away = main_thread_away_s(health)
+        if away is not None:
+            row["main_thread_away_s"] = away
     if worker is not None:
         row["job"] = worker.job_id
         row["lease_age_s"] = round(max(0.0, now - worker.leased_at), 1)
@@ -380,7 +422,9 @@ def stop_worker(call: Call) -> dict[str, Any]:
 
 def stop_one(call: Call, store: Any, handle: str) -> dict[str, Any]:
     router = call.router
-    record = named(router, handle)
+    record = named(router.records(include_gone=True), handle)
+    if record.state == store_module.SESSION_GONE:
+        raise dead(record.session_id, record.alias, [])
     if record.kind != "hython":
         raise CallError(
             "NOT_A_WORKER",
@@ -391,6 +435,8 @@ def stop_one(call: Call, store: Any, handle: str) -> dict[str, Any]:
     worker = next((w for w in workers if w.session_id == record.session_id), None)
     if worker is None:
         raise not_a_worker(record)
+    if not call.arguments.get("force"):
+        refuse_if_in_use(router, record, worker)
     try:
         stopped = pool.stop_worker(
             pool.PoolConfig(home=router.home), store, worker.token, grace_s=STOP_GRACE_S
@@ -422,16 +468,48 @@ def stop_one(call: Call, store: Any, handle: str) -> dict[str, Any]:
     }
 
 
-def named(router: Router, handle: str) -> SessionRecord:
-    """The session a stop means. One whose port went quiet can still be stopped."""
-    records = router.records(include_gone=True)
-    try:
-        return choose(records, handle)
-    except CallError as error:
-        if error.code != "SESSION_UNRESPONSIVE":
-            raise
-        wanted = error.details.get("session_id")
-        return next(r for r in records if r.session_id == wanted)
+def named(
+    records: list[SessionRecord], handle: str | None, default: str | None = None
+) -> SessionRecord:
+    """The session a caller means, in whatever state it is.
+
+    By id first, then the newest under an alias, preferring one that has not
+    ended. With no name, the usual rules for a call that names none.
+    """
+    if not handle:
+        return choose(records, None, default=default)
+    handle = handle.strip()
+    for record in records:
+        if record.session_id == handle:
+            return record
+    under = sorted((r for r in records if r.alias == handle), key=lambda r: r.started_at)
+    open_ones = [r for r in under if r.state != store_module.SESSION_GONE]
+    if open_ones or under:
+        return (open_ones or under)[-1]
+    # Nobody by that name: the rules say so, with the nearest names.
+    return choose(records, handle)
+
+
+def refuse_if_in_use(router: Router, record: SessionRecord, worker: WorkerRecord) -> None:
+    """`WORKER_BUSY` for a worker a job holds or a call is running on."""
+    details: dict[str, Any] = {"session_id": record.session_id, "alias": record.alias}
+    if worker.job_id or worker.state == "leased":
+        details["job_id"] = worker.job_id
+        raise CallError(
+            "WORKER_BUSY",
+            f"worker {record.alias} is held by job {worker.job_id or 'unnamed'}",
+            details=details,
+        )
+    if record.state not in LIVE_STATES:
+        return
+    _target, health, state = look(router, record)
+    if state == "busy" and health is not None:
+        details["current_op"] = health.get("current_op")
+        raise CallError(
+            "WORKER_BUSY",
+            f"worker {record.alias} is running {health.get('current_op') or 'a call'}",
+            details=details,
+        )
 
 
 def not_a_worker(record: SessionRecord) -> CallError:
@@ -523,7 +601,7 @@ HOU_SESSIONS = ToolSpec(
     description=(
         "List sessions, or start and stop hython workers. state: live, busy, unresponsive, "
         "crashed, gone. A session_id lasts until its process exits; an alias like w1 may later "
-        "name a new one. stop needs session and never closes a GUI Houdini."
+        "name a new one. stop never closes a GUI Houdini."
     ),
     input_schema=inputs(
         {
@@ -534,6 +612,10 @@ HOU_SESSIONS = ToolSpec(
                 "type": "string",
                 "enum": list(pool.WEIGHTS),
                 "description": "start only. heavy may use every core.",
+            },
+            "force": {
+                "type": "boolean",
+                "description": "stop only: stop it even while in use.",
             },
             "operation_id": OPERATION_ID,
         }

@@ -37,7 +37,7 @@ from nscr_houdini_mcp.router import Router, Target
 SESSION = {
     "type": "string",
     "minLength": 1,
-    "description": "Session id or alias. May be left out when one session is live.",
+    "description": "Session id or alias. Optional when one session is live.",
     "x-mcp-header": "Session",
 }
 
