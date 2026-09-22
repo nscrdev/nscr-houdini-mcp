@@ -11,6 +11,7 @@ a real headless session before it was written here.
 from __future__ import annotations
 
 import queue
+import re
 import threading
 import time
 from contextlib import contextmanager
@@ -59,6 +60,9 @@ class Vector3:
     def __init__(self, *values: float) -> None:
         self._values = tuple(float(value) for value in values)
 
+    def __iter__(self) -> Any:
+        return iter(self._values)
+
     def asTuple(self) -> tuple[float, ...]:  # noqa: N802 - the name is Houdini's
         return self._values
 
@@ -75,23 +79,9 @@ _as_hou(Vector3)
 _as_hou(Matrix4)
 
 
-class Parm:
-    def __init__(self, node: Node, name: str) -> None:
-        self._node = node
-        self._name = name
-        self.value: Any = None
+class TemplateType:
+    """A parameter kind, named the way the build names it: Float, String, Ramp."""
 
-    def name(self) -> str:
-        return self._name
-
-    def path(self) -> str:
-        return f"{self._node.path()}/{self._name}"
-
-    def set(self, value: Any) -> None:
-        self.value = value
-
-
-class NodeType:
     def __init__(self, name: str) -> None:
         self._name = name
 
@@ -99,18 +89,337 @@ class NodeType:
         return self._name
 
 
+class ParmTemplate:
+    """What a parameter is: its kind, label, default, tags and menu."""
+
+    def __init__(
+        self,
+        kind: str,
+        label: str = "",
+        default: tuple[Any, ...] = (0.0,),
+        *,
+        tags: dict[str, str] | None = None,
+        folder: str = "",
+        menu: tuple[str, ...] = (),
+    ) -> None:
+        self._kind = TemplateType(kind)
+        self._label = label
+        self.default = default
+        self._tags = dict(tags or {})
+        self._folder = folder
+        self._menu = menu
+
+    def type(self) -> TemplateType:
+        return self._kind
+
+    def label(self) -> str:
+        return self._label
+
+    def tags(self) -> dict[str, str]:
+        return dict(self._tags)
+
+    def folderType(self) -> str:  # noqa: N802 - the name is Houdini's
+        return f"folderType.{self._folder or 'Tabs'}"
+
+    def menuItems(self) -> tuple[str, ...]:  # noqa: N802 - the name is Houdini's
+        return self._menu
+
+    def defaultValue(self) -> tuple[Any, ...]:  # noqa: N802 - the name is Houdini's
+        return self.default
+
+
+# What an expression may call in this stand in, and what reading a node from
+# one does: `npoints` cooks the node it names, as it does in Houdini.
+_EXPRESSION_CALL = re.compile(r'(npoints|ch)\("([^"]+)"\)')
+
+
+class Parm:
+    """One parameter component, with a value or an expression."""
+
+    def __init__(
+        self,
+        node: Node,
+        name: str,
+        template: ParmTemplate,
+        default: Any = None,
+        *,
+        instance_of: Parm | None = None,
+        index: int = 0,
+        spare: bool = False,
+    ) -> None:
+        self._node = node
+        self._name = name
+        self._template = template
+        self.default = default
+        self.value: Any = default
+        self._expression: str | None = None
+        self._language = "hscript"
+        self.locked = False
+        self._instance_of = instance_of
+        self._index = index
+        self._spare = spare
+        self._tuple: ParmTuple | None = None
+        # How many times an evaluation ran, so a check can see nothing did.
+        self.evaluations = 0
+
+    def name(self) -> str:
+        return self._name
+
+    def path(self) -> str:
+        return f"{self._node.path()}/{self._name}"
+
+    def node(self) -> Node:
+        return self._node
+
+    def tuple(self) -> ParmTuple | None:
+        return self._tuple
+
+    def parmTemplate(self) -> ParmTemplate:  # noqa: N802 - the name is Houdini's
+        return self._template
+
+    def set(self, value: Any) -> None:
+        self.value = value
+        self._node.dirty = True
+        if self._template.type().name() == "Folder":
+            self._node.grow(self)
+
+    def setExpression(self, text: str, language: str = "hscript") -> None:  # noqa: N802
+        self._expression = text
+        self._language = language
+        self._node.dirty = True
+
+    def expression(self) -> str:
+        if self._expression is None:
+            raise OperationFailed("Parameter is not animated")
+        return self._expression
+
+    def expressionLanguage(self) -> str:  # noqa: N802 - the name is Houdini's
+        if self._expression is None:
+            raise OperationFailed("Parameter is not animated")
+        return "exprLanguage.Python" if self._language == "python" else "exprLanguage.Hscript"
+
+    def eval(self) -> Any:
+        self.evaluations += 1
+        if self._expression is None:
+            return self.value
+        return self._node.scene.evaluate(self)
+
+    def evalAsString(self) -> str:  # noqa: N802 - the name is Houdini's
+        if self._expression is not None:
+            return str(self.eval())
+        self.evaluations += 1
+        return self._node.scene.expand(str(self.value), self._node)
+
+    def unexpandedString(self) -> str:  # noqa: N802 - the name is Houdini's
+        if self._template.type().name() != "String":
+            raise OperationFailed("Only string parms have unexpanded strings")
+        return str(self.value)
+
+    def isLocked(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return self.locked
+
+    def isSpare(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return self._spare
+
+    def isAtDefault(  # noqa: N802 - the name is Houdini's
+        self, compare_temporary_defaults: bool = True, compare_expressions: bool = True
+    ) -> bool:
+        return self._expression is None and self.value == self.default
+
+    def isMultiParmInstance(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return self._instance_of is not None
+
+    def parentMultiParm(self) -> Parm | None:  # noqa: N802 - the name is Houdini's
+        return self._instance_of
+
+    def multiParmInstanceIndices(self) -> tuple[int, ...]:  # noqa: N802 - the name is Houdini's
+        return (self._index,) if self._instance_of is not None else ()
+
+
+class ParmTuple:
+    """A parameter as the pane shows it: one name, one or more components."""
+
+    def __init__(self, name: str, parms: list[Parm]) -> None:
+        self._name = name
+        self._parms = parms
+        for parm in parms:
+            parm._tuple = self
+
+    def name(self) -> str:
+        return self._name
+
+    def node(self) -> Node:
+        return self._parms[0].node()
+
+    def parmTemplate(self) -> ParmTemplate:  # noqa: N802 - the name is Houdini's
+        return self._parms[0].parmTemplate()
+
+    def __iter__(self) -> Any:
+        return iter(self._parms)
+
+    def __len__(self) -> int:
+        return len(self._parms)
+
+    def __getitem__(self, index: int) -> Parm:
+        return self._parms[index]
+
+    def set(self, values: Any) -> None:
+        for parm, value in zip(self._parms, values, strict=False):
+            parm.set(value)
+
+    def isAtDefault(  # noqa: N802 - the name is Houdini's
+        self, compare_temporary_defaults: bool = True, compare_expressions: bool = True
+    ) -> bool:
+        return all(parm.isAtDefault() for parm in self._parms)
+
+
+# The parameters each stand in node type has, as (name, kind, components,
+# default, extras). A type not named here has a translate and a scale.
+_STANDARD = (("t", "Float", ("tx", "ty", "tz"), 0.0, {}), ("scale", "Float", ("scale",), 1.0, {}))
+TYPE_PARMS: dict[str, tuple[tuple[str, str, tuple[str, ...], Any, dict[str, Any]], ...]] = {
+    "box": (("size", "Float", ("sizex", "sizey", "sizez"), 1.0, {}), *_STANDARD),
+    "xform": _STANDARD,
+    "attribwrangle": (
+        (
+            "snippet",
+            "String",
+            ("snippet",),
+            "",
+            {"tags": {"editor": "1", "editorlang": "VEX"}},
+        ),
+        ("class", "Menu", ("class",), 2, {"menu": ("detail", "primitive", "point", "vertex")}),
+        ("bindings", "Toggle", ("bindings",), 0, {}),
+        ("go", "Button", ("go",), 0, {}),
+    ),
+    "attribcreate": (
+        ("group", "String", ("group",), "", {}),
+        ("numattr", "Folder", ("numattr",), 1, {"folder": "MultiparmBlock"}),
+    ),
+    "file": (("file", "String", ("file",), "default.bgeo", {}),),
+}
+
+# What each instance of a multiparm holds, by the multiparm's name.
+MULTIPARM_INSTANCE = {
+    "numattr": (("name#", "String", ""), ("value#", "Float", 0.0)),
+}
+
+# Descriptions for the types whose default name comes from their description.
+DESCRIPTIONS = {"xform": "Transform", "attribwrangle": "Attribute Wrangle"}
+
+
+class NodeType:
+    def __init__(self, name: str, category: str = "Sop") -> None:
+        self._name = name
+        self._category = category
+
+    def name(self) -> str:
+        return self._name
+
+    def nameComponents(self) -> tuple[str, str, str, str]:  # noqa: N802 - the name is Houdini's
+        return ("", "", self._name, "")
+
+    def nameWithCategory(self) -> str:  # noqa: N802 - the name is Houdini's
+        return f"{self._category}/{self._name}"
+
+    def description(self) -> str:
+        return DESCRIPTIONS.get(self._name, self._name.title())
+
+    def category(self) -> Any:
+        return SimpleNamespace(name=lambda: self._category)
+
+    def defaultColor(self) -> Color:  # noqa: N802 - the name is Houdini's
+        return Color(0.8, 0.8, 0.8)
+
+
+class Color:
+    def __init__(self, *rgb: float) -> None:
+        self._rgb = tuple(rgb)
+
+    def rgb(self) -> tuple[float, ...]:
+        return self._rgb
+
+
+class Connection:
+    """One wire into a node."""
+
+    def __init__(self, index: int, source: Node, output: int) -> None:
+        self._index = index
+        self._source = source
+        self._output = output
+
+    def inputIndex(self) -> int:  # noqa: N802 - the name is Houdini's
+        return self._index
+
+    def outputIndex(self) -> int:  # noqa: N802 - the name is Houdini's
+        return self._output
+
+    def inputNode(self) -> Node:  # noqa: N802 - the name is Houdini's
+        return self._source
+
+    def inputItem(self) -> Node:  # noqa: N802 - the name is Houdini's
+        return self._source
+
+
+class Item:
+    """A network box or a sticky note."""
+
+    def __init__(self, parent: Node, name: str, *, text: str = "", nodes: tuple = ()) -> None:
+        self._parent = parent
+        self._name = name
+        self._text = text
+        self._nodes = nodes
+
+    def path(self) -> str:
+        return f"{self._parent.path()}/{self._name}"
+
+    def comment(self) -> str:
+        return self._text
+
+    def text(self) -> str:
+        return self._text
+
+    def nodes(self) -> tuple:
+        return self._nodes
+
+    def position(self) -> Vector3:
+        return Vector3(0.0, 0.0)
+
+    def size(self) -> Vector3:
+        return Vector3(2.5, 2.5)
+
+
 class Node:
     """One node, with the few readers and writers the tools use."""
 
-    PARMS = ("tx", "ty", "tz", "scale")
-
     def __init__(self, scene: Scene, name: str, type_name: str, parent: Node | None) -> None:
+        self.scene = scene
         self._scene = scene
         self._name = name
-        self._type = NodeType(type_name)
+        self._type = NodeType(type_name, _category(parent))
         self._parent = parent
         self._children: list[Node] = []
-        self._parms = {name: Parm(self, name) for name in self.PARMS}
+        self._tuples: list[ParmTuple] = []
+        self._instances: dict[str, list[list[ParmTuple]]] = {}
+        for tuple_name, kind, parts, default, extra in TYPE_PARMS.get(type_name, _STANDARD):
+            template = ParmTemplate(kind, tuple_name.title(), (default,) * len(parts), **extra)
+            parms = [Parm(self, part, template, default) for part in parts]
+            self._tuples.append(ParmTuple(tuple_name, parms))
+            if kind == "Folder":
+                self.grow(parms[0])
+        # What the node reports about its cooks, and what its next cook says.
+        self.cooks = 0
+        self.dirty = True
+        self.errors_now: list[str] = []
+        self.warnings_now: list[str] = []
+        self.fails_with: list[str] = []
+        self.flags: set[str] = set()
+        self.inputs_now: dict[int, tuple[Node, int]] = {}
+        self.note = ""
+        self.tint: tuple[float, ...] = (0.8, 0.8, 0.8)
+        self.user: dict[str, Any] = {}
+        self.boxes: list[Item] = []
+        self.stickies: list[Item] = []
+        self.locked_asset = False
 
     def name(self) -> str:
         return self._name
@@ -126,14 +435,146 @@ class Node:
     def children(self) -> tuple[Node, ...]:
         return tuple(self._children)
 
+    def allSubChildren(  # noqa: N802 - the name is Houdini's
+        self, top_down: bool = True, recurse_in_locked_nodes: bool = True
+    ) -> tuple[Node, ...]:
+        found: list[Node] = []
+        for child in self._children:
+            found.append(child)
+            if recurse_in_locked_nodes or not child.locked_asset:
+                found.extend(child.allSubChildren(top_down, recurse_in_locked_nodes))
+        return tuple(found)
+
+    def grow(self, counter: Parm) -> None:
+        """Make or drop the instances of a multiparm to match its count."""
+        wanted = int(counter.value or 0)
+        groups = self._instances.setdefault(counter.name(), [])
+        while len(groups) < wanted:
+            index = len(groups) + 1
+            group = []
+            for pattern, kind, default in MULTIPARM_INSTANCE.get(counter.name(), ()):
+                name = pattern.replace("#", str(index))
+                template = ParmTemplate(kind, name, (default,))
+                parm = Parm(self, name, template, default, instance_of=counter, index=index)
+                group.append(ParmTuple(name, [parm]))
+            groups.append(group)
+        del groups[wanted:]
+
+    def parmTuples(self) -> tuple[ParmTuple, ...]:  # noqa: N802 - the name is Houdini's
+        found: list[ParmTuple] = []
+        for tuple_ in self._tuples:
+            found.append(tuple_)
+            for group in self._instances.get(tuple_.name(), ()):
+                found.extend(group)
+        return tuple(found)
+
     def parms(self) -> tuple[Parm, ...]:
-        return tuple(self._parms.values())
+        return tuple(parm for tuple_ in self.parmTuples() for parm in tuple_)
 
     def parm(self, name: str) -> Parm | None:
-        return self._parms.get(name)
+        if "/" in name:
+            holder, _, leaf = name.rpartition("/")
+            node = self.relative(holder)
+            return None if node is None else node.parm(leaf)
+        return next((parm for parm in self.parms() if parm.name() == name), None)
 
-    def parmTuple(self, name: str) -> Parm | None:  # noqa: N802 - the name is Houdini's
-        return None
+    def parmTuple(self, name: str) -> ParmTuple | None:  # noqa: N802 - the name is Houdini's
+        return next((tuple_ for tuple_ in self.parmTuples() if tuple_.name() == name), None)
+
+    def addSpareParm(self, name: str, kind: str = "Float", default: Any = 0.0) -> Parm:  # noqa: N802
+        template = ParmTemplate(kind, name.title(), (default,))
+        parm = Parm(self, name, template, default, spare=True)
+        self._tuples.append(ParmTuple(name, [parm]))
+        return parm
+
+    def relative(self, path: str) -> Node | None:
+        node: Node | None = self
+        for part in path.split("/"):
+            if node is None:
+                return None
+            if part in ("", "."):
+                continue
+            if part == "..":
+                node = node._parent
+                continue
+            node = next((child for child in node._children if child.name() == part), None)
+        return node
+
+    # Section: cooking, as far as a read can see it
+
+    def cookCount(self) -> int:  # noqa: N802 - the name is Houdini's
+        return self.cooks
+
+    def needsToCook(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return self.dirty
+
+    def cook(self, force: bool = False) -> None:
+        for source, _ in self.inputs_now.values():
+            source.cook()
+        if self.dirty or force:
+            self.cooks += 1
+            self.dirty = False
+            self.errors_now = list(self.fails_with)
+        if self.errors_now:
+            raise OperationFailed("the node has errors")
+
+    def errors(self) -> tuple[str, ...]:
+        return tuple(self.errors_now)
+
+    def warnings(self) -> tuple[str, ...]:
+        return tuple(self.warnings_now)
+
+    def lastCookTime(self) -> float:  # noqa: N802 - the name is Houdini's
+        return 1.5 if self.cooks else 0.0
+
+    # Section: what the network editor shows
+
+    def isGenericFlagSet(self, flag: str) -> bool:  # noqa: N802 - the name is Houdini's
+        return flag in self.flags
+
+    def isLockedHDA(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return self.locked_asset
+
+    def setInput(self, index: int, source: Node | None, output: int = 0) -> None:  # noqa: N802
+        if source is None:
+            self.inputs_now.pop(index, None)
+        else:
+            self.inputs_now[index] = (source, output)
+        self.dirty = True
+
+    def inputConnections(self) -> tuple[Connection, ...]:  # noqa: N802 - the name is Houdini's
+        return tuple(
+            Connection(index, source, output)
+            for index, (source, output) in sorted(self.inputs_now.items())
+        )
+
+    def inputLabels(self) -> tuple[str, ...]:  # noqa: N802 - the name is Houdini's
+        return ("First Input", "Second Input")
+
+    def outputs(self) -> tuple[Node, ...]:
+        return tuple(
+            node
+            for node in self._scene.everything()
+            if any(source is self for source, _ in node.inputs_now.values())
+        )
+
+    def comment(self) -> str:
+        return self.note
+
+    def color(self) -> Color:
+        return Color(*self.tint)
+
+    def position(self) -> Vector3:
+        return Vector3(1.0, -2.0)
+
+    def userDataDict(self) -> dict[str, Any]:  # noqa: N802 - the name is Houdini's
+        return dict(self.user)
+
+    def networkBoxes(self) -> tuple[Item, ...]:  # noqa: N802 - the name is Houdini's
+        return tuple(self.boxes)
+
+    def stickyNotes(self) -> tuple[Item, ...]:  # noqa: N802 - the name is Houdini's
+        return tuple(self.stickies)
 
     def childTypeCategory(self) -> Any:  # noqa: N802 - the name is Houdini's
         return SimpleNamespace(nodeTypes=lambda: dict.fromkeys(self._scene.types, None))
@@ -150,7 +591,17 @@ class Node:
         return node
 
 
+def _category(parent: Node | None) -> str:
+    """Which network a node lives in, which is what decides its category."""
+    if parent is None:
+        return "Manager"
+    if parent._parent is None:
+        return "Manager"
+    return {"/obj": "Object", "/out": "Driver", "/stage": "Lop"}.get(parent.path(), "Sop")
+
+
 _as_hou(Parm)
+_as_hou(ParmTuple)
 _as_hou(NodeType)
 _as_hou(Node)
 
@@ -423,6 +874,8 @@ class Scene:
         self.ui = MainThread()
         self.root = Node(self, "", "root", None)
         self._counts: dict[str, int] = {}
+        # What a person has selected in the interface.
+        self.selected: list[Node] = []
         self.empty()
         self.undos.labels.clear()
         self.hipFile = HipFile(self, "/Users/somebody/scenes/example.hip")
@@ -446,10 +899,72 @@ class Scene:
             found = children[part]
         return found
 
+    def parm(self, path: str) -> Parm | None:
+        holder, _, name = str(path).rpartition("/")
+        node = self.node(holder) if holder else None
+        return None if node is None else node.parm(name)
+
+    def parm_tuple(self, path: str) -> ParmTuple | None:
+        holder, _, name = str(path).rpartition("/")
+        node = self.node(holder) if holder else None
+        return None if node is None else node.parmTuple(name)
+
+    def everything(self) -> tuple[Node, ...]:
+        return self.root.allSubChildren()
+
+    def evaluate(self, parm: Parm) -> Any:
+        """Evaluate an expression, cooking what it reads the way Houdini does."""
+        return self.run(parm.node(), str(parm._expression), parm._language)
+
+    def run(self, node: Node, text: str, language: str = "hscript") -> Any:
+        if language == "python":
+            # Any node a Python expression names is read, and so cooked.
+            for named in re.findall(r"hou\.node\('([^']+)'\)", text):
+                found = node.relative(named)
+                if found is not None:
+                    found.cook()
+            return 0.0
+
+        def call(match: re.Match[str]) -> str:
+            kind, target = match.groups()
+            if kind == "npoints":
+                found = node.relative(target)
+                if found is None:
+                    raise OperationFailed("no such node")
+                found.cook()
+                return "8"
+            referenced = node.parm(target)
+            if referenced is None:
+                raise OperationFailed("no such parameter")
+            return repr(float(referenced.eval()))
+
+        body = _EXPRESSION_CALL.sub(call, text).replace("$F", repr(self.frame()))
+        return eval(body, {"__builtins__": {}}, {})  # noqa: S307 - arithmetic the test wrote
+
+    def expand(self, text: str, node: Node) -> str:
+        """A string as Houdini expands it: variables, and backticks evaluated."""
+        text = re.sub(r"`([^`]*)`", lambda match: str(self.run(node, match.group(1))), text)
+        folder = self.hipFile.path().replace("\\", "/").rsplit("/", 1)[0]
+        return text.replace("$HIP", folder)
+
+    def frame(self) -> float:
+        return 72.0 if threading.current_thread().name == "fake-main" else 1.0
+
     def module(self) -> Any:
         """The scene as something that answers like the `hou` module."""
         return SimpleNamespace(
             node=self.node,
+            parm=self.parm,
+            parmTuple=self.parm_tuple,
+            selectedNodes=lambda: tuple(self.selected),
+            nodeFlag=SimpleNamespace(
+                Display="Display",
+                Render="Render",
+                Bypass="Bypass",
+                Template="Template",
+                Lock="Lock",
+                SoftLock="SoftLock",
+            ),
             undos=self.undos,
             ui=self.ui,
             hipFile=self.hipFile,
@@ -459,7 +974,7 @@ class Scene:
             # The frame a thread that is not the main thread reads is not the
             # frame the session is on, which is why ambient state is only ever
             # read on the main thread.
-            frame=lambda: 72.0 if threading.current_thread().name == "fake-main" else 1.0,
+            frame=self.frame,
             fps=lambda: 24.0,
             isUIAvailable=lambda: True,
             Vector3=Vector3,

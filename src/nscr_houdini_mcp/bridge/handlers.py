@@ -55,6 +55,9 @@ class Tool:
     # Its own run budget, when it needs one other than the bridge default.
     timeout_s: float | None = None
     summary: str = ""
+    # How much of its answer is carried, when that is more than the default
+    # caps in `encoding`: a keyword for each cap `encoding.convert` takes.
+    caps: Mapping[str, int] | None = None
 
     def undo_label(self) -> str:
         return self.label or self.name
@@ -83,6 +86,7 @@ class ToolRegistry:
         label: str | None = None,
         timeout_s: float | None = None,
         summary: str = "",
+        caps: Mapping[str, int] | None = None,
     ) -> Tool:
         if name in self._tools:
             raise ValueError(f"tool {name} is already registered")
@@ -98,6 +102,7 @@ class ToolRegistry:
             label=label,
             timeout_s=timeout_s,
             summary=summary,
+            caps=dict(caps) if caps else None,
         )
         self._tools[name] = tool
         return tool
@@ -116,6 +121,32 @@ class ToolRegistry:
 
     def __len__(self) -> int:
         return len(self._tools)
+
+
+# What `node.inspect` takes. `path` is the one a tree or a search looks under,
+# `paths` the ones a node or parameter read reads. The server turns its
+# caller's page token into `after`, and says with `batch` whether a missing
+# path is one entry's error or the whole call's.
+INSPECT_ARGUMENTS = (
+    "mode",
+    "path",
+    "paths",
+    "batch",
+    "evaluate",
+    "depth",
+    "pattern",
+    "type",
+    "parm_filter",
+    "include",
+    "detail",
+    "limit",
+    "after",
+)
+
+# A page can hold two thousand rows, and a full read of fifty nodes a great
+# many values. The server spills an answer that large to a file rather than
+# cut it, so the bridge carries all of it.
+INSPECT_CAPS = {"max_items": 4096, "max_values": 500_000}
 
 
 def ping(arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -211,5 +242,13 @@ def default_registry(*, selfcheck: bool = False) -> ToolRegistry:
         context=True,
         label="create node",
         summary="make one node and set its parameters",
+    )
+    registry.add(
+        "node.inspect",
+        tool_module.inspect,
+        arguments=INSPECT_ARGUMENTS,
+        context=True,
+        summary="read nodes, networks and parameters a page at a time",
+        caps=INSPECT_CAPS,
     )
     return registry

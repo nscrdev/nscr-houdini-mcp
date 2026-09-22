@@ -34,6 +34,8 @@ CODES: dict[str, str] = {
     "BAD_ARGUMENTS": "an argument is missing, unknown or of the wrong shape",
     "NODE_NOT_FOUND": "no node at that path",
     "PARM_NOT_FOUND": "the node has no parameter of that name",
+    "PATH_NOT_A_NODE": "the path names a parameter where a node was expected",
+    "PATH_NOT_A_PARM": "the path names a node where a parameter was expected",
     "SCENE_REPLACED": "the scene changed under the call",
     "SESSION_DEAD": "that session is not there any more",
     "OPERATION_MISMATCH": "the same operation id arrived with different arguments",
@@ -62,6 +64,7 @@ RESERVED = frozenset(
         "OPERATION_MISMATCH",
         "OUTCOME_UNKNOWN",
         "CAPTURE_EMPTY",
+        "PATH_NOT_A_PARM",
     }
 )
 

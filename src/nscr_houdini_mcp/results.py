@@ -61,6 +61,7 @@ SERVER_CODES: dict[str, str] = {
     "OUTPUT_REFUSED": "the output conventions do not allow a path for this",
     "OUTPUT_BUSY": "every version tried was taken by another writer first",
     "OUTPUT_UNWRITABLE": "the folder for an output could not be made",
+    "BAD_CURSOR": "the page token is not one this read handed out",
 }
 
 CODES: dict[str, str] = {**BRIDGE_CODES, **SERVER_CODES}
@@ -75,6 +76,9 @@ HINTS: dict[str, str] = {
     "BAD_ARGUMENTS": "fix the argument named in the details and call again",
     "NODE_NOT_FOUND": "read the scene again and use a path that exists",
     "PARM_NOT_FOUND": "use one of the parameter names in the details",
+    "PATH_NOT_A_NODE": "read it with mode parms, or ask for the node named in the details",
+    "PATH_NOT_A_PARM": "ask for one of the node's parameters, or read the node itself",
+    "BAD_CURSOR": "send next_page back only with the mode and session that gave it",
     "SCENE_REPLACED": "read the new scene, then call again with its scene_epoch",
     "SESSION_DEAD": "address the live session named in the details, or start a new one",
     "OPERATION_MISMATCH": "use a new operation_id for different arguments",

@@ -649,7 +649,7 @@ class Dispatcher:
         if work.error is not None:
             return self._failed(tool, work.error, running, trace)
 
-        converted = encoding.convert(work.result)
+        converted = encoding.convert(work.result, **(tool.caps or {}))
         payload = {**ok_payload(converted.value, timing_ms=timing_ms), **self._said(trace)}
         if work.picked_by is not None:
             # Which route to the main thread reached the work first, so a check
