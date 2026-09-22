@@ -27,6 +27,7 @@ from typing import Any
 # work that raises them is not written yet.
 CODES: dict[str, str] = {
     "SESSION_BUSY": "the session is running another call",
+    "UNKNOWN_SESSION": "this bridge is a different session",
     "TIMEOUT": "the call gave up waiting, and says whether the work goes on",
     "TOOL_FAILED": "the tool ran and raised",
     "UNKNOWN_TOOL": "no tool is registered under that name",
@@ -39,6 +40,11 @@ CODES: dict[str, str] = {
     "OUTCOME_UNKNOWN": "the work may have happened, and the bridge cannot say",
     "BODY_REFUSED": "the request body was refused before it was read",
     "CAPTURE_EMPTY": "the capture wrote no usable image",
+    # The transport refuses these before a tool is ever chosen.
+    "BAD_ENVELOPE": "the request envelope could not be read",
+    "UNAUTHORIZED": "the request was not signed for this bridge",
+    "FORBIDDEN": "the request came from somewhere this bridge does not answer",
+    "METHOD_REFUSED": "that endpoint takes POST",
 }
 
 # Codes the bridge does not raise yet. They are in the table so the meaning is
@@ -106,7 +112,15 @@ _DISK_ROOTS = (
     "usr",
 )
 
-_POSIX_PATH = re.compile(r"/(?:" + "|".join(_DISK_ROOTS) + r")(?:/[^\s\"'<>|]*)*")
+# A file path starts a word and is followed by a separator or nothing. That
+# keeps `/obj/tmp/thing`, which is a node path and the caller's own subject,
+# out of it: the `/tmp` in it starts no word.
+_POSIX_PATH = re.compile(
+    r"(?:\A|(?<=[\s\"'(\[]))"
+    r"/(?:" + "|".join(_DISK_ROOTS) + r")"
+    r"(?=/|\Z|[\s\"')\],;:])"
+    r"(?:/[^\s\"'<>|]*)*"
+)
 _WINDOWS_PATH = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|]*")
 _UNC_PATH = re.compile(r"\\\\[^\s\"'<>|]+")
 

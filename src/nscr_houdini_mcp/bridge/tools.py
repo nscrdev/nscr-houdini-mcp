@@ -25,14 +25,23 @@ from nscr_houdini_mcp.bridge.errors import BridgeError, did_you_mean
 CONTEXTS = ("/obj", "/out", "/stage", "/mat", "/ch", "/shop", "/img", "/tasks")
 
 # Bounds on what the self check will do, so a mistyped argument cannot park
-# the session for an hour or fill a scene.
-MAX_SLEEP_S = 600.0
+# the session for long or fill a scene.
+MAX_SLEEP_S = 60.0
 MAX_CREATES = 64
+
+# How long the self check sleeps between looks at the cancel flag.
+SLICE_S = 0.05
 
 
 @dataclass(frozen=True)
 class ToolContext:
-    """What a tool is told about the call it is running under."""
+    """What a tool is told about the call it is running under.
+
+    `cancel` is set when somebody asks this call to stop, `stopping` when the
+    session itself is going down. A tool that takes any time at all should
+    look at `should_stop` between pieces of work and return what it has. It is
+    a request: nothing takes the session off a tool that ignores it.
+    """
 
     hou: Any | None = None
     kind: str = "hython"
@@ -40,6 +49,12 @@ class ToolContext:
     scene_epoch: int = 0
     operation_id: str = ""
     label: str = ""
+    cancel: Any = None
+    stopping: Any = None
+
+    def should_stop(self) -> bool:
+        """Whether this call has been asked to stop, or the session has."""
+        return any(flag is not None and flag.is_set() for flag in (self.cancel, self.stopping))
 
 
 # Section: reads
@@ -166,22 +181,40 @@ def selfcheck(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, A
     sleep_s = _number(arguments.get("sleep_s"), "sleep_s", MAX_SLEEP_S)
     creates = int(_number(arguments.get("creates"), "creates", MAX_CREATES))
     fail_at = arguments.get("fail_at")
+    if fail_at is not None:
+        fail_at = int(_number(fail_at, "fail_at", MAX_CREATES))
     parent_path = str(arguments.get("parent") or "/obj")
 
-    if sleep_s:
-        time.sleep(sleep_s)
+    slept = _sleep(sleep_s, context)
 
     made: list[str] = []
     parent = _node(hou, parent_path) if creates or fail_at else None
     for index in range(1, creates + 1):
-        if fail_at is not None and int(fail_at) == index:
+        if context.should_stop():
+            break
+        if fail_at is not None and fail_at == index:
             raise BridgeError(
                 "TOOL_FAILED",
                 "the self check was asked to fail here",
                 {"failed_at": index, "created_before_failing": list(made)},
             )
         made.append(parent.createNode("geo").path())
-    return {"created": made, "slept_s": sleep_s, "operation_id": context.operation_id}
+    return {
+        "created": made,
+        "slept_s": round(slept, 3),
+        "stopped_early": context.should_stop(),
+        "operation_id": context.operation_id,
+    }
+
+
+def _sleep(seconds: float, context: ToolContext) -> float:
+    """Wait, looking often at whether this call has been asked to stop."""
+    began = time.monotonic()
+    while time.monotonic() - began < seconds:
+        if context.should_stop():
+            break
+        time.sleep(min(SLICE_S, seconds - (time.monotonic() - began)))
+    return time.monotonic() - began
 
 
 # Section: shared helpers
@@ -220,9 +253,9 @@ def _near(hou: Any, path: str) -> list[str]:
         if found is None:
             continue
         children = _quiet(found.children) or ()
-        paths = [child.path() for child in children]
-        near = did_you_mean(path, paths)
-        return near or paths[:3]
+        # Only names that really are close. Three unrelated siblings under a
+        # heading of did you mean is worse than saying nothing.
+        return did_you_mean(path, [child.path() for child in children])
     return []
 
 

@@ -10,9 +10,17 @@ already did. So the reply is converted first, by walking it once:
 - bytes become base64 text, capped
 - anything else becomes `repr()`, cut short
 
-Nothing here raises. When something was cut or replaced, the conversion says
-so, and the reply carries `lossy: true` with the places it happened, so a
-caller never has to guess whether it got the whole answer.
+Nothing here raises, and that is load bearing rather than tidy: this runs
+while the reply is being built, so anything that got through would leave the
+caller with no answer at all. A deleted node raises from its own `repr`, a
+mapping can raise while it is being read, so every one of those is caught and
+the value becomes the name of its type.
+
+There is a cap on everything: how many items of a list, how many keys of a
+mapping, how many bytes, and how much in total. When something was cut or
+replaced, the conversion says so, and the reply carries `lossy: true` with the
+places it happened, so a caller never has to guess whether it got the whole
+answer.
 """
 
 from __future__ import annotations
@@ -24,6 +32,11 @@ from typing import Any
 
 # How many numbers of an array are carried. Big arrays belong in a file.
 MAX_ITEMS = 1024
+
+# How many keys of one mapping are carried, and how many values in the whole
+# reply. A scene can hand back a dictionary with a key per node.
+MAX_KEYS = 256
+MAX_VALUES = 20000
 
 # How many bytes are carried inline, before base64 grows them by a third.
 MAX_BYTES = 64 * 1024
@@ -42,18 +55,32 @@ class Converted:
     value: Any
     lossy: bool = False
     cut: list[str] = field(default_factory=list)
+    left: int = MAX_VALUES
+
+
+@dataclass(frozen=True)
+class Caps:
+    """What one conversion is allowed to carry."""
+
+    items: int = MAX_ITEMS
+    keys: int = MAX_KEYS
+    byte_count: int = MAX_BYTES
+    depth: int = MAX_DEPTH
 
 
 def convert(
     value: Any,
     *,
     max_items: int = MAX_ITEMS,
+    max_keys: int = MAX_KEYS,
     max_bytes: int = MAX_BYTES,
     max_depth: int = MAX_DEPTH,
+    max_values: int = MAX_VALUES,
 ) -> Converted:
     """Convert one reply value, reporting anything that was cut."""
-    result = Converted(None)
-    result.value = _walk(value, "data", result, max_items, max_bytes, max_depth)
+    result = Converted(None, left=max_values)
+    caps = Caps(items=max_items, keys=max_keys, byte_count=max_bytes, depth=max_depth)
+    result.value = _walk(value, "data", result, caps, max_depth)
     return result
 
 
@@ -64,17 +91,11 @@ def _cut(where: str, result: Converted) -> None:
     del result.cut[16:]
 
 
-def _walk(
-    value: Any,
-    where: str,
-    result: Converted,
-    max_items: int,
-    max_bytes: int,
-    depth: int,
-) -> Any:
-    if depth <= 0:
+def _walk(value: Any, where: str, result: Converted, caps: Caps, depth: int) -> Any:
+    if depth <= 0 or result.left <= 0:
         _cut(where, result)
-        return _shorten(repr(value))
+        return _describe(value)
+    result.left -= 1
     if value is None or isinstance(value, (bool, int, str)):
         return value
     if isinstance(value, float):
@@ -82,44 +103,62 @@ def _walk(
         # an invalid document.
         return value if value == value and abs(value) != float("inf") else str(value)
     if isinstance(value, (bytes, bytearray)):
-        return _bytes(bytes(value), where, result, max_bytes)
+        return _bytes(bytes(value), where, result, caps.byte_count)
     if isinstance(value, Mapping):
-        return {
-            str(key): _walk(item, f"{where}.{key}", result, max_items, max_bytes, depth - 1)
-            for key, item in value.items()
-        }
+        return _mapping(value, where, result, caps, depth)
 
     array = _as_array(value)
     if array is not None:
-        return _sequence(array, where, result, max_items, max_bytes, depth)
+        return _sequence(array, where, result, caps, depth)
     if isinstance(value, Sequence):
-        return _sequence(list(value), where, result, max_items, max_bytes, depth)
+        listed = _listed(value)
+        if listed is not None:
+            return _sequence(listed, where, result, caps, depth)
     if isinstance(value, (set, frozenset)):
-        return _sequence(sorted(map(str, value)), where, result, max_items, max_bytes, depth)
+        listed = _listed(value)
+        if listed is not None:
+            return _sequence(sorted(_describe(item) for item in listed), where, result, caps, depth)
 
     houdini = _houdini_value(value)
     if houdini is not _UNKNOWN:
-        return _walk(houdini, where, result, max_items, max_bytes, depth - 1)
+        return _walk(houdini, where, result, caps, depth - 1)
 
     _cut(where, result)
-    return _shorten(repr(value))
+    return _describe(value)
 
 
-def _sequence(
-    items: list[Any],
-    where: str,
-    result: Converted,
-    max_items: int,
-    max_bytes: int,
-    depth: int,
-) -> list[Any]:
-    kept = items[:max_items]
-    if len(items) > max_items:
+def _mapping(value: Mapping[Any, Any], where: str, result: Converted, caps: Caps, depth: int):
+    """One mapping, capped in breadth, reading it guarded from end to end."""
+    try:
+        items = list(value.items())
+    except Exception:  # noqa: BLE001 - a mapping we cannot read is described instead
+        _cut(where, result)
+        return _describe(value)
+    kept = items[: caps.keys]
+    if len(items) > len(kept):
+        _cut(where, result)
+    converted: dict[str, Any] = {}
+    for key, item in kept:
+        name = _describe(key) if not isinstance(key, str) else key
+        converted[name] = _walk(item, f"{where}.{name}", result, caps, depth - 1)
+    return converted
+
+
+def _sequence(items: list[Any], where: str, result: Converted, caps: Caps, depth: int) -> list[Any]:
+    kept = items[: caps.items]
+    if len(items) > len(kept):
         _cut(where, result)
     return [
-        _walk(item, f"{where}[{index}]", result, max_items, max_bytes, depth - 1)
-        for index, item in enumerate(kept)
+        _walk(item, f"{where}[{index}]", result, caps, depth - 1) for index, item in enumerate(kept)
     ]
+
+
+def _listed(value: Any) -> list[Any] | None:
+    """A sequence as a plain list, or nothing when reading it raised."""
+    try:
+        return list(value)
+    except Exception:  # noqa: BLE001 - a value we cannot read is described instead
+        return None
 
 
 def _bytes(raw: bytes, where: str, result: Converted, max_bytes: int) -> dict[str, Any]:
@@ -203,5 +242,14 @@ def _houdini_value(value: Any) -> Any:
     return _UNKNOWN
 
 
-def _shorten(text: str) -> str:
+def _describe(value: Any) -> str:
+    """Short text for one value, even when the value refuses to describe itself.
+
+    A node that has been deleted raises from its own `repr`, and this runs
+    while a reply is being built, so the name of the type is the answer there.
+    """
+    try:
+        text = repr(value)
+    except Exception:  # noqa: BLE001 - the type name is always available
+        return f"<{type(value).__name__}>"
     return text if len(text) <= MAX_REPR else text[: MAX_REPR - 3] + "..."
