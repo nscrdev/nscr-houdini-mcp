@@ -10,6 +10,7 @@ open.
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,11 @@ from nscr_houdini_mcp.server import SERVER_NAME, package_version, run
 # session busy with a long cook still answers health, so anything slower than
 # this is a session that is not there.
 HEALTH_TIMEOUT_S = 2.0
+
+# How long the whole sweep of sessions may take. Twenty dead sessions must not
+# turn a status into a minute of waiting, so the budget is shared: once it is
+# spent, the sessions left are reported as not asked.
+HEALTH_BUDGET_S = 5.0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -150,7 +156,7 @@ def _print_sessions(home: Path) -> None:
     # Nothing is cleared up on the way past: status only reports.
     live = registry.live_entries(home, remove_stale=False)
     entries = {str(entry.get("session_id")): entry for entry in live}
-    rows = _session_rows(home, entries)
+    rows = _session_rows(home, entries, time.monotonic() + HEALTH_BUDGET_S)
     if not rows:
         print("sessions: none")
         return
@@ -165,7 +171,9 @@ def _print_sessions(home: Path) -> None:
         print(f"    health {row['health']}")
 
 
-def _session_rows(home: Path, entries: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+def _session_rows(
+    home: Path, entries: dict[str, dict[str, Any]], deadline: float
+) -> list[dict[str, Any]]:
     """One row per session, from the store where it can be read, else the files."""
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -181,6 +189,7 @@ def _session_rows(home: Path, entries: dict[str, dict[str, Any]]) -> list[dict[s
                 hip_path=record.hip_path,
                 scene_epoch=record.scene_epoch,
                 entry=entries.get(record.session_id),
+                deadline=deadline,
             )
         )
     for session_id, entry in entries.items():
@@ -196,6 +205,7 @@ def _session_rows(home: Path, entries: dict[str, dict[str, Any]]) -> list[dict[s
                 hip_path=entry.get("hip_path"),
                 scene_epoch=entry.get("scene_epoch"),
                 entry=entry,
+                deadline=deadline,
             )
         )
     return rows
@@ -224,8 +234,9 @@ def _row(
     hip_path: Any,
     scene_epoch: Any,
     entry: dict[str, Any] | None,
+    deadline: float,
 ) -> dict[str, Any]:
-    health, busy = _health(entry)
+    health, busy = _health(entry, deadline)
     return {
         "session_id": session_id,
         "alias": alias or "-",
@@ -239,16 +250,22 @@ def _row(
     }
 
 
-def _health(entry: dict[str, Any] | None) -> tuple[str, str]:
+def _health(entry: dict[str, Any] | None, deadline: float) -> tuple[str, str]:
     """What the session says about itself, and whether it is working.
 
     The session file holds the token, so a session with no file cannot be
-    asked. Nothing here waits longer than the short timeout above.
+    asked. No session is waited on longer than the short timeout, and no sweep
+    longer than what is left of the budget the caller passed.
     """
     if entry is None or not entry.get("token") or not entry.get("port"):
         return "not asked", "-"
+    left = deadline - time.monotonic()
+    if left <= 0:
+        return "not asked, the time for asking was spent on the sessions before it", "-"
     try:
-        answer = client.health(client.Session.from_entry(entry), timeout_s=HEALTH_TIMEOUT_S)
+        answer = client.health(
+            client.Session.from_entry(entry), timeout_s=min(HEALTH_TIMEOUT_S, left)
+        )
     except client.BridgeNotAuthentic:
         return "answered by something else", "-"
     except client.BridgeUnreachable:

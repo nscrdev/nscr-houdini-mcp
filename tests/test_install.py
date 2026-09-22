@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import time
+import tomllib
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -208,6 +210,22 @@ def test_the_last_word_is_the_usual_folder_for_this_system(
     assert found.source == install_module.SOURCE_DEFAULT
 
 
+def test_a_redirected_documents_folder_on_windows_is_where_the_profile_says(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(install_module.PREF_DIR_ENV_VAR)
+    monkeypatch.setattr(install_module.sys, "platform", "win32")
+    # A synced documents folder is the usual reason the profile is not the
+    # place the folder really is.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "Users" / "me" / "OneDrive"))
+    found = install_module.resolve()
+    assert (
+        found.path
+        == tmp_path / "Users" / "me" / "OneDrive" / "Documents" / ("houdini22.0") / "packages"
+    )
+    assert found.source == install_module.SOURCE_DEFAULT
+
+
 def test_a_houdini_answer_is_read_from_its_marked_line() -> None:
     printed = (
         "Licence line\n"
@@ -247,6 +265,27 @@ def test_install_and_uninstall_take_the_named_folder(
     assert not (folder / install_module.PACKAGE_FILE_NAME).exists()
 
 
+# Section: what travels with an installed copy
+
+
+def test_the_payload_travels_inside_the_package() -> None:
+    """An installed copy has no project tree, so the payload ships in it."""
+    settings = tomllib.loads(
+        (Path(install_module.__file__).parents[2] / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    included = settings["tool"]["hatch"]["build"]["targets"]["wheel"]["force-include"]
+    assert included["houdini"] == "nscr_houdini_mcp/houdini"
+
+
+def test_the_payload_next_to_the_package_is_preferred(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    beside = tmp_path / "nscr_houdini_mcp"
+    (beside / "houdini" / install_module.PACKAGES_DIR_NAME).mkdir(parents=True)
+    monkeypatch.setattr(install_module, "__file__", str(beside / "install.py"))
+    assert install_module.payload_root() == beside / "houdini"
+
+
 # Section: install
 
 
@@ -266,7 +305,9 @@ def test_install_writes_one_file_with_both_paths_and_no_auto_start() -> None:
         "value": f"${install_module.SOURCE_ENV_VAR}",
         "method": "prepend",
     }
-    assert document["path"] == f"${install_module.PAYLOAD_ENV_VAR}"
+    # `hpath` is the key Houdini reads for its own path; `path` is deprecated.
+    assert document["hpath"] == f"${install_module.PAYLOAD_ENV_VAR}"
+    assert "path" not in document
     # The paths in it are real folders of this copy of the project.
     assert install_module.payload_root().is_dir()
     assert (install_module.source_root() / "nscr_houdini_mcp").is_dir()
@@ -318,6 +359,54 @@ def test_a_file_that_is_not_json_is_not_ours_either() -> None:
         install_module.install()
 
 
+def test_a_link_where_the_package_goes_is_never_written_through(tmp_path: Path) -> None:
+    path = package_file()
+    path.parent.mkdir(parents=True)
+    elsewhere = tmp_path / "somewhere" / "else.json"
+    path.symlink_to(elsewhere)
+
+    with pytest.raises(install_module.NotOurs):
+        install_module.install()
+    # The link pointed nowhere, and still points nowhere.
+    assert path.is_symlink()
+    assert not elsewhere.exists()
+
+
+def test_a_link_to_a_package_of_ours_is_left_alone_too(tmp_path: Path) -> None:
+    real = tmp_path / "real.json"
+    real.write_text(
+        json.dumps(install_module.document(source=tmp_path, payload=tmp_path)), encoding="utf-8"
+    )
+    path = package_file()
+    path.parent.mkdir(parents=True)
+    path.symlink_to(real)
+
+    with pytest.raises(install_module.NotOurs):
+        install_module.install()
+    assert install_module.is_ours(path) is False
+    removed = install_module.uninstall()
+    assert [(item.removed, item.reason) for item in removed] == [(False, "a link, kept")]
+    assert path.is_symlink()
+    assert real.exists()
+
+
+def test_a_path_houdini_would_expand_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(install_module.InstallError) as raised:
+        install_module.document(source=tmp_path / "$WORK" / "src", payload=tmp_path)
+    assert "$" in str(raised.value)
+    with pytest.raises(install_module.InstallError):
+        install_module.document(source=tmp_path, payload=tmp_path / "back`tick")
+
+
+def test_a_marker_on_its_own_is_not_enough_to_be_ours() -> None:
+    path = package_file()
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({install_module.MARKER_KEY: install_module.MARKER_VALUE}), encoding="utf-8"
+    )
+    assert install_module.is_ours(path) is False
+
+
 def test_install_writes_nowhere_but_the_packages_folder(tmp_path: Path) -> None:
     install_module.install()
     made = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
@@ -354,6 +443,33 @@ def test_uninstall_keeps_a_package_it_did_not_write(capsys: pytest.CaptureFixtur
     assert cli.main(["bridge", "uninstall"]) == 1
     assert "kept" in capsys.readouterr().out
     assert path.exists()
+
+
+def test_uninstall_takes_away_the_folders_install_made(tmp_path: Path) -> None:
+    install_module.install()
+    made = package_file().parent
+    assert made.is_dir()
+    install_module.uninstall()
+    # The packages folder and the preference folder were both made here.
+    assert not made.exists()
+    assert not (tmp_path / "prefs22.0").exists()
+
+
+def test_uninstall_keeps_a_folder_it_did_not_make(tmp_path: Path) -> None:
+    folder = tmp_path / "already-there"
+    folder.mkdir()
+    install_module.install(packages=folder)
+    install_module.uninstall(packages=folder)
+    assert folder.is_dir()
+
+
+def test_uninstall_with_no_version_looks_at_every_version_present(tmp_path: Path) -> None:
+    install_module.install("22.0")
+    install_module.install("21.5")
+    removed = sorted(item.path for item in install_module.uninstall())
+    assert removed == sorted(
+        [install_module.package_path("21.5"), install_module.package_path("22.0")]
+    )
 
 
 def test_uninstall_can_be_pointed_at_one_version() -> None:
@@ -487,7 +603,7 @@ def test_status_lists_a_session_from_the_store(
 
 
 def test_status_says_when_a_session_does_not_answer(
-    home: Path, capsys: pytest.CaptureFixture[str]
+    home: Path, silent_port: int, capsys: pytest.CaptureFixture[str]
 ) -> None:
     registry.ensure_registry_dir(home)
     registry.write_entry(
@@ -498,7 +614,7 @@ def test_status_says_when_a_session_does_not_answer(
             "kind": "hython",
             "pid": os.getpid(),
             "pid_start": store_module.process_start_stamp(),
-            "port": free_port(),
+            "port": silent_port,
             "token": "nothing-is-listening",
             "scene_epoch": 0,
             "hip_path": None,
@@ -510,13 +626,105 @@ def test_status_says_when_a_session_does_not_answer(
     assert "health no answer" in printed
 
 
-def free_port() -> int:
-    """A port nothing is on, which is a port nothing will answer."""
-    import socket
+@pytest.fixture
+def silent_port() -> Iterator[int]:
+    """A port held open and never listened on, so a connection is refused.
 
+    Holding it for the length of the test is what keeps something else from
+    taking it in between, which a port merely found free cannot promise.
+    """
     with socket.socket() as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+        yield int(sock.getsockname()[1])
+
+
+def test_the_health_sweep_stops_when_its_time_is_spent(
+    home: Path,
+    silent_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    registry.ensure_registry_dir(home)
+    for number in (1, 2):
+        registry.write_entry(
+            home,
+            {
+                "session_id": f"s-{number}",
+                "alias": f"w{number}",
+                "kind": "hython",
+                "pid": os.getpid(),
+                "pid_start": store_module.process_start_stamp(),
+                "port": silent_port,
+                "token": "nothing-is-listening",
+                "scene_epoch": 0,
+                "hip_path": None,
+            },
+        )
+    monkeypatch.setattr(cli, "HEALTH_BUDGET_S", 0.0)
+    cli.main(["bridge", "status", "--home", str(home)])
+    printed = capsys.readouterr().out
+    assert printed.count("health not asked, the time for asking was spent") == 2
+
+
+# Section: the startup module that ships with the payload
+
+
+def autostart_module():
+    """The payload module, loaded from where Houdini would load it."""
+    import importlib.util
+
+    path = install_module.payload_root() / "python3.13libs" / "nscr_mcp_autostart.py"
+    spec = importlib.util.spec_from_file_location("nscr_mcp_autostart_for_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_a_port_range_that_makes_no_sense_is_refused(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    module = autostart_module()
+    default = (18100, 18199)
+
+    monkeypatch.setenv(module.PORT_VAR, "18400")
+    monkeypatch.setenv(module.MAX_PORT_VAR, "18449")
+    assert module.port_range(default) == (18400, 18449)
+
+    monkeypatch.setenv(module.PORT_VAR, "18500")
+    monkeypatch.setenv(module.MAX_PORT_VAR, "18400")
+    assert module.port_range(default) == default
+
+    monkeypatch.setenv(module.PORT_VAR, "80")
+    monkeypatch.setenv(module.MAX_PORT_VAR, "90")
+    assert module.port_range(default) == default
+
+    monkeypatch.setenv(module.PORT_VAR, "not a number")
+    assert module.port_range(default) == default
+    # Every refusal says so where a person can see it.
+    assert capsys.readouterr().err.count("\n") == 3
+
+
+def test_a_start_that_fails_says_so_and_writes_the_story_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    module = autostart_module()
+    monkeypatch.setenv(module.AUTOSTART_VAR, "1")
+    monkeypatch.setenv(module.HOME_VAR, str(tmp_path))
+    monkeypatch.setattr(module, "start", _raise_for_test)
+
+    assert module.start_if_wanted() is None
+    assert (
+        "nscr bridge did not start: RuntimeError: no port for this one" in capsys.readouterr().err
+    )
+    log = (tmp_path / "logs" / module.LOG_NAME).read_text(encoding="utf-8")
+    assert "RuntimeError: no port for this one" in log
+    assert "Traceback" in log
+
+
+def _raise_for_test() -> None:
+    raise RuntimeError("no port for this one")
 
 
 # Section: a real Houdini

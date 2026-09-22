@@ -31,6 +31,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,10 @@ PACKAGES_DIR_NAME = "packages"
 # rides along without meaning anything to it.
 MARKER_KEY = "//nscr-houdini-mcp"
 MARKER_VALUE = "written by nscr-houdini-mcp"
+
+# The folders an install had to make, written into the file it made them for,
+# so an uninstall can take away its own leftovers and nothing else.
+CREATED_KEY = "//folders-this-made"
 
 DEFAULT_HOUDINI_VERSION = "22.0"
 
@@ -79,7 +84,11 @@ def source_root() -> Path:
 
 
 def payload_root() -> Path:
-    """The shipped `houdini` folder, the one that goes on `HOUDINI_PATH`."""
+    """The shipped `houdini` folder, the one that goes on `HOUDINI_PATH`.
+
+    An installed copy carries the folder inside the package, and that is the
+    one preferred. A checkout has it at the top of the tree instead.
+    """
     here = Path(__file__).resolve()
     for candidate in (here.parent / "houdini", here.parents[2] / "houdini"):
         if (candidate / PACKAGES_DIR_NAME).is_dir():
@@ -140,8 +149,7 @@ def pref_dirs() -> list[tuple[str, Path]]:
     """
     override = os.environ.get(PREF_DIR_ENV_VAR)
     if override:
-        path = Path(override.replace(VERSION_TOKEN, DEFAULT_HOUDINI_VERSION)).expanduser()
-        return [(_version_in(path.name) or DEFAULT_HOUDINI_VERSION, path)]
+        return _pref_dirs_from(override)
     if sys.platform == "darwin":
         root = Path.home() / "Library" / "Preferences" / "houdini"
         pattern = "*"
@@ -160,6 +168,31 @@ def pref_dirs() -> list[tuple[str, Path]]:
             version = _version_in(child.name)
             if version:
                 found.append((version, child))
+    return found
+
+
+def _pref_dirs_from(setting: str) -> list[tuple[str, Path]]:
+    """Every folder the preference folder setting names on this machine.
+
+    The setting carries the version token, so one setting stands for as many
+    folders as there are Houdini versions here. Looking only at the default
+    version would miss a package left behind by another one.
+    """
+    template = Path(setting).expanduser()
+    if VERSION_TOKEN not in str(template):
+        version = _version_in(template.name) or DEFAULT_HOUDINI_VERSION
+        return [(version, template)]
+    parent = Path(str(template.parent).replace(VERSION_TOKEN, DEFAULT_HOUDINI_VERSION))
+    found = []
+    if parent.is_dir():
+        pattern = template.name.replace(VERSION_TOKEN, "*")
+        for child in sorted(parent.glob(pattern)):
+            version = _version_in(child.name)
+            if child.is_dir() and version:
+                found.append((version, child))
+    if not found:
+        default = Path(str(template).replace(VERSION_TOKEN, DEFAULT_HOUDINI_VERSION))
+        return [(DEFAULT_HOUDINI_VERSION, default)]
     return found
 
 
@@ -421,22 +454,45 @@ def _short(reported: str, fallback: str) -> str:
 # Section: the package file
 
 
+# Characters Houdini reads as something else inside a package value. A path
+# holding one cannot be written down as it stands, and writing it anyway would
+# put Houdini on a folder nobody named.
+UNWRITABLE = ("$", "`")
+
+
+def check_writable(path: Path, what: str) -> None:
+    """Refuse a path Houdini would read as an expression rather than a path."""
+    text = str(path)
+    for character in UNWRITABLE:
+        if character in text:
+            raise InstallError(
+                f"the {what} folder has a {character} in its name, which Houdini reads as"
+                f" something to expand rather than as part of the path: {text}"
+            )
+
+
 def document(
     *,
     autostart: bool = False,
     source: Path | None = None,
     payload: Path | None = None,
+    created: list[Path] | None = None,
 ) -> dict[str, Any]:
     """The package Houdini reads, as data.
 
-    `HOUDINI_PATH` gets the payload folder, so Houdini runs the startup script
-    in it. `PYTHONPATH` gets the source folder, so the bridge is importable in
-    Houdini's own interpreter. The startup script opens no port unless the
-    auto start variable is on.
+    `HOUDINI_PATH` gets the payload folder through `hpath`, so Houdini runs
+    the startup files in it. `PYTHONPATH` gets the source folder, so the
+    bridge is importable in Houdini's own interpreter. Nothing opens a port
+    unless the auto start variable is on.
+
+    The folders this install had to make are written down, so an uninstall can
+    take away what it made and nothing else.
     """
     source = Path(source) if source is not None else source_root()
     payload = Path(payload) if payload is not None else payload_root()
-    return {
+    check_writable(source, "source")
+    check_writable(payload, "payload")
+    body: dict[str, Any] = {
         MARKER_KEY: MARKER_VALUE,
         "//note": "Written by the bridge install command. Edits here are lost on the next one.",
         "enable": True,
@@ -446,8 +502,11 @@ def document(
             {AUTOSTART_ENV_VAR: "1" if autostart else "0"},
             {"PYTHONPATH": {"value": f"${SOURCE_ENV_VAR}", "method": "prepend"}},
         ],
-        "path": f"${PAYLOAD_ENV_VAR}",
+        "hpath": f"${PAYLOAD_ENV_VAR}",
     }
+    if created:
+        body[CREATED_KEY] = [str(folder) for folder in created]
+    return body
 
 
 def read_document(path: Path) -> dict[str, Any] | None:
@@ -462,11 +521,26 @@ def read_document(path: Path) -> dict[str, Any] | None:
 def is_ours(path: Path) -> bool:
     """Whether this tool wrote the file at that path.
 
-    A file that is not there is not ours either. Anything unreadable, or
-    readable and without the marker, belongs to somebody else and is left be.
+    It has to be a plain file, not a link to one somewhere else, and it has to
+    be shaped like the package this writes, not merely carry the marker. A
+    file that is not there is not ours either. Anything else belongs to
+    somebody else and is left exactly as it is.
     """
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        return False
     loaded = read_document(path)
-    return bool(loaded) and loaded.get(MARKER_KEY) == MARKER_VALUE
+    if not loaded or loaded.get(MARKER_KEY) != MARKER_VALUE:
+        return False
+    return isinstance(loaded.get("env"), list) and "enable" in loaded
+
+
+def created_folders(loaded: dict[str, Any] | None) -> list[Path]:
+    """The folders the install that wrote this file had to make."""
+    listed = (loaded or {}).get(CREATED_KEY)
+    if not isinstance(listed, list):
+        return []
+    return [Path(str(item)) for item in listed]
 
 
 @dataclass(frozen=True)
@@ -504,16 +578,19 @@ def install(
     payload = payload_root()
     found = lookup or resolve(version, override=packages)
     path = found.path / PACKAGE_FILE_NAME
+    # A link is never written through. Following one would write the package
+    # wherever it points, which is outside the packages folder, and a link
+    # that points nowhere would pass for a file that is not there at all.
+    if path.is_symlink():
+        raise NotOurs(f"{path} is a link, so it is left alone")
     exists = path.exists()
     if exists and not is_ours(path):
         raise NotOurs(f"{path} was not written by this tool, so it is left alone")
-    body = document(autostart=autostart, source=source, payload=payload)
+    would_make = _missing_folders(path.parent)
+    body = document(autostart=autostart, source=source, payload=payload, created=would_make)
     if not dry_run:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(body, indent=4, sort_keys=False, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        _write_atomically(path, json.dumps(body, indent=4, ensure_ascii=False) + "\n")
     return InstallResult(
         path=path,
         version=version,
@@ -533,6 +610,35 @@ def install(
             f"{AUTOSTART_ENV_VAR}   {'1' if autostart else '0'}",
         ],
     )
+
+
+def _missing_folders(folder: Path) -> list[Path]:
+    """The folders that would have to be made to hold a file in this one.
+
+    Deepest first, which is the order they can be taken away again in.
+    """
+    missing = []
+    walk = folder
+    while not walk.exists() and walk != walk.parent:
+        missing.append(walk)
+        walk = walk.parent
+    return missing
+
+
+def _write_atomically(path: Path, text: str) -> None:
+    """Write beside the file, then move it into place in one step.
+
+    A half written package is one Houdini would read and refuse, and moving
+    over a name never follows a link that appears in the meantime.
+    """
+    handle, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".part")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as opened:
+            opened.write(text)
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
 
 
 @dataclass(frozen=True)
@@ -565,6 +671,9 @@ def uninstall(
         if path in seen:
             continue
         seen.append(path)
+        if path.is_symlink():
+            results.append(RemovedPackage(path, found_version, False, "a link, kept"))
+            continue
         if not path.exists():
             continue
         if not is_ours(path):
@@ -572,9 +681,25 @@ def uninstall(
                 RemovedPackage(path, found_version, False, "not written by this tool, kept")
             )
             continue
+        made = created_folders(read_document(path))
         path.unlink()
         results.append(RemovedPackage(path, found_version, True, "removed"))
+        _remove_empty(made)
     return results
+
+
+def _remove_empty(folders: list[Path]) -> None:
+    """Take away the folders that install made, while they are empty.
+
+    Only folders the package file itself named, so a packages folder that was
+    already there when this arrived is never touched.
+    """
+    for folder in folders:
+        try:
+            if folder.is_dir() and not folder.is_symlink() and not any(folder.iterdir()):
+                folder.rmdir()
+        except OSError:
+            return
 
 
 def _targets(
