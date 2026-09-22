@@ -63,7 +63,7 @@ Run the server on stdio:
 nscr-houdini-mcp
 ```
 
-Three tools so far. `hou_ping` says which session a call reaches and that it
+Four tools so far. `hou_ping` says which session a call reaches and that it
 answers. `hou_sessions` lists every session with its state (`live`, `busy`,
 `unresponsive`, `crashed` or `gone`) and starts and stops workers under the
 pool's rules; it never closes a Houdini with a user interface. `hou_scene`
@@ -73,6 +73,38 @@ anything. A scene open in a user interface with unsaved changes is not
 replaced unless the call says to throw them away.
 Opening a scene runs the code that scene file carries, as Houdini always
 does, so only open files you trust.
+
+`hou_inspect` reads nodes, networks and parameters. `tree` lists what is
+under a path, `node` reads one node or a batch of up to fifty, `parms` reads
+parameter tables, `find` searches by a glob on the name or path and by type,
+and `selection` lists what is selected in a session with a user interface.
+Rows come sorted by path. A read with more rows than `limit` (200 unless you
+say, up to 2000) hands back `next_page`; send it back as `page` to carry on
+after the last path. If the scene changed in between, the page still comes
+back and says `scene_changed`. A batch never fails for one missing path: that
+entry carries its own error, with the closest paths that are there.
+
+A read cooks nothing unless it passes `evaluate`. Without it, a value that
+could only be had by cooking, such as an expression that counts another
+node's points, is left out and marked `not_cooked`, and errors are the ones
+the last cook left, marked `not_cooked` when there has been none and `stale`
+with the reason when the node has changed since. With `evaluate` the read may
+cook, under the same `wait_s` and `timeout_s` as any other call; a render node
+or a task network is never cooked by a read.
+
+Every tool that reads takes the same three `detail` levels:
+
+- `summary`, the default: who each item is and how many of things it has,
+  one compact row per item.
+- `standard`: what a person sees without digging, on the node and in the
+  parameter pane: the parameters that differ from their defaults, the wires
+  by input label, the flags, error text and comments.
+- `full`: everything else: parameters at their defaults, expressions with
+  their text and values, code, spare parameter templates, cook times and user
+  data.
+
+`include` brings single items into a lower level: `wires`, `flags`, `errors`,
+`expressions`, `code`, `notes` or `cook_time`.
 
 ### The Houdini side
 
