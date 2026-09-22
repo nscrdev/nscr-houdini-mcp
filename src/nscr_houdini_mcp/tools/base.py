@@ -28,6 +28,7 @@ from mcp_types import ToolAnnotations
 
 from nscr_houdini_mcp.bridge import client
 from nscr_houdini_mcp.bridge.errors import did_you_mean
+from nscr_houdini_mcp.bridge.tools import DETAIL_LEVELS
 from nscr_houdini_mcp.config import Config
 from nscr_houdini_mcp.results import CallError, empty_trace
 from nscr_houdini_mcp.router import Router, Target
@@ -77,10 +78,24 @@ OPERATION_ID = {
     "description": "Send the same id again after a lost reply to get the outcome, not a repeat.",
 }
 
+# How much a read says, the same three steps for every tool that reads:
+#
+# - summary: who each item is and how many of things it has, one compact row
+#   per item. The default.
+# - standard: adds what a person sees without digging, on the node and in the
+#   parameter pane: the parameters that differ from their defaults, the wires
+#   by input label, the flags, error text and comments.
+# - full: adds everything else: parameters at their defaults, expressions with
+#   their text and values, code, spare parameter templates, cook times and
+#   user data.
+#
+# A tool that has nothing to add at a level answers it as the level below.
+# The names come from the bridge, which reads at the same three levels.
+
 DETAIL = {
     "type": "string",
-    "enum": ["summary", "full"],
-    "description": "summary by default; full adds everything else.",
+    "enum": list(DETAIL_LEVELS),
+    "description": "Default summary.",
 }
 
 # Described once in the server instructions rather than in every tool.

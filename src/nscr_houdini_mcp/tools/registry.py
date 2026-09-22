@@ -8,8 +8,9 @@ else.
 from __future__ import annotations
 
 from nscr_houdini_mcp.tools.base import ToolSpec
+from nscr_houdini_mcp.tools.inspect import HOU_INSPECT
 from nscr_houdini_mcp.tools.ping import HOU_PING
 from nscr_houdini_mcp.tools.scene import HOU_SCENE
 from nscr_houdini_mcp.tools.sessions import HOU_SESSIONS
 
-TOOLS: tuple[ToolSpec, ...] = (HOU_PING, HOU_SESSIONS, HOU_SCENE)
+TOOLS: tuple[ToolSpec, ...] = (HOU_PING, HOU_SESSIONS, HOU_SCENE, HOU_INSPECT)
