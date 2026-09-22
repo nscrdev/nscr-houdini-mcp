@@ -6,7 +6,9 @@ tool uses. A session busy with another call still pings: the health part says
 what it is doing and the call part says it was busy, rather than the whole
 ping failing.
 
-It reads no scene and changes nothing.
+It reads no scene and changes nothing. Pinging a worker renews its idle lease
+like any other call: a worker that is being read from is in use, and keeping
+it warm is the point.
 """
 
 from __future__ import annotations
@@ -66,7 +68,7 @@ HOU_PING = ToolSpec(
     description=(
         "Check which Houdini session a call reaches and that it answers. Returns its "
         "session_id, alias, kind (gui or hython), Houdini build, transport, health and "
-        "scene_epoch. Reads no scene."
+        "scene_epoch. Reads no scene. Any call to a worker keeps it warm."
     ),
     input_schema=inputs({"session": SESSION, "wait_s": WAIT_S}),
     output_schema=outputs(
@@ -83,4 +85,6 @@ HOU_PING = ToolSpec(
     ),
     handler=ping,
     read_only=True,
+    idempotent=True,
+    open_world=False,
 )

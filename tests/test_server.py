@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import pytest
 from mcp.client.client import Client
 from mcp.shared.inbound import find_invalid_x_mcp_header
 
@@ -132,7 +135,11 @@ def test_hou_ping_is_listed_read_only_with_plain_schemas() -> None:
     listed, _ = talk(serve(Stage([])))
     [tool] = listed.tools
     assert tool.name == "hou_ping"
-    assert tool.annotations is not None and tool.annotations.read_only_hint is True
+    assert tool.annotations is not None
+    assert tool.annotations.read_only_hint is True
+    assert tool.annotations.idempotent_hint is True
+    assert tool.annotations.open_world_hint is False
+    assert tool.annotations.destructive_hint is None
     assert tool.input_schema["additionalProperties"] is False
     assert set(tool.input_schema["properties"]) == {"session", "wait_s"}
     assert find_invalid_x_mcp_header(tool.input_schema) is None
@@ -140,11 +147,24 @@ def test_hou_ping_is_listed_read_only_with_plain_schemas() -> None:
     assert tool.output_schema["required"] == ["trace"]
 
 
-def test_the_instructions_are_five_short_lines() -> None:
+def test_the_instructions_are_four_short_lines() -> None:
     lines = INSTRUCTIONS.splitlines()
-    assert len(lines) <= 5
+    assert len(lines) == 4
     assert len(INSTRUCTIONS.split()) < 120
-    assert "session" in INSTRUCTIONS and "wait_s" in INSTRUCTIONS and "job" in INSTRUCTIONS
+    assert "session" in INSTRUCTIONS and "wait_s" in INSTRUCTIONS
+    # Nothing is promised that no tool offers yet.
+    assert "job" not in INSTRUCTIONS and "operation_id" not in INSTRUCTIONS
+
+
+def test_only_tools_are_advertised() -> None:
+    async def capabilities() -> Any:
+        async with Client(serve(Stage([])), mode="legacy") as connected:
+            return connected.session.server_capabilities
+
+    advertised = asyncio.run(capabilities())
+    assert advertised.tools is not None
+    assert advertised.prompts is None
+    assert advertised.resources is None
 
 
 def test_the_server_never_imports_hou() -> None:
@@ -259,6 +279,21 @@ def test_a_bad_config_is_reported_on_the_call_and_read_again_next_time() -> None
     assert not second.is_error
 
 
+def test_a_bad_config_names_its_file_without_the_whole_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("NSCR_MCP_HOME", str(home))
+    (home / "config.toml").write_text("poolcap = 2\n", encoding="utf-8")
+    server = build_server(router_factory=Stage([]).router)
+    _, [result] = talk(server, ("hou_ping", {}))
+    assert result.is_error is True
+    details = result.structured_content["error"]["details"]
+    assert details == {"path": "config.toml", "key": "poolcap"}
+    assert str(tmp_path) not in text_of(result)
+
+
 # Section: the plumbing a changing tool gets
 
 
@@ -303,19 +338,20 @@ def test_a_change_mints_an_operation_id_and_passes_the_budgets() -> None:
     assert not result.is_error, text_of(result)
     first, second = stage.sent.calls
     assert first["operation_id"].startswith("op-")
-    assert second["operation_id"] == f"{first['operation_id']}.2"
+    assert second["operation_id"] == f"{first['operation_id']}:2"
     for sent in (first, second):
         assert sent["scene_epoch"] == 4
         assert sent["wait_s"] == 5
         assert sent["timeout_s"] == 60
-    assert result.structured_content["trace"]["operation_id"] == "y"
+    # The trace names the id the caller can send again, not a derived one.
+    assert result.structured_content["trace"]["operation_id"] == first["operation_id"]
 
 
 def test_a_caller_operation_id_is_used_as_given() -> None:
     stage = Stage([record("s-1", "w1")], replies=(made(0, "op-mine"), made(0, "op-mine.2")))
     _, [result] = talk(serve(stage, tools=(EDIT,)), ("test_edit", {"operation_id": "op-mine"}))
     assert not result.is_error
-    assert [c["operation_id"] for c in stage.sent.calls] == ["op-mine", "op-mine.2"]
+    assert [c["operation_id"] for c in stage.sent.calls] == ["op-mine", "op-mine:2"]
     # No epoch was given, so none is sent: the guard is the caller's choice.
     assert [c["scene_epoch"] for c in stage.sent.calls] == [None, None]
 
@@ -367,3 +403,105 @@ def test_a_large_result_spills_under_the_state_home(tmp_path: Path) -> None:
     assert spilled["bytes"] > 2048
     assert json.loads(path.read_text(encoding="utf-8"))["rows"][499] == "/obj/node499"
     assert str(path) in text_of(result)
+
+
+@pytest.mark.parametrize("given", ["", "op.2", "op:2", "op 1", "x" * 121])
+def test_an_operation_id_outside_the_allowed_form_is_refused(given: str) -> None:
+    stage = Stage([record("s-1", "w1")])
+    _, [result] = talk(serve(stage, tools=(EDIT,)), ("test_edit", {"operation_id": given}))
+    assert result.is_error is True
+    assert result.structured_content["error"]["code"] == "BAD_ARGUMENTS"
+    assert stage.sent.calls == []
+
+
+def test_a_session_given_as_an_empty_string_is_refused() -> None:
+    _, [result] = talk(serve(Stage([record("s-1", "w1")])), ("hou_ping", {"session": ""}))
+    assert result.structured_content["error"]["code"] == "BAD_ARGUMENTS"
+
+
+def test_a_lost_reply_on_the_second_change_names_the_base_id_to_resend() -> None:
+    lost = bridge_client.BridgeUnreachable("the reply was lost")
+    stage = Stage(
+        [record("s-1", "w1")],
+        replies=(made(0, "op-base"), lost, made(0, "op-base"), made(0, "op-base:2")),
+    )
+    server = serve(stage, tools=(EDIT,))
+    _, [first, again] = talk(
+        server,
+        ("test_edit", {"operation_id": "op-base"}),
+        ("test_edit", {"operation_id": "op-base"}),
+    )
+    assert first.is_error is True
+    body = first.structured_content
+    assert body["error"]["code"] == "SESSION_UNREACHABLE"
+    assert body["error"]["details"]["operation_id"] == "op-base"
+    assert body["trace"]["operation_id"] == "op-base"
+    assert "op-base:2" not in text_of(first)
+    # Sending the base id again replays both steps under the same ids.
+    assert not again.is_error
+    sent = [call["operation_id"] for call in stage.sent.calls]
+    assert sent == ["op-base", "op-base:2", "op-base", "op-base:2"]
+    assert again.structured_content["trace"]["operation_id"] == "op-base"
+
+
+SLOW_SERVER = """
+import time
+from nscr_houdini_mcp.server import build_server
+from nscr_houdini_mcp.tools.base import ToolSpec, inputs
+
+def slow(call):
+    time.sleep(60)
+    return {}
+
+spec = ToolSpec(name="test_slow", description="test only", input_schema=inputs({}), handler=slow)
+build_server((spec,)).run(transport="stdio")
+"""
+
+
+def test_the_server_exits_at_once_when_stdin_closes_during_a_long_call(tmp_path: Path) -> None:
+    env = {**os.environ, "NSCR_MCP_HOME": str(tmp_path / "home")}
+    child = subprocess.Popen(
+        [sys.executable, "-c", SLOW_SERVER],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    )
+    assert child.stdin is not None and child.stdout is not None
+
+    def send(message: dict) -> None:
+        child.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
+        child.stdin.flush()
+
+    try:
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "1"},
+                },
+            }
+        )
+        assert json.loads(child.stdout.readline())["id"] == 1
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "test_slow", "arguments": {}},
+            }
+        )
+        time.sleep(0.5)
+        closed = time.monotonic()
+        child.stdin.close()
+        child.wait(timeout=10)
+        assert time.monotonic() - closed < 2.0
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()

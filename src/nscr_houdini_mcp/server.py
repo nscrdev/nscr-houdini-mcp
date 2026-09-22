@@ -25,13 +25,15 @@ from importlib.metadata import version as _pkg_version
 from typing import Any
 
 import anyio
+import anyio.from_thread
+import anyio.lowlevel
 from mcp.server.mcpserver import MCPServer
 from mcp_types import CallToolResult
 from mcp_types import Tool as MCPTool
 
 from nscr_houdini_mcp.bridge.errors import did_you_mean
 from nscr_houdini_mcp.config import Config, ConfigError, load_config
-from nscr_houdini_mcp.results import CallError, Spill, error_result, ok_result
+from nscr_houdini_mcp.results import CallError, Spill, error_result, ok_result, reap_spill
 from nscr_houdini_mcp.router import Router
 from nscr_houdini_mcp.tools.base import Call, ToolSpec
 from nscr_houdini_mcp.tools.registry import TOOLS
@@ -43,8 +45,19 @@ Drives SideFX Houdini 22: GUI sessions running the bridge, and hython workers.
 Tools take an optional `session` id or alias; with one live session it is used.
 Every result has a trace (session_id, alias, scene_epoch); pass scene_epoch back on edits.
 SESSION_BUSY means another call is running: pass wait_s (up to 50) rather than retry loops.
-Slow work returns a job id to wait on, not a sleep; resend a lost edit with its operation_id.
 """.strip()
+
+# Methods the SDK answers by default that this server has nothing behind. Left
+# in, they would be advertised as capabilities. The tool list never changes
+# while the server runs, so there is nothing to subscribe to either.
+UNSERVED_METHODS = (
+    "prompts/list",
+    "prompts/get",
+    "resources/list",
+    "resources/read",
+    "resources/templates/list",
+    "subscriptions/listen",
+)
 
 log = logging.getLogger(__name__)
 
@@ -58,7 +71,7 @@ def package_version() -> str:
 
 
 class Runtime:
-    """What every call shares: the config, the router and the spill writer."""
+    """What every call shares: the config and the router."""
 
     def __init__(
         self,
@@ -133,6 +146,40 @@ class Runtime:
             )
 
 
+async def in_daemon_thread(work: Callable[..., Any], *args: Any) -> Any:
+    """Run blocking work on a thread of its own and wait for it, cancellably.
+
+    A call can sit on a busy session for as long as its budgets allow. When the
+    client goes away or cancels, the wait here ends at once and the thread is
+    left to finish on its own. It is a daemon thread, so it never holds the
+    process open: a worker thread that is not one keeps the interpreter alive
+    at exit until the socket gives up, which is the delay this avoids. The work
+    it was doing is safe to abandon: a change carries an operation id, and the
+    bridge keeps the receipt.
+    """
+    done = anyio.Event()
+    token = anyio.lowlevel.current_token()
+    box: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            box["value"] = work(*args)
+        except BaseException as error:  # noqa: BLE001 - handed to the waiting task
+            box["error"] = error
+        finally:
+            try:
+                anyio.from_thread.run_sync(done.set, token=token)
+            except RuntimeError:
+                # The loop has closed: nobody is waiting for the answer.
+                pass
+
+    threading.Thread(target=run, name="nscr-mcp-call", daemon=True).start()
+    await done.wait()
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
 def _router_for(config: Config) -> Router:
     return Router(config.state_home, default_session=config.default_session)
 
@@ -148,6 +195,9 @@ class HoudiniServer(MCPServer):
     def __init__(self, runtime: Runtime, **rest: Any) -> None:
         super().__init__(**rest)
         self.runtime = runtime
+        handlers = self._lowlevel_server._request_handlers
+        for method in UNSERVED_METHODS:
+            handlers.pop(method, None)
 
     async def list_tools(self) -> list[MCPTool]:
         return [spec.as_tool() for spec in self.runtime.tools.values()]
@@ -155,7 +205,7 @@ class HoudiniServer(MCPServer):
     async def call_tool(
         self, name: str, arguments: dict[str, Any], context: Any = None
     ) -> CallToolResult:
-        return await anyio.to_thread.run_sync(self.runtime.run, name, arguments)
+        return await in_daemon_thread(self.runtime.run, name, arguments)
 
 
 def build_server(
@@ -174,6 +224,17 @@ def build_server(
     )
 
 
+def reap_at_start(config_loader: Callable[[], Config] = load_config) -> int:
+    """Clear old spilled results. A config that will not load is left for the
+    first call to report, so a start never fails over housekeeping."""
+    try:
+        config = config_loader()
+        return reap_spill(config.spill_folder, config.spill_keep_days)
+    except (ConfigError, OSError):
+        return 0
+
+
 def run() -> None:
     """Run the server on the configured transport. Only stdio exists today."""
+    reap_at_start()
     build_server().run(transport="stdio")

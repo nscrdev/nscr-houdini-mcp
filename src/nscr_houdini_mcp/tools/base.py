@@ -34,6 +34,7 @@ from nscr_houdini_mcp.router import Router, Target
 
 SESSION = {
     "type": "string",
+    "minLength": 1,
     "description": "Session id or alias. May be left out when one session is live.",
     "x-mcp-header": "Session",
 }
@@ -59,9 +60,18 @@ SCENE_EPOCH = {
     "was replaced since.",
 }
 
+# A tool that makes several changes sends the caller's id for the first and
+# derives the rest by adding a separator and a count. The separator is outside
+# what a caller may send, so a derived id can never equal one a caller chose,
+# and the length cap leaves room for the suffix inside the bridge's 128.
+OPERATION_ID_SEPARATOR = ":"
+OPERATION_ID_MAX = 120
+
 OPERATION_ID = {
     "type": "string",
-    "maxLength": 128,
+    "minLength": 1,
+    "maxLength": OPERATION_ID_MAX,
+    "pattern": "^[A-Za-z0-9_-]+$",
     "description": "Send the same id again after a lost reply to get the outcome, not a repeat.",
 }
 
@@ -109,6 +119,10 @@ class ToolSpec:
     output_schema: Mapping[str, Any] | None = None
     # Only for a tool that never changes anything, in any mode.
     read_only: bool = False
+    # Left out of the list unless set: the protocol's defaults are the careful
+    # reading, a tool that may change things and reach outside.
+    idempotent: bool | None = None
+    open_world: bool | None = None
     title: str | None = None
     # One line for a result too long to repeat in the text block.
     summary: Callable[[Mapping[str, Any]], str] | None = None
@@ -125,8 +139,17 @@ class ToolSpec:
             description=self.description,
             input_schema=dict(self.input_schema),
             output_schema=dict(self.output_schema) if self.output_schema else None,
-            annotations=ToolAnnotations(read_only_hint=True) if self.read_only else None,
+            annotations=self.annotations(),
         )
+
+    def annotations(self) -> ToolAnnotations | None:
+        hints = {
+            "read_only_hint": True if self.read_only else None,
+            "idempotent_hint": self.idempotent,
+            "open_world_hint": self.open_world,
+        }
+        given = {key: value for key, value in hints.items() if value is not None}
+        return ToolAnnotations(**given) if given else None
 
     def check(self, arguments: Mapping[str, Any]) -> CallError | None:
         """`BAD_ARGUMENTS` for arguments the schema refuses, or nothing."""
@@ -203,7 +226,8 @@ class Call:
         A change carries an operation id: the caller's, or one minted here. A
         tool that makes more than one change derives the later ids from the
         first, so sending the same id again replays every step from its
-        receipt rather than doing any of them twice.
+        receipt rather than doing any of them twice. The trace and any error
+        name the id the caller holds, never a derived one.
         """
         target = self.target()
         operation_id = self._next_operation_id() if mutating else None
@@ -220,11 +244,13 @@ class Call:
         except CallError as error:
             self._note(error.trace)
             if operation_id:
-                self.trace["operation_id"] = operation_id
+                self.trace["operation_id"] = self._operation_id
+                if "operation_id" in error.details:
+                    error.details["operation_id"] = self._operation_id
             raise
         self._note(reply)
         if operation_id:
-            self.trace["operation_id"] = reply.get("operation_id") or operation_id
+            self.trace["operation_id"] = self._operation_id
         return reply
 
     def _next_operation_id(self) -> str:
@@ -233,7 +259,7 @@ class Call:
         self._changes += 1
         if self._changes == 1:
             return self._operation_id
-        return f"{self._operation_id}.{self._changes}"
+        return f"{self._operation_id}{OPERATION_ID_SEPARATOR}{self._changes}"
 
     def _note(self, said: Mapping[str, Any]) -> None:
         """Take what a reply says about who answered and which scene it was."""
