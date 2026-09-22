@@ -81,6 +81,9 @@ PORTS = {
 POOL_CAP = 3
 RACERS = 8
 
+# A body far past any cap, for the check that one is refused on its length.
+BIG_BODY_BYTES = 50 * 1024 * 1024
+
 # How long a session that is holding an answer keeps it, and how long a caller
 # waits before it decides the answer is lost. The caller gives up first.
 HOLD_S = 8.0
@@ -876,14 +879,31 @@ def check_security(run: Run) -> str:
         assert answered.status == 400, answered.status
         assert answered.payload["error"]["code"] == "BODY_REFUSED", answered.payload
         assert bridge.health().status == 200, "the bomb stopped the session answering"
+
+        # A body far over the cap, refused on its length before any of it is
+        # read. A server may answer it or close on it; either way the session
+        # goes on serving and never holds the body.
+        try:
+            refused = client.request(
+                bridge.port, CALL_PATH, body=b"x" * BIG_BODY_BYTES, timeout_s=120.0
+            )
+            assert refused.status == 413, refused.status
+            code = refused.payload["error"]["code"]
+            assert code == "BODY_REFUSED", refused.payload
+            big = f"answered 413 {code}"
+        except client.BridgeUnreachable:
+            big = "closed on"
+        assert bridge.health().status == 200, "the large body stopped the session answering"
         assert bridge.process is not None and bridge.process.poll() is None
         assert bridge.call("bridge.ping").payload["ok"] is True
 
         tested = ", ".join(outside) if outside else "no address outside loopback to test"
+        megabytes = BIG_BODY_BYTES // (1024 * 1024)
     return (
         f"the port is loopback only ({tested}), unsigned and wrongly signed requests get 401 on "
-        "both paths, an Origin or Referer gets 403 with no allow header, /api is 404, and the "
-        "nesting bomb was answered BODY_REFUSED with the session still serving"
+        "both paths, an Origin or Referer gets 403 with no allow header, /api is 404, the "
+        f"nesting bomb was answered BODY_REFUSED and a {megabytes} MB body was {big}, with the "
+        "session still serving"
     )
 
 
