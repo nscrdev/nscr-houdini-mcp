@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -271,6 +272,52 @@ def test_a_call_runs_when_there_is_nowhere_to_keep_a_receipt(scene: Scene) -> No
 
     assert reply.payload["ok"] is True
     assert len(counter.calls) == 1
+
+
+def test_work_that_outlived_its_call_still_finishes_its_receipt(
+    tmp_path: Path, scene: Scene
+) -> None:
+    """The caller gave up waiting. The answer still belongs under its id."""
+    path = tmp_path / "coord.sqlite"
+    started = threading.Event()
+    release = threading.Event()
+    tools = ToolRegistry()
+
+    def slow(arguments: Mapping[str, Any]) -> dict[str, Any]:
+        started.set()
+        assert release.wait(10.0)
+        return {"finished": True}
+
+    tools.add("scene.touch", slow, mutating=True)
+    running = Dispatcher(
+        tools,
+        lock=threading.Lock(),
+        kind="hython",
+        session_id=SESSION,
+        identity=Identity(session_id=SESSION),
+        receipts=receipt_module.Receipts(lambda: store_module.Store(path), session_id=SESSION),
+        hou=scene.module(),
+        timeout_s=0.2,
+    )
+
+    gave_up = running.dispatch(touch(operation_id="op-1"))
+    assert gave_up.payload["error"]["code"] == "TIMEOUT"
+    assert started.wait(10.0)
+    release.set()
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        with store_at(path) as store:
+            record = store.get_operation("op-1")
+        if record is not None and record.state == "done":
+            break
+        time.sleep(0.02)
+    assert record.state == "done"
+    assert record.outcome["data"] == {"finished": True}
+
+    replayed = running.dispatch(touch(operation_id="op-1"))
+    assert replayed.payload["replayed"] is True
+    assert replayed.payload["data"] == {"finished": True}
 
 
 # Section: keeping the table small

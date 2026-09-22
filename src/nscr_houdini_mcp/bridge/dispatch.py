@@ -269,8 +269,10 @@ class Dispatcher:
             running.timed_out = True
             if wanted:
                 # The work is still going, so the receipt says so rather than
-                # looking abandoned to the next caller that presents the id.
+                # looking abandoned to the next caller that presents the id,
+                # and it is finished with the answer whenever the work ends.
                 self.receipts.touch(wanted)
+                self._record_when_it_ends(wanted, tool, work, running, dict(trace))
             return Reply(
                 200,
                 {
@@ -295,6 +297,30 @@ class Dispatcher:
         return reply
 
     # Section: answering
+
+    def _record_when_it_ends(
+        self,
+        operation_id: str,
+        tool: Tool,
+        work: marshal.Work,
+        running: Running,
+        trace: dict[str, Any],
+    ) -> None:
+        """Finish the receipt of a call whose work outlived it.
+
+        The caller has been told the work goes on. What it ends up doing still
+        belongs under its operation id, so the same id sent again gets the
+        answer rather than being told that nobody knows.
+        """
+
+        def record() -> None:
+            work.finished.wait()
+            try:
+                self.receipts.finish(operation_id, self._answer(tool, work, running, trace).payload)
+            except Exception as error:  # noqa: BLE001 - a missed receipt is not a failed call
+                self._log(f"could not record {operation_id}: {type(error).__name__}: {error}")
+
+        threading.Thread(target=record, name="nscr-mcp-receipt", daemon=True).start()
 
     def _said(self, trace: Mapping[str, Any]) -> dict[str, Any]:
         """The trace as it is at the moment of answering.
