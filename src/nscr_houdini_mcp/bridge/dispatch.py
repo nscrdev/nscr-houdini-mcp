@@ -13,6 +13,12 @@ The lock in the app says one call at a time. This says the rest of it:
   session, health reports it, and calls behind it wait or are told the session
   is busy.
 - `skip_if_busy` answers at once rather than queueing at all.
+- A call that carries a scene epoch older than this session's is refused with
+  `SCENE_REPLACED` and a summary of the scene there is now, before any tool
+  runs. The paths in it belong to a scene that has been thrown away.
+- A mutating call that carries an operation id takes a receipt before it runs
+  and finishes it with the answer, so the same id sent again is answered from
+  the receipt instead of doing the work twice.
 - Every mutating call runs inside one undo group, on the main thread where
   there is one, and a failure rolls the group's graph edits back.
 - Every error carries a code from the table, and no exception text.
@@ -36,10 +42,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from nscr_houdini_mcp.bridge import encoding, host, marshal
+from nscr_houdini_mcp.bridge import receipts as receipt_module
 from nscr_houdini_mcp.bridge.envelope import Envelope, Reply, error_payload, ok_payload
 from nscr_houdini_mcp.bridge.errors import BridgeError, did_you_mean, map_exception
 from nscr_houdini_mcp.bridge.gate import Gate
 from nscr_houdini_mcp.bridge.handlers import Tool, ToolRegistry, UnknownTool
+from nscr_houdini_mcp.bridge.identity import Identity
 from nscr_houdini_mcp.bridge.tools import ToolContext
 from nscr_houdini_mcp.bridge.undo import run_in_undo_group
 
@@ -99,7 +107,8 @@ class Dispatcher:
         lock: Any,
         kind: str = host.HYTHON,
         session_id: str = "",
-        scene_epoch: Callable[[], int] | None = None,
+        identity: Identity | None = None,
+        receipts: receipt_module.Receipts | None = None,
         hou: Any | None = None,
         log: Callable[[str], None] | None = None,
         main_loop: marshal.MainLoop | None = None,
@@ -112,7 +121,8 @@ class Dispatcher:
         self.session_id = session_id
         self.wait_s = wait_s
         self.timeout_s = timeout_s
-        self._scene_epoch = scene_epoch or (lambda: 0)
+        self.identity = identity or Identity(session_id=session_id, kind=kind)
+        self.receipts = receipts or receipt_module.Receipts(None)
         self._hou = hou if hou is not None else host.houdini()
         self._log = log or (lambda text: None)
         self._main_loop = main_loop
@@ -153,7 +163,7 @@ class Dispatcher:
     def dispatch(self, envelope: Envelope) -> Reply:
         """Run one call and answer it."""
         operation_id = envelope.operation_id or _new_operation_id()
-        trace = {"operation_id": operation_id, "scene_epoch": self._scene_epoch()}
+        trace = {"operation_id": operation_id, **self.identity.trace()}
 
         try:
             tool = self.tools.get(envelope.tool)
@@ -181,6 +191,20 @@ class Dispatcher:
             # another call is running. That is the whole point of it.
             return self._answer_now(tool, envelope.arguments, trace)
 
+        stale = self._scene_guard(envelope, trace)
+        if stale is not None:
+            return stale
+
+        # A receipt only answers a retry when the caller chose the id, so a
+        # call that named none takes none: a fresh id could answer nothing.
+        wanted = envelope.operation_id if tool.mutating else None
+        digest = _digest(tool, envelope.arguments) if wanted else None
+        if wanted and digest:
+            peeked = self.receipts.peek(wanted, digest, scene_epoch=self.identity.scene_epoch)
+            early = self._receipt_reply(peeked, tool, trace)
+            if early is not None:
+                return early
+
         wait_s = self.wait_s if envelope.wait_s is None else envelope.wait_s
         timeout_s = _first(envelope.timeout_s, tool.timeout_s, self.timeout_s)
 
@@ -188,13 +212,20 @@ class Dispatcher:
         if not self._gate.enter(wait_s=wait_s, skip_if_busy=bool(envelope.skip_if_busy)):
             return self._busy(trace, waited=waited, wait_s=wait_s, cause="session busy")
 
+        if wanted and digest:
+            verdict = self.receipts.claim(wanted, digest, scene_epoch=self.identity.scene_epoch)
+            settled = self._receipt_reply(verdict, tool, trace)
+            if settled is not None:
+                self._gate.leave()
+                return settled
+
         running = Running(operation_id=operation_id, tool=tool.name, mutating=tool.mutating)
         self._running = running
         context = ToolContext(
             hou=self._hou,
             kind=self.kind,
             session_id=self.session_id,
-            scene_epoch=self._scene_epoch(),
+            scene_epoch=self.identity.scene_epoch,
             operation_id=operation_id,
             label=tool.undo_label(),
             cancel=running.cancel,
@@ -236,6 +267,10 @@ class Dispatcher:
 
         if not work.finished.wait(timeout_s):
             running.timed_out = True
+            if wanted:
+                # The work is still going, so the receipt says so rather than
+                # looking abandoned to the next caller that presents the id.
+                self.receipts.touch(wanted)
             return Reply(
                 200,
                 {
@@ -254,7 +289,89 @@ class Dispatcher:
                 },
             )
 
-        return self._answer(tool, work, running, trace)
+        reply = self._answer(tool, work, running, trace)
+        if wanted:
+            self.receipts.finish(wanted, reply.payload)
+        return reply
+
+    # Section: the scene and the receipt
+
+    def _scene_guard(self, envelope: Envelope, trace: Mapping[str, Any]) -> Reply | None:
+        """Refuse a call written against a scene this session has thrown away."""
+        carried = envelope.scene_epoch
+        current = self.identity.scene_epoch
+        if carried is None or carried == current:
+            return None
+        return self._refuse(
+            BridgeError(
+                "SCENE_REPLACED",
+                "this session has replaced its scene since that call was written",
+                {
+                    "carried_epoch": carried,
+                    "scene_epoch": current,
+                    "scene": self.identity.scene(),
+                },
+                hint="read the scene again, then send the call with the new epoch",
+            ),
+            trace,
+        )
+
+    def _receipt_reply(
+        self, verdict: receipt_module.Verdict, tool: Tool, trace: Mapping[str, Any]
+    ) -> Reply | None:
+        """Turn a receipt verdict into an answer, or nothing when it may run."""
+        if verdict.may_run:
+            return None
+        if verdict.action == receipt_module.REPLAY:
+            stored = verdict.outcome
+            if isinstance(stored, Mapping):
+                return Reply(200, {**stored, "replayed": True})
+            # A receipt with no answer in it says nothing useful, so the call
+            # is treated as one whose outcome nobody knows.
+            return self._unknown(verdict, tool, trace)
+        if verdict.action == receipt_module.MISMATCH:
+            return self._refuse(
+                BridgeError(
+                    "OPERATION_MISMATCH",
+                    "that operation id was used for a different call",
+                    {"tool": tool.name, **verdict.state()},
+                    hint="use a new operation id, or send the arguments the id was used with",
+                ),
+                trace,
+            )
+        if verdict.action == receipt_module.SCENE_REPLACED:
+            return self._refuse(
+                BridgeError(
+                    "SCENE_REPLACED",
+                    "that operation id belongs to a scene this session has replaced",
+                    {
+                        "recorded_epoch": verdict.recorded_epoch,
+                        "scene_epoch": self.identity.scene_epoch,
+                        "scene": self.identity.scene(),
+                    },
+                    hint="read the scene again and send the call with a new operation id",
+                ),
+                trace,
+            )
+        return self._unknown(verdict, tool, trace)
+
+    def _unknown(
+        self, verdict: receipt_module.Verdict, tool: Tool, trace: Mapping[str, Any]
+    ) -> Reply:
+        return self._refuse(
+            BridgeError(
+                "OUTCOME_UNKNOWN",
+                "that operation id may already have changed the scene",
+                {
+                    "tool": tool.name,
+                    "reason": verdict.reason,
+                    "receipt": verdict.state(),
+                    "scene": self.identity.scene(),
+                },
+                hint="read the scene, decide what is already there, then call with a new id",
+            ),
+            trace,
+        )
 
     def _answer_now(
         self, tool: Tool, arguments: Mapping[str, Any], trace: Mapping[str, Any]
@@ -447,3 +564,15 @@ def _first(*values: float | None) -> float:
 
 def _new_operation_id() -> str:
     return f"op-{secrets.token_hex(OPERATION_ID_BYTES)}"
+
+
+def _digest(tool: Tool, arguments: Mapping[str, Any]) -> str | None:
+    """The digest an operation id is bound to, or nothing when there is none.
+
+    An argument JSON cannot carry has no stable digest, so the call runs with
+    no receipt rather than with one that could match the wrong arguments.
+    """
+    try:
+        return receipt_module.digest_call(tool.name, arguments)
+    except Exception:  # noqa: BLE001 - no receipt is better than a wrong one
+        return None

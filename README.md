@@ -82,6 +82,35 @@ other than this bridge, is not JSON, is over the size cap, or nests too deeply
 for an envelope. The bridge registers no built in API route, so the one that
 parses a posted form before any handler runs does not exist on its server.
 
+### Addressing a session, and sending a call twice
+
+A session has two handles. `session_id` is random, minted at start and never
+reused. `alias` is the readable name: a session with a scene is named after
+the scene file, a worker is `w1`, `w2` and so on, and two Houdinis on the same
+file get different names. Either handle addresses a session. The name never
+moves once it is settled, so a scene saved under a different name leaves the
+session's name out of date, which health and every reply say and nothing
+silently corrects.
+
+`scene_epoch` counts the times a session has replaced its scene, which is any
+open, new scene or reload. A call carrying an older epoch is refused with
+`SCENE_REPLACED` and a summary of the scene there is now, before the tool
+runs. A call addressed to a session whose process has gone is refused by the
+calling end with `SESSION_DEAD` and the id of whatever answers to the same
+name now. Nothing is sent to the new process.
+
+A call that changes the scene carries an `operation_id`. The bridge takes a
+receipt under that id before the work runs and finishes it with the answer, so
+the same id arriving again is answered from the receipt rather than doing the
+work twice. The same id with different arguments is `OPERATION_MISMATCH`, and
+an id whose first attempt left no answer is `OUTCOME_UNKNOWN` rather than a
+guess. Reads take no receipt.
+
+That is what makes a retry safe, and the only retry the client does by itself:
+one, on a lost reply (the connection closed, or the read ran out of time), and
+only for a call that carries an operation id, using that same id. A reply that
+arrived is never sent again, whatever it says.
+
 Start one in a headless Houdini:
 
 ```sh

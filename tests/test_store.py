@@ -32,6 +32,7 @@ from nscr_houdini_mcp.store import (
 )
 
 DEAD_PID = 2**22 - 1  # Above every system's pid range, so never a live process.
+LIVE_PID = os.getpid()  # A pid that is certainly running, on every system.
 
 
 class FakeClock:
@@ -190,18 +191,38 @@ def test_capabilities_survive_a_round_trip(store: Store) -> None:
 
 
 def test_an_alias_cannot_be_taken_twice_while_it_is_live(store: Store) -> None:
-    store.register_session("s1", kind="gui", pid=1, alias="shot-1")
+    store.register_session("s1", kind="gui", pid=LIVE_PID, alias="shot-1")
     with pytest.raises(AliasInUse):
-        store.register_session("s2", kind="gui", pid=2, alias="shot-1")
+        store.register_session("s2", kind="gui", pid=LIVE_PID, alias="shot-1")
 
 
 def test_an_alias_template_takes_the_lowest_free_name(store: Store) -> None:
-    first = store.register_session("s1", kind="gui", pid=1, alias_template="shot-{n}")
-    second = store.register_session("s2", kind="gui", pid=2, alias_template="shot-{n}")
+    first = store.register_session("s1", kind="gui", pid=LIVE_PID, alias_template="shot-{n}")
+    second = store.register_session("s2", kind="gui", pid=LIVE_PID, alias_template="shot-{n}")
     assert [first.alias, second.alias] == ["shot-1", "shot-2"]
     store.end_session("s1")
-    third = store.register_session("s3", kind="gui", pid=3, alias_template="shot-{n}")
+    third = store.register_session("s3", kind="gui", pid=LIVE_PID, alias_template="shot-{n}")
     assert third.alias == "shot-1"
+
+
+def test_a_name_held_by_a_session_that_crashed_is_free_again(store: Store) -> None:
+    """A crash cannot end its own row, so the next start ends it instead."""
+    store.register_session("s1", kind="hython", pid=DEAD_PID, alias="w1")
+
+    restarted = store.register_session("s2", kind="hython", pid=LIVE_PID, alias="w1")
+
+    assert restarted.alias == "w1"
+    assert store.get_session("s1").state == "gone"
+    assert store.resolve_session("w1").session_id == "s2"
+
+
+def test_sessions_whose_process_is_gone_can_be_tidied_up_on_their_own(store: Store) -> None:
+    store.register_session("s1", kind="hython", pid=LIVE_PID, alias="w1")
+    store.register_session("s2", kind="hython", pid=DEAD_PID, alias="w2")
+
+    assert store.reclaim_sessions() == ["s2"]
+    assert [record.session_id for record in store.list_sessions()] == ["s1"]
+    assert store.reclaim_sessions() == []
 
 
 def test_register_wants_exactly_one_of_alias_or_template(store: Store) -> None:

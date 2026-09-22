@@ -136,10 +136,19 @@ def default_registry(*, selfcheck: bool = False) -> ToolRegistry:
             "bridge.selfcheck",
             tool_module.selfcheck,
             mutating=True,
-            arguments=("sleep_s", "creates", "fail_at", "parent"),
+            arguments=(
+                "sleep_s",
+                "creates",
+                "fail_at",
+                "parent",
+                "save_hip",
+                "new_scene",
+                "load_hip",
+                "drop_reply",
+            ),
             context=True,
             label="self check",
-            summary="take a while, make nodes, fail where asked",
+            summary="take a while, make nodes, replace the scene or fail where asked",
         )
     registry.add(
         "scene.info",

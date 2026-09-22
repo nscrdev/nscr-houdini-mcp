@@ -745,6 +745,7 @@ class Store:
             raise ValueError("pass exactly one of alias or alias_template")
         now = self._now()
         with self._txn(write=True) as db:
+            self._reclaim_sessions(db, now)
             if alias_template is not None:
                 taken = {
                     row["alias"]
@@ -848,6 +849,32 @@ class Store:
                     (epoch, hip_path, session_id),
                 )
         return epoch
+
+    def reclaim_sessions(self) -> list[str]:
+        """Mark sessions gone whose process is not there any more.
+
+        A session that crashed cannot end its own row, and its alias would
+        otherwise stay taken for good. `register_session` does this for itself,
+        so this is for a caller that only wants to tidy up or to read an
+        honest list afterwards. Returns the ids that were marked.
+        """
+        with self._txn(write=True) as db:
+            return self._reclaim_sessions(db, self._now())
+
+    def _reclaim_sessions(self, db: sqlite3.Connection, now: float) -> list[str]:
+        rows = db.execute(
+            "SELECT session_id, pid FROM sessions WHERE state <> ?", (SESSION_GONE,)
+        ).fetchall()
+        reclaimed: list[str] = []
+        for row in rows:
+            if process_is_alive(row["pid"]):
+                continue
+            db.execute(
+                "UPDATE sessions SET state = ?, heartbeat_at = ? WHERE session_id = ?",
+                (SESSION_GONE, now, row["session_id"]),
+            )
+            reclaimed.append(row["session_id"])
+        return reclaimed
 
     def end_session(self, session_id: str) -> None:
         """Mark a session gone, which frees its alias for a later process."""

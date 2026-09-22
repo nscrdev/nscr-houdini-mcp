@@ -7,9 +7,11 @@ sees is a separate, smaller set built on top of these.
 - `scene.info` reads. It cooks nothing and changes nothing.
 - `node.create` mutates, so it runs on the main thread in a graphical session
   and inside one undo group in every session.
-- `bridge.selfcheck` mutates on purpose, and can be asked to take its time or
-  to fail part way, so the queue, the timeout and the rollback can be tried
-  against a real Houdini rather than only against a stand in.
+- `bridge.selfcheck` mutates on purpose, and can be asked to take its time, to
+  fail part way, or to throw the scene away, so the queue, the timeout, the
+  rollback, the scene epoch and the receipts can be tried against a real
+  Houdini rather than only against a stand in. It is registered in a worker
+  this project started to be driven and nowhere else.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from __future__ import annotations
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from nscr_houdini_mcp.bridge.errors import BridgeError, did_you_mean
@@ -171,11 +174,12 @@ def _set_parm(node: Any, name: str, value: Any) -> None:
 
 
 def selfcheck(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, Any]:
-    """Take a while, make a few nodes, and fail where asked to.
+    """Take a while, make a few nodes, fail or replace the scene where asked.
 
     It exists so the rules around a tool can be tried against a real Houdini:
-    the queue, the wait, the timeout, one undo entry per call, and the
-    rollback when a call fails after it has already changed the graph.
+    the queue, the wait, the timeout, one undo entry per call, the rollback
+    when a call fails after it has already changed the graph, the scene epoch,
+    and what a repeated operation id does.
     """
     hou = _houdini(context)
     sleep_s = _number(arguments.get("sleep_s"), "sleep_s", MAX_SLEEP_S)
@@ -199,12 +203,49 @@ def selfcheck(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, A
                 {"failed_at": index, "created_before_failing": list(made)},
             )
         made.append(parent.createNode("geo").path())
+
+    scene = _scene_moves(hou, arguments)
     return {
         "created": made,
         "slept_s": round(slept, 3),
         "stopped_early": context.should_stop(),
         "operation_id": context.operation_id,
+        **scene,
     }
+
+
+def _scene_moves(hou: Any, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Save, clear or load a scene, for the checks about scene identity.
+
+    Each one is what it says: `save_hip` writes the scene where it is told,
+    `new_scene` throws the scene away, and `load_hip` reads one back. The last
+    two replace the scene, which is what moves the session's scene epoch.
+    """
+    done: dict[str, Any] = {}
+    saved = arguments.get("save_hip")
+    if saved:
+        hou.hipFile.save(_hip_path(saved))
+        done["saved"] = str(hou.hipFile.path())
+    if arguments.get("new_scene"):
+        hou.hipFile.clear(suppress_save_prompt=True)
+        done["cleared"] = True
+    loaded = arguments.get("load_hip")
+    if loaded:
+        hou.hipFile.load(_hip_path(loaded), suppress_save_prompt=True)
+        done["loaded"] = str(hou.hipFile.path())
+    return done
+
+
+def _hip_path(value: Any) -> str:
+    """One scene file path, refused unless it names a scene file."""
+    text = str(value)
+    if not text.endswith(".hip") and not text.endswith(".hipnc"):
+        raise BridgeError(
+            "BAD_ARGUMENTS",
+            "a scene file path has to end in .hip or .hipnc",
+            {"suffix": Path(text).suffix},
+        )
+    return text
 
 
 def _sleep(seconds: float, context: ToolContext) -> float:

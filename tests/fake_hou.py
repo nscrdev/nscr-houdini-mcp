@@ -224,6 +224,70 @@ class MainThread:
             callback()
 
 
+class HipFileEventType:
+    """The event names this Houdini build reports, as read from it."""
+
+    BeforeClear = "BeforeClear"
+    AfterClear = "AfterClear"
+    BeforeLoad = "BeforeLoad"
+    AfterLoad = "AfterLoad"
+    BeforeMerge = "BeforeMerge"
+    AfterMerge = "AfterMerge"
+    BeforeSave = "BeforeSave"
+    AfterSave = "AfterSave"
+    BeforeQuit = "BeforeQuit"
+
+
+class HipFile:
+    """The scene file, and the events it reports in the order it reports them.
+
+    The orders here were read off a real headless session: a load reports a
+    clear of its own inside it, which is why one load is one scene epoch and
+    not two.
+    """
+
+    def __init__(self, scene: Scene, path: str) -> None:
+        self._scene = scene
+        self._path = path
+        self._callbacks: list[Any] = []
+
+    def path(self) -> str:
+        return self._path
+
+    def hasUnsavedChanges(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return True
+
+    def addEventCallback(self, callback: Any) -> None:  # noqa: N802 - the name is Houdini's
+        self._callbacks.append(callback)
+
+    def removeEventCallback(self, callback: Any) -> None:  # noqa: N802 - the name is Houdini's
+        if callback in self._callbacks:
+            self._callbacks.remove(callback)
+
+    def _fire(self, *events: str) -> None:
+        for event in events:
+            for callback in list(self._callbacks):
+                callback(event)
+
+    def clear(self, suppress_save_prompt: bool = False) -> None:
+        self._scene.empty()
+        self._fire(HipFileEventType.BeforeClear, HipFileEventType.AfterClear)
+
+    def load(self, path: str, suppress_save_prompt: bool = False) -> None:
+        self._fire(HipFileEventType.BeforeLoad, HipFileEventType.BeforeClear)
+        self._scene.empty()
+        self._path = str(path)
+        self._fire(HipFileEventType.AfterClear, HipFileEventType.AfterLoad)
+
+    def merge(self, path: str) -> None:
+        self._fire(HipFileEventType.BeforeMerge, HipFileEventType.AfterMerge)
+
+    def save(self, path: str | None = None) -> None:
+        if path:
+            self._path = str(path)
+        self._fire(HipFileEventType.BeforeSave, HipFileEventType.AfterSave)
+
+
 class Scene:
     """One fake session: a scene, an undo stack and a main thread."""
 
@@ -233,9 +297,15 @@ class Scene:
         self.ui = MainThread()
         self.root = Node(self, "", "root", None)
         self._counts: dict[str, int] = {}
+        self.empty()
+        self.undos.labels.clear()
+        self.hipFile = HipFile(self, "/Users/somebody/scenes/example.hip")
+
+    def empty(self) -> None:
+        """Throw the scene away and put the empty networks back."""
+        self.root._children.clear()
         for name in ("obj", "out", "mat", "stage"):
             self.root._children.append(Node(self, name, "network", self.root))
-        self.undos.labels.clear()
 
     def next_name(self, type_name: str) -> str:
         self._counts[type_name] = self._counts.get(type_name, 0) + 1
@@ -256,10 +326,8 @@ class Scene:
             node=self.node,
             undos=self.undos,
             ui=self.ui,
-            hipFile=SimpleNamespace(
-                path=lambda: "/Users/somebody/scenes/example.hip",
-                hasUnsavedChanges=lambda: True,
-            ),
+            hipFile=self.hipFile,
+            hipFileEventType=HipFileEventType,
             playbar=SimpleNamespace(frameRange=lambda: (1.0, 240.0)),
             applicationVersionString=lambda: "22.0.368",
             frame=lambda: 1.0,

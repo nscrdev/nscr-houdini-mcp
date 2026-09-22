@@ -40,16 +40,16 @@ nothing here offers a way around it.
 For the same reason, nothing drives a bridge from inside its own process. The
 caller is always another process.
 
-The order calls are served in, the wait and timeout budgets, the undo group
-and the error codes belong to the dispatcher. What is still not here: the
-receipt table for repeated operation ids, and the scene guard.
+The order calls are served in, the wait and timeout budgets, the undo group,
+the scene guard, the receipts for repeated operation ids and the error codes
+belong to the dispatcher. Who this session is and which scene it is holding
+belong to the identity.
 """
 
 from __future__ import annotations
 
 import atexit
 import os
-import re
 import secrets
 import threading
 import time
@@ -59,7 +59,16 @@ from pathlib import Path
 from typing import Any
 
 from nscr_houdini_mcp import store as store_module
-from nscr_houdini_mcp.bridge import host, liveness, marshal, registry, signing
+from nscr_houdini_mcp.bridge import (
+    host,
+    liveness,
+    marshal,
+    registry,
+    signing,
+)
+from nscr_houdini_mcp.bridge import (
+    receipts as receipt_module,
+)
 from nscr_houdini_mcp.bridge.dispatch import DEFAULT_TIMEOUT_S, DEFAULT_WAIT_S, Dispatcher
 from nscr_houdini_mcp.bridge.envelope import (
     MAX_DEPTH,
@@ -72,6 +81,7 @@ from nscr_houdini_mcp.bridge.envelope import (
     parse_envelope,
 )
 from nscr_houdini_mcp.bridge.handlers import ToolRegistry, default_registry
+from nscr_houdini_mcp.bridge.identity import Identity, alias_template
 from nscr_houdini_mcp.bridge.net import (
     DEFAULT_PORT_RANGE,
     LOOPBACK,
@@ -141,14 +151,18 @@ def houdini_lock() -> threading.Lock:
     return _HOUDINI_LOCK
 
 
-# Alias templates. A worker is addressed by number, a session with a scene by
-# the scene name, and a scene with no name yet by a plain word.
-WORKER_ALIAS = "w{n}"
-UNTITLED_ALIAS = "scene-{n}"
-
-ALIAS_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
-
 LOG_DIR_NAME = "logs"
+
+# The self check argument that holds an answer back until the caller has given
+# up on it, so the lost reply case can be tried end to end. It is only ever
+# read in a session that carries the self check tool, which is a worker this
+# project started to be driven.
+DROP_REPLY_ARG = "drop_reply"
+
+# How long such an answer is held. Longer than any sensible client read
+# budget, and short enough that the thread is not parked for the session's
+# whole life.
+DEFAULT_DROP_REPLY_S = 30.0
 
 
 class BridgeStartError(Exception):
@@ -178,6 +192,8 @@ class BridgeConfig:
     # will not stop does not get to keep the process alive for ever.
     owns_process: bool = False
     shutdown_grace_s: float = DEFAULT_SHUTDOWN_GRACE_S
+    # How long an answer is held when a call asks for it to be dropped.
+    drop_reply_s: float = DEFAULT_DROP_REPLY_S
     facts: dict[str, Any] = field(default_factory=dict)
 
 
@@ -210,8 +226,17 @@ class Bridge:
         self.pid = os.getpid()
         self.pid_start = liveness.process_start_stamp()
         self.session_id = secrets.token_hex(SESSION_ID_BYTES)
-        self.scene_epoch = 0
-        self.alias: str | None = None
+        # The name is settled once, at start, and never changes afterwards.
+        # A scene saved under another name makes the name out of date, which
+        # every reply says, rather than moving it under a caller's feet.
+        self.identity = Identity(
+            session_id=self.session_id,
+            kind=self.kind,
+            hip_path=self.facts.get("hip_path"),
+            tracks_hip=self.kind == host.GUI and not self.config.alias,
+            on_change=self._scene_replaced,
+            log=self._log,
+        )
         self.port: int | None = None
         self.started_at: float | None = None
         self.privacy: dict[str, Any] | None = None
@@ -235,7 +260,10 @@ class Bridge:
             lock=_HOUDINI_LOCK,
             kind=self.kind,
             session_id=self.session_id,
-            scene_epoch=lambda: self.scene_epoch,
+            identity=self.identity,
+            receipts=receipt_module.Receipts(
+                self._open_store, session_id=self.session_id, owner_pid=self.pid, log=self._log
+            ),
             log=self._log,
             main_loop=self.main_loop,
             stopping=self.stopping,
@@ -246,7 +274,33 @@ class Bridge:
         self._heartbeat_stop = threading.Event()
         self._heartbeat: threading.Thread | None = None
         self._remove_quit_hook = None
+        self._entry: dict[str, Any] = {}
         self.problems: list[str] = []
+
+    # Section: identity
+
+    @property
+    def alias(self) -> str | None:
+        """The readable name this session was given when it started."""
+        return self.identity.alias
+
+    @property
+    def scene_epoch(self) -> int:
+        """How many times this process has replaced its scene."""
+        return self.identity.scene_epoch
+
+    def _scene_replaced(self, epoch: int, hip_path: str | None) -> None:
+        """Write the new epoch where other processes read it.
+
+        Called from Houdini's own scene event, on the main thread, so it does
+        the least it can: one store row and one file.
+        """
+        self._log(f"the scene was replaced, epoch {epoch}")
+        with self._open_store() as store:
+            store.bump_scene_epoch(self.session_id, hip_path=hip_path)
+        if self._entry:
+            self._entry = {**self._entry, "scene_epoch": epoch, "hip_path": hip_path}
+            registry.write_entry(self.home, self._entry)
 
     # Lifetime
 
@@ -292,6 +346,10 @@ class Bridge:
         self._heartbeat.start()
         atexit.register(self.stop)
         self._remove_quit_hook = host.install_quit_hook(self.stop)
+        # From here the session follows its own scene: the first summary is
+        # taken now, and the epoch moves whenever the scene is replaced.
+        self.identity.refresh()
+        self.identity.watch()
         return record
 
     def stop(self) -> list[str]:
@@ -316,6 +374,7 @@ class Bridge:
         self._leave_anyway()
         hook, self._remove_quit_hook = self._remove_quit_hook, None
         for what, step in (
+            ("stop following the scene", self.identity.unwatch),
             ("take the quit hook off", hook),
             ("stop being called at exit", lambda: atexit.unregister(self.stop)),
             ("end the session row", self._end_session_row),
@@ -405,6 +464,8 @@ class Bridge:
                         "pid": self.pid,
                         "port": self.port,
                         "scene_epoch": self.scene_epoch,
+                        "scene": self.identity.scene(),
+                        "alias_drift": self.identity.drift(),
                         "started_at": self.started_at,
                         "heartbeat_age_s": round(max(0.0, now - self._heartbeat_at), 3),
                         "privacy": self.privacy,
@@ -453,7 +514,36 @@ class Bridge:
                     "scene_epoch": self.scene_epoch,
                 },
             )
+        if self._drop_wanted(envelope):
+            self._hold_back(envelope)
         return self._answer(request, reply)
+
+    # Losing an answer on purpose
+
+    def _drop_wanted(self, envelope: Envelope) -> bool:
+        """Whether this call asked for its answer to go missing.
+
+        Only a session carrying the self check tool will do it, which is a
+        worker this project started to be driven. A session somebody is
+        working in never has it, so nothing a user does can reach this.
+        """
+        if "bridge.selfcheck" not in self.tools:
+            return False
+        return bool(envelope.arguments.get(DROP_REPLY_ARG))
+
+    def _hold_back(self, envelope: Envelope) -> None:
+        """Hold an answer until the caller has stopped waiting for it.
+
+        This is the failure the receipts exist for: the work has run and
+        changed the scene, and the caller learns nothing. It waits on the
+        shutdown flag rather than sleeping, so a session told to stop is not
+        held open by it.
+        """
+        self._log(
+            f"holding back the answer to {envelope.tool} for "
+            f"{self.config.drop_reply_s:g} seconds, as the call asked"
+        )
+        self.stopping.wait(self.config.drop_reply_s)
 
     # Dispatch
 
@@ -596,35 +686,29 @@ class Bridge:
                     "privacy": self.privacy,
                 },
             )
-        self.alias = record.alias
-        registry.write_entry(
-            self.home,
-            {
-                "session_id": self.session_id,
-                "alias": record.alias,
-                "kind": self.kind,
-                "pid": self.pid,
-                "pid_start": self.pid_start,
-                "port": port,
-                "address": self.config.address,
-                "health_path": HEALTH_PATH,
-                "call_path": CALL_PATH,
-                "token": self._token,
-                "scene_epoch": self.scene_epoch,
-                "started_at": self.started_at,
-                **self.facts,
-            },
-        )
+        self.identity.settle_alias(record.alias)
+        self._entry = {
+            "session_id": self.session_id,
+            "alias": record.alias,
+            "kind": self.kind,
+            "pid": self.pid,
+            "pid_start": self.pid_start,
+            "port": port,
+            "address": self.config.address,
+            "health_path": HEALTH_PATH,
+            "call_path": CALL_PATH,
+            "token": self._token,
+            "scene_epoch": self.scene_epoch,
+            "started_at": self.started_at,
+            **self.facts,
+        }
+        registry.write_entry(self.home, self._entry)
         return record
 
     def _alias_template(self) -> str:
         if self.config.alias_template:
             return self.config.alias_template
-        if self.kind != host.GUI:
-            return WORKER_ALIAS
-        hip = self.facts.get("hip_path")
-        stem = ALIAS_SAFE.sub("-", Path(hip).stem).strip("-") if hip else ""
-        return f"{stem}-{{n}}" if stem else UNTITLED_ALIAS
+        return alias_template(self.kind, self.facts.get("hip_path"))
 
     def _open_store(self) -> store_module.Store:
         """A store handle for this thread. Handles are never shared."""

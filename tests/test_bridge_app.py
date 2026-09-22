@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -160,6 +161,103 @@ def test_a_session_id_is_random_and_the_alias_comes_back(tmp_path: Path) -> None
         assert third.session_id not in (first.session_id, second.session_id)
     finally:
         third.stop()
+
+
+def test_two_sessions_on_the_same_scene_get_different_ids_and_names(tmp_path: Path) -> None:
+    facts = {"hip_path": str(tmp_path / "shot_010.hip")}
+    first, _ = make_bridge(tmp_path, kind="gui", facts=facts)
+    second, _ = make_bridge(tmp_path, kind="gui", facts=facts)
+    first.start()
+    second.start()
+    try:
+        assert first.session_id != second.session_id
+        assert [first.alias, second.alias] == ["shot_010-1", "shot_010-2"]
+    finally:
+        second.stop()
+        first.stop()
+
+
+def test_a_replaced_scene_is_written_where_other_processes_read_it(tmp_path: Path) -> None:
+    bridge, backend = make_bridge(tmp_path)
+    bridge.start()
+    try:
+        bridge.identity.bump("cleared")
+
+        assert bridge.scene_epoch == 1
+        with store_module.Store(tmp_path / store_module.STORE_FILE_NAME) as store:
+            assert store.get_session(bridge.session_id).scene_epoch == 1
+        entry = registry.read_entry(registry.entry_path(tmp_path, bridge.session_id))
+        assert entry["scene_epoch"] == 1
+        data = body_of(send(bridge, backend, HEALTH_PATH))["data"]
+        assert data["scene_epoch"] == 1
+        assert data["scene"]["changed"] == "cleared"
+    finally:
+        bridge.stop()
+
+
+def test_a_call_written_against_a_scene_that_has_gone_is_refused(tmp_path: Path) -> None:
+    bridge, backend = make_bridge(tmp_path)
+    bridge.start()
+    try:
+        bridge.identity.bump("loaded")
+        reply = send(bridge, backend, CALL_PATH, envelope(scene_epoch=0))
+        payload = body_of(reply)
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "SCENE_REPLACED"
+        assert payload["error"]["details"]["scene"]["scene_epoch"] == 1
+    finally:
+        bridge.stop()
+
+
+def test_an_answer_can_be_held_back_so_the_lost_reply_case_can_be_tried(tmp_path: Path) -> None:
+    """The work runs, and the caller is left with nothing. That is the point.
+
+    Only a session carrying the self check tool will do it, which is a worker
+    this project started to be driven.
+    """
+    tools = ToolRegistry()
+    ran: list[str] = []
+    tools.add(
+        "bridge.selfcheck",
+        lambda arguments: ran.append("once") or {"created": ["/obj/geo1"]},
+        arguments=("drop_reply",),
+        mutating=True,
+    )
+    bridge, backend = make_bridge(tmp_path, drop_reply_s=0.2)
+    bridge.tools = tools
+    bridge.dispatcher.tools = tools
+    bridge.start()
+    try:
+        began = time.monotonic()
+        send(
+            bridge,
+            backend,
+            CALL_PATH,
+            envelope(tool="bridge.selfcheck", arguments={"drop_reply": True}),
+        )
+        took = time.monotonic() - began
+        assert took >= 0.2
+        assert ran == ["once"]
+    finally:
+        bridge.stop()
+
+
+def test_an_answer_is_only_held_back_where_the_self_check_lives(tmp_path: Path) -> None:
+    bridge, backend = make_bridge(tmp_path, drop_reply_s=30.0)
+    bridge.start()
+    try:
+        began = time.monotonic()
+        reply = send(
+            bridge,
+            backend,
+            CALL_PATH,
+            envelope(arguments={"echo": 1, "drop_reply": True}),
+        )
+        assert time.monotonic() - began < 5.0
+        assert body_of(reply)["ok"] is False
+        assert body_of(reply)["error"]["code"] == "BAD_ARGUMENTS"
+    finally:
+        bridge.stop()
 
 
 def test_health_answers_from_memory(tmp_path: Path) -> None:

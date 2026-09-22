@@ -9,10 +9,22 @@ things it will not do:
   same token, and a reply that does not match is treated as coming from
   something other than the bridge.
 - It never talks to a session whose process has gone. A session file outlives
-  a crash, and the port in it is free for anything to take.
+  a crash, and the port in it is free for anything to take. A call addressed
+  to a session id that is not there is refused here, before anything is sent,
+  with the id of the session now answering to the same name. The dead process
+  cannot say any of that for itself, and the live one must never be handed
+  work that was written for its predecessor.
 
 It sends no `Origin` and no `Referer`, which is what lets the bridge refuse
 anything that does.
+
+Retries. A read may be sent again as often as the caller likes. A call that
+changes the scene is sent again only when it carries an operation id, and only
+with the same id, because that is what makes the second send a receipt lookup
+in the bridge rather than the same work done twice. One retry, on a lost reply
+alone: the connection closed or the read ran out of time, which are the cases
+where the work may well have happened and the answer never arrived. A reply
+that arrived and said something is never retried, whatever it said.
 
 Standard library only: the same module is imported inside Houdini.
 """
@@ -22,10 +34,12 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge import registry, signing
 from nscr_houdini_mcp.bridge.net import LOOPBACK
 from nscr_houdini_mcp.bridge.serving import CALL_PATH, HEALTH_PATH, JSON_TYPE
@@ -46,6 +60,43 @@ class BridgeNotAuthentic(Exception):
 
 class SessionGone(Exception):
     """The process that owned this session file is not there any more."""
+
+
+class SessionDead(SessionGone):
+    """That session id belonged to a process that has gone.
+
+    It carries what a caller needs to carry on: the name the dead session
+    answered to, and the id of the session answering to that name now, when
+    there is one. Nothing was sent.
+    """
+
+    CODE = "SESSION_DEAD"
+
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        alias: str | None = None,
+        live_session_id: str | None = None,
+    ) -> None:
+        super().__init__(f"session {session_id} is not there any more")
+        self.session_id = session_id
+        self.alias = alias
+        self.live_session_id = live_session_id
+
+    def details(self) -> dict[str, Any]:
+        """The recovery data, shaped like the details of a bridge error."""
+        return {
+            "code": self.CODE,
+            "session_id": self.session_id,
+            "alias": self.alias,
+            "live_session_id": self.live_session_id,
+            "hint": (
+                "address the session answering to that name"
+                if self.live_session_id
+                else "start a session, then send the call again"
+            ),
+        }
 
 
 class Answer(NamedTuple):
@@ -79,12 +130,52 @@ class Session(NamedTuple):
         )
 
     @classmethod
-    def open(cls, home: Path, handle: str) -> Session:
-        """Find a live session by id or alias, or say it is gone."""
-        entry = registry.find_entry(Path(home), handle)
-        if entry is None:
+    def open(cls, home: Path, handle: str, *, store_path: Path | None = None) -> Session:
+        """Find a live session by id or alias, or say what became of it.
+
+        A handle that names a session this machine has seen before, and whose
+        process is gone, raises `SessionDead` with the id of whatever answers
+        to the same name now. A handle nothing has ever heard of raises
+        `SessionGone`.
+        """
+        home = Path(home)
+        entry = registry.find_entry(home, handle)
+        if entry is not None:
+            return cls.from_entry(entry)
+        known = _remembered(home, handle, store_path)
+        if known is None:
             raise SessionGone(f"no live session {handle}")
-        return cls.from_entry(entry)
+        alias, live_id = known
+        raise SessionDead(handle, alias=alias, live_session_id=live_id)
+
+
+def _remembered(home: Path, handle: str, store_path: Path | None) -> tuple[str, str | None] | None:
+    """What the coordination store remembers about a handle that is not live.
+
+    Returns the name that handle answered to and the id of the live session
+    under that name, or nothing when the store has never heard of it. The
+    store is asked to mark the sessions whose processes are gone first, so a
+    session that crashed does not hold its name against its successor.
+    """
+    path = Path(store_path) if store_path is not None else Path(home) / store_module.STORE_FILE_NAME
+    if not path.exists():
+        return None
+    try:
+        with store_module.Store(path) as store:
+            store.reclaim_sessions()
+            record = store.get_session(handle)
+            if record is None:
+                return None
+            live = store.resolve_session(record.alias)
+            live_id = None if live is None or live.session_id == handle else live.session_id
+            return record.alias, live_id
+    except store_module.StoreError:
+        return None
+
+
+def new_operation_id() -> str:
+    """One id for one mutating call, and for every retry of that same call."""
+    return f"op-{uuid.uuid4().hex}"
 
 
 def request(
@@ -171,6 +262,7 @@ def call(
     timeout_s: float | None = None,
     skip_if_busy: bool | None = None,
     http_timeout_s: float | None = None,
+    retry_lost_reply: bool = True,
     **rest: Any,
 ) -> Answer:
     """Send one request envelope.
@@ -183,6 +275,12 @@ def call(
     `http_timeout_s` is how long this end waits on the socket. It defaults to
     a little more than both, because a client that gives up before the bridge
     answers learns nothing and leaves the work running.
+
+    A lost reply is sent once more when, and only when, the call carries an
+    `operation_id`. The second send carries the same id, so the bridge answers
+    it from the receipt the first send took rather than doing the work again.
+    Without an id there is no retry: repeating a mutation blind is how one
+    request becomes two nodes.
     """
     envelope: dict[str, Any] = {"tool": tool, "arguments": dict(arguments or {})}
     if session_id is not None:
@@ -202,7 +300,27 @@ def call(
             DEFAULT_TIMEOUT_S, (wait_s or 0.0) + (timeout_s or 0.0) + SOCKET_MARGIN_S
         )
     rest.setdefault("timeout_s", http_timeout_s)
+    try:
+        return post(session, CALL_PATH, envelope, **rest)
+    except BridgeUnreachable:
+        if not (retry_lost_reply and operation_id):
+            raise
     return post(session, CALL_PATH, envelope, **rest)
+
+
+def mutate(
+    session: Session,
+    tool: str,
+    *,
+    operation_id: str | None = None,
+    **rest: Any,
+) -> Answer:
+    """Send one call that changes the scene, safe to lose the answer to.
+
+    It mints an operation id when the caller passes none, so the call is one
+    the bridge can recognise if it ever arrives twice.
+    """
+    return call(session, tool, operation_id=operation_id or new_operation_id(), **rest)
 
 
 def _check_answer(session: Session, nonce: str, answer: Answer) -> None:
