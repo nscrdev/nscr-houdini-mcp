@@ -1694,7 +1694,7 @@ class Store:
         cutoff = self._now() - max_age_s
         with self._txn(write=True) as db:
             return db.execute(
-                "UPDATE versions SET run_id = NULL WHERE run_id IS NOT NULL AND created_at < ?"
+                "UPDATE versions SET run_id = NULL WHERE run_id IS NOT NULL AND created_at <= ?"
                 " AND run_id NOT IN (SELECT run_id FROM runs)",
                 (cutoff,),
             ).rowcount

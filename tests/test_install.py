@@ -546,7 +546,8 @@ def test_the_snippet_names_the_source_folder_it_was_printed_from(
 ) -> None:
     assert cli.main(["bridge", "snippet"]) == 0
     printed = capsys.readouterr().out
-    assert str(install_module.source_root()) in printed
+    # The snippet prints the folder as a Python string, so compare the same way.
+    assert repr(str(install_module.source_root())) in printed
     assert "from nscr_houdini_mcp.bridge import Bridge" in printed
     assert "bridge.start()" in printed
     # It has to run as it stands in a Houdini, so it has to parse here.
