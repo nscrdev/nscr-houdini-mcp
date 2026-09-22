@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import socket
+import threading
+import time
 
 import pytest
 
@@ -37,6 +39,25 @@ def test_this_machine_does_not_list_its_loopback_as_an_outside_address() -> None
         assert not address.startswith("127.")
         assert address not in ("::1", "0.0.0.0", "::")
         assert not address.lower().startswith("fe80")
+
+
+def test_a_name_lookup_that_does_not_answer_is_not_waited_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = threading.Event()
+
+    def stuck(*_args: object, **_kwargs: object) -> list:
+        release.wait(30.0)
+        raise OSError("the resolver gave up")
+
+    monkeypatch.setattr(net.socket, "getaddrinfo", stuck)
+    started = time.monotonic()
+    try:
+        assert net.own_name_addresses(timeout_s=0.2) == []
+        net.outward_addresses()
+    finally:
+        release.set()
+    assert time.monotonic() - started < 2 * net.NAME_LOOKUP_TIMEOUT_S + 1.0
 
 
 def test_a_port_bound_to_loopback_answers_there_and_nowhere_else() -> None:

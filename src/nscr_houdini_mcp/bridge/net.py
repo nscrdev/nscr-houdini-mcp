@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import socket
 import sys
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -49,6 +50,12 @@ DEFAULT_PORT_RANGE = (18100, 18199)
 ROUTE_PROBE_ADDRESS = ("192.0.2.1", 9)
 
 CONNECT_TIMEOUT_S = 0.4
+
+# How long the machine's own name gets to resolve. Where no resolver knows the
+# name, the lookup only ends when the resolver gives up, which on a macOS build
+# machine takes about half a minute, and every bridge start would wait for it.
+# The route probe has already found the address that matters by then.
+NAME_LOOKUP_TIMEOUT_S = 1.0
 
 
 class PortUnavailable(Exception):
@@ -112,12 +119,7 @@ def outward_addresses() -> list[str]:
             found.append(probe.getsockname()[0])
         except OSError:
             pass
-    try:
-        infos = socket.getaddrinfo(socket.gethostname(), None, type=socket.SOCK_STREAM)
-    except OSError:
-        infos = []
-    for info in infos:
-        found.append(info[4][0])
+    found.extend(own_name_addresses())
     keep: list[str] = []
     for address in found:
         plain = address.split("%", 1)[0]
@@ -128,6 +130,27 @@ def outward_addresses() -> list[str]:
         if plain not in keep:
             keep.append(plain)
     return keep
+
+
+def own_name_addresses(*, timeout_s: float = NAME_LOOKUP_TIMEOUT_S) -> list[str]:
+    """What this machine's own name resolves to, or nothing if that is slow.
+
+    The lookup runs on a daemon thread of its own, so a resolver that takes
+    half a minute to give up is left to do so without holding up the caller.
+    """
+    found: list[str] = []
+
+    def look_up() -> None:
+        try:
+            infos = socket.getaddrinfo(socket.gethostname(), None, type=socket.SOCK_STREAM)
+        except OSError:
+            return
+        found.extend(str(info[4][0]) for info in infos)
+
+    lookup = threading.Thread(target=look_up, name="nscr-mcp-name-lookup", daemon=True)
+    lookup.start()
+    lookup.join(timeout_s)
+    return [] if lookup.is_alive() else found
 
 
 def can_connect(address: str, port: int, *, timeout_s: float = CONNECT_TIMEOUT_S) -> bool:
