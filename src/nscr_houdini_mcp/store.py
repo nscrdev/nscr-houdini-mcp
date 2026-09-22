@@ -1537,6 +1537,36 @@ class Store:
             if written.rowcount == 0:
                 raise UnknownRecord(f"no version {version} for {kind} {name}")
 
+    def disown_version(self, *, kind: str, name: str, hip_family: str, version: int) -> bool:
+        """Take a run's name off a number it did not get to use.
+
+        The number stays taken. Whoever won the race owns the folder it points
+        at, so handing the number out again would only fail in the same way.
+        What is dropped is the claim that this run wrote it.
+        """
+        with self._txn(write=True) as db:
+            written = db.execute(
+                "UPDATE versions SET run_id = NULL WHERE kind = ? AND name = ? AND"
+                " hip_family = ? AND version = ?",
+                (kind, name, hip_family, version),
+            )
+            return written.rowcount > 0
+
+    def reap_versions(self, max_age_s: float) -> int:
+        """Clear the run id from old numbers whose run never arrived.
+
+        A process that stops between taking a number and recording its run
+        leaves a name pointing at nothing. After the grace period the number
+        keeps its place in the sequence and loses the name. Returns the count.
+        """
+        cutoff = self._now() - max_age_s
+        with self._txn(write=True) as db:
+            return db.execute(
+                "UPDATE versions SET run_id = NULL WHERE run_id IS NOT NULL AND created_at < ?"
+                " AND run_id NOT IN (SELECT run_id FROM runs)",
+                (cutoff,),
+            ).rowcount
+
     def latest_version(self, *, kind: str, name: str, hip_family: str) -> int:
         """Highest number handed out so far, or 0 when there is none."""
         row = self._read_one(
