@@ -159,11 +159,12 @@ class Dispatcher:
         return self._running
 
     def state(self) -> dict[str, Any]:
-        """Busy state for the health endpoint. Takes no lock and reads no scene."""
+        """Busy state for the health endpoint. Reads no scene and no `hou`."""
         running = self._running
+        gate = self._gate.state()
         return {
             "busy": running is not None,
-            "queued": self._gate.waiting(),
+            "queued": gate["waiting"],
             "main_thread": self._main_thread_state(),
             "current_op": None if running is None else running.tool,
             "current_op_id": None if running is None else running.operation_id,
