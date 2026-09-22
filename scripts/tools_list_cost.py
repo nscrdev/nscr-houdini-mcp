@@ -5,7 +5,8 @@ How it counts
 -------------
 1. Build the server and ask it for its tool list.
 2. Serialise each tool the way the protocol sends it: the JSON object a client
-   receives, with `None` fields dropped and no extra whitespace.
+   receives, with the wire names (`inputSchema`, not `input_schema`), `None`
+   fields dropped and no extra whitespace.
 3. Estimate tokens as `ceil(len(json_text) / 4)`.
 
 The divisor of 4 is a rough characters-per-token figure for English prose and
@@ -13,8 +14,10 @@ JSON. It is an estimate, not a tokeniser: treat it as a budget signal and as a
 number to watch across commits, not as an exact count. The byte figures are
 exact.
 
-Exit code is 1 when `--max-tokens` is given and the estimate goes over it, so
-the script can gate a build.
+The total is reported against the budget for the whole tool list. Going over
+the budget is reported, not failed: a schema is never thinned to fit it. Exit
+code is 1 only when `--max-tokens` is given and the estimate goes over that, so
+the script can gate a build when someone asks it to.
 """
 
 from __future__ import annotations
@@ -32,6 +35,9 @@ from nscr_houdini_mcp.server import build_server  # noqa: E402
 
 CHARS_PER_TOKEN = 4
 
+# The goal for the whole `tools/list` payload.
+BUDGET_TOKENS = 2500
+
 
 def estimate_tokens(text: str) -> int:
     return math.ceil(len(text) / CHARS_PER_TOKEN)
@@ -39,7 +45,7 @@ def estimate_tokens(text: str) -> int:
 
 def tool_payloads() -> list[dict]:
     tools = asyncio.run(build_server().list_tools())
-    return [tool.model_dump(mode="json", exclude_none=True) for tool in tools]
+    return [tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in tools]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -59,12 +65,20 @@ def main(argv: list[str] | None = None) -> int:
     rows.sort(key=lambda row: row["tokens"], reverse=True)
 
     if args.json:
-        report = {"total_tokens": total, "total_bytes": len(whole), "tools": rows}
+        report = {
+            "total_tokens": total,
+            "total_bytes": len(whole),
+            "budget_tokens": BUDGET_TOKENS,
+            "tools": rows,
+        }
         print(json.dumps(report, indent=2))
     else:
         print(f"tools: {len(rows)}")
         print(f"payload bytes: {len(whole)}")
         print(f"estimated tokens: {total}  (bytes / {CHARS_PER_TOKEN}, rounded up)")
+        share = total * 100 / BUDGET_TOKENS
+        state = "within" if total <= BUDGET_TOKENS else "OVER"
+        print(f"budget: {BUDGET_TOKENS} tokens, {share:.0f} percent used, {state} budget")
         if rows:
             width = max(len(row["name"]) for row in rows)
             print()
