@@ -135,6 +135,10 @@ def test_a_lost_reply_is_sent_again_under_the_same_operation_id(monkeypatch) -> 
     assert len(attempts.sent) == 2
     # The same id, so the bridge answers the second send from its receipt.
     assert {sent["operation_id"] for sent in attempts.sent} == {"op-1"}
+    # And the second send waits for its turn, because the work the first one
+    # started may still be holding the session.
+    assert "wait_s" not in attempts.sent[0]
+    assert attempts.sent[1]["wait_s"] == client.RETRY_WAIT_S
 
 
 def test_a_call_with_no_operation_id_is_never_sent_again(monkeypatch) -> None:

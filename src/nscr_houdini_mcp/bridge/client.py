@@ -49,6 +49,11 @@ DEFAULT_TIMEOUT_S = 10.0
 # How much longer than the bridge budgets this end waits on the socket.
 SOCKET_MARGIN_S = 10.0
 
+# How long the second send of a lost call waits for its turn. The work the
+# first send started is often still running, and queueing behind it is what
+# gets the answer rather than a busy session.
+RETRY_WAIT_S = 30.0
+
 
 class BridgeUnreachable(Exception):
     """Nothing answered on that port."""
@@ -281,6 +286,14 @@ def call(
     it from the receipt the first send took rather than doing the work again.
     Without an id there is no retry: repeating a mutation blind is how one
     request becomes two nodes.
+
+    What a retry can meet. A reply is lost most often because this end gave up
+    on the socket first, and the work the first send started is then still
+    running in the session. The second send has to queue behind it, so it can
+    come back `SESSION_BUSY` rather than with the answer, and the answer is in
+    the receipt as soon as the work ends. That is why the retry asks for a
+    longer turn than the first send did, and why a caller that still gets
+    `SESSION_BUSY` should send the same id again rather than start afresh.
     """
     envelope: dict[str, Any] = {"tool": tool, "arguments": dict(arguments or {})}
     if session_id is not None:
@@ -305,6 +318,11 @@ def call(
     except BridgeUnreachable:
         if not (retry_lost_reply and operation_id):
             raise
+    # The work the first send started may still be holding the session, so
+    # the retry waits for its turn instead of being told at once that the
+    # session is busy, and waits on the socket long enough to hear the answer.
+    envelope["wait_s"] = max(wait_s or 0.0, RETRY_WAIT_S)
+    rest["timeout_s"] = max(rest["timeout_s"], envelope["wait_s"] + SOCKET_MARGIN_S)
     return post(session, CALL_PATH, envelope, **rest)
 
 

@@ -111,6 +111,12 @@ one, on a lost reply (the connection closed, or the read ran out of time), and
 only for a call that carries an operation id, using that same id. A reply that
 arrived is never sent again, whatever it says.
 
+A reply is usually lost because this end gave up on the socket first, so the
+work is often still running when the second send arrives. That send queues
+behind it, asking for a longer turn than the first, and can still come back
+`SESSION_BUSY`. The answer is in the receipt as soon as the work ends, so the
+way on from there is the same id again, not a fresh call.
+
 Start one in a headless Houdini:
 
 ```sh
