@@ -63,6 +63,15 @@ Run the server on stdio:
 nscr-houdini-mcp
 ```
 
+Three tools so far. `hou_ping` says which session a call reaches and that it
+answers. `hou_sessions` lists every session with its state (`live`, `busy`,
+`unresponsive`, `crashed` or `gone`) and starts and stops workers under the
+pool's rules; it never closes a Houdini with a user interface. `hou_scene`
+reads the scene, opens a file and reports what it could not resolve as data,
+saves in place, and saves the next `<name>_v###` without writing over
+anything. A scene open in a user interface with unsaved changes is not
+replaced unless the call says to throw them away.
+
 ### The Houdini side
 
 `nscr_houdini_mcp.bridge` runs inside Houdini's own Python. It serves two
@@ -197,6 +206,10 @@ nscr-houdini-mcp bridge worker reserve w1 --job job-1
 nscr-houdini-mcp bridge worker release w1
 nscr-houdini-mcp bridge worker stop w1
 ```
+
+A worker started from a client through `hou_sessions` takes `pool_cap`,
+`hython` or `houdini_build`, and `worker_ports` from `config.toml`, and so
+does `worker start` for any flag it is not given.
 
 Three workers may run at once by default. The slot is taken in one
 transaction in the coordination store, which counts the workers that are

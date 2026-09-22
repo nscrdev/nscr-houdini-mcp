@@ -125,7 +125,7 @@ def test_a_protocol_client_lists_the_tools_and_pings_a_worker(
     )
 
     assert seen["protocol"] == revision
-    assert [tool.name for tool in seen["tools"]] == ["hou_ping", "hou_sessions"]
+    assert [tool.name for tool in seen["tools"]] == ["hou_ping", "hou_sessions", "hou_scene"]
     unnamed, by_alias, unknown = seen["results"]
 
     for result in (unnamed, by_alias):
