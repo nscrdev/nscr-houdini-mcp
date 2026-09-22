@@ -18,8 +18,13 @@ Two handles and one counter, and the rules that keep them honest.
 How the counter is kept. Houdini reports scene changes through the hip file
 event callbacks, and in this build a load reports four of them: `BeforeLoad`,
 then `BeforeClear` and `AfterClear` for the scene it is dropping, then
-`AfterLoad`. Counting clears and loads separately would count one load twice,
-so a load holds the clear inside it and the epoch moves once.
+`AfterLoad`. Counting each of those would count one load twice, so the count
+moves on the clear and the load that follows only says what the scene is now.
+
+The count moves on the clear rather than on the load because that is the
+moment the old scene stops existing. A load that fails after clearing never
+reports `AfterLoad` at all, and a session left with an empty scene must not go
+on telling callers that their paths are still good.
 
 A merge is left alone on purpose. It adds to the scene rather than replacing
 it, so every path a caller is holding still means what it meant.
@@ -54,6 +59,12 @@ CONTEXTS = ("/obj", "/out", "/stage", "/mat")
 # Why the epoch moved, as the reply says it.
 LOADED = "loaded"
 CLEARED = "cleared"
+
+# How long after a load starts its clear is still read as part of that load.
+# A load reports its clear within moments of starting, so this is a wide
+# margin, and it is a window rather than a flag because a load that fails
+# reports nothing at all and must not leave the next clear uncounted.
+LOADING_WINDOW_S = 120.0
 
 
 def hip_stem(hip_path: str | None) -> str:
@@ -115,7 +126,8 @@ class Identity:
         self._hou = hou if hou is not None else host.houdini()
         self._on_change = on_change
         self._log = log or (lambda text: None)
-        self._loading = False
+        self._load_began: float | None = None
+        self._counted_the_clear = False
         self._remove_watch: Callable[[], None] | None = None
 
     # Section: handles
@@ -229,9 +241,22 @@ class Identity:
 
     def bump(self, reason: str) -> int:
         """Count one scene replacement and take a fresh summary."""
+        return self._replaced(reason, count=True)
+
+    def settled(self, reason: str) -> int:
+        """Say what the scene is now, without counting it again.
+
+        For the second half of a replacement that has already been counted: a
+        load whose clear moved the epoch a moment ago, where what is left to
+        do is read the new scene and say why it changed.
+        """
+        return self._replaced(reason, count=False)
+
+    def _replaced(self, reason: str, *, count: bool) -> int:
         self.refresh()
         with self._lock:
-            self._epoch += 1
+            if count:
+                self._epoch += 1
             self._reason = reason
             self._changed_at = time.time()
             epoch = self._epoch
@@ -245,11 +270,21 @@ class Identity:
 
     # Section: watching Houdini
 
+    def _mid_load(self) -> bool:
+        """Whether a load started recently enough to still be the one running.
+
+        A load that fails reports nothing to say it is over, so this is read
+        as a window rather than kept as a flag somebody has to clear.
+        """
+        began = self._load_began
+        return began is not None and (time.monotonic() - began) <= LOADING_WINDOW_S
+
     def watch(self) -> Callable[[], None] | None:
         """Follow this process's scene changes. Returns the way to stop.
 
-        A load reports a clear of its own inside it, so the clear is swallowed
-        while a load is in flight and the epoch moves once for one load.
+        A load reports its own clear, and the clear is what moves the epoch,
+        so the load that follows says what the scene is now without counting
+        a second time. A load that never finishes has still been counted.
         """
         hou = self._hou
         if hou is None:
@@ -266,12 +301,20 @@ class Identity:
         def on_event(event_type: Any = None, *_rest: Any) -> None:
             try:
                 if event_type == before_load:
-                    self._loading = True
-                elif event_type == after_load:
-                    self._loading = False
-                    self.bump(LOADED)
-                elif event_type == after_clear and not self._loading:
+                    self._load_began = time.monotonic()
+                    self._counted_the_clear = False
+                elif event_type == after_clear:
+                    # The old scene is gone from here, load or no load.
                     self.bump(CLEARED)
+                    self._counted_the_clear = self._mid_load()
+                elif event_type == after_load:
+                    counted = self._counted_the_clear and self._mid_load()
+                    self._load_began = None
+                    self._counted_the_clear = False
+                    if counted:
+                        self.settled(LOADED)
+                    else:
+                        self.bump(LOADED)
             except Exception as error:  # noqa: BLE001 - never raise into Houdini's event loop
                 self._log(f"scene event: {type(error).__name__}: {error}")
 

@@ -264,6 +264,18 @@ def test_scene_epoch_counts_up_and_records_the_new_hip(store: Store) -> None:
     assert store.get_session("s1").hip_path == "/scenes/other.hip"
 
 
+def test_a_session_can_write_the_epoch_it_says_it_is_on(store: Store) -> None:
+    """The session that owns the scene owns the count."""
+    store.register_session("s1", kind="gui", pid=LIVE_PID, alias="shot-1")
+
+    assert store.set_scene_epoch("s1", 4, hip_path="/scenes/other.hip") == 4
+    record = store.get_session("s1")
+    assert record.scene_epoch == 4
+    assert record.hip_path == "/scenes/other.hip"
+    with pytest.raises(UnknownRecord):
+        store.set_scene_epoch("nope", 1)
+
+
 def test_session_helpers_report_an_unknown_id(store: Store) -> None:
     for call in (
         lambda: store.touch_session("nope"),

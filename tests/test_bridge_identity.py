@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from fake_hou import Scene
+from nscr_houdini_mcp.bridge import identity as identity_module
 from nscr_houdini_mcp.bridge.dispatch import Dispatcher
 from nscr_houdini_mcp.bridge.envelope import Envelope
 from nscr_houdini_mcp.bridge.handlers import ToolRegistry
@@ -93,6 +94,39 @@ def test_the_epoch_moves_again_for_every_replacement(scene: Scene) -> None:
     assert session.scene_epoch == 3
 
 
+def test_a_load_that_fails_after_clearing_still_counts(scene: Scene) -> None:
+    """The scene really is gone, so the count moves whatever happens next.
+
+    A failed load reports no end of its own, so a session that waited for one
+    would go on telling callers their paths were good in an empty scene.
+    """
+    session = identity(scene)
+    session.watch()
+
+    with pytest.raises(Exception, match="cannot read"):
+        scene.hipFile.fail_load("/scenes/missing.hip")
+
+    assert session.scene_epoch == 1
+    assert session.scene()["nodes"]["/obj"] == 0
+
+    # And the next clear is counted too: nothing was left half set.
+    scene.hipFile.clear()
+    assert session.scene_epoch == 2
+
+
+def test_a_load_that_started_too_long_ago_no_longer_holds_a_clear(scene: Scene) -> None:
+    session = identity(scene)
+    session.watch()
+    scene.hipFile._fire("BeforeLoad")
+    session._load_began -= identity_module.LOADING_WINDOW_S + 1.0
+
+    scene.hipFile.clear()
+    scene.hipFile._fire("AfterLoad")
+
+    # The clear counted, and the late load counted as the replacement it is.
+    assert session.scene_epoch == 2
+
+
 def test_a_merge_or_a_save_leaves_the_epoch_alone(scene: Scene) -> None:
     """A merge adds to the scene, so every path a caller holds still means
     what it meant."""
@@ -116,7 +150,9 @@ def test_a_replacement_is_passed_on_with_the_new_epoch_and_file(scene: Scene) ->
     session = identity(scene, on_change=lambda epoch, path: seen.append((epoch, path)))
     session.watch()
     scene.hipFile.load("/scenes/other.hip")
-    assert seen == [(1, "/scenes/other.hip")]
+    # Once when the old scene went, once when the new one had settled.
+    assert seen[-1] == (1, "/scenes/other.hip")
+    assert [epoch for epoch, _ in seen] == [1, 1]
 
 
 def test_the_summary_counts_the_top_level_networks(scene: Scene) -> None:

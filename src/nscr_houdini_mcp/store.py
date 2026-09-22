@@ -879,6 +879,22 @@ class Store:
             reclaimed.append(row["session_id"])
         return reclaimed
 
+    def set_scene_epoch(self, session_id: str, epoch: int, *, hip_path: str | None = None) -> int:
+        """Write the epoch a session says it is on, and the scene it is in.
+
+        The session that owns the scene owns the count, so a bridge writes the
+        number it holds rather than asking this to add one: what happened in
+        Houdini decides, not how many times the row was touched.
+        """
+        with self._txn(write=True) as db:
+            written = db.execute(
+                "UPDATE sessions SET scene_epoch = ?, hip_path = ? WHERE session_id = ?",
+                (epoch, hip_path, session_id),
+            )
+            if written.rowcount == 0:
+                raise UnknownRecord(f"no session {session_id}")
+        return epoch
+
     def end_session(self, session_id: str) -> None:
         """Mark a session gone, which frees its alias for a later process."""
         with self._txn(write=True) as db:

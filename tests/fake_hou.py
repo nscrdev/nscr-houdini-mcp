@@ -279,6 +279,17 @@ class HipFile:
         self._path = str(path)
         self._fire(HipFileEventType.AfterClear, HipFileEventType.AfterLoad)
 
+    def fail_load(self, path: str) -> None:
+        """A load that clears the old scene and then gives up.
+
+        Houdini reports nothing to say the load is over, so the session is
+        left with an empty scene and no `AfterLoad` ever arrives.
+        """
+        self._fire(HipFileEventType.BeforeLoad, HipFileEventType.BeforeClear)
+        self._scene.empty()
+        self._fire(HipFileEventType.AfterClear)
+        raise OperationFailed(f"cannot read {path}")
+
     def merge(self, path: str) -> None:
         self._fire(HipFileEventType.BeforeMerge, HipFileEventType.AfterMerge)
 

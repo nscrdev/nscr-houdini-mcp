@@ -297,7 +297,7 @@ class Bridge:
         """
         self._log(f"the scene was replaced, epoch {epoch}")
         with self._open_store() as store:
-            store.bump_scene_epoch(self.session_id, hip_path=hip_path)
+            store.set_scene_epoch(self.session_id, epoch, hip_path=hip_path)
         if self._entry:
             self._entry = {**self._entry, "scene_epoch": epoch, "hip_path": hip_path}
             registry.write_entry(self.home, self._entry)
