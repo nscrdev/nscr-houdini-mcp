@@ -78,19 +78,29 @@ does, so only open files you trust.
 under a path, `node` reads one node or a batch of up to fifty, `parms` reads
 parameter tables, `find` searches by a glob on the name or path and by type,
 and `selection` lists what is selected in a session with a user interface.
-Rows come sorted by path. A read with more rows than `limit` (200 unless you
-say, up to 2000) hands back `next_page`; send it back as `page` to carry on
-after the last path. If the scene changed in between, the page still comes
-back and says `scene_changed`. A batch never fails for one missing path: that
-entry carries its own error, with the closest paths that are there.
+Rows come sorted by path, in every mode. A read with more rows than `limit`
+(200 unless you say, up to 2000) hands back `next_page`; send it back as
+`page`, with the same arguments, to carry on after the last path. A tree or a
+search stops walking once its page is full, so `total` comes only with a
+first page that holds everything. If the scene changed in between, the page
+still comes back and says `scene_changed`. A batch never fails for one
+missing path: that entry carries its own error, with the closest paths that
+are there. A tree's network boxes and sticky notes come whole on its first
+page, up to 500 of each, with `boxes_truncated` or `notes_truncated` past
+that. A multiparm row carries up to 200 instances and says how many there
+are; name the multiparm itself to page through all of them.
 
 A read cooks nothing unless it passes `evaluate`. Without it, a value that
-could only be had by cooking, such as an expression that counts another
-node's points, is left out and marked `not_cooked`, and errors are the ones
-the last cook left, marked `not_cooked` when there has been none and `stale`
-with the reason when the node has changed since. With `evaluate` the read may
-cook, under the same `wait_s` and `timeout_s` as any other call; a render node
-or a task network is never cooked by a read.
+could only be had by cooking is left out and `not_cooked` says why: a number
+a channel operator's export may drive, a parameter with several keyframes, a
+Python expression, a backtick, a variable such as `$NPT` that only means
+something inside a cook, or an expression that reads the scene, such as one
+that counts another node's points, directly or through `ch()`. A node's
+errors are the ones the last cook left, marked `not_cooked` when there has
+been none and `stale` with the reason when the node has changed since. With
+`evaluate` the read may cook, under the same `wait_s` and `timeout_s` as any
+other call, and one that runs out of time is asked to stop between rows; a
+render node or a task network is never cooked by a read.
 
 Every tool that reads takes the same three `detail` levels:
 
