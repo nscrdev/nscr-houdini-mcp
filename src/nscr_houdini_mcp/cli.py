@@ -4,7 +4,8 @@ With no arguments this runs the MCP server on stdio, which is how a client
 starts it. The `bridge` group is for a person at a terminal: it puts the
 Houdini package in place, takes it away again, says what is running, and
 prints the few lines that start a bridge inside a Houdini that is already
-open.
+open. The `worker` commands under it drive the pool of hython workers: start
+one, stop one, list what is there, and take or hand back a warm worker.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from nscr_houdini_mcp import install as install_module
+from nscr_houdini_mcp import pool
 from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge import client, registry
 from nscr_houdini_mcp.server import SERVER_NAME, package_version, run
@@ -88,7 +90,78 @@ def build_parser() -> argparse.ArgumentParser:
     snippet = actions.add_parser("snippet", help="Python that starts a bridge in an open Houdini")
     snippet.set_defaults(handler=_snippet)
 
+    _add_worker_commands(actions)
     return parser
+
+
+def _add_worker_commands(actions: Any) -> None:
+    """The commands for the hython workers this machine may run."""
+    worker = actions.add_parser("worker", help="the pool of hython workers")
+    jobs = worker.add_subparsers(dest="worker_action", required=True)
+
+    start = jobs.add_parser("start", help="start one worker, if the pool has room")
+    _add_home(start)
+    start.add_argument("--cap", type=int, default=pool.DEFAULT_CAP, help="how many workers may run")
+    start.add_argument(
+        "--weight",
+        default=pool.DEFAULT_WEIGHT,
+        choices=sorted(pool.WEIGHTS),
+        help="how much of the machine this worker is for",
+    )
+    start.add_argument(
+        "--weight-budget",
+        type=float,
+        default=None,
+        help="how much weight the whole pool may hold, the cap when left out",
+    )
+    start.add_argument(
+        "--max-idle-s",
+        type=float,
+        default=pool.DEFAULT_MAX_IDLE_S,
+        help="how long the worker stays warm with no job before it ends itself",
+    )
+    start.add_argument("--max-threads", type=int, default=None, help="thread cap for this worker")
+    start.add_argument("--hython", type=Path, default=None, help="the hython to start")
+    start.add_argument("--port", type=int, default=pool.DEFAULT_PORT_RANGE[0])
+    start.add_argument("--max-port", type=int, default=pool.DEFAULT_PORT_RANGE[1])
+    start.add_argument("--job", default=None, help="take the worker for this job at once")
+    start.add_argument(
+        "--timeout-s",
+        type=float,
+        default=pool.DEFAULT_START_TIMEOUT_S,
+        help="how long to wait for the worker's bridge",
+    )
+    start.set_defaults(handler=_worker_start)
+
+    stop = jobs.add_parser("stop", help="ask one worker to stop, then make sure it has")
+    _add_home(stop)
+    stop.add_argument("alias", help="the worker's name, token or session id")
+    stop.add_argument(
+        "--grace-s",
+        type=float,
+        default=pool.DEFAULT_STOP_GRACE_S,
+        help="how long it may take to go before it is ended here",
+    )
+    stop.set_defaults(handler=_worker_stop)
+
+    listing = jobs.add_parser("list", help="what the pool is holding")
+    _add_home(listing)
+    listing.set_defaults(handler=_worker_list)
+
+    reserve = jobs.add_parser("reserve", help="take a warm worker for one job")
+    _add_home(reserve)
+    reserve.add_argument("alias", nargs="?", default=None, help="a worker, or the first free one")
+    reserve.add_argument("--job", required=True, help="the job the worker is taken for")
+    reserve.set_defaults(handler=_worker_reserve)
+
+    give_back = jobs.add_parser("release", help="hand a worker back to the pool, warm")
+    _add_home(give_back)
+    give_back.add_argument("alias", help="the worker's name, token or session id")
+    give_back.set_defaults(handler=_worker_release)
+
+
+def _add_home(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--home", type=Path, default=None, help="state folder to use")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -146,6 +219,112 @@ def _status(args: argparse.Namespace) -> int:
 
 def _snippet(_args: argparse.Namespace) -> int:
     print(install_module.snippet())
+    return 0
+
+
+# Section: the worker commands
+
+
+def _home_of(args: argparse.Namespace) -> Path:
+    return Path(args.home) if args.home else store_module.default_home()
+
+
+def _worker_start(args: argparse.Namespace) -> int:
+    config = pool.PoolConfig(
+        home=_home_of(args),
+        cap=args.cap,
+        max_idle_s=args.max_idle_s,
+        weight_budget=args.weight_budget,
+        max_threads=args.max_threads,
+        hython=args.hython,
+        port_range=(args.port, args.max_port),
+        start_timeout_s=args.timeout_s,
+    )
+    try:
+        with pool.open_store(config.home) as store:
+            record = pool.start_worker(config, store, weight=args.weight, job_id=args.job)
+    except store_module.PoolFull as error:
+        # One word first, so a person and an agent read the same thing.
+        print(f"{pool.POOL_FULL}: {error}")
+        return 1
+    except (pool.PoolError, store_module.StoreError) as error:
+        print(str(error))
+        return 1
+    print(f"started {record.alias} {record.session_id} pid {record.pid}")
+    print(f"  log {pool.log_path(config.home, record.alias)}")
+    print(f"  state {record.state}  weight {record.weight:g}  job {record.job_id or '-'}")
+    print(f"  {pool.capability_summary(record.capabilities)}")
+    return 0
+
+
+def _worker_stop(args: argparse.Namespace) -> int:
+    config = pool.PoolConfig(home=_home_of(args))
+    try:
+        with pool.open_store(config.home) as store:
+            stopped = pool.stop_worker(config, store, args.alias, grace_s=args.grace_s)
+    except (pool.PoolError, store_module.StoreError) as error:
+        print(str(error))
+        return 1
+    how = "ended here" if stopped.killed else "stopped on request"
+    print(f"{stopped.record.alias} {how}")
+    if not stopped.ended:
+        print("  the process is still there")
+        return 1
+    return 0
+
+
+def _worker_list(args: argparse.Namespace) -> int:
+    home = _home_of(args)
+    path = pool.store_path(home)
+    if not path.exists():
+        print("workers: none")
+        return 0
+    with pool.open_store(home) as store:
+        rows = pool.list_workers(store)
+    if not rows:
+        print("workers: none")
+        return 0
+    print("workers:")
+    for row in rows:
+        print(f"  {row['alias']} {row['session_id']}")
+        print(
+            f"    pid {row['pid']}  state {row['state']}  job {row['job']}"
+            f"  weight {row['weight']:g}  lease age {row['lease_age_s']:.0f}s"
+        )
+        print(f"    {row['capabilities']}")
+    return 0
+
+
+def _worker_reserve(args: argparse.Namespace) -> int:
+    home = _home_of(args)
+    try:
+        with pool.open_store(home) as store:
+            handle = args.alias or _first_free(store)
+            record = pool.reserve(store, handle, job_id=args.job)
+    except (pool.PoolError, store_module.StoreError) as error:
+        print(str(error))
+        return 1
+    print(f"{record.alias} taken for job {record.job_id}")
+    return 0
+
+
+def _first_free(store: store_module.Store) -> str:
+    """The warm worker that has been waiting longest, or nothing doing."""
+    for record in store.list_workers():
+        if record.state == "running" and record.job_id is None:
+            return record.alias
+    raise pool.UnknownWorker("no warm worker is free")
+
+
+def _worker_release(args: argparse.Namespace) -> int:
+    home = _home_of(args)
+    try:
+        with pool.open_store(home) as store:
+            record = pool.release(store, args.alias)
+    except (pool.PoolError, store_module.StoreError) as error:
+        print(str(error))
+        return 1
+    print(f"{record.alias} is back in the pool")
     return 0
 
 
