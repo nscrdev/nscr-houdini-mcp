@@ -310,7 +310,8 @@ def test_an_answer_can_be_held_back_so_the_lost_reply_case_can_be_tried(tmp_path
             envelope(tool="bridge.selfcheck", arguments={"drop_reply": True}),
         )
         took = time.monotonic() - began
-        assert took >= 0.2
+        # Some clocks tick coarsely, so allow a sliver under the hold.
+        assert took >= 0.19
         assert ran == ["once"]
     finally:
         bridge.stop()
