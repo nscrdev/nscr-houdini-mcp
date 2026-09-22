@@ -1,7 +1,8 @@
 """Houdini runs this every time a scene is loaded.
 
-A session that already has a bridge keeps it, so this only matters for a
-session that opened a scene before anything else started one.
+A second chance, not the route in: `python3.13libs/ready.py` is what starts a
+bridge. This matters only for a session that is somehow up with no bridge and
+then opens a scene. A session that already has one keeps it.
 """
 
 import nscr_mcp_autostart
