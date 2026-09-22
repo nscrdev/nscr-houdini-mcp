@@ -45,7 +45,7 @@ APP_DIR_NAME = "nscr-houdini-mcp"
 HOME_ENV_VAR = "NSCR_MCP_HOME"
 STORE_FILE_NAME = "coord.sqlite"
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SESSION_KINDS = frozenset({"gui", "hython"})
 SESSION_STATES = frozenset({"live", "busy", "unresponsive", "crashed", "gone"})
@@ -463,6 +463,10 @@ class WorkerRecord:
     start_deadline: float | None
     reserved_at: float
     leased_at: float
+    pid: int | None = None
+    pid_start: str | None = None
+    capabilities: Any = None
+    weight: float = 1.0
 
     @classmethod
     def _from_row(cls, row: sqlite3.Row) -> WorkerRecord:
@@ -476,6 +480,10 @@ class WorkerRecord:
             start_deadline=row["start_deadline"],
             reserved_at=row["reserved_at"],
             leased_at=row["leased_at"],
+            pid=row["pid"],
+            pid_start=row["pid_start"],
+            capabilities=_load(row["capabilities"]),
+            weight=float(row["weight"]),
         )
 
 
@@ -701,7 +709,16 @@ _SCHEMA_2 = (
 # belongs to a process that took the number over.
 _SCHEMA_3 = ("ALTER TABLE sessions ADD COLUMN pid_start TEXT",)
 
-MIGRATIONS = (_SCHEMA_1, _SCHEMA_2, _SCHEMA_3)
+# What a worker turned into once it was running: the process it is, what that
+# process can do, and how much of the pool budget its work takes.
+_SCHEMA_4 = (
+    "ALTER TABLE workers ADD COLUMN pid INTEGER",
+    "ALTER TABLE workers ADD COLUMN pid_start TEXT",
+    "ALTER TABLE workers ADD COLUMN capabilities TEXT",
+    "ALTER TABLE workers ADD COLUMN weight REAL NOT NULL DEFAULT 1",
+)
+
+MIGRATIONS = (_SCHEMA_1, _SCHEMA_2, _SCHEMA_3, _SCHEMA_4)
 
 
 class Store:
@@ -1040,6 +1057,8 @@ class Store:
         job_id: str | None = None,
         owner_pid: int | None = None,
         start_budget_s: float = DEFAULT_START_BUDGET_S,
+        weight: float = 1.0,
+        weight_budget: float | None = None,
     ) -> WorkerRecord:
         """Take a slot under the pool cap, or raise `PoolFull`.
 
@@ -1049,26 +1068,40 @@ class Store:
         count cannot both get the last slot. A reservation counts from here,
         before hython starts, and stops counting once the worker ends up failed
         or stopped.
+
+        `weight` says how much of the machine this reservation means to use.
+        With a `weight_budget` the weights already held are added up too, so a
+        heavy job is refused while lighter ones have the machine, although a
+        slot under the cap is free.
         """
         if cap < 1:
             raise ValueError("cap must be at least 1")
+        if weight <= 0:
+            raise ValueError("weight must be more than zero")
         now = self._now()
         pid = os.getpid() if owner_pid is None else owner_pid
         placeholders = ", ".join("?" * len(WORKER_ACTIVE_STATES))
         with self._txn(write=True) as db:
             self._reclaim_workers(db, now)
             rows = db.execute(
-                f"SELECT alias FROM workers WHERE state IN ({placeholders})",
+                f"SELECT alias, weight FROM workers WHERE state IN ({placeholders})",
                 WORKER_ACTIVE_STATES,
             ).fetchall()
             if len(rows) >= cap:
                 raise PoolFull(f"{len(rows)} of {cap} worker slots are in use")
+            if weight_budget is not None:
+                held = sum(float(row["weight"]) for row in rows)
+                if held + weight > weight_budget:
+                    raise PoolFull(
+                        f"a weight of {weight:g} does not fit beside {held:g}"
+                        f" under a budget of {weight_budget:g}"
+                    )
             alias = _first_free_alias(alias_template, {row["alias"] for row in rows})
             db.execute(
                 "INSERT INTO workers (token, alias, state, session_id, job_id, owner_pid,"
-                " start_deadline, reserved_at, leased_at)"
-                " VALUES (?, ?, 'reserved', NULL, ?, ?, ?, ?, ?)",
-                (token, alias, job_id, pid, now + start_budget_s, now, now),
+                " start_deadline, reserved_at, leased_at, weight)"
+                " VALUES (?, ?, 'reserved', NULL, ?, ?, ?, ?, ?, ?)",
+                (token, alias, job_id, pid, now + start_budget_s, now, now, float(weight)),
             )
             return WorkerRecord._from_row(
                 db.execute("SELECT * FROM workers WHERE token = ?", (token,)).fetchone()
@@ -1091,11 +1124,16 @@ class Store:
         reclaimed: list[str] = []
         for row in rows:
             owner_gone = row["owner_pid"] is not None and not process_is_alive(row["owner_pid"])
+            # A worker that came up records the process it is. That process
+            # going away frees the slot whoever started it is still running.
+            worker_gone = (
+                row["pid"] is not None and same_process(row["pid"], row["pid_start"]) is False
+            )
             deadline = row["start_deadline"]
             never_started = (
                 row["state"] in WORKER_STARTING_STATES and deadline is not None and now > deadline
             )
-            if owner_gone or never_started:
+            if owner_gone or worker_gone or never_started:
                 db.execute(
                     "UPDATE workers SET state = 'failed', job_id = NULL, leased_at = ?"
                     " WHERE token = ?",
@@ -1113,6 +1151,10 @@ class Store:
         job_id: str | None | _Clear = None,
         owner_pid: int | None = None,
         start_budget_s: float | None = None,
+        pid: int | None = None,
+        pid_start: str | None = None,
+        capabilities: Any = None,
+        weight: float | None = None,
     ) -> WorkerRecord:
         """Move a reservation on. The token proves who owns the slot.
 
@@ -1131,7 +1173,8 @@ class Store:
                 deadline = now + start_budget_s
             db.execute(
                 "UPDATE workers SET state = ?, session_id = ?, job_id = ?, owner_pid = ?,"
-                " start_deadline = ?, leased_at = ? WHERE token = ?",
+                " start_deadline = ?, leased_at = ?, pid = ?, pid_start = ?, capabilities = ?,"
+                " weight = ? WHERE token = ?",
                 (
                     state,
                     _settle(session_id, row["session_id"]),
@@ -1139,6 +1182,10 @@ class Store:
                     row["owner_pid"] if owner_pid is None else owner_pid,
                     deadline,
                     now,
+                    row["pid"] if pid is None else pid,
+                    row["pid_start"] if pid_start is None else pid_start,
+                    row["capabilities"] if capabilities is None else _dump(capabilities),
+                    row["weight"] if weight is None else float(weight),
                     token,
                 ),
             )

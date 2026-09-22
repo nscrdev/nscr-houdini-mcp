@@ -405,6 +405,45 @@ def test_releasing_a_worker_clears_the_job_it_held(store: Store) -> None:
     assert store.release_worker("t1").job_id is None
 
 
+def test_a_worker_records_the_process_it_is_and_what_it_can_do(store: Store) -> None:
+    store.reserve_worker(cap=2, token="t1")
+    record = store.set_worker_state(
+        "t1",
+        "running",
+        pid=4321,
+        pid_start="whenever",
+        capabilities={"renderers": ["husk"]},
+    )
+    assert (record.pid, record.pid_start) == (4321, "whenever")
+    assert record.capabilities == {"renderers": ["husk"]}
+    # What is not named again keeps what it held.
+    assert store.set_worker_state("t1", "leased").capabilities == {"renderers": ["husk"]}
+
+
+def test_a_worker_whose_own_process_has_gone_is_reclaimed(store: Store) -> None:
+    """Its slot comes back although whoever started it is still running."""
+    store.reserve_worker(cap=1, token="t1")
+    store.set_worker_state("t1", "running", pid=DEAD_PID, pid_start="whenever")
+    assert store.reclaim_workers() == ["t1"]
+    assert store.reserve_worker(cap=1, token="t2").alias == "w1"
+
+
+def test_weights_are_refused_past_the_budget_although_a_slot_is_free(store: Store) -> None:
+    store.reserve_worker(cap=4, token="t1", weight=2.0, weight_budget=3.0)
+    with pytest.raises(PoolFull):
+        store.reserve_worker(cap=4, token="t2", weight=2.0, weight_budget=3.0)
+    # The budget is the caller's, and a lighter job still fits.
+    assert store.reserve_worker(cap=4, token="t3", weight=1.0, weight_budget=3.0).weight == 1.0
+    with pytest.raises(ValueError):
+        store.reserve_worker(cap=4, token="t4", weight=0.0)
+
+
+def test_a_released_weight_is_not_counted_any_more(store: Store) -> None:
+    store.reserve_worker(cap=4, token="t1", weight=3.0, weight_budget=3.0)
+    store.release_worker("t1")
+    assert store.reserve_worker(cap=4, token="t2", weight=3.0, weight_budget=3.0).weight == 3.0
+
+
 def test_worker_moves_need_a_known_token_and_a_known_state(store: Store) -> None:
     store.reserve_worker(cap=1, token="t1")
     with pytest.raises(UnknownRecord):
