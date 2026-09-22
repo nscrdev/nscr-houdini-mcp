@@ -1,0 +1,349 @@
+"""Running one tool call, with the rules around it.
+
+The lock in the app says one call at a time. This says the rest of it:
+
+- Order. Calls that wait are served oldest first, so a caller that has waited
+  is not passed over by one that has just arrived.
+- Two budgets, kept apart. `wait_s` is how long a caller will wait for its
+  turn and for the work to be picked up. `timeout_s` is how long it will wait
+  for the work once it is running. A call that asks for a short wait and a
+  long run is a normal thing to ask for.
+- A call that runs out of `timeout_s` gets `TIMEOUT` with `still_running` and
+  the operation id. Nothing is interrupted: the work carries on holding the
+  session, health reports it, and calls behind it wait or are told the session
+  is busy.
+- `skip_if_busy` answers at once rather than queueing at all.
+- Every mutating call runs inside one undo group, on the main thread where
+  there is one, and a failure rolls the group's graph edits back.
+- Every error carries a code from the table, and no exception text.
+"""
+
+from __future__ import annotations
+
+import secrets
+import time
+import traceback
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from typing import Any
+
+from nscr_houdini_mcp.bridge import encoding, host, marshal
+from nscr_houdini_mcp.bridge.envelope import Envelope, Reply, error_payload, ok_payload
+from nscr_houdini_mcp.bridge.errors import BridgeError, did_you_mean, map_exception
+from nscr_houdini_mcp.bridge.gate import Gate
+from nscr_houdini_mcp.bridge.handlers import Tool, ToolRegistry, UnknownTool
+from nscr_houdini_mcp.bridge.tools import ToolContext
+from nscr_houdini_mcp.bridge.undo import run_in_undo_group
+
+# How long a call waits for its turn when it names no wait of its own. Short
+# on purpose: the worst pickup measured on a busy main thread was about a
+# tenth of a second, so a second is a wide margin, and a caller that wants to
+# queue behind a long job says so.
+DEFAULT_WAIT_S = 1.0
+
+# How long a call waits for work that is already running.
+DEFAULT_TIMEOUT_S = 60.0
+
+# The shortest the pickup wait can be, so a call with no wait at all still
+# gives the thread that runs the work a moment to take it.
+MIN_PICKUP_S = 0.25
+
+OPERATION_ID_BYTES = 8
+
+
+@dataclass
+class Running:
+    """The call that holds the session, as the rest of the bridge sees it."""
+
+    operation_id: str
+    tool: str
+    mutating: bool
+    began: float = field(default_factory=time.monotonic)
+    started_at: float = field(default_factory=time.time)
+    timed_out: bool = False
+    recorded: bool = False
+    rolled_back: bool = False
+
+    def elapsed_s(self) -> float:
+        return round(max(0.0, time.monotonic() - self.began), 3)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "operation_id": self.operation_id,
+            "tool": self.tool,
+            "elapsed_s": self.elapsed_s(),
+            "timed_out": self.timed_out,
+        }
+
+
+class Dispatcher:
+    """Runs one call at a time, in order, and says what happened."""
+
+    def __init__(
+        self,
+        tools: ToolRegistry,
+        *,
+        lock: Any,
+        kind: str = host.HYTHON,
+        session_id: str = "",
+        scene_epoch: Callable[[], int] | None = None,
+        hou: Any | None = None,
+        log: Callable[[str], None] | None = None,
+        main_loop: marshal.MainLoop | None = None,
+        wait_s: float = DEFAULT_WAIT_S,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
+    ) -> None:
+        self.tools = tools
+        self.kind = kind
+        self.session_id = session_id
+        self.wait_s = wait_s
+        self.timeout_s = timeout_s
+        self._scene_epoch = scene_epoch or (lambda: 0)
+        self._hou = hou if hou is not None else host.houdini()
+        self._log = log or (lambda text: None)
+        self._main_loop = main_loop
+        self._gate = Gate(lock)
+        self._running: Running | None = None
+        self._last: dict[str, Any] | None = None
+
+    # Section: what the rest of the bridge asks
+
+    @property
+    def running(self) -> Running | None:
+        return self._running
+
+    def state(self) -> dict[str, Any]:
+        """Busy state for the health endpoint. Takes no lock and reads no scene."""
+        running = self._running
+        return {
+            "busy": running is not None,
+            "queued": self._gate.waiting(),
+            "current_op": None if running is None else running.tool,
+            "current_op_id": None if running is None else running.operation_id,
+            "current_op_elapsed_s": None if running is None else running.elapsed_s(),
+            "current_op_timed_out": False if running is None else running.timed_out,
+            "last_op": self._last,
+        }
+
+    # Section: one call
+
+    def dispatch(self, envelope: Envelope) -> Reply:
+        """Run one call and answer it."""
+        operation_id = envelope.operation_id or _new_operation_id()
+        trace = {"operation_id": operation_id, "scene_epoch": self._scene_epoch()}
+
+        try:
+            tool = self.tools.get(envelope.tool)
+        except UnknownTool:
+            return self._refuse(
+                BridgeError(
+                    "UNKNOWN_TOOL",
+                    f"no tool named {envelope.tool}",
+                    {
+                        "tool": envelope.tool,
+                        "did_you_mean": did_you_mean(envelope.tool, self.tools.names()),
+                        "tools": self.tools.names(),
+                    },
+                    hint="call one of the names in the tool list",
+                ),
+                trace,
+            )
+
+        bad = _check_arguments(tool, envelope.arguments)
+        if bad is not None:
+            return self._refuse(bad, trace)
+
+        wait_s = self.wait_s if envelope.wait_s is None else envelope.wait_s
+        timeout_s = envelope.timeout_s or tool.timeout_s or self.timeout_s
+
+        waited = time.monotonic()
+        if not self._gate.enter(wait_s=wait_s, skip_if_busy=bool(envelope.skip_if_busy)):
+            return self._busy(trace, waited=waited, wait_s=wait_s, cause="session busy")
+
+        running = Running(operation_id=operation_id, tool=tool.name, mutating=tool.mutating)
+        self._running = running
+        context = ToolContext(
+            hou=self._hou,
+            kind=self.kind,
+            session_id=self.session_id,
+            scene_epoch=self._scene_epoch(),
+            operation_id=operation_id,
+            label=tool.undo_label(),
+        )
+
+        work = marshal.Work(lambda: self._work(tool, envelope.arguments, context, running))
+        runner = marshal.choose_runner(
+            self.kind, mutating=tool.mutating, hou=self._hou, main_loop=self._main_loop
+        )
+        runner.submit(work)
+
+        pickup_s = max(MIN_PICKUP_S, wait_s - (time.monotonic() - waited))
+        if not work.started.wait(pickup_s) and work.cancel():
+            self._release(running)
+            return self._busy(
+                trace,
+                waited=waited,
+                wait_s=wait_s,
+                cause="main thread busy",
+            )
+
+        if not work.finished.wait(timeout_s):
+            running.timed_out = True
+            return Reply(
+                200,
+                {
+                    **error_payload(
+                        "TIMEOUT",
+                        f"{tool.name} is still running after {timeout_s:g} seconds",
+                        hint="the work goes on, ask health for the session before calling again",
+                        details={
+                            "tool": tool.name,
+                            "operation_id": operation_id,
+                            "timeout_s": timeout_s,
+                            "still_running": True,
+                        },
+                    ),
+                    **trace,
+                },
+            )
+
+        return self._answer(tool, work, running, trace)
+
+    # Section: running the work
+
+    def _work(
+        self,
+        tool: Tool,
+        arguments: Mapping[str, Any],
+        context: ToolContext,
+        running: Running,
+    ) -> Any:
+        """The whole of one call, on whichever thread it was given to."""
+        try:
+            if not tool.mutating or self._hou is None:
+                return tool.run(arguments, context)
+            outcome = run_in_undo_group(
+                lambda: tool.run(arguments, context),
+                label=tool.undo_label(),
+                hou=self._hou,
+            )
+            running.recorded = outcome.recorded
+            running.rolled_back = outcome.rolled_back
+            if outcome.error is not None:
+                raise outcome.error
+            return outcome.value
+        finally:
+            self._release(running)
+
+    def _release(self, running: Running) -> None:
+        """Note how the call ended and give the session to the next caller."""
+        if self._running is running:
+            self._last = {**running.as_dict(), "finished_at": time.time()}
+            self._running = None
+        self._gate.leave()
+
+    # Section: answers
+
+    def _answer(self, tool: Tool, work: marshal.Work, running: Running, trace: dict) -> Reply:
+        timing_ms = 0.0
+        if work.started_at is not None and work.finished_at is not None:
+            timing_ms = (work.finished_at - work.started_at) * 1000.0
+
+        if work.error is not None:
+            return self._failed(tool, work.error, running, trace)
+
+        converted = encoding.convert(work.result)
+        payload = {**ok_payload(converted.value, timing_ms=timing_ms), **trace}
+        if converted.lossy:
+            payload["lossy"] = True
+            payload["cut"] = converted.cut
+        if tool.mutating:
+            payload["undo"] = {
+                "label": tool.undo_label(),
+                "recorded": running.recorded,
+                "rolled_back": running.rolled_back,
+            }
+        return Reply(200, payload)
+
+    def _failed(self, tool: Tool, error: BaseException, running: Running, trace: dict) -> Reply:
+        # The text of an exception can hold paths and scene contents, so it
+        # goes to the local log and the caller gets a code and a type.
+        self._log(
+            f"tool {tool.name} raised: {type(error).__name__}: {error}\n"
+            + "".join(traceback.format_exception(error)[-8:])
+        )
+        coded = map_exception(error, tool=tool.name)
+        if tool.mutating:
+            coded.details.setdefault("rolled_back", running.rolled_back)
+            coded.details.setdefault("undo_recorded", running.recorded)
+        return self._refuse(coded, trace)
+
+    def _refuse(self, error: BridgeError, trace: Mapping[str, Any]) -> Reply:
+        safe = error.safe()
+        return Reply(
+            200,
+            {
+                **error_payload(safe.code, safe.message, hint=safe.hint, details=safe.details),
+                **trace,
+            },
+        )
+
+    def _busy(self, trace: Mapping[str, Any], *, waited: float, wait_s: float, cause: str) -> Reply:
+        running = self._running
+        return self._refuse(
+            BridgeError(
+                "SESSION_BUSY",
+                "this session is running another call",
+                {
+                    "cause": cause,
+                    "current_op": None if running is None else running.tool,
+                    "current_op_id": None if running is None else running.operation_id,
+                    "elapsed_s": None if running is None else running.elapsed_s(),
+                    "queued": self._gate.waiting(),
+                    "waited_s": round(time.monotonic() - waited, 3),
+                    "wait_s": wait_s,
+                },
+                hint="wait for the running call to finish, then send this one again",
+            ),
+            trace,
+        )
+
+
+# Section: arguments
+
+
+def _check_arguments(tool: Tool, arguments: Mapping[str, Any]) -> BridgeError | None:
+    """Refuse a call whose argument names are not the tool's, with the near ones."""
+    if tool.arguments is None:
+        return None
+    unknown = [name for name in arguments if name not in tool.arguments]
+    if unknown:
+        return BridgeError(
+            "BAD_ARGUMENTS",
+            f"{tool.name} takes no argument named {unknown[0]}",
+            {
+                "tool": tool.name,
+                "unknown": sorted(unknown),
+                "did_you_mean": did_you_mean(unknown[0], tool.arguments),
+                "arguments": list(tool.arguments),
+            },
+            hint="use one of the argument names this tool takes",
+        )
+    missing = [name for name in tool.required if arguments.get(name) is None]
+    if missing:
+        return BridgeError(
+            "BAD_ARGUMENTS",
+            f"{tool.name} needs {missing[0]}",
+            {
+                "tool": tool.name,
+                "missing": sorted(missing),
+                "required": list(tool.required),
+                "arguments": list(tool.arguments),
+            },
+            hint="send every required argument",
+        )
+    return None
+
+
+def _new_operation_id() -> str:
+    return f"op-{secrets.token_hex(OPERATION_ID_BYTES)}"

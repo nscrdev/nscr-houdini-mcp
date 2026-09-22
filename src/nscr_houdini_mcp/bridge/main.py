@@ -7,12 +7,18 @@ Run with hython:
 The process stays alive until its input closes or the word `stop` arrives on
 it. Tying the lifetime to the input means a launcher that dies takes its
 worker with it, instead of leaving a Houdini running with nobody to talk to.
+
+The input is watched on a thread of its own, because the thread that owns the
+process has work to do: it runs the scene edits. Headless, an undo group only
+records on the main thread, so a bridge whose main thread sat in a read would
+give the artist no single step to undo and no way to roll a failed call back.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import threading
 from pathlib import Path
 
 from nscr_houdini_mcp.bridge.app import DEFAULT_HEARTBEAT_S, Bridge, BridgeConfig
@@ -65,13 +71,27 @@ def main(argv: list[str] | None = None) -> int:
     # The token is not printed here and never is. Whoever may read the session
     # file may read the token.
     print(f"bridge {record.alias} {record.session_id} on port {bridge.port}", flush=True)
+    stop = threading.Event()
+    watcher = threading.Thread(
+        target=_watch, args=(sys.stdin, stop), name="nscr-mcp-stdin", daemon=True
+    )
+    watcher.start()
     try:
-        wait_for_stop(sys.stdin)
+        bridge.main_loop.run_until(stop)
     except KeyboardInterrupt:
         pass
     finally:
+        stop.set()
         bridge.stop()
     return 0
+
+
+def _watch(stream, stop: threading.Event) -> None:
+    """Watch the input, and say so when it asks the process to end."""
+    try:
+        wait_for_stop(stream)
+    finally:
+        stop.set()
 
 
 if __name__ == "__main__":  # pragma: no cover - the process entry point

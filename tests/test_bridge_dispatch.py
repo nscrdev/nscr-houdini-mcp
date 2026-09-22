@@ -1,0 +1,594 @@
+"""The rules around one tool call, against a stand in for Houdini.
+
+What a real Houdini has to confirm is in the integration tests. What is here
+is everything that can be decided without one: the order calls are served in,
+the two budgets, where the work runs, what an undo group does when a call
+fails, the error codes, and what the encoder will and will not carry.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from collections.abc import Iterator, Mapping
+from typing import Any
+
+import pytest
+
+from fake_hou import InvalidInput, Matrix4, ObjectWasDeleted, OperationFailed, Scene, Vector3
+from nscr_houdini_mcp.bridge import encoding, errors, marshal
+from nscr_houdini_mcp.bridge.dispatch import Dispatcher
+from nscr_houdini_mcp.bridge.envelope import Envelope
+from nscr_houdini_mcp.bridge.errors import BridgeError
+from nscr_houdini_mcp.bridge.gate import Gate
+from nscr_houdini_mcp.bridge.handlers import ToolRegistry, default_registry
+from nscr_houdini_mcp.bridge.undo import run_in_undo_group
+
+
+@pytest.fixture
+def scene() -> Iterator[Scene]:
+    made = Scene()
+    try:
+        yield made
+    finally:
+        made.ui.stop()
+
+
+def dispatcher(
+    tools: ToolRegistry | None = None,
+    *,
+    kind: str = "hython",
+    hou: Any = None,
+    wait_s: float = 5.0,
+    timeout_s: float = 5.0,
+) -> Dispatcher:
+    return Dispatcher(
+        tools if tools is not None else default_registry(),
+        lock=threading.Lock(),
+        kind=kind,
+        session_id="session-1",
+        hou=hou,
+        wait_s=wait_s,
+        timeout_s=timeout_s,
+    )
+
+
+def call(tool: str, **fields: Any) -> Envelope:
+    return Envelope(tool=tool, **fields)
+
+
+class Blocker:
+    """A tool that holds the session until it is let go."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.order: list[Any] = []
+
+    def __call__(self, arguments: Mapping[str, Any]) -> Any:
+        self.started.set()
+        assert self.release.wait(10.0)
+        return {"held": True}
+
+
+# Section: order
+
+
+def test_waiting_calls_are_served_in_the_order_they_arrived() -> None:
+    blocker = Blocker()
+    served: list[str] = []
+    tools = ToolRegistry()
+    tools.add("bridge.block", blocker)
+    tools.add("bridge.mark", lambda arguments: served.append(arguments["who"]) or {"ok": True})
+    running = dispatcher(tools, wait_s=20.0)
+
+    holder = threading.Thread(target=lambda: running.dispatch(call("bridge.block")))
+    holder.start()
+    assert blocker.started.wait(10.0)
+
+    waiters = []
+    for who in ("first", "second", "third"):
+        waiter = threading.Thread(
+            target=lambda who=who: running.dispatch(
+                call("bridge.mark", arguments={"who": who}, wait_s=20.0)
+            )
+        )
+        waiters.append(waiter)
+        waiter.start()
+        # Each one is queued before the next arrives, so arrival order is known.
+        queued = len(waiters)
+        _until(lambda queued=queued: running.state()["queued"] == queued)
+
+    blocker.release.set()
+    for waiter in waiters:
+        waiter.join(10.0)
+    holder.join(10.0)
+
+    assert served == ["first", "second", "third"]
+
+
+def test_a_call_that_gives_up_takes_its_place_in_the_queue_with_it() -> None:
+    gate = Gate(threading.Lock())
+    assert gate.enter(wait_s=0.0) is True
+    assert gate.enter(wait_s=0.05) is False
+    assert gate.waiting() == 0
+    gate.leave()
+    assert gate.enter(wait_s=0.0) is True
+    gate.leave()
+
+
+# Section: busy
+
+
+def test_skip_if_busy_is_answered_at_once() -> None:
+    blocker = Blocker()
+    tools = ToolRegistry()
+    tools.add("bridge.block", blocker)
+    running = dispatcher(tools, wait_s=20.0)
+
+    holder = threading.Thread(target=lambda: running.dispatch(call("bridge.block")))
+    holder.start()
+    try:
+        assert blocker.started.wait(10.0)
+        began = time.monotonic()
+        reply = running.dispatch(call("bridge.block", wait_s=20.0, skip_if_busy=True))
+        assert time.monotonic() - began < 1.0
+        error = reply.payload["error"]
+        assert error["code"] == "SESSION_BUSY"
+        assert error["details"]["current_op"] == "bridge.block"
+        assert error["details"]["cause"] == "session busy"
+    finally:
+        blocker.release.set()
+        holder.join(10.0)
+
+
+def test_a_call_that_will_not_wait_is_told_the_session_is_busy() -> None:
+    blocker = Blocker()
+    tools = ToolRegistry()
+    tools.add("bridge.block", blocker)
+    running = dispatcher(tools, wait_s=20.0)
+    holder = threading.Thread(target=lambda: running.dispatch(call("bridge.block")))
+    holder.start()
+    try:
+        assert blocker.started.wait(10.0)
+        reply = running.dispatch(call("bridge.block", wait_s=0.0))
+        assert reply.payload["error"]["code"] == "SESSION_BUSY"
+    finally:
+        blocker.release.set()
+        holder.join(10.0)
+
+
+# Section: the two budgets
+
+
+def test_work_that_outlives_its_timeout_answers_and_keeps_running() -> None:
+    blocker = Blocker()
+    tools = ToolRegistry()
+    tools.add("bridge.block", blocker)
+    tools.add("bridge.after", lambda arguments: {"after": True})
+    running = dispatcher(tools, wait_s=10.0)
+
+    reply = running.dispatch(call("bridge.block", timeout_s=0.3))
+    error = reply.payload["error"]
+    assert error["code"] == "TIMEOUT"
+    assert error["details"]["still_running"] is True
+    assert error["details"]["operation_id"] == reply.payload["operation_id"]
+
+    # The session is still held by the work that did not finish.
+    state = running.state()
+    assert state["busy"] is True
+    assert state["current_op"] == "bridge.block"
+    assert state["current_op_id"] == error["details"]["operation_id"]
+    assert state["current_op_timed_out"] is True
+
+    busy = running.dispatch(call("bridge.after", wait_s=0.0))
+    assert busy.payload["error"]["code"] == "SESSION_BUSY"
+
+    blocker.release.set()
+    _until(lambda: running.state()["busy"] is False)
+    later = running.dispatch(call("bridge.after", wait_s=5.0))
+    assert later.payload["ok"] is True
+    assert running.state()["last_op"]["tool"] == "bridge.after"
+
+
+def test_the_wait_budget_and_the_run_budget_are_separate() -> None:
+    tools = ToolRegistry()
+    tools.add("bridge.slow", lambda arguments: time.sleep(0.4) or {"slow": True})
+    running = dispatcher(tools)
+    reply = running.dispatch(call("bridge.slow", wait_s=0.0, timeout_s=10.0))
+    assert reply.payload["ok"] is True
+
+
+# Section: where the work runs
+
+
+def test_a_mutating_call_in_a_session_with_a_interface_runs_on_the_main_thread(
+    scene: Scene,
+) -> None:
+    scene.ui.start()
+    running = dispatcher(kind="gui", hou=scene.module())
+    reply = running.dispatch(
+        call("node.create", arguments={"parent": "/obj", "type": "geo"}, timeout_s=10.0)
+    )
+    assert reply.payload["ok"] is True
+    assert reply.payload["data"]["path"] == "/obj/geo1"
+    assert scene.ui.ran_on == ["fake-main"]
+
+
+def test_a_read_in_a_session_with_an_interface_does_not_wait_for_the_main_thread(
+    scene: Scene,
+) -> None:
+    # The main thread loop is never started, so anything posted to it would
+    # never run. A read must not be posted there.
+    running = dispatcher(kind="gui", hou=scene.module())
+    reply = running.dispatch(call("scene.info", timeout_s=10.0))
+    assert reply.payload["ok"] is True
+    assert scene.ui.posted.empty()
+
+
+def test_a_main_thread_that_never_picks_the_work_up_says_it_is_busy(scene: Scene) -> None:
+    running = dispatcher(kind="gui", hou=scene.module(), wait_s=0.3)
+    reply = running.dispatch(
+        call("node.create", arguments={"parent": "/obj", "type": "geo"}, wait_s=0.3)
+    )
+    error = reply.payload["error"]
+    assert error["code"] == "SESSION_BUSY"
+    assert error["details"]["cause"] == "main thread busy"
+    # The session is free again, and the work that was posted never runs.
+    assert running.state()["busy"] is False
+    scene.ui.start()
+    time.sleep(0.2)
+    assert scene.node("/obj").children() == ()
+
+
+def test_a_mutating_call_in_a_headless_session_runs_on_the_main_thread(scene: Scene) -> None:
+    loop = marshal.MainLoop()
+    stop = threading.Event()
+    ran_on: list[str] = []
+    main = threading.Thread(target=lambda: loop.run_until(stop), name="fake-process-main")
+    main.start()
+    _until(lambda: loop.running)
+    tools = ToolRegistry()
+
+    def edit(arguments: Mapping[str, Any]) -> Any:
+        ran_on.append(threading.current_thread().name)
+        scene.node("/obj").createNode("geo")
+        return {"edited": True}
+
+    tools.add("bridge.edit", edit, mutating=True, label="edit")
+    running = Dispatcher(
+        tools,
+        lock=threading.Lock(),
+        kind="hython",
+        hou=scene.module(),
+        main_loop=loop,
+        wait_s=5.0,
+        timeout_s=5.0,
+    )
+    try:
+        reply = running.dispatch(call("bridge.edit", timeout_s=5.0))
+    finally:
+        stop.set()
+        main.join(5.0)
+    assert reply.payload["ok"] is True
+    assert ran_on == ["fake-process-main"]
+    assert reply.payload["undo"]["recorded"] is True
+
+
+def test_a_mutating_call_with_no_main_thread_loop_says_nothing_was_recorded() -> None:
+    """A bridge nobody is pumping still answers, and does not pretend to group.
+
+    There is no `hou` here, so there is no undo group at all. The reply says
+    so rather than claiming a step the artist could undo.
+    """
+    running = dispatcher()
+    reply = running.dispatch(call("bridge.selfcheck", timeout_s=5.0))
+    assert reply.payload["error"]["code"] == "TOOL_FAILED"
+    assert reply.payload["error"]["details"]["undo_recorded"] is False
+
+
+def test_the_marshal_seam_hands_back_a_result_and_gives_up_on_time(scene: Scene) -> None:
+    module = scene.module()
+    scene.ui.start()
+    assert marshal.run_on_main_thread(lambda: 21 * 2, timeout_s=5.0, hou=module) == 42
+    scene.ui.stop()
+    with pytest.raises(marshal.MarshalTimeout):
+        marshal.run_on_main_thread(lambda: None, timeout_s=1.0, pickup_s=0.2, hou=module)
+
+
+# Section: the undo group
+
+
+def test_a_failed_call_that_changed_the_graph_is_rolled_back(scene: Scene) -> None:
+    running = dispatcher(hou=scene.module())
+    reply = running.dispatch(
+        call("bridge.selfcheck", arguments={"creates": 2, "fail_at": 2}, timeout_s=10.0)
+    )
+    error = reply.payload["error"]
+    assert error["code"] == "TOOL_FAILED"
+    assert error["details"]["rolled_back"] is True
+    assert scene.node("/obj").children() == ()
+    assert scene.undos.undoLabels() == []
+    assert scene.undos.performed == 1
+
+
+def test_a_failed_call_that_changed_nothing_is_not_rolled_back(scene: Scene) -> None:
+    running = dispatcher(hou=scene.module())
+    scene.node("/obj").createNode("geo", "kept")
+    before = scene.undos.undoLabels()
+
+    reply = running.dispatch(
+        call("bridge.selfcheck", arguments={"creates": 1, "fail_at": 1}, timeout_s=10.0)
+    )
+    error = reply.payload["error"]
+    assert error["code"] == "TOOL_FAILED"
+    assert error["details"]["rolled_back"] is False
+    # Somebody else's last edit is still there, which is the point.
+    assert scene.undos.undoLabels() == before
+    assert scene.undos.performed == 0
+    assert scene.node("/obj/kept") is not None
+
+
+def test_a_call_that_worked_leaves_one_undo_entry(scene: Scene) -> None:
+    running = dispatcher(hou=scene.module())
+    reply = running.dispatch(call("bridge.selfcheck", arguments={"creates": 3}, timeout_s=10.0))
+    assert reply.payload["ok"] is True
+    assert reply.payload["undo"] == {
+        "label": "self check",
+        "recorded": True,
+        "rolled_back": False,
+    }
+    assert scene.undos.undoLabels() == ["self check"]
+    assert len(scene.node("/obj").children()) == 3
+
+
+def test_a_group_that_recorded_nothing_is_reported_as_nothing_to_undo(scene: Scene) -> None:
+    outcome = run_in_undo_group(lambda: 1 + 1, label="read", hou=scene.module())
+    assert outcome.value == 2
+    assert outcome.recorded is False
+    assert outcome.rolled_back is False
+
+
+# Section: errors
+
+
+def test_a_name_that_is_not_a_tool_comes_back_with_the_closest_ones() -> None:
+    reply = dispatcher().dispatch(call("scene.inf"))
+    error = reply.payload["error"]
+    assert error["code"] == "UNKNOWN_TOOL"
+    assert error["details"]["did_you_mean"] == ["scene.info"]
+
+
+def test_an_argument_name_that_is_not_the_tools_comes_back_with_the_closest_ones() -> None:
+    reply = dispatcher().dispatch(call("node.create", arguments={"paren": "/obj", "type": "geo"}))
+    error = reply.payload["error"]
+    assert error["code"] == "BAD_ARGUMENTS"
+    assert error["details"]["unknown"] == ["paren"]
+    assert error["details"]["did_you_mean"][0] == "parent"
+    assert "parms" in error["details"]["arguments"]
+
+
+def test_a_required_argument_that_was_left_out_is_named() -> None:
+    reply = dispatcher().dispatch(call("node.create", arguments={"parent": "/obj"}))
+    error = reply.payload["error"]
+    assert error["code"] == "BAD_ARGUMENTS"
+    assert error["details"]["missing"] == ["type"]
+
+
+def test_a_parameter_name_that_is_not_on_the_node_comes_back_with_the_closest_ones(
+    scene: Scene,
+) -> None:
+    running = dispatcher(hou=scene.module())
+    reply = running.dispatch(
+        call(
+            "node.create",
+            arguments={"parent": "/obj", "type": "geo", "parms": {"tx1": 1.0}},
+            timeout_s=10.0,
+        )
+    )
+    error = reply.payload["error"]
+    assert error["code"] == "PARM_NOT_FOUND"
+    assert error["details"]["did_you_mean"] == ["tx"]
+    assert error["details"]["rolled_back"] is True
+    assert scene.node("/obj").children() == ()
+
+
+def test_a_path_that_is_not_in_the_scene_comes_back_with_the_closest_ones(scene: Scene) -> None:
+    running = dispatcher(hou=scene.module())
+    reply = running.dispatch(
+        call("node.create", arguments={"parent": "/objj", "type": "geo"}, timeout_s=10.0)
+    )
+    error = reply.payload["error"]
+    assert error["code"] == "NODE_NOT_FOUND"
+    assert "/obj" in error["details"]["did_you_mean"]
+
+
+def test_a_node_type_that_does_not_exist_comes_back_as_an_argument_mistake(scene: Scene) -> None:
+    running = dispatcher(hou=scene.module())
+    reply = running.dispatch(
+        call("node.create", arguments={"parent": "/obj", "type": "gep"}, timeout_s=10.0)
+    )
+    error = reply.payload["error"]
+    assert error["code"] == "BAD_ARGUMENTS"
+    assert error["details"]["did_you_mean"] == ["geo"]
+
+
+@pytest.mark.parametrize(
+    ("raised", "code"),
+    [
+        (ObjectWasDeleted("gone"), "NODE_NOT_FOUND"),
+        (InvalidInput("no"), "BAD_ARGUMENTS"),
+        (OperationFailed("no"), "TOOL_FAILED"),
+        (TypeError("takes 2 positional arguments"), "BAD_ARGUMENTS"),
+        (RuntimeError("boom"), "TOOL_FAILED"),
+    ],
+)
+def test_what_houdini_raises_becomes_a_code(raised: Exception, code: str) -> None:
+    tools = ToolRegistry()
+
+    def explode(arguments: Mapping[str, Any]) -> Any:
+        raise raised
+
+    tools.add("bridge.explode", explode)
+    reply = dispatcher(tools).dispatch(call("bridge.explode", timeout_s=5.0))
+    error = reply.payload["error"]
+    assert error["code"] == code
+    assert error["details"]["exception"] == type(raised).__name__
+    assert str(raised) not in reply.payload["error"]["message"]
+
+
+def test_a_coded_error_a_tool_raises_is_carried_with_its_details() -> None:
+    tools = ToolRegistry()
+
+    def refuse(arguments: Mapping[str, Any]) -> Any:
+        raise BridgeError("PARM_NOT_FOUND", "no parameter named sizex", {"parm": "sizex"})
+
+    tools.add("bridge.refuse", refuse)
+    reply = dispatcher(tools).dispatch(call("bridge.refuse", timeout_s=5.0))
+    error = reply.payload["error"]
+    assert error["code"] == "PARM_NOT_FOUND"
+    assert error["details"]["parm"] == "sizex"
+
+
+@pytest.mark.parametrize(
+    ("text", "hidden"),
+    [
+        ("could not read /Users/somebody/scenes/shot.hip", True),
+        (r"could not read C:\Users\somebody\shot.hip", True),
+        ("no node at /obj/geo1/box2", False),
+    ],
+)
+def test_a_reply_never_names_a_place_on_disk(text: str, hidden: bool) -> None:
+    cleaned = errors.hide_paths(text)
+    assert (errors.PATH_MARKER in cleaned) is hidden
+    if not hidden:
+        assert cleaned == text
+
+
+def test_every_code_the_bridge_sends_is_in_the_table() -> None:
+    for code in ("SESSION_BUSY", "TIMEOUT", "TOOL_FAILED", "UNKNOWN_TOOL", "BAD_ARGUMENTS"):
+        assert code in errors.CODES
+    assert errors.RESERVED <= set(errors.CODES)
+
+
+# Section: what the reply can carry
+
+
+def test_houdini_values_become_something_json_can_hold(scene: Scene) -> None:
+    node = scene.node("/obj")
+    parm = node.parm("tx")
+    converted = encoding.convert(
+        {
+            "vector": Vector3(1, 2, 3),
+            "matrix": Matrix4(1),
+            "node": node,
+            "parm": parm,
+            "nested": [{"node": node}],
+        }
+    )
+    assert converted.lossy is False
+    assert converted.value == {
+        "vector": [1.0, 2.0, 3.0],
+        "matrix": [1.0] * 16,
+        "node": "/obj",
+        "parm": "/obj/tx",
+        "nested": [{"node": "/obj"}],
+    }
+
+
+class Array:
+    """An array as the encoder reads one: a shape and a `tolist`."""
+
+    def __init__(self, values: list[Any]) -> None:
+        self._values = values
+        self.shape = (len(values),)
+
+    def tolist(self) -> list[Any]:
+        return list(self._values)
+
+
+def test_a_long_array_is_cut_and_the_reply_says_so() -> None:
+    converted = encoding.convert({"points": Array(list(range(10)))}, max_items=4)
+    assert converted.value["points"] == [0, 1, 2, 3]
+    assert converted.lossy is True
+    assert converted.cut == ["data.points"]
+
+
+def test_a_real_array_is_read_the_same_way() -> None:
+    numpy = pytest.importorskip("numpy")
+    converted = encoding.convert({"points": numpy.arange(3)})
+    assert converted.value["points"] == [0, 1, 2]
+    assert converted.lossy is False
+
+
+def test_bytes_come_back_as_text_and_are_capped() -> None:
+    converted = encoding.convert({"image": b"abcdef"}, max_bytes=3)
+    assert converted.value["image"]["encoding"] == "base64"
+    assert converted.value["image"]["bytes"] == 6
+    assert converted.lossy is True
+
+
+def test_something_the_encoder_does_not_know_becomes_short_text() -> None:
+    class Odd:
+        def __repr__(self) -> str:
+            return "x" * 500
+
+    converted = encoding.convert({"odd": Odd()})
+    assert len(converted.value["odd"]) == encoding.MAX_REPR
+    assert converted.lossy is True
+
+
+def test_a_reply_that_was_cut_is_marked(scene: Scene) -> None:
+    tools = ToolRegistry()
+    tools.add("bridge.big", lambda arguments: {"blob": b"x" * (encoding.MAX_BYTES + 1)})
+    reply = dispatcher(tools).dispatch(call("bridge.big", timeout_s=5.0))
+    assert reply.payload["ok"] is True
+    assert reply.payload["lossy"] is True
+    assert reply.payload["cut"] == ["data.blob"]
+
+
+# Section: the two real tools
+
+
+def test_scene_info_reads_what_is_open(scene: Scene) -> None:
+    running = dispatcher(hou=scene.module())
+    reply = running.dispatch(call("scene.info", timeout_s=5.0))
+    data = reply.payload["data"]
+    assert data["houdini_version"] == "22.0.368"
+    assert data["frame"] == 1.0
+    assert data["fps"] == 24.0
+    assert data["nodes"]["/obj"] == 0
+    assert data["kind"] == "hython"
+    # A headless session cannot tell, and says so rather than always yes.
+    assert data["unsaved"] is None
+
+
+def test_scene_info_says_it_is_unsaved_where_that_is_worth_knowing(scene: Scene) -> None:
+    running = dispatcher(kind="gui", hou=scene.module())
+    reply = running.dispatch(call("scene.info", timeout_s=5.0))
+    assert reply.payload["data"]["unsaved"] is True
+
+
+def test_node_create_sets_the_parameters_it_was_given(scene: Scene) -> None:
+    running = dispatcher(hou=scene.module())
+    reply = running.dispatch(
+        call(
+            "node.create",
+            arguments={"parent": "/obj", "type": "geo", "name": "barrel", "parms": {"tx": 3.0}},
+            timeout_s=5.0,
+        )
+    )
+    data = reply.payload["data"]
+    assert data["path"] == "/obj/barrel"
+    assert data["parms_set"] == ["tx"]
+    assert scene.node("/obj/barrel").parm("tx").value == 3.0
+
+
+def _until(ready: Any, timeout_s: float = 10.0) -> None:
+    """Wait for something a background thread is about to do."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if ready():
+            return
+        time.sleep(0.01)
+    raise AssertionError("waited too long")

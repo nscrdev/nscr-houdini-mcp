@@ -10,17 +10,21 @@ A bridge is always driven from another process, never from its own.
 
 from __future__ import annotations
 
-from nscr_houdini_mcp.bridge.app import Bridge, BridgeConfig, BridgeError
+from nscr_houdini_mcp.bridge.app import Bridge, BridgeConfig, BridgeStartError
 from nscr_houdini_mcp.bridge.envelope import Envelope, EnvelopeError, Reply
-from nscr_houdini_mcp.bridge.handlers import ToolRegistry, default_registry
+from nscr_houdini_mcp.bridge.errors import CODES, BridgeError
+from nscr_houdini_mcp.bridge.handlers import Tool, ToolRegistry, default_registry
 
 __all__ = [
     "Bridge",
     "BridgeConfig",
+    "CODES",
     "BridgeError",
+    "BridgeStartError",
     "Envelope",
     "EnvelopeError",
     "Reply",
+    "Tool",
     "ToolRegistry",
     "default_registry",
 ]

@@ -32,6 +32,9 @@ from nscr_houdini_mcp.bridge.serving import CALL_PATH, HEALTH_PATH, JSON_TYPE
 
 DEFAULT_TIMEOUT_S = 10.0
 
+# How much longer than the bridge budgets this end waits on the socket.
+SOCKET_MARGIN_S = 10.0
+
 
 class BridgeUnreachable(Exception):
     """Nothing answered on that port."""
@@ -165,9 +168,19 @@ def call(
     scene_epoch: int | None = None,
     operation_id: str | None = None,
     wait_s: float | None = None,
+    timeout_s: float | None = None,
+    skip_if_busy: bool | None = None,
+    http_timeout_s: float | None = None,
     **rest: Any,
 ) -> Answer:
-    """Send one request envelope."""
+    """Send one request envelope.
+
+    `wait_s` and `timeout_s` are the bridge's budgets: how long the call may
+    wait for its turn, and how long it may wait for work that is running.
+    `http_timeout_s` is how long this end waits on the socket. It defaults to
+    a little more than both, because a client that gives up before the bridge
+    answers learns nothing and leaves the work running.
+    """
     envelope: dict[str, Any] = {"tool": tool, "arguments": dict(arguments or {})}
     if session_id is not None:
         envelope["session_id"] = session_id
@@ -177,6 +190,15 @@ def call(
         envelope["operation_id"] = operation_id
     if wait_s is not None:
         envelope["wait_s"] = wait_s
+    if timeout_s is not None:
+        envelope["timeout_s"] = timeout_s
+    if skip_if_busy is not None:
+        envelope["skip_if_busy"] = skip_if_busy
+    if http_timeout_s is None:
+        http_timeout_s = max(
+            DEFAULT_TIMEOUT_S, (wait_s or 0.0) + (timeout_s or 0.0) + SOCKET_MARGIN_S
+        )
+    rest.setdefault("timeout_s", http_timeout_s)
     return post(session, CALL_PATH, envelope, **rest)
 
 

@@ -27,11 +27,25 @@ from typing import Any
 BROWSER_HEADERS = ("origin", "referer")
 
 ENVELOPE_FIELDS = frozenset(
-    {"session_id", "scene_epoch", "operation_id", "tool", "arguments", "wait_s"}
+    {
+        "session_id",
+        "scene_epoch",
+        "operation_id",
+        "tool",
+        "arguments",
+        "wait_s",
+        "timeout_s",
+        "skip_if_busy",
+    }
 )
 
 # How long a call may wait for the session to be free. Zero means answer now.
 MAX_WAIT_S = 50.0
+
+# How long a call may wait for work that is already running. It is a separate
+# budget from `wait_s`: waiting for a turn and waiting for an answer are
+# different things, and a caller may want a short first and a long second.
+MAX_TIMEOUT_S = 3600.0
 
 MAX_TOOL_NAME = 128
 
@@ -64,6 +78,8 @@ class Envelope:
     scene_epoch: int | None = None
     operation_id: str | None = None
     wait_s: float | None = None
+    timeout_s: float | None = None
+    skip_if_busy: bool = False
 
 
 @dataclass(frozen=True)
@@ -110,24 +126,30 @@ def parse_envelope(payload: Any) -> Envelope:
         if isinstance(scene_epoch, bool) or not isinstance(scene_epoch, int):
             raise EnvelopeError("scene_epoch must be an integer")
 
+    skip = payload.get("skip_if_busy", False)
+    if not isinstance(skip, bool):
+        raise EnvelopeError("skip_if_busy must be true or false")
+
     return Envelope(
         tool=tool,
         arguments=dict(arguments),
         session_id=_text(payload.get("session_id"), "session_id"),
         scene_epoch=scene_epoch,
         operation_id=_text(payload.get("operation_id"), "operation_id"),
-        wait_s=_wait(payload.get("wait_s")),
+        wait_s=_seconds(payload.get("wait_s"), "wait_s", MAX_WAIT_S),
+        timeout_s=_seconds(payload.get("timeout_s"), "timeout_s", MAX_TIMEOUT_S),
+        skip_if_busy=skip,
     )
 
 
-def _wait(value: Any) -> float | None:
-    """How long this call may wait, checked against the allowed range."""
+def _seconds(value: Any, name: str, limit: float) -> float | None:
+    """One time budget, checked against the range it is allowed."""
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise EnvelopeError("wait_s must be a number")
-    if value != value or value < 0 or value > MAX_WAIT_S:
-        raise EnvelopeError(f"wait_s must be between 0 and {MAX_WAIT_S:g}")
+        raise EnvelopeError(f"{name} must be a number")
+    if value != value or value < 0 or value > limit:
+        raise EnvelopeError(f"{name} must be between 0 and {limit:g}")
     return float(value)
 
 

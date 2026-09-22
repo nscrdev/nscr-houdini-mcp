@@ -9,8 +9,8 @@ Two endpoints, both on paths of the bridge's own:
 - `/nscr-mcp/health` answers from values held in memory. It reads no scene,
   touches no `hou`, takes no lock and opens no file, so it still answers while
   the session is busy.
-- `/nscr-mcp/call` takes one request envelope and dispatches it to a tool, one
-  call at a time in the whole process.
+- `/nscr-mcp/call` takes one request envelope and hands it to the dispatcher,
+  which runs one call at a time in the whole process.
 
 What this protects against, and what it does not. Anything running as the
 same person on the same machine is already inside: it can read that person's
@@ -40,9 +40,9 @@ nothing here offers a way around it.
 For the same reason, nothing drives a bridge from inside its own process. The
 caller is always another process.
 
-What is deliberately not here: the queue with its own ordering, the full wait
-and timeout policy, the undo group, the receipt table and the full error code
-table. Those sit on top of this dispatch point.
+The order calls are served in, the wait and timeout budgets, the undo group
+and the error codes belong to the dispatcher. What is still not here: the
+receipt table for repeated operation ids, and the scene guard.
 """
 
 from __future__ import annotations
@@ -53,15 +53,16 @@ import re
 import secrets
 import threading
 import time
-import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from nscr_houdini_mcp import store as store_module
-from nscr_houdini_mcp.bridge import host, liveness, registry, signing
+from nscr_houdini_mcp.bridge import host, liveness, marshal, registry, signing
+from nscr_houdini_mcp.bridge.dispatch import DEFAULT_TIMEOUT_S, DEFAULT_WAIT_S, Dispatcher
 from nscr_houdini_mcp.bridge.envelope import (
     MAX_DEPTH,
+    Envelope,
     EnvelopeError,
     Reply,
     error_payload,
@@ -69,7 +70,7 @@ from nscr_houdini_mcp.bridge.envelope import (
     ok_payload,
     parse_envelope,
 )
-from nscr_houdini_mcp.bridge.handlers import ToolRegistry, UnknownTool, default_registry
+from nscr_houdini_mcp.bridge.handlers import ToolRegistry, default_registry
 from nscr_houdini_mcp.bridge.net import (
     DEFAULT_PORT_RANGE,
     LOOPBACK,
@@ -98,9 +99,11 @@ SESSION_ID_BYTES = 16
 
 DEFAULT_HEARTBEAT_S = 10.0
 
-# How long a call waits for the one at a time lock when it names no wait of
-# its own. A call may ask for less, including none at all.
-DEFAULT_DISPATCH_WAIT_S = 30.0
+# How long a call waits for its turn when it names no wait of its own, and how
+# long it waits for work that is already running. A call may ask for less, or
+# for none at all.
+DEFAULT_DISPATCH_WAIT_S = DEFAULT_WAIT_S
+DEFAULT_DISPATCH_TIMEOUT_S = DEFAULT_TIMEOUT_S
 
 # The largest request body the bridge will read. An envelope is small; this is
 # room for a long piece of code as an argument and nothing more.
@@ -131,7 +134,7 @@ ALIAS_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 LOG_DIR_NAME = "logs"
 
 
-class BridgeError(Exception):
+class BridgeStartError(Exception):
     """The bridge could not start, or could not start safely."""
 
 
@@ -148,6 +151,7 @@ class BridgeConfig:
     kind: str | None = None
     heartbeat_s: float = DEFAULT_HEARTBEAT_S
     dispatch_wait_s: float = DEFAULT_DISPATCH_WAIT_S
+    dispatch_timeout_s: float = DEFAULT_DISPATCH_TIMEOUT_S
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
     max_depth: int = MAX_DEPTH
     server_name: str = "nscr_mcp_bridge"
@@ -192,8 +196,22 @@ class Bridge:
         self._own_backend = backend is None
         self._lock = threading.Lock()
         self._running = False
-        self._current_tool: str | None = None
-        self._busy_since: float | None = None
+        # The thread that owns the process runs this while the bridge is up,
+        # because a scene edit has to happen on the main thread to be one
+        # undo step. A bridge whose owner never runs it still works, and says
+        # in every mutating reply that nothing was recorded.
+        self.main_loop = marshal.MainLoop()
+        self.dispatcher = Dispatcher(
+            self.tools,
+            lock=_HOUDINI_LOCK,
+            kind=self.kind,
+            session_id=self.session_id,
+            scene_epoch=lambda: self.scene_epoch,
+            log=self._log,
+            main_loop=self.main_loop,
+            wait_s=self.config.dispatch_wait_s,
+            timeout_s=self.config.dispatch_timeout_s,
+        )
         self._heartbeat_at = 0.0
         self._heartbeat_stop = threading.Event()
         self._heartbeat: threading.Thread | None = None
@@ -206,7 +224,7 @@ class Bridge:
         """Start the server, prove it is private, then announce the session."""
         with self._lock:
             if self._running:
-                raise BridgeError("this bridge is already running")
+                raise BridgeStartError("this bridge is already running")
             backend, port = self._listen()
             self._backend = backend
             self.port = port
@@ -216,7 +234,7 @@ class Bridge:
             if self.config.verify_loopback and not proof.private:
                 backend.stop()
                 self.port = None
-                raise BridgeError(
+                raise BridgeStartError(
                     f"port {port} is held or answered on {', '.join(proof.reachable)},"
                     " not loopback alone"
                 )
@@ -332,11 +350,9 @@ class Bridge:
                         "scene_epoch": self.scene_epoch,
                         "started_at": self.started_at,
                         "heartbeat_age_s": round(max(0.0, now - self._heartbeat_at), 3),
-                        "busy": self._busy_since is not None,
-                        "current_op": self._current_tool,
-                        "current_op_elapsed_s": self._elapsed_s(),
                         "privacy": self.privacy,
                         "tools": self.tools.names(),
+                        **self.dispatcher.state(),
                     }
                 ),
             ),
@@ -358,9 +374,8 @@ class Bridge:
 
     # Dispatch
 
-    def _dispatch(self, envelope: Any) -> Reply:
-        """Run one tool under the one at a time lock."""
-        trace = {"operation_id": envelope.operation_id, "scene_epoch": envelope.scene_epoch}
+    def _dispatch(self, envelope: Envelope) -> Reply:
+        """Check the call is for this session, then hand it to the dispatcher."""
         if envelope.session_id is not None and envelope.session_id != self.session_id:
             return Reply(
                 200,
@@ -371,80 +386,11 @@ class Bridge:
                         hint="read the session id from the health endpoint and call again",
                         details={"session_id": self.session_id},
                     ),
-                    **trace,
+                    "operation_id": envelope.operation_id,
+                    "scene_epoch": self.scene_epoch,
                 },
             )
-        try:
-            handler = self.tools.get(envelope.tool)
-        except UnknownTool:
-            return Reply(
-                200,
-                {
-                    **error_payload(
-                        "TOOL_UNKNOWN",
-                        f"no tool named {envelope.tool}",
-                        details={"tools": self.tools.names()},
-                    ),
-                    **trace,
-                },
-            )
-
-        wait_s = self.config.dispatch_wait_s if envelope.wait_s is None else envelope.wait_s
-        waited = time.perf_counter()
-        if not self._take_lock(wait_s):
-            return Reply(
-                200,
-                {
-                    **error_payload(
-                        "SESSION_BUSY",
-                        "this session is running another call",
-                        hint="wait for the running call to finish, then send this one again",
-                        details={
-                            "current_op": self._current_tool,
-                            "elapsed_s": self._elapsed_s(),
-                            "waited_s": round(time.perf_counter() - waited, 3),
-                            "wait_s": wait_s,
-                        },
-                    ),
-                    **trace,
-                },
-            )
-        began = time.perf_counter()
-        self._current_tool = envelope.tool
-        self._busy_since = time.time()
-        try:
-            data = handler(envelope.arguments)
-        except Exception as error:  # noqa: BLE001 - one failed tool, not a failed bridge
-            # The text of an exception can hold paths and scene contents, so it
-            # goes to the local log and the caller gets the type.
-            self._log(
-                f"tool {envelope.tool} raised: {type(error).__name__}: {error}\n"
-                + "".join(traceback.format_exception(error)[-8:])
-            )
-            return Reply(
-                200,
-                {
-                    **error_payload(
-                        "TOOL_FAILED",
-                        f"the tool raised {type(error).__name__}",
-                        hint="the bridge log for this session has the detail",
-                        details={"tool": envelope.tool, "exception": type(error).__name__},
-                    ),
-                    **trace,
-                },
-            )
-        finally:
-            self._current_tool = None
-            self._busy_since = None
-            _HOUDINI_LOCK.release()
-        timing_ms = (time.perf_counter() - began) * 1000.0
-        return Reply(200, {**ok_payload(data, timing_ms=timing_ms), **trace})
-
-    def _take_lock(self, wait_s: float) -> bool:
-        """Take the one at a time lock, waiting no longer than asked."""
-        if wait_s <= 0:
-            return _HOUDINI_LOCK.acquire(blocking=False)
-        return _HOUDINI_LOCK.acquire(timeout=wait_s)
+        return self.dispatcher.dispatch(envelope)
 
     # The front of every request
 
@@ -546,8 +492,8 @@ class Bridge:
             if start_port <= port <= end_port:
                 return backend, port
             backend.stop()
-            raise BridgeError(f"the server took port {port}, outside {self.config.port_range}")
-        raise BridgeError(f"no port in {self.config.port_range} could be served: {last}")
+            raise BridgeStartError(f"the server took port {port}, outside {self.config.port_range}")
+        raise BridgeStartError(f"no port in {self.config.port_range} could be served: {last}")
 
     def _announce(self, port: int) -> store_module.SessionRecord:
         """Take an alias, write the session row, then the private file."""
@@ -610,11 +556,6 @@ class Bridge:
                     self._heartbeat_at = store.touch_session(self.session_id)
             except Exception as error:  # noqa: BLE001 - a missed beat is not a crash
                 self._note(f"heartbeat: {error}")
-
-    def _elapsed_s(self) -> float | None:
-        """How long the running call has been running, read without a lock."""
-        since = self._busy_since
-        return None if since is None else round(max(0.0, time.time() - since), 3)
 
     def log_path(self) -> Path:
         """Where this session's detail goes. The token is never written here."""

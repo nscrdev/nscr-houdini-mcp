@@ -10,7 +10,7 @@ import pytest
 
 from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge import registry, security, signing
-from nscr_houdini_mcp.bridge.app import Bridge, BridgeConfig, BridgeError, houdini_lock
+from nscr_houdini_mcp.bridge.app import Bridge, BridgeConfig, BridgeStartError, houdini_lock
 from nscr_houdini_mcp.bridge.handlers import ToolRegistry, default_registry
 from nscr_houdini_mcp.bridge.serving import (
     CALL_PATH,
@@ -175,7 +175,8 @@ def test_health_answers_from_memory(tmp_path: Path) -> None:
         assert data["port"] == bridge.port
         assert data["scene_epoch"] == 0
         assert data["busy"] is False
-        assert data["tools"] == ["bridge.ping"]
+        assert data["tools"][0] == "bridge.ping"
+        assert "node.create" in data["tools"]
     finally:
         bridge.stop()
 
@@ -434,8 +435,8 @@ def test_another_session_id_and_an_unknown_tool_fail_without_failing_the_call(
 
         unknown = send(bridge, backend, CALL_PATH, envelope(tool="nothing.here"))
         assert unknown.status == 200
-        assert body_of(unknown)["error"]["code"] == "TOOL_UNKNOWN"
-        assert body_of(unknown)["error"]["details"]["tools"] == ["bridge.ping"]
+        assert body_of(unknown)["error"]["code"] == "UNKNOWN_TOOL"
+        assert body_of(unknown)["error"]["details"]["tools"] == bridge.tools.names()
     finally:
         bridge.stop()
 
@@ -598,7 +599,7 @@ def test_a_port_the_server_took_outside_the_range_stops_the_bridge(tmp_path: Pat
         BridgeConfig(home=tmp_path, kind="hython", verify_loopback=False),
         backend=backend,
     )
-    with pytest.raises(BridgeError):
+    with pytest.raises(BridgeStartError):
         bridge.start()
     assert backend.stops == 1
     assert registry.list_entries(tmp_path) == []
@@ -614,7 +615,7 @@ def test_a_port_that_is_not_private_stops_the_bridge(
         lambda port, **rest: PrivacyProof(False, True, ("192.0.2.7",), ("192.0.2.7",), "held"),
     )
     bridge, backend = make_bridge(tmp_path, verify_loopback=True)
-    with pytest.raises(BridgeError) as raised:
+    with pytest.raises(BridgeStartError) as raised:
         bridge.start()
     assert "192.0.2.7" in str(raised.value)
     assert backend.stops == 1
@@ -660,9 +661,10 @@ def test_the_tool_table_refuses_a_name_twice() -> None:
     tools = default_registry()
     with pytest.raises(ValueError):
         tools.add("bridge.ping", lambda arguments: None)
-    assert tools.names() == ["bridge.ping"]
+    names = tools.names()
+    assert names == sorted(set(names), key=names.index)
     assert "bridge.ping" in tools
-    assert len(tools) == 1
+    assert len(tools) == len(names)
 
 
 def _explode(arguments: Mapping[str, Any]) -> Any:
