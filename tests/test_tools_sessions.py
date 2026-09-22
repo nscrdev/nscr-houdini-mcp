@@ -461,3 +461,65 @@ def test_a_worker_that_had_to_be_ended_lists_as_gone(
         if launched.poll() is None:
             pool.kill_process(launched.pid, process_start_stamp(launched.pid))
         pool.reap_started()
+
+
+def test_a_receipt_left_by_a_server_that_died_is_not_run_again(
+    bench: Bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[dict[str, Any]] = []
+    monkeypatch.setattr(pool, "start_worker", fake_start(bench, seen))
+    digest = store_module.digest_arguments({"action": "start", "weight": "light"})
+    with bench.store() as store:
+        store.begin_operation("start-9", digest, owner_pid=DEAD_PID)
+    arguments = {"action": "start", "operation_id": "start-9"}
+    _, [first, second] = talk(
+        bench.serve(), ("hou_sessions", arguments), ("hou_sessions", arguments)
+    )
+    assert first.structured_content["error"]["code"] == "OUTCOME_UNKNOWN"
+    assert second.structured_content["error"]["code"] == "OUTCOME_UNKNOWN"
+    assert seen == []
+    with bench.store() as store:
+        assert store.get_operation("start-9").state == "abandoned"
+
+
+def test_a_start_that_may_have_left_a_worker_running_closes_its_id(
+    bench: Bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def half(config: pool.PoolConfig, store: Store, **rest: Any) -> WorkerRecord:
+        error = store_module.StoreError("could not record the worker")
+        error.spawned_pid = 4242  # type: ignore[attr-defined]
+        error.spawned_ended = False  # type: ignore[attr-defined]
+        raise error
+
+    monkeypatch.setattr(pool, "start_worker", half)
+    arguments = {"action": "start", "operation_id": "start-10"}
+    _, [first] = talk(bench.serve(), ("hou_sessions", arguments))
+    assert first.structured_content["error"]["code"] == "STORE_UNAVAILABLE"
+    assert first.structured_content["error"]["details"]["spawned_ended"] is False
+
+    seen: list[dict[str, Any]] = []
+    monkeypatch.setattr(pool, "start_worker", fake_start(bench, seen))
+    _, [again] = talk(bench.serve(), ("hou_sessions", arguments))
+    assert again.structured_content["error"]["code"] == "OUTCOME_UNKNOWN"
+    assert seen == []
+
+
+def test_a_start_whose_process_was_ended_frees_its_id(
+    bench: Bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def ended(config: pool.PoolConfig, store: Store, **rest: Any) -> WorkerRecord:
+        error = pool.WorkerStartFailed("no worker bridge after 1 seconds")
+        error.spawned_pid = 4242  # type: ignore[attr-defined]
+        error.spawned_ended = True  # type: ignore[attr-defined]
+        raise error
+
+    monkeypatch.setattr(pool, "start_worker", ended)
+    arguments = {"action": "start", "operation_id": "start-11"}
+    _, [first] = talk(bench.serve(), ("hou_sessions", arguments))
+    assert first.structured_content["error"]["code"] == "WORKER_START_FAILED"
+
+    seen: list[dict[str, Any]] = []
+    monkeypatch.setattr(pool, "start_worker", fake_start(bench, seen))
+    _, [again] = talk(bench.serve(), ("hou_sessions", arguments))
+    assert not again.is_error, text_of(again)
+    assert len(seen) == 1

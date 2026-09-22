@@ -472,6 +472,12 @@ def start_worker(
     Raises `store.PoolFull` when there is no room, and `WorkerStartFailed`
     when hython came up with no bridge in it. Either way the slot is the
     pool's again before this returns.
+
+    A failure after the process was started, a store that would not record the
+    running worker included, ends that process where it can be shown to be
+    the one started, and removes its session file. What became of it is put
+    on the error as `spawned_pid` and `spawned_ended`, so a caller holding a
+    receipt knows whether a worker may still be running.
     """
     chosen = Path(hython) if hython is not None else hython_path(config.hython)
     reserved = store.reserve_worker(
@@ -482,6 +488,9 @@ def start_worker(
         weight=weight_of(weight),
         weight_budget=config.budget,
     )
+    launched: Launched | None = None
+    stamp: str | None = None
+    entry: dict[str, Any] | None = None
     try:
         store.set_worker_state(reserved.token, "starting")
         since = time.time()
@@ -490,6 +499,7 @@ def start_worker(
             log=log_path(config.home, reserved.alias),
             env=worker_env(config, token=reserved.token, weight=reserved.weight),
         )
+        stamp = process_start_stamp(launched.pid)
         entry = wait_for_entry(
             config.home,
             launched,
@@ -498,25 +508,64 @@ def start_worker(
             timeout_s=config.start_timeout_s if timeout_s is None else timeout_s,
         )
         capabilities = probe(entry)
-    except BaseException:
+        # From here the worker owns its own slot. The process that started it
+        # may go away without taking the warm worker with it.
+        record = store.set_worker_state(
+            reserved.token,
+            "running",
+            session_id=str(entry["session_id"]),
+            owner_pid=launched.pid,
+            pid=launched.pid,
+            pid_start=stamp,
+            capabilities=capabilities,
+        )
+        # A worker started for a job is taken the same way any other is, so
+        # the row says which process is holding it.
+        return store.lease_worker(record.token, job_id=job_id) if job_id else record
+    except BaseException as error:
+        if launched is not None:
+            ended = end_spawned(launched, stamp)
+            if ended and entry is not None:
+                registry.remove_entry(Path(config.home), str(entry.get("session_id") or ""))
+            _note_spawned(error, launched.pid, ended)
         # The slot goes back whatever went wrong, including a caller that gave
-        # up on the start, so a failure cannot shrink the pool.
-        store.release_worker(reserved.token, state="failed")
+        # up on the start, so a failure cannot shrink the pool. A store that
+        # cannot take that now is left to the reaper rather than hiding why
+        # the start failed.
+        try:
+            store.release_worker(reserved.token, state="failed")
+        except store_module.StoreError:
+            pass
         raise
-    # From here the worker owns its own slot. The process that started it may
-    # go away without taking the warm worker with it.
-    record = store.set_worker_state(
-        reserved.token,
-        "running",
-        session_id=str(entry["session_id"]),
-        owner_pid=launched.pid,
-        pid=launched.pid,
-        pid_start=process_start_stamp(launched.pid),
-        capabilities=capabilities,
-    )
-    # A worker started for a job is taken the same way any other is, so the
-    # row says which process is holding it.
-    return store.lease_worker(record.token, job_id=job_id) if job_id else record
+
+
+def end_spawned(launched: Launched, stamp: str | None) -> bool:
+    """End a process a failed start left behind. Says whether it has ended.
+
+    Only a process that can be shown to be the one started is ended, and
+    never this process itself.
+    """
+    if launched.poll() is not None:
+        return True
+    if launched.pid == os.getpid():
+        return False
+    if not kill_process(launched.pid, stamp):
+        return same_process(launched.pid, stamp) is False
+    deadline = time.monotonic() + KILL_WAIT_S
+    while time.monotonic() < deadline:
+        reap_started()
+        if launched.poll() is not None or same_process(launched.pid, stamp) is False:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _note_spawned(error: BaseException, pid: int, ended: bool) -> None:
+    try:
+        error.spawned_pid = pid  # type: ignore[attr-defined]
+        error.spawned_ended = ended  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
 
 
 def _token() -> str:
@@ -622,7 +671,8 @@ def stop_worker(
     worker that has not gone when the grace period is over is ended here, if
     it can be proved to still be the same process. Once it has gone its
     session file goes with it, because a file left behind names a port
-    anything could be answering on.
+    anything could be answering on. A worker that has not gone keeps its
+    slot, so the pool never counts a running process as free room.
     """
     record = find_worker(store, handle)
     store.set_worker_state(record.token, "stopping")
@@ -636,10 +686,17 @@ def stop_worker(
         else:
             note = f"the process {record.pid} could not be shown to be this worker"
     ended = not worker_is_alive(record)
-    if ended and record.session_id:
+    if not ended:
+        # The process is still there, so its slot is still taken. The row
+        # stays `stopping`: the worker releases it when it goes, or the
+        # reaper does once the process is shown to have ended.
+        current = store.get_worker(record.token) or record
+        note = note or "the process did not end in time; the slot stays taken until it does"
+        return Stopped(current, killed=killed, ended=False, note=note)
+    if record.session_id:
         registry.remove_entry(Path(config.home), record.session_id)
     stopped = store.release_worker(record.token, state="stopped")
-    return Stopped(stopped, killed=killed, ended=ended, note=note)
+    return Stopped(stopped, killed=killed, ended=True, note=note)
 
 
 def _wait_for_the_end(record: WorkerRecord, grace_s: float, poll_s: float) -> None:

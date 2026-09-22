@@ -19,7 +19,9 @@ Four actions.
 `start` and `stop` change what runs on the machine, so each takes a receipt
 under its operation id in the store. The same id sent again after a lost reply
 gets the first answer rather than a second worker. A start or stop that failed
-changed nothing, so its receipt is dropped and the id can be used again.
+and changed nothing drops its receipt, so the id can be used again. One that
+may have left a worker running, or whose attempt stopped part way, closes it
+as abandoned, and the id answers `OUTCOME_UNKNOWN` from then on.
 
 This module never imports `hou`.
 """
@@ -276,15 +278,24 @@ def start_worker(call: Call) -> dict[str, Any]:
         try:
             record = pool.start_worker(pool_config(router, config), store, weight=weight)
         except Exception as error:
-            stored(lambda: store.drop_operation(operation_id))
+            if getattr(error, "spawned_pid", None) and not getattr(error, "spawned_ended", False):
+                # A worker may be running that nothing recorded, so the id is
+                # closed rather than freed for a second start.
+                abandon(store, operation_id)
+            else:
+                stored(lambda: store.drop_operation(operation_id))
             raise start_failure(error, store, config) from None
-        session = stored(lambda: store.get_session(record.session_id or ""))
-        active = stored(store.list_workers)
-        result = {
-            "session": started_row(record, session),
-            "pool": pool_summary(active, config),
-        }
-        stored(lambda: store.finish_operation(operation_id, outcome=result))
+        try:
+            session = store.get_session(record.session_id or "")
+            result = {
+                "session": started_row(record, session),
+                "pool": pool_summary(store.list_workers(), config),
+            }
+            store.finish_operation(operation_id, outcome=result)
+        except (store_module.StoreError, sqlite3.Error) as error:
+            # The worker is up; only the answer could not be recorded.
+            abandon(store, operation_id)
+            raise unavailable(error) from None
     return result
 
 
@@ -308,6 +319,15 @@ def started_row(record: WorkerRecord, session: SessionRecord | None) -> dict[str
 
 def start_failure(error: Exception, store: Any, config: Config) -> Exception:
     """What a failed start comes back as, coded where the pool said why."""
+    coded = coded_start_failure(error, store, config)
+    spawned = getattr(error, "spawned_pid", None)
+    if isinstance(coded, CallError) and spawned:
+        coded.details["spawned_pid"] = spawned
+        coded.details["spawned_ended"] = bool(getattr(error, "spawned_ended", False))
+    return coded
+
+
+def coded_start_failure(error: Exception, store: Any, config: Config) -> Exception:
     if isinstance(error, store_module.PoolFull):
         active = stored(store.list_workers)
         return CallError(
@@ -426,7 +446,12 @@ def not_a_worker(record: SessionRecord) -> CallError:
 
 
 def begin(store: Any, operation_id: str, digest: str) -> dict[str, Any] | None:
-    """Claim an operation id. Returns the first answer when it already ran."""
+    """Claim an operation id. Returns the first answer when it already ran.
+
+    As the bridge's receipts do: an id whose earlier attempt stopped without
+    recording what it did is closed as abandoned and not run again, because
+    that attempt may have started or stopped a worker before it went.
+    """
     try:
         claim = store.begin_operation(operation_id, digest)
     except store_module.OperationMismatch as error:
@@ -435,16 +460,38 @@ def begin(store: Any, operation_id: str, digest: str) -> dict[str, Any] | None:
         ) from None
     except (store_module.StoreError, sqlite3.Error) as error:
         raise unavailable(error) from None
+    if claim.outcome_unknown:
+        if claim.claimed:
+            abandon(store, operation_id)
+            raise unknown(operation_id, "an earlier attempt with this id stopped part way")
+        raise unknown(operation_id, "another call with this id is still running")
     if claim.claimed:
         return None
-    if claim.outcome_unknown:
-        raise CallError(
-            "OUTCOME_UNKNOWN",
-            "another call with this operation id is still running",
-            details={"operation_id": operation_id},
-        )
+    if claim.record.state == store_module.OPERATION_ABANDONED:
+        raise unknown(operation_id, "an earlier attempt with this id stopped part way")
     outcome = claim.record.outcome
     return {**outcome, "replayed": True} if isinstance(outcome, Mapping) else None
+
+
+def abandon(store: Any, operation_id: str) -> None:
+    """Close a receipt whose work may have happened, so it is never run again."""
+    try:
+        store.finish_operation(
+            operation_id,
+            state=store_module.OPERATION_ABANDONED,
+            error={"reason": "the attempt stopped without recording what it did"},
+        )
+    except (store_module.StoreError, sqlite3.Error):
+        pass
+
+
+def unknown(operation_id: str, why: str) -> CallError:
+    return CallError(
+        "OUTCOME_UNKNOWN",
+        f"{why}, so whether it happened is not known",
+        hint="list the sessions to see what is running, then use a new operation_id",
+        details={"operation_id": operation_id},
+    )
 
 
 def stored(action: Callable[[], Any]) -> Any:

@@ -9,6 +9,7 @@ one process.
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -538,6 +539,82 @@ def test_a_worker_that_never_writes_its_file_is_a_failed_start(
             config, store, hython=hython, spawn=say_nothing, probe=lambda entry: {}, timeout_s=0.5
         )
     assert store.list_workers() == []
+
+
+def test_a_start_that_fails_after_the_spawn_ends_the_process(
+    config: pool.PoolConfig, store: Store, hython: Path
+) -> None:
+    """A real process stands in for hython, so there is something to end."""
+    started: list[pool.Launched] = []
+
+    def spawn(command, *, log: Path, env) -> pool.Launched:
+        launched = pool.spawn_detached(
+            [sys.executable, "-c", "import time; time.sleep(120)"], log=log
+        )
+        started.append(launched)
+        registry.write_entry(
+            config.home,
+            {
+                "session_id": "session-spawned",
+                "alias": _alias(command),
+                "kind": "hython",
+                "pid": launched.pid,
+                "pid_start": store_module.process_start_stamp(launched.pid),
+                "port": 18490,
+                "token": "not-a-real-token",
+                "started_at": time.time(),
+            },
+        )
+        return launched
+
+    def refuse(entry, **rest: Any) -> dict[str, Any]:
+        raise RuntimeError("the store went away")
+
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            pool.start_worker(config, store, hython=hython, spawn=spawn, probe=refuse)
+        [launched] = started
+        assert caught.value.spawned_pid == launched.pid
+        assert caught.value.spawned_ended is True
+        assert launched.poll() is not None
+        assert not registry.entry_path(config.home, "session-spawned").exists()
+        assert store.list_workers() == []
+    finally:
+        for launched in started:
+            if launched.poll() is None:
+                pool.kill_process(launched.pid, store_module.process_start_stamp(launched.pid))
+        pool.reap_started()
+
+
+def test_a_process_that_cannot_be_shown_to_be_the_one_started_is_left_and_said_so(
+    config: pool.PoolConfig, store: Store, hython: Path
+) -> None:
+    """The stand in names this process, which is never ended from here."""
+
+    def refuse(entry, **rest: Any) -> dict[str, Any]:
+        raise RuntimeError("probe failed")
+
+    with pytest.raises(RuntimeError) as caught:
+        pool.start_worker(
+            config, store, hython=hython, spawn=FakeLauncher(config.home).spawn, probe=refuse
+        )
+    assert caught.value.spawned_pid == os.getpid()
+    assert caught.value.spawned_ended is False
+
+
+def test_a_worker_that_did_not_end_keeps_its_slot(config: pool.PoolConfig, store: Store) -> None:
+    """With no start stamp the process cannot be shown to be the worker, so it
+    is neither ended nor counted as gone, and its slot stays taken."""
+    single = pool.PoolConfig(home=config.home, cap=1)
+    store.reserve_worker(cap=1, token="kept")
+    store.set_worker_state("kept", "running", session_id="session-kept", pid=os.getpid())
+    stopped = pool.stop_worker(single, store, "kept", grace_s=0.1, poll_s=0.05)
+    assert stopped.ended is False
+    assert stopped.killed is False
+    assert stopped.note
+    assert store.get_worker("kept").state == "stopping"
+    with pytest.raises(PoolFull):
+        store.reserve_worker(cap=1, token="another")
 
 
 def test_a_probe_that_could_not_be_sent_keeps_the_worker(
