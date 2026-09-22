@@ -212,6 +212,26 @@ def test_hou_ping_of_a_busy_session_reports_busy_rather_than_failing() -> None:
     assert stage.sent.calls[0]["wait_s"] == 0
 
 
+def test_hou_ping_shows_the_progress_the_running_call_reported() -> None:
+    busy = {
+        "ok": False,
+        "error": {"code": "SESSION_BUSY", "message": "this session is running another call"},
+        "session_id": "s-1",
+        "alias": "w1",
+        "scene_epoch": 4,
+    }
+    note = {"done": 2, "total": 5, "message": "caching", "elapsed_s": 1.2}
+    stage = Stage([record("s-1", "w1")], replies=(busy,))
+    said = {**HEALTH["data"], "busy": True, "current_op": "python.run"}
+    stage.health = lambda session, **rest: bridge_client.Answer(  # type: ignore[method-assign]
+        200, {"ok": True, "data": {**said, "current_op_progress": [note]}}, {}
+    )
+    _, [result] = talk(serve(stage), ("hou_ping", {"wait_s": 0}))
+    health = result.structured_content["health"]
+    assert health["current_op"] == "python.run"
+    assert health["progress"] == [note]
+
+
 def test_an_ambiguous_ping_is_an_error_the_text_alone_can_fix() -> None:
     stage = Stage([record("s-1", "w1"), record("s-2", "acc-1", kind="gui")])
     _, [result] = talk(serve(stage), ("hou_ping", {}))

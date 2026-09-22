@@ -54,6 +54,7 @@ def ping(call: Call) -> Mapping[str, Any]:
             "status": health.get("status"),
             "busy": health.get("busy"),
             "current_op": health.get("current_op"),
+            "progress": health.get("current_op_progress") or None,
             "queued": health.get("queued"),
             "heartbeat_age_s": health.get("heartbeat_age_s"),
             "round_trip_ms": health.get("round_trip_ms"),
