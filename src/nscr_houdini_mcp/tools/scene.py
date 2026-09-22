@@ -248,18 +248,30 @@ def claim_increment(store: Any, key: str, digest: str) -> dict[str, Any] | None:
 
 
 def planned(plan: outputs_module.OutputPlan) -> dict[str, Any]:
-    """What a receipt keeps of a version that was taken."""
+    """What a receipt keeps of a version that was taken.
+
+    The path is made once, here, in the form this system writes its own paths
+    in, and that one string is what the session is sent, what the receipt
+    keeps and what a retry sends again. The session keys its own receipt on
+    the exact text of the call, so a retry that spelled the same file another
+    way would be a different call.
+    """
     return {
-        "path": plan.path,
+        "path": native(plan.path),
         "version": plan.version,
         "name": plan.name,
         "hip_family": plan.hip_family,
         "template": plan.template,
-        "sidecar": plan.sidecar,
+        "sidecar": native(plan.sidecar),
         "run_id": plan.run_id,
         "unsaved_hip": plan.unsaved_hip,
         "warnings": list(plan.warnings),
     }
+
+
+def native(path: str) -> str:
+    """A path in the one form this system writes paths in."""
+    return os.fspath(Path(path))
 
 
 def keep(store: Any, key: str, plan: Mapping[str, Any], error: CallError) -> None:

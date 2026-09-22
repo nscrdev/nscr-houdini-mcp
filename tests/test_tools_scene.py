@@ -130,9 +130,14 @@ def test_open_refuses_a_path_that_is_not_there_without_asking_the_session(
 
 @pytest.mark.parametrize(
     ("path", "why"),
-    [(None, "open needs path"), ("shot.hip", "absolute"), ("/p/notes.txt", ".hip")],
+    [(None, "open needs path"), ("shot.hip", "absolute"), ("notes.txt", ".hip")],
 )
-def test_open_refuses_a_path_it_cannot_use(bench: Bench, path: str | None, why: str) -> None:
+def test_open_refuses_a_path_it_cannot_use(
+    bench: Bench, project: Path, path: str | None, why: str
+) -> None:
+    if path == "notes.txt":
+        # Absolute on every system, so the suffix is what is refused.
+        path = str(project / path)
     arguments = {"action": "open"} if path is None else {"action": "open", "path": path}
     result = scene(bench, **arguments)
     assert result.structured_content["error"]["code"] == "BAD_ARGUMENTS"
