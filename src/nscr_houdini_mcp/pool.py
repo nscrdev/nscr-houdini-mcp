@@ -168,6 +168,10 @@ class Launched:
 
     pid: int
     poll: Callable[[], int | None] = _still_running
+    # Ends the process through the handle that started it, which is the one
+    # way to be sure of reaching that process and no other. Nothing when the
+    # starter holds no handle.
+    kill: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -388,7 +392,7 @@ def spawn_detached(
         # The child holds its own handle on the file from here on.
         handle.close()
     _STARTED.append(process)
-    return Launched(process.pid, process.poll)
+    return Launched(process.pid, process.poll, process.kill)
 
 
 def wait_for_entry(
@@ -523,17 +527,26 @@ def start_worker(
         # the row says which process is holding it.
         return store.lease_worker(record.token, job_id=job_id) if job_id else record
     except BaseException as error:
+        ended = True
         if launched is not None:
             ended = end_spawned(launched, stamp)
             if ended and entry is not None:
                 registry.remove_entry(Path(config.home), str(entry.get("session_id") or ""))
             _note_spawned(error, launched.pid, ended)
         # The slot goes back whatever went wrong, including a caller that gave
-        # up on the start, so a failure cannot shrink the pool. A store that
-        # cannot take that now is left to the reaper rather than hiding why
-        # the start failed.
+        # up on the start, so a failure cannot shrink the pool. A process that
+        # could not be ended keeps its slot instead: the row names it and
+        # stays stopping, and the reaper frees it once the process has gone.
+        # A store that cannot take either now is left to the reaper rather
+        # than hiding why the start failed.
         try:
-            store.release_worker(reserved.token, state="failed")
+            if ended:
+                store.release_worker(reserved.token, state="failed")
+            else:
+                assert launched is not None
+                store.set_worker_state(
+                    reserved.token, "stopping", pid=launched.pid, pid_start=stamp
+                )
         except store_module.StoreError:
             pass
         raise
@@ -542,14 +555,22 @@ def start_worker(
 def end_spawned(launched: Launched, stamp: str | None) -> bool:
     """End a process a failed start left behind. Says whether it has ended.
 
-    Only a process that can be shown to be the one started is ended, and
-    never this process itself.
+    Only a process that can be shown to be the one started is ended: through
+    the handle that started it, or by pid when its start stamp matches. Never
+    this process itself.
     """
     if launched.poll() is not None:
         return True
-    if launched.pid == os.getpid():
+    if launched.kill is not None:
+        # The handle that started the process can only reach that process,
+        # so it needs no stamp to prove who the pid is.
+        try:
+            launched.kill()
+        except OSError:
+            return launched.poll() is not None
+    elif launched.pid == os.getpid():
         return False
-    if not kill_process(launched.pid, stamp):
+    elif not kill_process(launched.pid, stamp):
         return same_process(launched.pid, stamp) is False
     deadline = time.monotonic() + KILL_WAIT_S
     while time.monotonic() < deadline:
@@ -576,9 +597,16 @@ def _token() -> str:
 # Section: using and letting go of a worker
 
 
-def find_worker(store: Store, handle: str) -> WorkerRecord:
-    """One live worker by alias, by token or by session id."""
+def find_worker(store: Store, handle: str, *, include_stopping: bool = False) -> WorkerRecord:
+    """One live worker by alias, by token or by session id.
+
+    A worker that is stopping is not found unless asked for: it is on its way
+    out, and taking it for a job or renewing its lease would only lose the
+    work when it goes. A stop asks for it, so a stop can be sent again.
+    """
     for record in store.list_workers():
+        if record.state == "stopping" and not include_stopping:
+            continue
         if handle in (record.alias, record.token, record.session_id):
             return record
     raise UnknownWorker(f"no live worker {handle}")
@@ -674,7 +702,7 @@ def stop_worker(
     anything could be answering on. A worker that has not gone keeps its
     slot, so the pool never counts a running process as free room.
     """
-    record = find_worker(store, handle)
+    record = find_worker(store, handle, include_stopping=True)
     store.set_worker_state(record.token, "stopping")
     _wait_for_the_end(record, grace_s, poll_s)
     killed = False
@@ -777,15 +805,29 @@ def _lease_pass(
     if record is None or record.state in store_module.WORKER_FINAL_STATES:
         return "gone"
     if record.state == "stopping":
-        store.release_worker(token, state="stopped")
+        # The row stays stopping, and the slot taken, until the process is
+        # about to exit: the worker releases it then, or whoever stops it
+        # does once the process has gone, or the reaper.
         return "asked"
     # A clock that stepped backwards must not make a worker look fresh or
     # old, so the age is never negative.
     idle_for = max(0.0, clock() - record.leased_at)
     if record.job_id is None and max_idle_s > 0 and idle_for >= max_idle_s:
-        store.release_worker(token, state="stopped")
+        store.set_worker_state(token, "stopping")
         return "idle"
     return None
+
+
+def release_on_exit(home: Path | str, token: str) -> None:
+    """Give this worker's slot back as its process is about to exit.
+
+    Called last, after the bridge has stopped, so the slot is never free while
+    the process that holds it is still there to do work.
+    """
+    with open_store(home) as store:
+        record = store.get_worker(token)
+        if record is not None and record.state not in store_module.WORKER_FINAL_STATES:
+            store.release_worker(token, state="stopped")
 
 
 # Section: what a person is shown

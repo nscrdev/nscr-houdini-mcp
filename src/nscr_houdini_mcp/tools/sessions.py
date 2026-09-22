@@ -64,11 +64,6 @@ STOP_GRACE_S = pool.DEFAULT_STOP_GRACE_S
 RECENT_S = 3600.0
 MAX_ENDED = 20
 
-# What a failed health answer says about the session behind it.
-SILENT_CODES = frozenset(
-    {"SESSION_UNREACHABLE", "SESSION_UNRESPONSIVE", "REPLY_NOT_AUTHENTIC", "BAD_REPLY"}
-)
-
 
 def sessions(call: Call) -> Mapping[str, Any]:
     action = call.arguments.get("action") or "list"
@@ -183,11 +178,27 @@ def look(router: Router, record: SessionRecord) -> tuple[Target | None, dict[str
         health = router.health(target)
     except CallError as error:
         if error.code == "SESSION_DEAD":
-            return None, None, "crashed"
-        if error.code in SILENT_CODES:
-            return None, {"error": error.code}, "unresponsive"
-        raise
+            return None, None, after_dead(router, record)
+        # Whatever else went wrong, the session did not answer for itself.
+        return None, {"error": error.code}, "unresponsive"
     return target, health, "busy" if is_busy(health) else "live"
+
+
+def after_dead(router: Router, record: SessionRecord) -> str:
+    """What a session is when its file could not be opened.
+
+    That happens to a session that has just ended, and also to one that has
+    registered its row and not yet written its file. The row says which: an
+    ended row says how it ended, an open one is not answering yet.
+    """
+    try:
+        records = router.records(include_gone=True)
+    except CallError:
+        return "unresponsive"
+    now = next((r for r in records if r.session_id == record.session_id), None)
+    if now is not None and now.state == store_module.SESSION_GONE:
+        return ended_state(now)
+    return "unresponsive"
 
 
 def is_busy(health: Mapping[str, Any]) -> bool:
@@ -414,17 +425,27 @@ def stop_worker(call: Call) -> dict[str, Any]:
             replayed = begin(store, operation_id, digest)
             if replayed is not None:
                 return replayed
+        progress = {"asked": False}
         try:
-            result = stop_one(call, store, str(handle))
-        except Exception:
+            result = stop_one(call, store, str(handle), progress)
             if store is not None:
-                stored(lambda: store.drop_operation(operation_id))
+                store.finish_operation(operation_id, outcome=result)
+        except Exception as error:
+            if store is not None:
+                if progress["asked"]:
+                    # The stop was written, so it may well have happened. The id
+                    # is closed rather than freed for a second try that would
+                    # only find the session ended.
+                    abandon(store, operation_id)
+                else:
+                    stored(lambda: store.drop_operation(operation_id))
+            if isinstance(error, (store_module.StoreError, sqlite3.Error)):
+                raise unavailable(error) from None
             raise
-        stored(lambda: store.finish_operation(operation_id, outcome=result))
     return result
 
 
-def stop_one(call: Call, store: Any, handle: str) -> dict[str, Any]:
+def stop_one(call: Call, store: Any, handle: str, progress: dict[str, bool]) -> dict[str, Any]:
     router = call.router
     record = named(router.records(include_gone=True), handle)
     if record.state == store_module.SESSION_GONE:
@@ -441,6 +462,7 @@ def stop_one(call: Call, store: Any, handle: str) -> dict[str, Any]:
         raise not_a_worker(record)
     if not call.arguments.get("force"):
         refuse_if_in_use(router, record, worker)
+    progress["asked"] = True
     try:
         stopped = pool.stop_worker(
             pool.PoolConfig(home=router.home), store, worker.token, grace_s=STOP_GRACE_S
@@ -506,7 +528,12 @@ def refuse_if_in_use(router: Router, record: SessionRecord, worker: WorkerRecord
         )
     if record.state not in LIVE_STATES:
         return
-    _target, health, state = look(router, record)
+    try:
+        _target, health, state = look(router, record)
+    except CallError:
+        # A health read that failed says nothing about a job or a call, so it
+        # does not stand in the way of a stop.
+        return
     if state == "busy" and health is not None:
         details["current_op"] = health.get("current_op")
         raise CallError(

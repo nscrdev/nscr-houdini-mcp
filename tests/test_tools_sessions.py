@@ -619,3 +619,54 @@ def test_stop_refuses_a_worker_that_is_running_a_call(
     assert result.structured_content["error"]["code"] == "WORKER_BUSY"
     assert result.structured_content["error"]["details"]["current_op"] == "bridge.selfcheck"
     assert seen == []
+
+
+def test_a_session_whose_file_is_not_written_yet_is_not_called_crashed(bench: Bench) -> None:
+    bench.session("s-1", "w1")
+    # The row is registered and open; the file the client opens is not there.
+    bench.reachable.discard("s-1")
+    assert listed(bench)["w1"]["state"] == "unresponsive"
+
+
+def test_a_health_read_that_fails_does_not_block_a_stop(
+    bench: Bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[str] = []
+    monkeypatch.setattr(pool, "stop_worker", fake_stop(bench, seen))
+    bench.session("s-1", "w1")
+    bench.worker("s-1", "wk-1")
+    bench.health["s-1"] = client.BridgeNotAuthentic("somebody else answered")
+    _, [result] = talk(bench.serve(), ("hou_sessions", {"action": "stop", "session": "w1"}))
+    assert not result.is_error, text_of(result)
+    assert seen == ["wk-1"]
+
+
+def test_a_stop_that_failed_after_it_was_asked_closes_its_id(
+    bench: Bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stop = fake_stop(bench, [])
+
+    def stop_then_fail(*args: Any, **rest: Any) -> pool.Stopped:
+        stop(*args, **rest)
+        raise store_module.StoreError("the store went away")
+
+    monkeypatch.setattr(pool, "stop_worker", stop_then_fail)
+    bench.session("s-1", "w1")
+    bench.worker("s-1", "wk-1")
+    arguments = {"action": "stop", "session": "w1", "operation_id": "stop-7"}
+    _, [first, again] = talk(
+        bench.serve(), ("hou_sessions", arguments), ("hou_sessions", arguments)
+    )
+    assert first.structured_content["error"]["code"] == "STORE_UNAVAILABLE"
+    assert again.structured_content["error"]["code"] == "OUTCOME_UNKNOWN"
+
+
+def test_worker_busy_says_how_to_stop_it_anyway(
+    bench: Bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bench.session("s-1", "w1")
+    bench.worker("s-1", "wk-1")
+    with bench.store() as store:
+        store.lease_worker("wk-1", job_id="job-8")
+    _, [result] = talk(bench.serve(), ("hou_sessions", {"action": "stop", "session": "w1"}))
+    assert "pass force true" in text_of(result)

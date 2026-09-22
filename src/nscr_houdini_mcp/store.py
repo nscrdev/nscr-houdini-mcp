@@ -61,6 +61,9 @@ SESSION_ENDINGS = frozenset({SESSION_GONE, SESSION_CRASHED})
 # the moment it is made, before hython has started.
 WORKER_ACTIVE_STATES = ("reserved", "starting", "running", "leased", "stopping")
 WORKER_STARTING_STATES = ("reserved", "starting")
+# A worker that is stopping still holds its slot, but is never taken for a job:
+# the job would be lost when the process goes.
+WORKER_LEASABLE_STATES = ("reserved", "starting", "running", "leased")
 WORKER_FINAL_STATES = ("failed", "stopped")
 WORKER_STATES = frozenset(WORKER_ACTIVE_STATES + WORKER_FINAL_STATES)
 
@@ -1326,14 +1329,14 @@ class Store:
         now = self._now()
         pid = os.getpid() if lessee_pid is None else lessee_pid
         stamp = process_start_stamp(pid) if lessee_start is None else lessee_start
-        placeholders = ", ".join("?" * len(WORKER_ACTIVE_STATES))
+        placeholders = ", ".join("?" * len(WORKER_LEASABLE_STATES))
         with self._txn(write=True) as db:
             written = db.execute(
                 "UPDATE workers SET state = 'leased', job_id = ?, lessee_pid = ?,"
                 " lessee_start = ?, leased_at = ? WHERE token = ?"
                 f" AND state IN ({placeholders})"
                 " AND (job_id IS NULL OR job_id = ?)",
-                (job_id, pid, stamp, now, token, *WORKER_ACTIVE_STATES, job_id),
+                (job_id, pid, stamp, now, token, *WORKER_LEASABLE_STATES, job_id),
             )
             row = db.execute("SELECT * FROM workers WHERE token = ?", (token,)).fetchone()
             if row is None:

@@ -117,7 +117,19 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         bridge.stopping.set()
         bridge.stop()
+        _release_slot(bridge)
     return 0
+
+
+def _release_slot(bridge: Bridge) -> None:
+    """Give a worker's slot back, last of all, as the process exits."""
+    token = os.environ.get(pool.TOKEN_ENV_VAR)
+    if not token:
+        return
+    try:
+        pool.release_on_exit(bridge.home, token)
+    except Exception as error:  # noqa: BLE001 - the reaper frees it if this cannot
+        print(f"worker slot not given back: {error}", flush=True)
 
 
 def _start_watcher(args: argparse.Namespace, bridge: Bridge) -> threading.Thread:

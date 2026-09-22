@@ -198,7 +198,7 @@ def test_a_start_that_is_given_up_on_does_not_keep_the_slot(
 
     launcher = FakeLauncher(config.home)
     with pytest.raises(KeyboardInterrupt):
-        pool.start_worker(config, store, hython=hython, spawn=launcher.spawn, probe=refuse)
+        pool.start_worker(config, store, hython=hython, spawn=ends(launcher.spawn), probe=refuse)
     assert store.list_workers() == []
 
 
@@ -338,6 +338,9 @@ def test_an_idle_worker_ends_itself_when_nobody_has_wanted_it(home: Path, hython
         assert _watch_once(store, record.token, clock, stop) is None
         clock.tick(2.0)
         assert _watch_once(store, record.token, clock, stop) == "idle"
+        # The slot stays taken until the process is about to exit.
+        assert store.get_worker(record.token).state == "stopping"
+        pool.release_on_exit(home, record.token)
         assert store.get_worker(record.token).state == "stopped"
 
 
@@ -369,7 +372,24 @@ def test_a_worker_asked_to_stop_reads_that_from_its_own_row(home: Path, hython: 
         record = start(config, store, FakeLauncher(home), hython)
         store.set_worker_state(record.token, "stopping")
         assert _watch_once(store, record.token, clock, threading.Event()) == "asked"
+        # Still stopping, and still counted, while the process is there.
+        assert store.get_worker(record.token).state == "stopping"
+        assert _watch_once(store, record.token, clock, threading.Event()) == "asked"
+        assert [w.token for w in store.list_workers()] == [record.token]
+        pool.release_on_exit(home, record.token)
         assert store.get_worker(record.token).state == "stopped"
+
+
+def test_a_stopping_worker_is_never_taken_for_a_job(
+    config: pool.PoolConfig, store: Store, hython: Path
+) -> None:
+    record = start(config, store, FakeLauncher(config.home), hython)
+    store.set_worker_state(record.token, "stopping")
+    with pytest.raises(store_module.WorkerTaken):
+        store.lease_worker(record.token, job_id="job-1")
+    with pytest.raises(pool.UnknownWorker):
+        pool.reserve(store, record.alias, job_id="job-1")
+    assert pool.find_worker(store, record.alias, include_stopping=True).token == record.token
 
 
 def test_a_row_that_has_gone_ends_the_watch(home: Path, hython: Path) -> None:
@@ -536,9 +556,29 @@ def test_a_worker_that_never_writes_its_file_is_a_failed_start(
 
     with pytest.raises(pool.WorkerStartFailed):
         pool.start_worker(
-            config, store, hython=hython, spawn=say_nothing, probe=lambda entry: {}, timeout_s=0.5
+            config,
+            store,
+            hython=hython,
+            spawn=ends(say_nothing),
+            probe=lambda entry: {},
+            timeout_s=0.5,
         )
     assert store.list_workers() == []
+
+
+def ends(spawn: Any) -> Any:
+    """A stand in whose process ends when its handle is told to, as a real one does."""
+
+    def spawn_with_a_handle(command, *, log: Path, env) -> pool.Launched:
+        launched = spawn(command, log=log, env=env)
+        exit_code: list[int] = []
+        return pool.Launched(
+            pid=launched.pid,
+            poll=lambda: exit_code[0] if exit_code else None,
+            kill=lambda: exit_code.append(-9),
+        )
+
+    return spawn_with_a_handle
 
 
 def test_a_start_that_fails_after_the_spawn_ends_the_process(
@@ -600,6 +640,11 @@ def test_a_process_that_cannot_be_shown_to_be_the_one_started_is_left_and_said_s
         )
     assert caught.value.spawned_pid == os.getpid()
     assert caught.value.spawned_ended is False
+    # The process is still there, so its slot is still taken, by a row that
+    # names it for the reaper.
+    [kept] = store.list_workers()
+    assert kept.state == "stopping"
+    assert kept.pid == os.getpid()
 
 
 def test_a_worker_that_did_not_end_keeps_its_slot(config: pool.PoolConfig, store: Store) -> None:

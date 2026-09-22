@@ -255,6 +255,7 @@ def test_sessions_and_scene_files_through_a_real_worker(place: dict[str, Path]) 
         workers = store.list_workers(active_only=False)
     record = next(w for w in workers if w.session_id == session_id)
     assert not pool.worker_is_alive(record)
+    assert record.state == "stopped"
 
     # A worker that is killed shows as crashed on the next list.
     [again] = run(place, ("hou_sessions", {"action": "start"}))
