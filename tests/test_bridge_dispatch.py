@@ -23,6 +23,7 @@ from nscr_houdini_mcp.bridge.errors import BridgeError
 from nscr_houdini_mcp.bridge.gate import Gate
 from nscr_houdini_mcp.bridge.handlers import ToolRegistry, default_registry
 from nscr_houdini_mcp.bridge.undo import run_in_undo_group
+from thread_guard import Guard
 
 
 @pytest.fixture
@@ -51,6 +52,56 @@ def dispatcher(
         wait_s=wait_s,
         timeout_s=timeout_s,
     )
+
+
+@pytest.fixture
+def gui() -> Iterator[Any]:
+    """Dispatchers for a session with a user interface, taken down again.
+
+    Every one of them owns what a bridge owns: a pulse watching the main
+    thread and a runner with a poster thread, so the tests exercise the same
+    path a real session does.
+    """
+    made: list[tuple[marshal.MainThreadRunner, marshal.Pulse]] = []
+
+    def build(
+        scene: Scene,
+        *,
+        tools: ToolRegistry | None = None,
+        module: Any = None,
+        wait_s: float = 5.0,
+        timeout_s: float = 5.0,
+        stale_s: float = marshal.DEFAULT_STALE_S,
+        clock: Any = None,
+        install: bool = True,
+        start_poster: bool = True,
+    ) -> Dispatcher:
+        given = scene.module() if module is None else module
+        pulse = marshal.Pulse(stale_s=stale_s, **({} if clock is None else {"clock": clock}))
+        runner = marshal.MainThreadRunner(given, pulse=pulse)
+        made.append((runner, pulse))
+        if install:
+            pulse.install(given)
+        if start_poster:
+            runner.start()
+        return Dispatcher(
+            tools if tools is not None else default_registry(selfcheck=True),
+            lock=threading.Lock(),
+            kind="gui",
+            session_id="session-1",
+            hou=given,
+            wait_s=wait_s,
+            timeout_s=timeout_s,
+            main_thread=runner,
+            pulse=pulse,
+        )
+
+    try:
+        yield build
+    finally:
+        for runner, pulse in made:
+            runner.stop()
+            pulse.uninstall()
 
 
 def call(tool: str, **fields: Any) -> Envelope:
@@ -295,42 +346,239 @@ def test_the_wait_budget_and_the_run_budget_are_separate() -> None:
 
 
 def test_a_mutating_call_in_a_session_with_a_interface_runs_on_the_main_thread(
-    scene: Scene,
+    scene: Scene, gui: Any
 ) -> None:
     scene.ui.start()
-    running = dispatcher(kind="gui", hou=scene.module())
+    running = gui(scene, install=False)
     reply = running.dispatch(
         call("node.create", arguments={"parent": "/obj", "type": "geo"}, timeout_s=10.0)
     )
     assert reply.payload["ok"] is True
     assert reply.payload["data"]["path"] == "/obj/geo1"
+    assert reply.payload["picked_by"] == "kick"
     assert scene.ui.ran_on == ["fake-main"]
 
 
-def test_a_read_in_a_session_with_an_interface_does_not_wait_for_the_main_thread(
-    scene: Scene,
+def test_a_read_in_a_session_with_an_interface_runs_on_the_main_thread(
+    scene: Scene, gui: Any
 ) -> None:
-    # The main thread loop is never started, so anything posted to it would
-    # never run. A read must not be posted there.
-    running = dispatcher(kind="gui", hou=scene.module())
+    """A read is marshalled like a mutation, and for the same reasons.
+
+    Off the main thread it waits on the object model lock for as long as a
+    cook lasts, and reads ambient state that is not the session's.
+    """
+    scene.ui.start()
+    running = gui(scene, install=False)
     reply = running.dispatch(call("scene.info", timeout_s=10.0))
     assert reply.payload["ok"] is True
-    assert scene.ui.posted.empty()
+    assert reply.payload["picked_by"] == "kick"
+    assert scene.ui.ran_on == ["fake-main"]
 
 
-def test_a_main_thread_that_never_picks_the_work_up_says_it_is_busy(scene: Scene) -> None:
-    running = dispatcher(kind="gui", hou=scene.module(), wait_s=0.3)
+def test_scene_info_reports_the_frame_the_main_thread_sees(scene: Scene, gui: Any) -> None:
+    scene.ui.start()
+    running = gui(scene)
+    reply = running.dispatch(call("scene.info", timeout_s=10.0))
+    assert reply.payload["data"]["frame"] == 72.0
+
+
+def test_a_main_thread_that_never_picks_the_work_up_says_it_is_busy(scene: Scene, gui: Any) -> None:
+    running = gui(scene, wait_s=0.3, install=False)
     reply = running.dispatch(
         call("node.create", arguments={"parent": "/obj", "type": "geo"}, wait_s=0.3)
     )
     error = reply.payload["error"]
     assert error["code"] == "SESSION_BUSY"
     assert error["details"]["cause"] == "main thread busy"
+    assert error["details"]["picked_up"] is False
     # The session is free again, and the work that was posted never runs.
     assert running.state()["busy"] is False
     scene.ui.start()
     time.sleep(0.2)
     assert scene.node("/obj").children() == ()
+
+
+# Section: a busy main thread
+
+
+def test_a_call_during_a_blocking_cook_is_refused_within_its_wait_and_never_runs_late(
+    scene: Scene, gui: Any
+) -> None:
+    scene.ui.start()
+    running = gui(scene, wait_s=0.3)
+    scene.ui.cook(1.2)
+    _until(lambda: scene.ui.ran_on != [])
+
+    began = time.monotonic()
+    reply = running.dispatch(
+        call("node.create", arguments={"parent": "/obj", "type": "geo"}, wait_s=0.3)
+    )
+    assert time.monotonic() - began < 0.6
+    error = reply.payload["error"]
+    assert error["code"] == "SESSION_BUSY"
+    assert error["details"]["cause"] == "main thread busy"
+    assert error["details"]["picked_up"] is False
+    assert running.state()["busy"] is False
+
+    _until(lambda: scene.ui.ticks > 0, timeout_s=5.0)
+    time.sleep(0.3)
+    assert scene.node("/obj").children() == ()
+    assert scene.undos.undoLabels() == []
+
+    later = running.dispatch(
+        call("node.create", arguments={"parent": "/obj", "type": "geo"}, wait_s=5.0)
+    )
+    assert later.payload["ok"] is True
+    assert scene.undos.undoLabels() == ["create node"]
+
+
+def test_a_read_during_a_blocking_cook_is_refused_the_same_way(scene: Scene, gui: Any) -> None:
+    """A read is no worse off than a mutation, and no better."""
+    scene.ui.start()
+    running = gui(scene, wait_s=1.0, stale_s=0.2)
+    scene.ui.cook(2.5)
+    _until(lambda: scene.ui.ran_on != [])
+
+    began = time.monotonic()
+    reply = running.dispatch(call("scene.info"))
+    assert time.monotonic() - began < 1.3
+    assert reply.payload["error"]["details"]["cause"] == "main thread busy"
+
+    began = time.monotonic()
+    reply = running.dispatch(call("scene.info", wait_s=0.0))
+    assert time.monotonic() - began < 0.5
+    assert reply.payload["error"]["details"]["cause"] == "main thread busy"
+
+    began = time.monotonic()
+    reply = running.dispatch(call("scene.info", skip_if_busy=True))
+    assert time.monotonic() - began < 0.05
+    assert reply.payload["error"]["details"]["cause"] == "main thread busy"
+
+
+def test_a_stale_main_thread_is_refused_before_anything_is_posted(scene: Scene, gui: Any) -> None:
+    now = [100.0]
+    running = gui(scene, wait_s=1.0, stale_s=2.0, clock=lambda: now[0])
+    now[0] = 103.0
+
+    began = time.monotonic()
+    reply = running.dispatch(call("scene.info", wait_s=1.0))
+    assert time.monotonic() - began < 0.05
+    error = reply.payload["error"]
+    assert error["code"] == "SESSION_BUSY"
+    assert error["details"]["cause"] == "main thread busy"
+    assert error["details"]["main_thread_idle_s"] == 3.0
+    assert error["details"]["picked_up"] is False
+    # Nothing was handed to the main thread at all.
+    assert scene.ui.posted.empty()
+
+
+def test_a_caller_that_will_wait_longer_than_the_pulse_is_stale_gets_to_queue(
+    scene: Scene, gui: Any
+) -> None:
+    now = [100.0]
+    running = gui(scene, wait_s=5.0, stale_s=2.0, clock=lambda: now[0])
+    now[0] = 103.0
+
+    waking = threading.Timer(0.3, scene.ui.start)
+    waking.start()
+    try:
+        reply = running.dispatch(call("scene.info", wait_s=5.0, timeout_s=5.0))
+    finally:
+        waking.cancel()
+    assert reply.payload["ok"] is True
+
+
+def test_busy_is_decided_without_touching_hou(scene: Scene, gui: Any) -> None:
+    """The thread that answers a request calls nothing in `hou`, ever."""
+    now = [100.0]
+    guard = Guard(scene.module())
+    running = gui(scene, module=guard, wait_s=1.0, stale_s=2.0, clock=lambda: now[0])
+    now[0] = 103.0
+    guard.forget()
+
+    here = threading.current_thread().name
+    reply = running.dispatch(call("scene.info", wait_s=1.0))
+    assert reply.payload["error"]["details"]["cause"] == "main thread busy"
+    assert guard.touched_by(here) == []
+
+
+def test_a_queue_behind_a_busy_main_thread_drains_at_arrival_rate(scene: Scene, gui: Any) -> None:
+    scene.ui.start()
+    running = gui(scene, wait_s=0.3, stale_s=0.2)
+    scene.ui.cook(1.5)
+    _until(lambda: scene.ui.ran_on != [])
+
+    answers: list[tuple[float, Any]] = []
+
+    def ask() -> None:
+        began = time.monotonic()
+        reply = running.dispatch(
+            call("node.create", arguments={"parent": "/obj", "type": "geo"}, wait_s=0.3)
+        )
+        answers.append((time.monotonic() - began, reply))
+
+    askers = [threading.Thread(target=ask) for _ in range(3)]
+    for asker in askers:
+        asker.start()
+    for asker in askers:
+        asker.join(10.0)
+
+    assert len(answers) == 3
+    causes = []
+    for took, reply in answers:
+        # Each one is answered inside its own budget: the one that holds the
+        # session is refused by the main thread, the ones behind it by the
+        # session, and none of them waits for the cook.
+        assert took < 1.5
+        assert reply.payload["error"]["code"] == "SESSION_BUSY"
+        causes.append(reply.payload["error"]["details"]["cause"])
+    assert "main thread busy" in causes
+
+    _until(lambda: scene.ui.ticks > 0, timeout_s=5.0)
+    time.sleep(0.3)
+    assert scene.node("/obj").children() == ()
+    assert scene.undos.undoLabels() == []
+
+
+def test_a_mutation_still_records_one_undo_entry_on_either_pickup_path(
+    scene: Scene, gui: Any
+) -> None:
+    scene.ui.start()
+    through_loop = gui(scene, start_poster=False)
+    reply = through_loop.dispatch(
+        call("node.create", arguments={"parent": "/obj", "type": "geo"}, timeout_s=10.0)
+    )
+    assert reply.payload["ok"] is True
+    assert reply.payload["picked_by"] == "loop"
+    assert scene.undos.undoLabels() == ["create node"]
+
+    through_kick = gui(scene, install=False)
+    reply = through_kick.dispatch(
+        call("node.create", arguments={"parent": "/obj", "type": "geo"}, timeout_s=10.0)
+    )
+    assert reply.payload["ok"] is True
+    assert reply.payload["picked_by"] == "kick"
+    assert scene.undos.undoLabels() == ["create node", "create node"]
+
+
+def test_a_rejected_post_answers_tool_failed_not_busy(scene: Scene, gui: Any) -> None:
+    module = scene.module()
+    module.ui = _RefusingInterface()
+    running = gui(scene, module=module, install=False, wait_s=5.0)
+
+    reply = running.dispatch(call("scene.info", wait_s=5.0, timeout_s=5.0))
+    error = reply.payload["error"]
+    assert error["code"] == "TOOL_FAILED"
+    assert error["details"]["exception"] == "Rejected"
+    # And the session is free, not held by work nobody is going to run.
+    assert running.state()["busy"] is False
+
+
+class _RefusingInterface:
+    """An interface that will not take a posted callback."""
+
+    def postEventCallback(self, callback: Any) -> None:  # noqa: N802 - the name is Houdini's
+        raise RuntimeError("the interface is going away")
 
 
 def test_a_mutating_call_in_a_headless_session_runs_on_the_main_thread(scene: Scene) -> None:

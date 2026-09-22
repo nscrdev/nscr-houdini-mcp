@@ -18,6 +18,7 @@ import pytest
 
 from fake_hou import Scene
 from nscr_houdini_mcp import store as store_module
+from nscr_houdini_mcp.bridge import marshal
 from nscr_houdini_mcp.bridge import receipts as receipt_module
 from nscr_houdini_mcp.bridge.dispatch import Dispatcher
 from nscr_houdini_mcp.bridge.envelope import Envelope
@@ -289,17 +290,28 @@ def test_an_operation_that_replaced_the_scene_itself_still_answers_its_retry(
 # Section: a call that never reached its tool
 
 
-def unreachable(tmp_path: Path, scene: Scene, *, refuse_to_post: bool = False) -> tuple[Any, list]:
-    """A dispatcher whose main thread never picks anything up."""
+def unreachable(
+    tmp_path: Path, scene: Scene, *, refuse_to_post: bool = False
+) -> tuple[Any, list, Any]:
+    """A dispatcher whose main thread never picks anything up.
+
+    The poster is only started where the test needs a post to be refused.
+    Without it nothing is ever handed to the main thread, which is the case a
+    call that gives up on its pickup budget has to survive.
+    """
     path = tmp_path / "coord.sqlite"
     tools = ToolRegistry()
     counter = Counter()
     tools.add("scene.touch", counter, mutating=True)
     module = scene.module()
     if refuse_to_post:
-        module.ui = SimpleNamespace(
-            postEventCallback=_refuse_to_post, removeEventCallback=lambda callback: None
-        )
+        module.ui = SimpleNamespace(postEventCallback=_refuse_to_post)
+    pulse = marshal.Pulse()
+    runner = marshal.MainThreadRunner(module, pulse=pulse)
+    if refuse_to_post:
+        runner.start()
+    else:
+        pulse.install(module)
     running = Dispatcher(
         tools,
         lock=threading.Lock(),
@@ -308,9 +320,11 @@ def unreachable(tmp_path: Path, scene: Scene, *, refuse_to_post: bool = False) -
         identity=Identity(session_id=SESSION),
         receipts=receipt_module.Receipts(lambda: store_module.Store(path), session_id=SESSION),
         hou=module,
+        main_thread=runner,
+        pulse=pulse,
         wait_s=0.0,
     )
-    return running, counter.calls
+    return running, counter.calls, runner
 
 
 def _refuse_to_post(callback: Any) -> None:
@@ -324,32 +338,37 @@ def test_a_call_the_session_never_took_leaves_its_id_free(tmp_path: Path, scene:
     the call comes back busy. A receipt left behind would answer the retry
     with an outcome nobody knows, for work that never happened.
     """
-    running, calls = unreachable(tmp_path, scene)
+    running, calls, runner = unreachable(tmp_path, scene)
+    try:
+        refused = running.dispatch(touch(operation_id="op-1"))
+        assert refused.payload["error"]["code"] == "SESSION_BUSY"
+        assert calls == []
+        with store_at(tmp_path / "coord.sqlite") as store:
+            assert store.get_operation("op-1") is None
 
-    refused = running.dispatch(touch(operation_id="op-1"))
-    assert refused.payload["error"]["code"] == "SESSION_BUSY"
-    assert calls == []
-    with store_at(tmp_path / "coord.sqlite") as store:
-        assert store.get_operation("op-1") is None
-
-    # The same id again, with the main thread running this time.
-    scene.ui.start()
-    answered = running.dispatch(touch(operation_id="op-1", wait_s=5.0))
-    assert answered.payload["ok"] is True, answered.payload
-    assert len(calls) == 1
+        # The same id again, with the main thread running this time.
+        scene.ui.start()
+        answered = running.dispatch(touch(operation_id="op-1", wait_s=5.0))
+        assert answered.payload["ok"] is True, answered.payload
+        assert len(calls) == 1
+    finally:
+        runner.stop()
 
 
 def test_a_call_the_session_could_not_take_at_all_leaves_its_id_free(
     tmp_path: Path, scene: Scene
 ) -> None:
-    running, calls = unreachable(tmp_path, scene, refuse_to_post=True)
+    running, calls, runner = unreachable(tmp_path, scene, refuse_to_post=True)
+    try:
+        refused = running.dispatch(touch(operation_id="op-1"))
 
-    refused = running.dispatch(touch(operation_id="op-1"))
-
-    assert refused.payload["error"]["code"] == "TOOL_FAILED"
-    assert calls == []
-    with store_at(tmp_path / "coord.sqlite") as store:
-        assert store.get_operation("op-1") is None
+        assert refused.payload["error"]["code"] == "TOOL_FAILED"
+        assert refused.payload["error"]["details"]["exception"] == "Rejected"
+        assert calls == []
+        with store_at(tmp_path / "coord.sqlite") as store:
+            assert store.get_operation("op-1") is None
+    finally:
+        runner.stop()
 
 
 # Section: what takes no receipt

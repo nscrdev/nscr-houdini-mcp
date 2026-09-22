@@ -9,6 +9,14 @@ hands the session to whichever waiter the operating system wakes, so a call
 that has been waiting twenty seconds can lose to one that arrived last. Here
 every waiter takes a ticket and the session goes to the oldest ticket that is
 still waiting. A caller that gives up takes its ticket with it.
+
+The gate answers one question only: whether one of our own calls holds the
+session. Whether the main thread is taking work at all is a different question,
+and the pulse in `marshal.py` answers it. The two work together: a call that
+gives up while it holds the gate waiting to be picked up gives the gate back,
+and the next ticket is refused by the pulse in microseconds, so calls arriving
+during a cook are each answered in turn instead of piling up behind one that
+is stuck.
 """
 
 from __future__ import annotations
@@ -68,6 +76,11 @@ class Gate:
             self._held = False
             self._lock.release()
             self._ready.notify_all()
+
+    def state(self) -> dict[str, int | bool]:
+        """Whether the session is held and how many wait, in one lock take."""
+        with self._ready:
+            return {"held": self._held, "waiting": len(self._queue)}
 
     @property
     def held(self) -> bool:

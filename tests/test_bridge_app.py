@@ -5,10 +5,12 @@ import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from fake_hou import Scene
 from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge import registry, security, signing
 from nscr_houdini_mcp.bridge.app import Bridge, BridgeConfig, BridgeStartError, houdini_lock
@@ -32,7 +34,8 @@ def make_bridge(home: Path, **overrides: Any) -> tuple[Bridge, RecordingBackend]
         "facts": {"houdini_version": "22.0.0", "hfs": "/hfs", "hip_path": None},
     }
     settings.update(overrides)
-    bridge = Bridge(BridgeConfig(**settings), backend=backend)
+    hou = settings.pop("hou", None)
+    bridge = Bridge(BridgeConfig(**settings), backend=backend, hou=hou)
     return bridge, backend
 
 
@@ -974,3 +977,83 @@ def test_stopping_a_bridge_that_is_already_stopped_says_nothing_went_wrong(
     bridge.start()
     assert bridge.stop() == []
     assert bridge.stop() == []
+
+
+# Section: the main thread of a session with a user interface
+
+
+def test_health_reports_the_main_thread_and_answers_under_budget_while_it_is_held(
+    tmp_path: Path,
+) -> None:
+    """Health is the one answer a cook cannot delay, and it says what is going on."""
+    scene = Scene()
+    bridge, backend = make_bridge(tmp_path, kind="gui", hou=scene.module(), main_thread_stale_s=0.2)
+    scene.ui.start()
+    bridge.start()
+    try:
+        scene.ui.cook(1.0)
+        _wait_for(lambda: scene.ui.ran_on != [])
+
+        slowest = 0.0
+        ages: list[float] = []
+        away: list[bool] = []
+        for _ in range(25):
+            began = time.monotonic()
+            reply = send(bridge, backend, HEALTH_PATH)
+            slowest = max(slowest, time.monotonic() - began)
+            main_thread = body_of(reply)["data"]["main_thread"]
+            ages.append(main_thread["pulse_age_s"])
+            away.append(main_thread["away"])
+            time.sleep(0.02)
+
+        assert slowest < 0.05
+        assert ages[-1] > ages[0]
+        assert away[-1] is True
+        assert away[0] is False
+    finally:
+        bridge.stop()
+        scene.ui.stop()
+
+
+def test_a_gui_bridge_installs_the_pulse_at_start_and_removes_it_at_stop(
+    tmp_path: Path,
+) -> None:
+    scene = Scene()
+    bridge, _ = make_bridge(tmp_path, kind="gui", hou=scene.module())
+    scene.ui.start()
+    bridge.start()
+    try:
+        assert len(scene.ui.eventLoopCallbacks()) == 1
+        assert bridge.main_thread is not None
+        assert bridge.dispatcher.state()["main_thread"]["installed"] is True
+        scene.ui.cook(0.3)
+        _wait_for(lambda: scene.ui.ran_on != [])
+        assert bridge.stop() == []
+        assert scene.ui.eventLoopCallbacks() == ()
+    finally:
+        scene.ui.stop()
+
+
+def test_a_bridge_whose_pulse_cannot_install_still_starts_and_says_so(tmp_path: Path) -> None:
+    """A session that will not be watched is still a session that answers."""
+    scene = Scene()
+    module = scene.module()
+    module.ui = SimpleNamespace(postEventCallback=lambda callback: None)
+    bridge, backend = make_bridge(tmp_path, kind="gui", hou=module)
+    bridge.start()
+    try:
+        assert any("watching the main thread" in problem for problem in bridge.problems)
+        assert bridge.dispatcher.state()["main_thread"]["installed"] is False
+        assert body_of(send(bridge, backend, HEALTH_PATH))["data"]["status"] == "ok"
+    finally:
+        bridge.stop()
+
+
+def _wait_for(ready: Any, timeout_s: float = 10.0) -> None:
+    """Wait for something another thread is about to do."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if ready():
+            return
+        time.sleep(0.005)
+    raise AssertionError("waited too long")

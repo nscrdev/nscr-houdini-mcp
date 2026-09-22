@@ -37,6 +37,12 @@ model at once ends the process for good: no exception, no crash, full CPU and
 no answers ever again. So every tool runs under one process wide lock, and
 nothing here offers a way around it.
 
+In a session with a user interface every tool runs on the process main thread,
+reads included. Any `hou` call from another thread takes Houdini's object model
+lock, which the main thread holds for the whole of a cook, so a request thread
+that called into `hou` would be stuck there for as long as the cook lasts. The
+health endpoint stays answerable because it touches none of it.
+
 For the same reason, nothing drives a bridge from inside its own process. The
 caller is always another process.
 
@@ -181,6 +187,9 @@ class BridgeConfig:
     alias_template: str | None = None
     kind: str | None = None
     heartbeat_s: float = DEFAULT_HEARTBEAT_S
+    # How long the main thread may go without running our code before a call
+    # that will not wait that long is refused at once.
+    main_thread_stale_s: float = marshal.DEFAULT_STALE_S
     dispatch_wait_s: float = DEFAULT_DISPATCH_WAIT_S
     dispatch_timeout_s: float = DEFAULT_DISPATCH_TIMEOUT_S
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
@@ -206,8 +215,11 @@ class Bridge:
         *,
         backend: Backend | None = None,
         tools: ToolRegistry | None = None,
+        hou: Any | None = None,
     ) -> None:
         self.config = config or BridgeConfig()
+        # Handed in by the tests, read from the process otherwise.
+        self._hou = hou if hou is not None else host.houdini()
         self.home = Path(self.config.home) if self.config.home else store_module.default_home()
         check_home(self.home)
         self.store_path = (
@@ -255,6 +267,15 @@ class Bridge:
         # undo step. A bridge whose owner never runs it still works, and says
         # in every mutating reply that nothing was recorded.
         self.main_loop = marshal.MainLoop()
+        # With a user interface the main thread is Houdini's own, and it is
+        # reached through a queue and one poster thread rather than by calling
+        # into `hou` from whichever thread took the request.
+        self.pulse = marshal.Pulse(stale_s=self.config.main_thread_stale_s, log=self._log)
+        self.main_thread = (
+            marshal.MainThreadRunner(self._hou, pulse=self.pulse, log=self._log)
+            if self.kind == host.GUI and self._hou is not None
+            else None
+        )
         self.dispatcher = Dispatcher(
             self.tools,
             lock=_HOUDINI_LOCK,
@@ -264,8 +285,11 @@ class Bridge:
             receipts=receipt_module.Receipts(
                 self._open_store, session_id=self.session_id, owner_pid=self.pid, log=self._log
             ),
+            hou=self._hou,
             log=self._log,
             main_loop=self.main_loop,
+            main_thread=self.main_thread,
+            pulse=self.pulse,
             stopping=self.stopping,
             wait_s=self.config.dispatch_wait_s,
             timeout_s=self.config.dispatch_timeout_s,
@@ -340,6 +364,17 @@ class Bridge:
 
             self._running = True
 
+        if self.main_thread is not None:
+            # Both steps call into `hou`, so they belong here on the thread
+            # that starts the bridge while the session is idle, never on a
+            # thread answering a request. A pulse that could not be installed
+            # is noted and the bridge still starts: every call is then bounded
+            # by its pickup budget alone.
+            failure = _try(lambda: self.pulse.install(self._hou))
+            if failure is not None:
+                self._note(f"could not start watching the main thread: {failure}")
+            self.main_thread.start()
+
         self._heartbeat = threading.Thread(
             target=self._beat, name="nscr-mcp-heartbeat", daemon=True
         )
@@ -374,6 +409,11 @@ class Bridge:
         self._leave_anyway()
         hook, self._remove_quit_hook = self._remove_quit_hook, None
         for what, step in (
+            (
+                "stop posting to the main thread",
+                None if self.main_thread is None else self.main_thread.stop,
+            ),
+            ("stop watching the main thread", self.pulse.uninstall),
             ("stop following the scene", self.identity.unwatch),
             ("take the quit hook off", hook),
             ("stop being called at exit", lambda: atexit.unregister(self.stop)),
@@ -446,7 +486,14 @@ class Bridge:
     # Endpoints
 
     def handle_health(self, request: RawRequest) -> RawReply:
-        """Liveness, from memory. No scene, no `hou`, no lock, no disk."""
+        """Liveness, from memory. No scene, no `hou`, no lock, no disk.
+
+        `main_thread.pulse_age_s` is the number a caller reads to see whether
+        the main thread is taking work: it is a float in memory, stamped the
+        last time the main thread ran our code, and it climbs while Houdini is
+        cooking. `heartbeat_age_s` answers a different question, whether this
+        bridge is still writing where other processes can see it.
+        """
         refused = self._front(request)
         if refused is not None:
             return refused

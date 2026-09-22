@@ -8,6 +8,12 @@ The lock in the app says one call at a time. This says the rest of it:
   turn and for the work to be picked up. `timeout_s` is how long it will wait
   for the work once it is running. A call that asks for a short wait and a
   long run is a normal thing to ask for.
+- In a session with a user interface every tool runs on the main thread, reads
+  included. Whether the main thread is taking work at all is decided here from
+  the pulse, before anything is posted and without calling into `hou`, so a
+  call that arrives during a cook is refused inside its own wait rather than
+  waiting out the cook. A call that gives up is cancelled on its token, so the
+  main thread finds it cancelled and never runs it late.
 - A call that runs out of `timeout_s` gets `TIMEOUT` with `still_running` and
   the operation id. Nothing is interrupted: the work carries on holding the
   session, health reports it, and calls behind it wait or are told the session
@@ -115,6 +121,8 @@ class Dispatcher:
         hou: Any | None = None,
         log: Callable[[str], None] | None = None,
         main_loop: marshal.MainLoop | None = None,
+        main_thread: marshal.MainThreadRunner | None = None,
+        pulse: marshal.Pulse | None = None,
         stopping: threading.Event | None = None,
         wait_s: float = DEFAULT_WAIT_S,
         timeout_s: float = DEFAULT_TIMEOUT_S,
@@ -129,6 +137,8 @@ class Dispatcher:
         self._hou = hou if hou is not None else host.houdini()
         self._log = log or (lambda text: None)
         self._main_loop = main_loop
+        self._main_thread = main_thread
+        self._pulse = pulse
         self._stopping = stopping or threading.Event()
         self._gate = Gate(lock)
         self._running: Running | None = None
@@ -154,12 +164,44 @@ class Dispatcher:
         return {
             "busy": running is not None,
             "queued": self._gate.waiting(),
+            "main_thread": self._main_thread_state(),
             "current_op": None if running is None else running.tool,
             "current_op_id": None if running is None else running.operation_id,
             "current_op_elapsed_s": None if running is None else running.elapsed_s(),
             "current_op_timed_out": False if running is None else running.timed_out,
             "last_op": self._last,
         }
+
+    def _main_thread_state(self) -> dict[str, Any]:
+        """What the main thread is doing, from values held in memory."""
+        state: dict[str, Any] = {}
+        if self._pulse is not None:
+            state.update(self._pulse.state())
+        if self._main_thread is not None:
+            state.update(self._main_thread.state())
+        return state
+
+    def _main_thread_away(self, wait_s: float) -> float | None:
+        """How long the main thread has been away, when that is too long.
+
+        Nothing in a session without a user interface, and nothing while the
+        pulse is uninstalled: there the pickup budget alone bounds the call. A
+        caller willing to wait longer than the pulse is stale is allowed to
+        queue, because it has said it will wait for a busy session.
+        """
+        pulse = self._pulse
+        if pulse is None:
+            return None
+        age = pulse.age_s()
+        if age is None:
+            return None
+        return age if age > max(pulse.stale_s, wait_s) else None
+
+    def _pulse_age(self) -> float | None:
+        if self._pulse is None:
+            return None
+        age = self._pulse.age_s()
+        return None if age is None else round(age, 3)
 
     # Section: one call
 
@@ -219,6 +261,19 @@ class Dispatcher:
         timeout_s = _first(envelope.timeout_s, tool.timeout_s, self.timeout_s)
 
         waited = time.monotonic()
+        if envelope.skip_if_busy:
+            # A main thread that is away is as busy as a session another call
+            # holds, and saying so costs one float read.
+            idle = self._main_thread_away(0.0)
+            if idle is not None:
+                return self._busy(
+                    trace,
+                    waited=waited,
+                    wait_s=wait_s,
+                    cause="main thread busy",
+                    main_thread_idle_s=round(idle, 3),
+                    picked_up=False,
+                )
         if not self._gate.enter(wait_s=wait_s, skip_if_busy=bool(envelope.skip_if_busy)):
             return self._busy(trace, waited=waited, wait_s=wait_s, cause="session busy")
 
@@ -236,6 +291,23 @@ class Dispatcher:
                 self._gate.leave()
                 return settled
 
+        # The main thread is asked about here, after the session is in hand and
+        # before the call becomes the running one, so health never shows an
+        # operation that was refused before it began.
+        idle = self._main_thread_away(wait_s)
+        if idle is not None:
+            self._gate.leave()
+            if wanted:
+                self.receipts.drop(wanted)
+            return self._busy(
+                trace,
+                waited=waited,
+                wait_s=wait_s,
+                cause="main thread busy",
+                main_thread_idle_s=round(idle, 3),
+                picked_up=False,
+            )
+
         running = Running(operation_id=operation_id, tool=tool.name, mutating=tool.mutating)
         self._running = running
         context = ToolContext(
@@ -251,9 +323,16 @@ class Dispatcher:
 
         work = marshal.Work(lambda: self._work(tool, envelope.arguments, context, running, carried))
         runner = marshal.choose_runner(
-            self.kind, mutating=tool.mutating, hou=self._hou, main_loop=self._main_loop
+            self.kind,
+            mutating=tool.mutating,
+            hou=self._hou,
+            main_loop=self._main_loop,
+            main_thread=self._main_thread,
         )
         try:
+            # Submitting to the main thread runner is a queue put and cannot
+            # raise; the other runners can, and a user interface being torn
+            # down refuses a posted callback.
             runner.submit(work)
 
             pickup_s = max(MIN_PICKUP_S, wait_s - (time.monotonic() - waited))
@@ -264,23 +343,23 @@ class Dispatcher:
                     waited=waited,
                     wait_s=wait_s,
                     cause="main thread busy",
+                    main_thread_idle_s=self._pulse_age(),
+                    picked_up=False,
                 )
         except BaseException as error:  # noqa: BLE001 - a session held for ever is worse
-            # Handing the work over can fail: a user interface being torn down
-            # refuses a posted callback. The session goes back rather than
-            # staying busy with nothing running in it.
+            # The session goes back rather than staying busy with nothing
+            # running in it.
             self._log(f"could not hand {tool.name} over: {type(error).__name__}: {error}")
             if work.cancel():
                 self._never_ran(wanted, running)
-            return self._refuse(
-                BridgeError(
-                    "TOOL_FAILED",
-                    "the session could not take the work",
-                    {"tool": tool.name, "exception": type(error).__name__},
-                    hint="ask health whether this session is still there",
-                ),
-                trace,
-            )
+            return self._could_not_take(tool, type(error).__name__, trace)
+
+        if isinstance(work.error, marshal.Rejected):
+            # The work was given back rather than run: the interface would not
+            # take the post. The caller hears that now instead of waiting out
+            # its budget for work nobody is going to do.
+            self._never_ran(wanted, running)
+            return self._could_not_take(tool, type(work.error).__name__, trace)
 
         if not work.finished.wait(timeout_s):
             running.timed_out = True
@@ -476,7 +555,12 @@ class Dispatcher:
         running: Running,
         carried: int | None = None,
     ) -> Any:
-        """The whole of one call, on whichever thread it was given to."""
+        """The whole of one call, on whichever thread it was given to.
+
+        In a session with a user interface that thread is the main thread, for
+        a read as much as for a mutation. The undo group is still only for a
+        tool that changes the scene.
+        """
         try:
             # The last look at the scene, here on the thread that is about to
             # touch it. A call can wait a long time for its turn, and the
@@ -529,6 +613,10 @@ class Dispatcher:
 
         converted = encoding.convert(work.result)
         payload = {**ok_payload(converted.value, timing_ms=timing_ms), **self._said(trace)}
+        if work.picked_by is not None:
+            # Which route to the main thread reached the work first, so a check
+            # against a real Houdini can tell the two apart.
+            payload["picked_by"] = work.picked_by
         if converted.lossy:
             payload["lossy"] = True
             payload["cut"] = converted.cut
@@ -555,6 +643,18 @@ class Dispatcher:
             coded.details.setdefault("undo_recorded", running.recorded)
         return self._refuse(coded, trace)
 
+    def _could_not_take(self, tool: Tool, exception: str, trace: Mapping[str, Any]) -> Reply:
+        """The work was never handed over, and nobody is going to run it."""
+        return self._refuse(
+            BridgeError(
+                "TOOL_FAILED",
+                "the session could not take the work",
+                {"tool": tool.name, "exception": exception},
+                hint="ask health whether this session is still there",
+            ),
+            trace,
+        )
+
     def _refuse(
         self, error: BridgeError, trace: Mapping[str, Any], *, scene: bool = False
     ) -> Reply:
@@ -574,7 +674,20 @@ class Dispatcher:
             payload["scene"] = self.identity.scene()
         return Reply(200, payload)
 
-    def _busy(self, trace: Mapping[str, Any], *, waited: float, wait_s: float, cause: str) -> Reply:
+    def _busy(
+        self,
+        trace: Mapping[str, Any],
+        *,
+        waited: float,
+        wait_s: float,
+        cause: str,
+        **extra: Any,
+    ) -> Reply:
+        """One busy refusal.
+
+        The cause says which kind of busy it is, and `extra` carries how long
+        the main thread has been away where that is the reason.
+        """
         running = self._running
         return self._refuse(
             BridgeError(
@@ -582,6 +695,7 @@ class Dispatcher:
                 "this session is running another call",
                 {
                     "cause": cause,
+                    **extra,
                     "current_op": None if running is None else running.tool,
                     "current_op_id": None if running is None else running.operation_id,
                     "elapsed_s": None if running is None else running.elapsed_s(),

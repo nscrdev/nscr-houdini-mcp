@@ -34,8 +34,8 @@ class Tool:
 
     name: str
     handler: ToolHandler
-    # Whether it changes the scene. A mutating tool runs on the main thread in
-    # a graphical session, and always inside one undo group.
+    # Whether it changes the scene: it then runs inside one undo group. In a
+    # graphical session every tool runs on the main thread regardless.
     mutating: bool = False
     # The argument names it takes. `None` means it takes whatever it is given.
     arguments: tuple[str, ...] | None = None

@@ -80,7 +80,11 @@ class ToolContext:
 
 
 def scene_info(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, Any]:
-    """What is open, where it is, and how big it is. Nothing is cooked."""
+    """What is open, where it is, and how big it is. Nothing is cooked.
+
+    In a graphical session this runs on the main thread, so `frame` is the
+    frame the artist sees.
+    """
     hou = _houdini(context)
     counts: dict[str, int] = {}
     for path in CONTEXTS:
