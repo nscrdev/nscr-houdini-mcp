@@ -32,6 +32,7 @@ import support
 from nscr_houdini_mcp import pool
 from nscr_houdini_mcp.bridge import registry
 from nscr_houdini_mcp.store import WorkerRecord, process_is_alive
+from nscr_houdini_mcp.tools.registry import TOOLS
 
 
 def hython_available() -> bool:
@@ -125,7 +126,7 @@ def test_a_protocol_client_lists_the_tools_and_pings_a_worker(
     )
 
     assert seen["protocol"] == revision
-    assert [tool.name for tool in seen["tools"]] == ["hou_ping", "hou_sessions", "hou_scene"]
+    assert [tool.name for tool in seen["tools"]] == [spec.name for spec in TOOLS]
     unnamed, by_alias, unknown = seen["results"]
 
     for result in (unnamed, by_alias):
