@@ -57,6 +57,9 @@ def race(path: str, index: int, barrier, results) -> None:
                 store.allocate_version(kind="render", name="beauty", hip_family="shot")
                 for _ in range(VERSIONS_PER_RACER)
             ]
+            # A racer that exits early is a dead owner, and a dead owner's
+            # claim may be taken over. Everybody stays alive until the end.
+            barrier.wait(BARRIER_TIMEOUT_S)
     except BaseException as error:  # reported, so a failure reads as a message
         report["error"] = f"{type(error).__name__}: {error}"
     results.put(report)
