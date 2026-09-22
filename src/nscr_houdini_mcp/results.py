@@ -1,0 +1,251 @@
+"""What a tool call hands back to the client: the result shapes, errors and spill.
+
+Every result has two parts that say the same thing. `structuredContent` is the
+data. The text block is for a client that reads only text: a small result is
+the same JSON, a large one is a line saying where the whole of it went. An
+error's text carries the code, the message, the hint and the details, so it is
+enough to act on without the structured part.
+
+Every result, error or not, carries a `trace`: the session that answered, its
+alias and its scene epoch, and the operation id when the call changed the
+scene. Before a session is chosen these are empty.
+
+Spill. A result bigger than the configured cap is written to a file in the
+spill folder, one dated folder a day, and the call returns the path, the size,
+a digest and the first part of the text. The file is written so only its owner
+can read it, because a result can hold scene contents.
+
+This module never imports `hou`.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import secrets
+from collections.abc import Mapping
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from mcp_types import CallToolResult, TextContent
+
+from nscr_houdini_mcp.bridge.errors import CODES as BRIDGE_CODES
+from nscr_houdini_mcp.bridge.errors import hide_paths
+from nscr_houdini_mcp.bridge.security import InsecureLocation, write_private
+
+# Codes only the server raises. The bridge's own table is the rest.
+SERVER_CODES: dict[str, str] = {
+    "SESSION_UNKNOWN": "no session answers to that id or alias",
+    "SESSION_AMBIGUOUS": "several sessions are live and the call named none",
+    "SESSION_UNRESPONSIVE": "the session is running but its port does not answer",
+    "NO_SESSION": "no Houdini session is live",
+    "SESSION_UNREACHABLE": "nothing answered on the session's port",
+    "REPLY_NOT_AUTHENTIC": "an answer came back that the session did not sign",
+    "BAD_REPLY": "the session answered with something that is not a reply",
+    "STORE_UNAVAILABLE": "the coordination store could not be read",
+    "CONFIG_INVALID": "the config file could not be used",
+    "SPILL_FAILED": "the result was too large to return and could not be written out",
+}
+
+CODES: dict[str, str] = {**BRIDGE_CODES, **SERVER_CODES}
+
+# What to do about each code when the error itself says nothing more useful.
+HINTS: dict[str, str] = {
+    "SESSION_BUSY": "pass wait_s to queue behind the running call, or call again later",
+    "UNKNOWN_SESSION": "list the sessions and address the one you mean",
+    "TIMEOUT": "the work may still be running; send the same operation_id again to get its result",
+    "TOOL_FAILED": "the session log has the detail; check the arguments and try again",
+    "UNKNOWN_TOOL": "call one of the names in the tool list",
+    "BAD_ARGUMENTS": "fix the argument named in the details and call again",
+    "NODE_NOT_FOUND": "read the scene again and use a path that exists",
+    "PARM_NOT_FOUND": "use one of the parameter names in the details",
+    "SCENE_REPLACED": "read the new scene, then call again with its scene_epoch",
+    "SESSION_DEAD": "address the live session named in the details, or start a new one",
+    "OPERATION_MISMATCH": "use a new operation_id for different arguments",
+    "OUTCOME_UNKNOWN": "read the scene to see whether the change is there before redoing it",
+    "BODY_REFUSED": "send a smaller or less deeply nested request",
+    "CAPTURE_EMPTY": "check the camera and the node shown, then capture again",
+    "BAD_ENVELOPE": "the server sent a request the bridge could not read; report it",
+    "UNAUTHORIZED": "the session's token changed; call again so the session is read afresh",
+    "FORBIDDEN": "the request did not come from this machine's loopback; report it",
+    "METHOD_REFUSED": "the server used the wrong method; report it",
+    "NOT_FOUND": "the bridge is a different version; restart the session",
+    "SERVER_BUSY": "too many connections are open to the session; call again shortly",
+    "SESSION_UNKNOWN": "pass one of the live sessions in the details",
+    "SESSION_AMBIGUOUS": "pass session as one of the candidates, or set default_session in config",
+    "SESSION_UNRESPONSIVE": "wait for its next heartbeat, or use another live session",
+    "NO_SESSION": "open Houdini with the bridge, or start a worker: bridge worker start",
+    "SESSION_UNREACHABLE": "ping the session; if it stays silent, use another one",
+    "REPLY_NOT_AUTHENTIC": "the port may belong to another program now; list the sessions again",
+    "BAD_REPLY": "ping the session; restart it if this repeats",
+    "STORE_UNAVAILABLE": "check that the state folder is on a local disk and readable",
+    "CONFIG_INVALID": "fix the key named in the details, then call again",
+    "SPILL_FAILED": "free space in the spill folder, or narrow the request",
+}
+
+# The largest result whose text block repeats the whole JSON. Larger ones get a
+# summary line, so a client that shows both does not pay for the result twice.
+MIRROR_CHARS = 2000
+
+# How much of an error's details the text block carries.
+DETAILS_CHARS = 1500
+
+# How much of a spilled result comes back as a preview.
+PREVIEW_CHARS = 2000
+
+
+class CallError(Exception):
+    """A call that did not produce a result, with a code a caller can act on."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        hint: str | None = None,
+        details: Mapping[str, Any] | None = None,
+        trace: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.hint = hint or HINTS.get(code)
+        self.details: dict[str, Any] = dict(details or {})
+        # Who answered and on which scene, when a session said so.
+        self.trace: dict[str, Any] = dict(trace or {})
+
+    def as_dict(self) -> dict[str, Any]:
+        error: dict[str, Any] = {"code": self.code, "message": self.message}
+        if self.hint:
+            error["hint"] = self.hint
+        if self.details:
+            error["details"] = self.details
+        return error
+
+    @classmethod
+    def from_reply(cls, payload: Mapping[str, Any]) -> CallError:
+        """A bridge reply that says the call failed, as a server side error.
+
+        The trace beside the error comes along, and so does the summary of the
+        scene a `SCENE_REPLACED` reply carries, because the caller needs it to
+        go on.
+        """
+        error = payload.get("error")
+        error = error if isinstance(error, Mapping) else {}
+        code = str(error.get("code") or "BAD_REPLY")
+        details = error.get("details")
+        details = dict(details) if isinstance(details, Mapping) else {}
+        if payload.get("scene") is not None:
+            details["scene"] = payload["scene"]
+        return cls(
+            code,
+            str(error.get("message") or CODES.get(code, "the call failed")),
+            hint=error.get("hint") or None,
+            details=details,
+            trace={key: payload[key] for key in TRACE_KEYS if payload.get(key) is not None},
+        )
+
+
+# What a reply says about who answered it, copied into every result.
+TRACE_KEYS = ("session_id", "alias", "scene_epoch", "operation_id", "warnings")
+
+
+def empty_trace() -> dict[str, Any]:
+    return {"session_id": None, "alias": None, "scene_epoch": None}
+
+
+def compact(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def error_result(error: CallError, trace: Mapping[str, Any] | None = None) -> CallToolResult:
+    """An error the client reads as one, with a text block that stands alone."""
+    body = {"error": error.as_dict(), "trace": dict(trace or empty_trace())}
+    return CallToolResult(
+        content=[TextContent(type="text", text=error_text(error))],
+        structured_content=body,
+        is_error=True,
+    )
+
+
+def error_text(error: CallError) -> str:
+    """One block: code, message, hint and as much of the details as fits."""
+    text = f"{error.code}: {error.message}"
+    if error.hint:
+        text += f"\nhint: {error.hint}"
+    if error.details:
+        details = compact(error.details)
+        if len(details) > DETAILS_CHARS:
+            left = len(details) - DETAILS_CHARS
+            details = f"{details[:DETAILS_CHARS]} ({left} more characters in structuredContent)"
+        text += f"\ndetails: {details}"
+    return text
+
+
+def ok_result(
+    data: Mapping[str, Any],
+    trace: Mapping[str, Any],
+    *,
+    spill: Spill | None = None,
+    tool: str = "result",
+    summary: str | None = None,
+) -> CallToolResult:
+    """A result, or the path to it when it is too large to return."""
+    body = {**data, "trace": dict(trace)}
+    text = compact(body)
+    if spill is not None and len(text.encode("utf-8")) > spill.over_bytes:
+        body = {"spilled": spill.write(text, tool=tool), "trace": dict(trace)}
+        spilled = body["spilled"]
+        line = (
+            f"{tool}: the result is {spilled['bytes']} bytes, over the cap of"
+            f" {spill.over_bytes}, so it was written to {spilled['path']}."
+            f" Read that file for all of it. First part:\n{spilled['preview']}"
+        )
+        return CallToolResult(
+            content=[TextContent(type="text", text=line)], structured_content=body
+        )
+    if len(text) > MIRROR_CHARS:
+        line = summary or f"{tool}: {len(text)} characters, keys {', '.join(sorted(data))}"
+        text = f"{line}\ntrace: {compact(dict(trace))}\nThe full result is in structuredContent."
+    return CallToolResult(content=[TextContent(type="text", text=text)], structured_content=body)
+
+
+class Spill:
+    """Writes results that are too large to return into dated files."""
+
+    def __init__(self, folder: Path, over_bytes: int, *, clock: Any = None) -> None:
+        self.folder = Path(folder)
+        self.over_bytes = int(over_bytes)
+        self._clock = clock or datetime.now
+
+    def write(self, text: str, *, tool: str) -> dict[str, Any]:
+        """Write one result and say where it went.
+
+        Raises `CallError` with `SPILL_FAILED` when it cannot be written, so
+        the caller hears that rather than getting a truncated answer.
+        """
+        moment = self._clock()
+        day = self.folder / moment.strftime("%Y-%m-%d")
+        name = f"{moment.strftime('%H%M%S')}-{_safe_name(tool)}-{secrets.token_hex(3)}.json"
+        path = day / name
+        data = text.encode("utf-8")
+        try:
+            write_private(path, text)
+        except (OSError, InsecureLocation) as error:
+            raise CallError(
+                "SPILL_FAILED",
+                f"a {len(data)} byte result could not be written to the spill folder",
+                details={"exception": type(error).__name__, "reason": hide_paths(str(error))},
+            ) from None
+        return {
+            "path": str(path),
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "preview": text[:PREVIEW_CHARS],
+        }
+
+
+def _safe_name(tool: str) -> str:
+    kept = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in tool)
+    return kept.strip("-") or "result"
