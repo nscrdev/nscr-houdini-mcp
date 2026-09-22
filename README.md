@@ -135,6 +135,68 @@ none, so `pytest -q` is complete everywhere. Run only those with `pytest -m
 houdini`, or skip them with `pytest -m "not houdini"`. The bridge is found
 through `NSCR_MCP_HYTHON`, then `HFS`, then the usual install folder.
 
+## Output folders
+
+No tool takes an output path. You name a kind and a name, and the server
+builds the path from a token table. Renders, flipbooks and comps go to dated
+folders, because a person browses them by the day they were made. Caches, USD
+layers and hip files keep a stable folder under the name, because the scene
+reads them back and only the version should change between runs. Files the
+agent writes for itself go under `$HIP/.agent/`.
+
+The defaults, with `<ver>` three digits and `<date>` as `YYYYMMDD`:
+
+```
+render    $HIP/renders/<date>_<name>/v<ver>/<name>_v<ver>.$F4.exr
+flipbook  $HIP/flipbook/<date>_<name>/v<ver>/<name>_v<ver>.$F4.png
+comp      $HIP/comp/<date>_<name>/v<ver>/<name>_v<ver>.$F4.exr
+cache     $HIP/geo/<name>/v<ver>/<name>_v<ver>.$F4.bgeo.sc
+usd       $HIP/usd/<name>/v<ver>/<name>_v<ver>.usd
+hip       $HIP/<name>_v<ver>.hip
+capture   $HIP/.agent/captures/<date>/<time>_<name>_<run_id>.png
+compare   $HIP/.agent/compare/<date>_<name>/<ver>_<run_id>/
+```
+
+What goes into a parameter keeps its Houdini variables, so a scene still works
+on another machine: `$HIP/renders/20260921_${OS}/v003/${OS}_v003.$F4.exr`. The
+name is `${OS}` when it is the node's own, so renaming the node carries through
+to the next run. The run that has already started does not move: its expanded
+paths are frozen in the run record when it is accepted.
+
+A version number is taken inside one store transaction and the version folder
+is then created with an exclusive `mkdir`, so a number is used once even with
+several processes and several machines on the same scene folder. Every file the
+agent writes for itself carries the run id, so two captures in the same second
+are two files. Each run leaves a readable `_run.json` beside its output with the
+scene, session, node, version and paths.
+
+Edit the table where it suits you. Built in defaults come first, then
+`config.toml` in the state folder (`NSCR_MCP_HOME` moves it), then
+`.agent/outputs.toml` beside the scene, which may set only `[outputs]` and
+`[conventions]`. Later wins key by key, and a file that cannot be used says
+which key and why.
+
+```toml
+[outputs]
+producer = "3d/hip"        # an extra level under each kind, off by default
+cache_root = "$JOB/cache"  # heavy caches on a fast local disk
+version_width = 3
+
+[outputs.grammar]
+comp = "<output_root>/comp/<name>/v<ver>/<name>_v<ver>.<frame>.<ext>"
+
+[outputs.extensions]
+flipbook = "jpg"
+
+[conventions]
+output_marker_type = "null"
+output_marker_prefix = "OUT_"
+```
+
+A scene that has never been saved has no `$HIP`, so its runs go to a scratch
+folder in the state folder instead and every result says `unsaved_hip`, which
+is the cue to save and run again.
+
 ## License
 
 MIT
