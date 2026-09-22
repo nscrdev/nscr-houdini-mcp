@@ -14,10 +14,14 @@ Two rules stand behind everything here:
   a package file names the source folder this copy is actually running from,
   whether that is a checkout or an installed one.
 
-The packages folder is `HOUDINI_USER_PREF_DIR` when that is set, and otherwise
-the usual per user folder for the system: `~/Library/Preferences/houdini/<v>`
-on macOS, `Documents\\houdini<v>` under the profile on Windows, `~/houdini<v>`
-on Linux.
+Finding the packages folder is its own job, because a preference folder is
+often moved by something this command cannot see: a line in `houdini.env`, a
+launcher, another package, a redirected documents folder. The order is: the
+folder the caller named, `HOUDINI_PACKAGE_DIR` in this shell, what a real
+Houdini says when one is asked, `HOUDINI_USER_PREF_DIR` in this shell, then
+the usual folder for the system (`~/Library/Preferences/houdini/<v>` on macOS,
+`Documents\\houdini<v>` under the profile on Windows, `~/houdini<v>` on Linux).
+Every command reports which of those decided, and status lists them all.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -102,14 +107,29 @@ def user_pref_dir(version: str = DEFAULT_HOUDINI_VERSION) -> Path:
     return Path.home() / f"houdini{version}"
 
 
-def packages_dir(version: str = DEFAULT_HOUDINI_VERSION) -> Path:
-    """The folder Houdini reads package files from."""
+def default_packages_dir(version: str = DEFAULT_HOUDINI_VERSION) -> Path:
+    """The packages folder of the preference folder for this system."""
     return user_pref_dir(version) / PACKAGES_DIR_NAME
 
 
-def package_path(version: str = DEFAULT_HOUDINI_VERSION) -> Path:
+def packages_dir(
+    version: str = DEFAULT_HOUDINI_VERSION,
+    *,
+    override: Path | str | None = None,
+    ask_houdini: bool = True,
+) -> Path:
+    """The folder Houdini reads package files from, worked out in full."""
+    return resolve(version, override=override, ask_houdini=ask_houdini).path
+
+
+def package_path(
+    version: str = DEFAULT_HOUDINI_VERSION,
+    *,
+    override: Path | str | None = None,
+    ask_houdini: bool = True,
+) -> Path:
     """The one file this tool ever writes for a version."""
-    return packages_dir(version) / PACKAGE_FILE_NAME
+    return packages_dir(version, override=override, ask_houdini=ask_houdini) / PACKAGE_FILE_NAME
 
 
 def pref_dirs() -> list[tuple[str, Path]]:
@@ -146,6 +166,256 @@ def pref_dirs() -> list[tuple[str, Path]]:
 def _version_in(name: str) -> str | None:
     match = _VERSION_IN_NAME.search(name)
     return match.group(1) if match else None
+
+
+# Section: which packages folder this machine's Houdini really reads
+#
+# A preference folder in the usual place is the easy case. The variable that
+# moves it is often set inside `houdini.env`, or by a launcher, or by another
+# package, and a shell that runs this command sees none of that. So the
+# lookup goes, in order: what the caller named, the package folder variable in
+# this shell, what a real Houdini says when asked, the preference folder
+# variable in this shell, and only then the usual place for the system.
+# Nothing is remembered between runs: each command asks again.
+
+
+PACKAGE_DIR_ENV_VAR = "HOUDINI_PACKAGE_DIR"
+HSITE_ENV_VAR = "HSITE"
+
+SOURCE_GIVEN = "--packages-dir"
+SOURCE_PACKAGE_ENV = f"{PACKAGE_DIR_ENV_VAR} in this shell"
+SOURCE_HOUDINI_PACKAGE = "HOUDINI_PACKAGE_DIR as Houdini reads it"
+SOURCE_HOUDINI_HOME = "the home folder Houdini reports"
+SOURCE_HSITE = "HSITE, which Houdini also scans"
+SOURCE_PREF_ENV = f"{PREF_DIR_ENV_VAR} in this shell"
+SOURCE_DEFAULT = "the usual folder for this system"
+
+# How long one question to a Houdini may take. A cold hython is a few seconds,
+# and a machine where it takes longer than this is one where the answer is not
+# worth the wait: the lookup carries on without it and says so.
+ASK_TIMEOUT_S = 10.0
+
+# What the asking script prints its answer behind, so warnings and licence
+# lines on the same stream cannot be mistaken for it.
+ANSWER_MARKER = "nscr-houdini-mcp-answer "
+
+ASK_SCRIPT = f"""
+import json
+
+import hou
+
+
+def expand(text):
+    try:
+        return hou.text.expandString(text)
+    except AttributeError:
+        return hou.expandString(text)
+
+
+print(
+    {ANSWER_MARKER!r}
+    + json.dumps(
+        {{
+            "home": hou.homeHoudiniDirectory(),
+            "package_dir": expand("$HOUDINI_PACKAGE_DIR"),
+            "user_pref_dir": expand("$HOUDINI_USER_PREF_DIR"),
+            "hsite": expand("$HSITE"),
+            "version": hou.applicationVersionString(),
+        }}
+    )
+)
+"""
+
+
+@dataclass(frozen=True)
+class HoudiniAnswer:
+    """What a real Houdini said about its own folders."""
+
+    home: Path
+    package_dirs: list[Path]
+    user_pref_dir: Path | None
+    hsite: Path | None
+    version: str
+    hython: Path
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """One folder the lookup considered, and where the idea came from."""
+
+    source: str
+    path: Path
+    used: bool = False
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class Lookup:
+    """The folder to write into, and everything that led to it."""
+
+    path: Path
+    source: str
+    candidates: list[Candidate] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
+def split_paths(value: str | None) -> list[Path]:
+    """A path list variable as paths, keeping the order Houdini reads it in."""
+    if not value:
+        return []
+    found = []
+    for part in value.split(os.pathsep):
+        text = part.strip()
+        if text and text != "&":
+            found.append(Path(text).expanduser())
+    return found
+
+
+def ask_houdini(version: str = DEFAULT_HOUDINI_VERSION) -> tuple[HoudiniAnswer | None, str]:
+    """Ask a Houdini on this machine where it reads packages from.
+
+    Returns the answer and a line saying what happened, because a lookup that
+    could not ask has to say so rather than quietly move on. A Houdini that is
+    not there, will not start, or takes too long is not an error: the lookup
+    carries on with what it can work out by itself.
+    """
+    installs = find_installs()
+    if not installs:
+        return None, "no Houdini found to ask, so its own folders could not be read"
+    hython = installs[0].hfs / "bin" / ("hython.exe" if sys.platform == "win32" else "hython")
+    if not hython.is_file():
+        return None, f"no hython at {hython}, so Houdini's own folders could not be read"
+    try:
+        finished = subprocess.run(  # noqa: S603 - the binary is this machine's Houdini
+            [str(hython), "-c", ASK_SCRIPT],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=ASK_TIMEOUT_S,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"{hython} did not answer within {ASK_TIMEOUT_S:.0f} seconds"
+    except OSError as error:
+        return None, f"{hython} could not be run: {error}"
+    answer = _read_answer(finished.stdout, hython)
+    if answer is None:
+        first = (finished.stderr or finished.stdout or "").strip().splitlines()
+        reason = first[-1] if first else f"exit code {finished.returncode}"
+        return None, f"{hython} gave no answer: {reason}"
+    return answer, f"asked {hython}"
+
+
+def _read_answer(printed: str, hython: Path) -> HoudiniAnswer | None:
+    for line in (printed or "").splitlines():
+        if not line.startswith(ANSWER_MARKER):
+            continue
+        try:
+            loaded = json.loads(line[len(ANSWER_MARKER) :])
+        except ValueError:
+            return None
+        if not isinstance(loaded, dict) or not loaded.get("home"):
+            return None
+        pref = loaded.get("user_pref_dir")
+        site = loaded.get("hsite")
+        return HoudiniAnswer(
+            home=Path(str(loaded["home"])),
+            package_dirs=split_paths(loaded.get("package_dir")),
+            user_pref_dir=Path(str(pref)) if pref else None,
+            hsite=Path(str(site)) if site else None,
+            version=str(loaded.get("version") or ""),
+            hython=hython,
+        )
+    return None
+
+
+def resolve(
+    version: str = DEFAULT_HOUDINI_VERSION,
+    *,
+    override: Path | str | None = None,
+    ask_houdini: bool = True,
+) -> Lookup:
+    """Work out which packages folder to write into, and show the working.
+
+    Houdini reads every folder on its package path, so when a variable names
+    several the first is written into and the rest are reported.
+    """
+    candidates: list[Candidate] = []
+    notes: list[str] = []
+
+    if override is not None:
+        chosen = Path(override).expanduser()
+        candidates.append(Candidate(SOURCE_GIVEN, chosen, used=True))
+        return Lookup(chosen, SOURCE_GIVEN, candidates, notes)
+
+    from_shell = split_paths(os.environ.get(PACKAGE_DIR_ENV_VAR))
+    if from_shell:
+        _add(candidates, SOURCE_PACKAGE_ENV, from_shell)
+        return Lookup(from_shell[0], SOURCE_PACKAGE_ENV, candidates, notes)
+
+    if ask_houdini:
+        answer, note = _ask(version)
+        notes.append(note)
+        if answer is not None:
+            if answer.package_dirs:
+                _add(candidates, SOURCE_HOUDINI_PACKAGE, answer.package_dirs)
+                source = SOURCE_HOUDINI_PACKAGE
+                chosen = answer.package_dirs[0]
+            else:
+                chosen = answer.home / PACKAGES_DIR_NAME
+                source = SOURCE_HOUDINI_HOME
+                candidates.append(Candidate(SOURCE_HOUDINI_HOME, chosen, used=True))
+            _add_hsite(candidates, answer, version)
+            return Lookup(chosen, source, candidates, notes)
+
+    from_pref = os.environ.get(PREF_DIR_ENV_VAR)
+    if from_pref:
+        chosen = Path(from_pref.replace(VERSION_TOKEN, version)).expanduser() / PACKAGES_DIR_NAME
+        candidates.append(Candidate(SOURCE_PREF_ENV, chosen, used=True))
+        return Lookup(chosen, SOURCE_PREF_ENV, candidates, notes)
+
+    chosen = default_packages_dir(version)
+    candidates.append(Candidate(SOURCE_DEFAULT, chosen, used=True))
+    return Lookup(chosen, SOURCE_DEFAULT, candidates, notes)
+
+
+def _ask(version: str) -> tuple[HoudiniAnswer | None, str]:
+    """The question, as one call, so a test can answer it without a Houdini."""
+    return ask_houdini(version)
+
+
+def _add_hsite(candidates: list[Candidate], answer: HoudiniAnswer, version: str) -> None:
+    """Report the site folder Houdini also scans, and never write into it."""
+    if not answer.hsite:
+        return
+    short = _short(answer.version, version)
+    candidates.append(
+        Candidate(
+            SOURCE_HSITE,
+            answer.hsite / f"houdini{short}" / PACKAGES_DIR_NAME,
+            note="shared with other people, so nothing is written here",
+        )
+    )
+
+
+def _add(candidates: list[Candidate], source: str, paths: list[Path]) -> None:
+    """The first of a path list is written into, the rest are reported."""
+    for index, path in enumerate(paths):
+        candidates.append(
+            Candidate(
+                source,
+                path,
+                used=index == 0,
+                note="" if index == 0 else "also scanned by Houdini",
+            )
+        )
+
+
+def _short(reported: str, fallback: str) -> str:
+    version = _version_in(reported) or fallback
+    parts = version.split(".")
+    return ".".join(parts[:2]) if len(parts) > 1 else version
 
 
 # Section: the package file
@@ -211,6 +481,7 @@ class InstallResult:
     written: bool
     replaced: bool
     dry_run: bool
+    lookup: Lookup | None = None
     lines: list[str] = field(default_factory=list)
 
 
@@ -219,15 +490,20 @@ def install(
     *,
     autostart: bool = False,
     dry_run: bool = False,
+    packages: Path | str | None = None,
+    lookup: Lookup | None = None,
 ) -> InstallResult:
     """Write the package file for one Houdini version.
 
     A file already there and carrying the marker is replaced. One that is not
-    ours raises, and nothing on disk is touched.
+    ours raises, and nothing on disk is touched. `packages` names the folder
+    outright; without it the folder is worked out, and a caller that has
+    already worked it out passes that `lookup` rather than asking again.
     """
     source = source_root()
     payload = payload_root()
-    path = package_path(version)
+    found = lookup or resolve(version, override=packages)
+    path = found.path / PACKAGE_FILE_NAME
     exists = path.exists()
     if exists and not is_ours(path):
         raise NotOurs(f"{path} was not written by this tool, so it is left alone")
@@ -247,8 +523,10 @@ def install(
         written=not dry_run,
         replaced=exists,
         dry_run=dry_run,
+        lookup=found,
         lines=[
             f"package       {path}",
+            f"folder from   {found.source}",
             f"houdini        {version}",
             f"houdini path   {payload}",
             f"pythonpath     {source}",
@@ -267,13 +545,19 @@ class RemovedPackage:
     reason: str
 
 
-def uninstall(version: str | None = None) -> list[RemovedPackage]:
+def uninstall(
+    version: str | None = None,
+    *,
+    packages: Path | str | None = None,
+    lookup: Lookup | None = None,
+) -> list[RemovedPackage]:
     """Take away the package files this tool wrote.
 
-    With no version, every preference folder on this machine is looked at. A
-    file of the same name that this tool did not write is reported and kept.
+    Every folder this machine could be reading packages from is looked at, so
+    a file left in the old place is found after the folder has moved. A file
+    of the same name that this tool did not write is reported and kept.
     """
-    targets = [(version, packages_dir(version))] if version else _every_packages_dir()
+    targets = _targets(version, packages=packages, lookup=lookup)
     seen: list[Path] = []
     results = []
     for found_version, folder in targets:
@@ -293,8 +577,31 @@ def uninstall(version: str | None = None) -> list[RemovedPackage]:
     return results
 
 
-def _every_packages_dir() -> list[tuple[str, Path]]:
-    return [(version, path / PACKAGES_DIR_NAME) for version, path in pref_dirs()]
+def _targets(
+    version: str | None,
+    *,
+    packages: Path | str | None = None,
+    lookup: Lookup | None = None,
+) -> list[tuple[str, Path]]:
+    """Every folder to look in, the one that would be written into first.
+
+    Uninstall and status both work over this list. A folder Houdini names is
+    where the file is now; the per version preference folders are where an
+    earlier install may have left one.
+    """
+    wanted = version or DEFAULT_HOUDINI_VERSION
+    found = lookup or resolve(wanted, override=packages)
+    targets = [(wanted, candidate.path) for candidate in found.candidates]
+    if version is None and packages is None:
+        targets += [(known, path / PACKAGES_DIR_NAME) for known, path in pref_dirs()]
+    seen: list[Path] = []
+    unique = []
+    for known, path in targets:
+        if path in seen:
+            continue
+        seen.append(path)
+        unique.append((known, path))
+    return unique
 
 
 @dataclass(frozen=True)
@@ -308,9 +615,14 @@ class InstalledPackage:
     autostart: bool | None
 
 
-def installed(version: str | None = None) -> list[InstalledPackage]:
-    """The package state of every Houdini preference folder found."""
-    targets = [(version, packages_dir(version))] if version else _every_packages_dir()
+def installed(
+    version: str | None = None,
+    *,
+    packages: Path | str | None = None,
+    lookup: Lookup | None = None,
+) -> list[InstalledPackage]:
+    """The package state of every folder this machine may read packages from."""
+    targets = _targets(version, packages=packages, lookup=lookup)
     states = []
     for found_version, folder in targets:
         path = folder / PACKAGE_FILE_NAME

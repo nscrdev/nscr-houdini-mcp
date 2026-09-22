@@ -33,11 +33,47 @@ STOP_TIMEOUT_S = 60.0
 
 
 @pytest.fixture(autouse=True)
-def temp_pref_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Point every command in this file at a preference folder of its own."""
+def temp_pref_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> Path:
+    """Point every command in this file at a preference folder of its own.
+
+    The package folder variable is cleared, and no Houdini is asked anything,
+    so a unit test decides the lookup with the preference folder alone. A test
+    that wants a Houdini answer sets one with `answers`, and the test that
+    needs a real Houdini is marked and left to ask for itself.
+    """
     root = tmp_path / PREF_TEMPLATE
     monkeypatch.setenv(install_module.PREF_DIR_ENV_VAR, str(root))
+    monkeypatch.delenv(install_module.PACKAGE_DIR_ENV_VAR, raising=False)
+    if request.node.get_closest_marker("houdini") is None:
+        answers(monkeypatch, None, "no Houdini found to ask")
     return root
+
+
+def answers(
+    monkeypatch: pytest.MonkeyPatch,
+    answer: install_module.HoudiniAnswer | None,
+    note: str = "asked a Houdini",
+) -> None:
+    """Say what a Houdini would answer, without starting one."""
+    monkeypatch.setattr(install_module, "ask_houdini", lambda version=None: (answer, note))
+
+
+def houdini_answer(
+    home: Path,
+    *,
+    package_dirs: list[Path] | None = None,
+    hsite: Path | None = None,
+) -> install_module.HoudiniAnswer:
+    return install_module.HoudiniAnswer(
+        home=home,
+        package_dirs=package_dirs or [],
+        user_pref_dir=home,
+        hsite=hsite,
+        version="22.0.368",
+        hython=Path("/somewhere/bin/hython"),
+    )
 
 
 @pytest.fixture
@@ -85,6 +121,130 @@ def test_each_system_has_its_own_preference_folder(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(install_module.sys, "platform", "win32")
     monkeypatch.setenv("USERPROFILE", str(Path("/u/win")))
     assert install_module.packages_dir("22.0") == Path("/u/win/Documents/houdini22.0/packages")
+
+
+# Section: which folder the package goes into
+
+
+def test_a_named_folder_wins_over_everything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(install_module.PACKAGE_DIR_ENV_VAR, str(tmp_path / "from-shell"))
+    answers(monkeypatch, houdini_answer(tmp_path / "from-houdini"))
+    found = install_module.resolve(override=tmp_path / "named")
+    assert found.path == tmp_path / "named"
+    assert found.source == install_module.SOURCE_GIVEN
+
+
+def test_the_package_folder_variable_in_this_shell_comes_next(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "one"
+    second = tmp_path / "two"
+    monkeypatch.setenv(
+        install_module.PACKAGE_DIR_ENV_VAR, os.pathsep.join([str(first), str(second)])
+    )
+    answers(monkeypatch, houdini_answer(tmp_path / "from-houdini"))
+    found = install_module.resolve()
+    assert found.path == first
+    assert found.source == install_module.SOURCE_PACKAGE_ENV
+    # Houdini scans every folder on the list, so the rest are reported.
+    assert [(item.path, item.used) for item in found.candidates] == [
+        (first, True),
+        (second, False),
+    ]
+    assert "also scanned" in found.candidates[1].note
+
+
+def test_houdini_is_asked_before_the_preference_variable_in_this_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "houdini-home"
+    answers(monkeypatch, houdini_answer(home), "asked /somewhere/bin/hython")
+    found = install_module.resolve()
+    assert found.path == home / "packages"
+    assert found.source == install_module.SOURCE_HOUDINI_HOME
+    assert found.notes == ["asked /somewhere/bin/hython"]
+
+
+def test_the_package_folder_houdini_itself_reads_wins_over_its_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    named = tmp_path / "studio-packages"
+    site = tmp_path / "site"
+    answers(
+        monkeypatch,
+        houdini_answer(tmp_path / "houdini-home", package_dirs=[named], hsite=site),
+    )
+    found = install_module.resolve()
+    assert found.path == named
+    assert found.source == install_module.SOURCE_HOUDINI_PACKAGE
+    # The site folder is other people's, so it is reported and never written to.
+    site_candidates = [
+        item for item in found.candidates if item.source == install_module.SOURCE_HSITE
+    ]
+    assert [item.path for item in site_candidates] == [site / "houdini22.0" / "packages"]
+    assert site_candidates[0].used is False
+
+
+def test_a_houdini_that_cannot_be_asked_leaves_a_note_and_the_lookup_carries_on(
+    temp_pref_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answers(monkeypatch, None, "no hython at /nowhere/bin/hython")
+    found = install_module.resolve()
+    assert found.path == Path(str(temp_pref_dir).replace("__HVER__", "22.0")) / "packages"
+    assert found.source == install_module.SOURCE_PREF_ENV
+    assert found.notes == ["no hython at /nowhere/bin/hython"]
+
+
+def test_the_last_word_is_the_usual_folder_for_this_system(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(install_module.PREF_DIR_ENV_VAR)
+    monkeypatch.setattr(install_module.sys, "platform", "darwin")
+    monkeypatch.setattr(install_module.Path, "home", classmethod(lambda cls: Path("/u/me")))
+    found = install_module.resolve()
+    assert found.path == Path("/u/me/Library/Preferences/houdini/22.0/packages")
+    assert found.source == install_module.SOURCE_DEFAULT
+
+
+def test_a_houdini_answer_is_read_from_its_marked_line() -> None:
+    printed = (
+        "Licence line\n"
+        + install_module.ANSWER_MARKER
+        + json.dumps(
+            {
+                "home": "/u/me/houdini22.0",
+                "package_dir": os.pathsep.join(["/a", "/b"]),
+                "user_pref_dir": "/u/me/houdini22.0",
+                "hsite": "/studio",
+                "version": "22.0.368",
+            }
+        )
+    )
+    answer = install_module._read_answer(printed, Path("/bin/hython"))
+    assert answer is not None
+    assert answer.home == Path("/u/me/houdini22.0")
+    assert answer.package_dirs == [Path("/a"), Path("/b")]
+    assert answer.hsite == Path("/studio")
+
+
+def test_noise_on_its_own_is_no_answer() -> None:
+    assert install_module._read_answer("warning: something\n", Path("/bin/hython")) is None
+
+
+def test_install_and_uninstall_take_the_named_folder(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    folder = tmp_path / "somewhere-else"
+    assert cli.main(["bridge", "install", "--packages-dir", str(folder)]) == 0
+    assert (folder / install_module.PACKAGE_FILE_NAME).exists()
+    assert not (tmp_path / "prefs22.0").exists()
+    capsys.readouterr()
+
+    assert cli.main(["bridge", "uninstall", "--packages-dir", str(folder)]) == 0
+    assert "removed" in capsys.readouterr().out
+    assert not (folder / install_module.PACKAGE_FILE_NAME).exists()
 
 
 # Section: install
@@ -286,7 +446,9 @@ def test_status_says_when_there_is_nothing_running(
     assert cli.main(["bridge", "status", "--home", str(home)]) == 0
     printed = capsys.readouterr().out
     assert "sessions: none" in printed
-    assert "22.0 not installed" in printed
+    assert "not installed" in printed
+    assert f"decided by {install_module.SOURCE_PREF_ENV}" in printed
+    assert str(package_file()) in printed
 
 
 def test_status_reports_the_package_it_wrote(
@@ -294,7 +456,9 @@ def test_status_reports_the_package_it_wrote(
 ) -> None:
     install_module.install(autostart=True)
     cli.main(["bridge", "status", "--home", str(home)])
-    assert "22.0 installed, autostart on" in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    assert "installed, autostart on" in printed
+    assert "considered:" in printed
 
 
 def test_status_lists_a_session_from_the_store(
@@ -359,11 +523,17 @@ def free_port() -> int:
 
 
 @pytest.fixture
+def houdini_lookup(temp_pref_dir: Path) -> install_module.Lookup:
+    """Where a real Houdini on this machine says its packages folder is."""
+    return install_module.resolve()
+
+
+@pytest.fixture
 def hython_session(
-    tmp_path: Path, home: Path, temp_pref_dir: Path
+    tmp_path: Path, home: Path, temp_pref_dir: Path, houdini_lookup: install_module.Lookup
 ) -> Iterator[subprocess.Popen[str]]:
     """One hython started with the installed package, and stopped again."""
-    install_module.install(autostart=True)
+    install_module.install(autostart=True, lookup=houdini_lookup)
     script = tmp_path / "hold.py"
     # The bridge runs on a thread of its own, so the process only has to stay
     # alive. It ends as soon as anything arrives on its input.
@@ -404,9 +574,17 @@ def hython_session(
 def test_the_installed_package_starts_a_bridge_in_a_fresh_houdini(
     tmp_path: Path,
     home: Path,
+    temp_pref_dir: Path,
     capsys: pytest.CaptureFixture[str],
+    houdini_lookup: install_module.Lookup,
     hython_session: subprocess.Popen[str],
 ) -> None:
+    # The folder was not guessed: a real Houdini was asked and named its own
+    # home, which is the temporary one this test set.
+    assert houdini_lookup.source == install_module.SOURCE_HOUDINI_HOME
+    expected = Path(str(temp_pref_dir).replace(install_module.VERSION_TOKEN, "22.0"))
+    assert houdini_lookup.path == expected / "packages"
+
     entry = wait_for_entry(home, hython_session)
     assert PORT_RANGE[0] <= int(entry["port"]) <= PORT_RANGE[1]
 
@@ -433,9 +611,9 @@ def test_the_installed_package_starts_a_bridge_in_a_fresh_houdini(
     hython_session.stdin.close()
     assert hython_session.wait(timeout=STOP_TIMEOUT_S) == 0
 
-    removed = install_module.uninstall()
+    removed = install_module.uninstall(lookup=houdini_lookup)
     assert [item.removed for item in removed] == [True]
-    assert list(install_module.packages_dir().glob("*")) == []
+    assert list(houdini_lookup.path.glob("*")) == []
 
 
 def wait_for_entry(home: Path, process: subprocess.Popen[str]) -> dict:

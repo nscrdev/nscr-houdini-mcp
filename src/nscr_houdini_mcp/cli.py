@@ -47,6 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="start a bridge with every Houdini that reads this package",
     )
     add.add_argument("--dry-run", action="store_true", help="print the file, write nothing")
+    add.add_argument(
+        "--packages-dir",
+        type=Path,
+        default=None,
+        help="the packages folder to write into, ahead of everything else",
+    )
     add.set_defaults(handler=_install)
 
     remove = actions.add_parser("uninstall", help="take away package files this tool wrote")
@@ -55,10 +61,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="one version, or every preference folder found when left out",
     )
+    remove.add_argument(
+        "--packages-dir",
+        type=Path,
+        default=None,
+        help="the packages folder to look in, ahead of everything else",
+    )
     remove.set_defaults(handler=_uninstall)
 
     status = actions.add_parser("status", help="sessions, package state and Houdini installs")
     status.add_argument("--home", type=Path, default=None, help="state folder to read")
+    status.add_argument(
+        "--packages-dir",
+        type=Path,
+        default=None,
+        help="the packages folder to report on, ahead of everything else",
+    )
     status.set_defaults(handler=_status)
 
     snippet = actions.add_parser("snippet", help="Python that starts a bridge in an open Houdini")
@@ -82,7 +100,10 @@ def main(argv: list[str] | None = None) -> int:
 def _install(args: argparse.Namespace) -> int:
     try:
         result = install_module.install(
-            args.houdini_version, autostart=args.autostart, dry_run=args.dry_run
+            args.houdini_version,
+            autostart=args.autostart,
+            dry_run=args.dry_run,
+            packages=args.packages_dir,
         )
     except install_module.InstallError as error:
         print(str(error))
@@ -90,13 +111,15 @@ def _install(args: argparse.Namespace) -> int:
     print("would write" if result.dry_run else ("replaced" if result.replaced else "wrote"))
     for line in result.lines:
         print(f"  {line}")
+    for note in result.lookup.notes if result.lookup else []:
+        print(f"  note: {note}")
     if not result.autostart:
         print("  a Houdini reading this opens no port until the bridge is started by hand")
     return 0
 
 
 def _uninstall(args: argparse.Namespace) -> int:
-    results = install_module.uninstall(args.houdini_version)
+    results = install_module.uninstall(args.houdini_version, packages=args.packages_dir)
     if not results:
         print("nothing to remove")
         return 0
@@ -111,7 +134,7 @@ def _status(args: argparse.Namespace) -> int:
     home = Path(args.home) if args.home else store_module.default_home()
     print(f"home {home}")
     _print_sessions(home)
-    _print_packages()
+    _print_packages(install_module.resolve(override=args.packages_dir))
     return 0
 
 
@@ -237,28 +260,30 @@ def _health(entry: dict[str, Any] | None) -> tuple[str, str]:
     return "ok", ("-" if busy is None else ("yes" if busy else "no"))
 
 
-def _print_packages() -> None:
+def _print_packages(lookup: install_module.Lookup) -> None:
+    """Which folder was chosen, why, and what is in the ones considered."""
+    print(f"packages folder {lookup.path}")
+    print(f"  decided by {lookup.source}")
+    for note in lookup.notes:
+        print(f"  note: {note}")
+    print("  considered:")
+    for candidate in lookup.candidates:
+        mark = "->" if candidate.used else "  "
+        tail = f"  ({candidate.note})" if candidate.note else ""
+        print(f"    {mark} {candidate.source}: {candidate.path}{tail}")
+
+    print("packages:")
+    for state in install_module.installed(lookup=lookup):
+        if not state.present:
+            word = "not installed"
+        elif not state.ours:
+            word = "a package of that name is there, written by something else"
+        else:
+            word = f"installed, autostart {'on' if state.autostart else 'off'}"
+        print(f"  {word}")
+        print(f"    {state.path}")
+
     installs = install_module.find_installs()
-    states = {state.version: state for state in install_module.installed()}
-    for found in installs:
-        version = found.short_version
-        if version and version not in states:
-            for state in install_module.installed(version):
-                states[version] = state
-    if not states:
-        print("packages: no Houdini preference folder found")
-    else:
-        print("packages:")
-        for version in sorted(states):
-            state = states[version]
-            if not state.present:
-                word = "not installed"
-            elif not state.ours:
-                word = "a package of that name is there, written by something else"
-            else:
-                word = f"installed, autostart {'on' if state.autostart else 'off'}"
-            print(f"  {version} {word}")
-            print(f"    {state.path}")
     if not installs:
         print("houdini: none found")
         return
