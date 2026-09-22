@@ -189,18 +189,34 @@ capture   $HIP/.agent/captures/<date>/<time>_<name>_<run_id>.png
 compare   $HIP/.agent/compare/<date>_<name>/<ver>_<run_id>/
 ```
 
-What goes into a parameter keeps its Houdini variables, so a scene still works
-on another machine: `$HIP/renders/20260921_${OS}/v003/${OS}_v003.$F4.exr`. The
-name is `${OS}` when it is the node's own, so renaming the node carries through
-to the next run. The run that has already started does not move: its expanded
-paths are frozen in the run record when it is accepted.
+Each output comes with two lines. The template keeps its Houdini variables and
+uses `${OS}` for a name that came from the node, so it reads well and a scene
+carries it to another machine:
+`$HIP/renders/20260921_${OS}/v003/${OS}_v003.$F4.exr`. That is the line to show
+a person and to leave on a node with no run yet. What the server writes on the
+node for a run it has started is the expanded path, because the run is the
+server's from then on: renaming the node mid render must not send half the
+frames somewhere else, and the record and the scene have to say the same thing.
+A rename still carries through to the next run, which takes its own version.
+
+`$HIP`, `$HOUDINI_TEMP_DIR` and `$JOB` are the variables this fills in, the
+first two from the session and `$JOB` from the environment. A table naming any
+other variable is refused when it is read, so no run ever creates a folder
+called `$SHOT`. Roots have to start at one of those three, and templates,
+roots, producer levels and extensions may not step out of a folder with `..`;
+the finished path is checked against the root once more before anything is
+created.
 
 A version number is taken inside one store transaction and the version folder
 is then created with an exclusive `mkdir`, so a number is used once even with
-several processes and several machines on the same scene folder. Every file the
-agent writes for itself carries the run id, so two captures in the same second
-are two files. Each run leaves a readable `_run.json` beside its output with the
-scene, session, node, version and paths.
+several processes and several machines on the same scene folder. A hip file has
+no folder of its own, so it claims a small `.claim` file beside it instead,
+which is what stops two machines with their own stores from writing the same
+`v001`. Every file the agent writes for itself carries the run id, so two
+captures in the same second are two files. Each run leaves a readable
+`_run.json` beside its output with the scene, session, node, version and paths,
+absolute for the machine that made the run and again relative to the root, so
+the same folder read from somewhere else still makes sense.
 
 Edit the table where it suits you. Built in defaults come first, then
 `config.toml` in the state folder (`NSCR_MCP_HOME` moves it), then
@@ -225,9 +241,10 @@ output_marker_type = "null"
 output_marker_prefix = "OUT_"
 ```
 
-A scene that has never been saved has no `$HIP`, so its runs go to a scratch
-folder in the state folder instead and every result says `unsaved_hip`, which
-is the cue to save and run again.
+A scene that has never been saved has no `$HIP`, so its runs go under
+`$HOUDINI_TEMP_DIR/nscr-houdini-mcp/<session>/` and every result says
+`unsaved_hip`, which is the cue to save and run again. The template keeps the
+variable, so saving that scene later leaves nothing about this machine in it.
 
 ## License
 
