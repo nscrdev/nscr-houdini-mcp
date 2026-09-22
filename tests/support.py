@@ -11,8 +11,8 @@ a second copy would drift from the first.
   wait, and whatever is still running ended by the runner.
 - Ways to break things on purpose: an answer thrown away after the work ran, a
   session ended outright, and a caller that goes away in the middle of its own
-  call. Each one is a failure the design claims to survive, so each one has to
-  be producible on demand rather than waited for.
+  call. Each one is a failure the bridge must survive, so each one has to be
+  producible on demand rather than waited for.
 
 Ports. Every file that starts a session uses a range of its own, so a bridge
 somebody started by hand keeps the port it has and two test files never fight
