@@ -23,6 +23,7 @@ from nscr_houdini_mcp.store import (
     StoreError,
     UndigestableArgument,
     UnknownRecord,
+    WorkerTaken,
     default_home,
     default_store_path,
     digest_arguments,
@@ -442,6 +443,60 @@ def test_a_released_weight_is_not_counted_any_more(store: Store) -> None:
     store.reserve_worker(cap=4, token="t1", weight=3.0, weight_budget=3.0)
     store.release_worker("t1")
     assert store.reserve_worker(cap=4, token="t2", weight=3.0, weight_budget=3.0).weight == 3.0
+
+
+def test_only_one_of_two_servers_takes_the_same_warm_worker(tmp_path: Path) -> None:
+    """Both look, both decide, and the write is what settles it."""
+    path = tmp_path / "coord.sqlite"
+    with Store(path) as one, Store(path) as two:
+        one.reserve_worker(cap=2, token="t1")
+        one.set_worker_state("t1", "running")
+        # Both read a worker with no job on it, which is the interleaving.
+        assert one.get_worker("t1").job_id is None
+        assert two.get_worker("t1").job_id is None
+        assert one.lease_worker("t1", job_id="job-1").job_id == "job-1"
+        with pytest.raises(WorkerTaken):
+            two.lease_worker("t1", job_id="job-2")
+        assert two.get_worker("t1").job_id == "job-1"
+        # The same job asking again is the same claim, not a second one.
+        assert one.lease_worker("t1", job_id="job-1").job_id == "job-1"
+
+
+def test_taking_a_worker_records_which_process_took_it(store: Store) -> None:
+    store.reserve_worker(cap=2, token="t1")
+    record = store.lease_worker("t1", job_id="job-1")
+    assert record.lessee_pid == os.getpid()
+    assert record.lessee_start is not None
+    # Handing it back takes the holder off with the job.
+    freed = store.set_worker_state("t1", "running", job_id=CLEAR)
+    assert (freed.lessee_pid, freed.lessee_start) == (None, None)
+
+
+def test_a_lease_held_by_a_server_that_died_is_handed_back(store: Store) -> None:
+    store.reserve_worker(cap=2, token="t1")
+    store.set_worker_state("t1", "running", pid=os.getpid(), owner_pid=os.getpid())
+    store.lease_worker("t1", job_id="job-1", lessee_pid=DEAD_PID, lessee_start="whenever")
+    # The worker is fine, so its slot stays. The claim on it does not.
+    assert store.reclaim_workers() == []
+    record = store.get_worker("t1")
+    assert (record.state, record.job_id, record.lessee_pid) == ("running", None, None)
+
+
+def test_a_lease_whose_holder_cannot_be_asked_about_is_left_alone(store: Store) -> None:
+    store.reserve_worker(cap=2, token="t1")
+    store.set_worker_state("t1", "running", pid=os.getpid(), owner_pid=os.getpid())
+    store.lease_worker("t1", job_id="job-1", lessee_pid=os.getpid())
+    store.reclaim_workers()
+    assert store.get_worker("t1").job_id == "job-1"
+
+
+def test_leasing_needs_a_worker_that_is_there(store: Store) -> None:
+    with pytest.raises(UnknownRecord):
+        store.lease_worker("borrowed", job_id="job-1")
+    store.reserve_worker(cap=2, token="t1")
+    store.release_worker("t1")
+    with pytest.raises(WorkerTaken):
+        store.lease_worker("t1", job_id="job-1")
 
 
 def test_worker_moves_need_a_known_token_and_a_known_state(store: Store) -> None:

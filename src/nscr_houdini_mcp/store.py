@@ -45,7 +45,7 @@ APP_DIR_NAME = "nscr-houdini-mcp"
 HOME_ENV_VAR = "NSCR_MCP_HOME"
 STORE_FILE_NAME = "coord.sqlite"
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SESSION_KINDS = frozenset({"gui", "hython"})
 SESSION_STATES = frozenset({"live", "busy", "unresponsive", "crashed", "gone"})
@@ -107,6 +107,10 @@ class UnknownRecord(StoreError):
 
 class PoolFull(StoreError):
     """No worker slot is free under the current cap."""
+
+
+class WorkerTaken(StoreError):
+    """That worker is already on another job."""
 
 
 class AliasInUse(DuplicateRecord):
@@ -467,6 +471,8 @@ class WorkerRecord:
     pid_start: str | None = None
     capabilities: Any = None
     weight: float = 1.0
+    lessee_pid: int | None = None
+    lessee_start: str | None = None
 
     @classmethod
     def _from_row(cls, row: sqlite3.Row) -> WorkerRecord:
@@ -484,6 +490,8 @@ class WorkerRecord:
             pid_start=row["pid_start"],
             capabilities=_load(row["capabilities"]),
             weight=float(row["weight"]),
+            lessee_pid=row["lessee_pid"],
+            lessee_start=row["lessee_start"],
         )
 
 
@@ -718,7 +726,15 @@ _SCHEMA_4 = (
     "ALTER TABLE workers ADD COLUMN weight REAL NOT NULL DEFAULT 1",
 )
 
-MIGRATIONS = (_SCHEMA_1, _SCHEMA_2, _SCHEMA_3, _SCHEMA_4)
+# Who took a worker for a job. The worker owns its slot, so without this a
+# server that died while holding a lease would hold it for ever: the slot
+# looks busy to the pool and the row is never idle.
+_SCHEMA_5 = (
+    "ALTER TABLE workers ADD COLUMN lessee_pid INTEGER",
+    "ALTER TABLE workers ADD COLUMN lessee_start TEXT",
+)
+
+MIGRATIONS = (_SCHEMA_1, _SCHEMA_2, _SCHEMA_3, _SCHEMA_4, _SCHEMA_5)
 
 
 class Store:
@@ -1110,8 +1126,12 @@ class Store:
     def reclaim_workers(self) -> list[str]:
         """Fail slots whose owner is gone or that never finished starting.
 
-        Returns the tokens that were reclaimed. `reserve_worker` does this for
-        itself, so this is for a caller that only wants to tidy up or report.
+        A worker that is itself fine but was taken for a job by a server that
+        has since died is handed back to the pool instead, warm and free.
+
+        Returns the tokens whose slot was freed, which does not include those
+        handed back. `reserve_worker` does this for itself, so this is for a
+        caller that only wants to tidy up or report.
         """
         with self._txn(write=True) as db:
             return self._reclaim_workers(db, self._now())
@@ -1135,12 +1155,32 @@ class Store:
             )
             if owner_gone or worker_gone or never_started:
                 db.execute(
-                    "UPDATE workers SET state = 'failed', job_id = NULL, leased_at = ?"
-                    " WHERE token = ?",
+                    "UPDATE workers SET state = 'failed', job_id = NULL, lessee_pid = NULL,"
+                    " lessee_start = NULL, leased_at = ? WHERE token = ?",
                     (now, row["token"]),
                 )
                 reclaimed.append(row["token"])
+                continue
+            self._reclaim_lease(db, row, now)
         return reclaimed
+
+    def _reclaim_lease(self, db: sqlite3.Connection, row: sqlite3.Row, now: float) -> None:
+        """Hand a worker back when the server that took it is not there.
+
+        The worker itself is fine and stays in the pool. What is dropped is
+        the claim on it, which nobody is coming back for. A lease with no
+        recorded holder is left alone: it was taken by something this cannot
+        ask about, and taking work off a caller on a guess is worse.
+        """
+        if row["job_id"] is None or row["lessee_pid"] is None:
+            return
+        if same_process(row["lessee_pid"], row["lessee_start"]) is not False:
+            return
+        db.execute(
+            "UPDATE workers SET state = 'running', job_id = NULL, lessee_pid = NULL,"
+            " lessee_start = NULL, leased_at = ? WHERE token = ?",
+            (now, row["token"]),
+        )
 
     def set_worker_state(
         self,
@@ -1171,14 +1211,17 @@ class Store:
             deadline = row["start_deadline"]
             if start_budget_s is not None:
                 deadline = now + start_budget_s
+            settled_job = _settle(job_id, row["job_id"])
+            # No job means no lessee: whoever held it has let it go.
+            lessee = (row["lessee_pid"], row["lessee_start"]) if settled_job else (None, None)
             db.execute(
                 "UPDATE workers SET state = ?, session_id = ?, job_id = ?, owner_pid = ?,"
                 " start_deadline = ?, leased_at = ?, pid = ?, pid_start = ?, capabilities = ?,"
-                " weight = ? WHERE token = ?",
+                " weight = ?, lessee_pid = ?, lessee_start = ? WHERE token = ?",
                 (
                     state,
                     _settle(session_id, row["session_id"]),
-                    _settle(job_id, row["job_id"]),
+                    settled_job,
                     row["owner_pid"] if owner_pid is None else owner_pid,
                     deadline,
                     now,
@@ -1186,12 +1229,54 @@ class Store:
                     row["pid_start"] if pid_start is None else pid_start,
                     row["capabilities"] if capabilities is None else _dump(capabilities),
                     row["weight"] if weight is None else float(weight),
+                    lessee[0],
+                    lessee[1],
                     token,
                 ),
             )
             return WorkerRecord._from_row(
                 db.execute("SELECT * FROM workers WHERE token = ?", (token,)).fetchone()
             )
+
+    def lease_worker(
+        self,
+        token: str,
+        *,
+        job_id: str,
+        lessee_pid: int | None = None,
+        lessee_start: str | None = None,
+    ) -> WorkerRecord:
+        """Take a warm worker for one job, in one write, or `WorkerTaken`.
+
+        Reading who holds a worker and then writing that it is yours is two
+        decisions, and two servers can both make the first one. So the guard
+        is the write: it only lands on a worker that no other job holds, and a
+        write that lands on nothing means somebody else got there first.
+
+        The pid recorded here is the server that took the worker, not the
+        worker itself. A server that dies mid job would otherwise hold the
+        lease for good, because the worker's own process is still alive.
+        """
+        now = self._now()
+        pid = os.getpid() if lessee_pid is None else lessee_pid
+        stamp = process_start_stamp(pid) if lessee_start is None else lessee_start
+        placeholders = ", ".join("?" * len(WORKER_ACTIVE_STATES))
+        with self._txn(write=True) as db:
+            written = db.execute(
+                "UPDATE workers SET state = 'leased', job_id = ?, lessee_pid = ?,"
+                " lessee_start = ?, leased_at = ? WHERE token = ?"
+                f" AND state IN ({placeholders})"
+                " AND (job_id IS NULL OR job_id = ?)",
+                (job_id, pid, stamp, now, token, *WORKER_ACTIVE_STATES, job_id),
+            )
+            row = db.execute("SELECT * FROM workers WHERE token = ?", (token,)).fetchone()
+            if row is None:
+                raise UnknownRecord(f"no worker reservation {token}")
+            if written.rowcount == 0:
+                raise WorkerTaken(
+                    f"worker {row['alias']} is {row['state']} and holds job {row['job_id']}"
+                )
+            return WorkerRecord._from_row(row)
 
     def release_worker(self, token: str, *, state: str = "stopped") -> WorkerRecord:
         """Give a slot back. Use `failed` when the start never came up."""

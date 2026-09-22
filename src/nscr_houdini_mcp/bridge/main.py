@@ -144,13 +144,19 @@ def _watch_lease(bridge: Bridge, token: str, max_idle_s: float) -> None:
     """Watch this worker's own row, and end the process when it says to.
 
     The store handle belongs to this thread alone, which is the rule for
-    store handles. A store that cannot be read is not a reason to end a
-    worker that is otherwise working, so the watcher says so and stops
-    watching.
+    store handles. A read that fails is written into the worker's log and the
+    watch carries on; a store that cannot be opened at all leaves the worker
+    running, with the reason in the log, and nothing watching it.
     """
+
+    def note(line: str) -> None:
+        print(f"worker lease: {line}", flush=True)
+
     try:
         with pool.open_store(bridge.home) as store:
-            reason = pool.watch_lease(store, token, max_idle_s=max_idle_s, stop=bridge.stopping)
+            reason = pool.watch_lease(
+                store, token, max_idle_s=max_idle_s, stop=bridge.stopping, log=note
+            )
     except Exception as error:  # noqa: BLE001 - reported, never fatal to the worker
         print(f"worker lease not watched: {error}", flush=True)
         return

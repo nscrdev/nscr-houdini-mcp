@@ -74,6 +74,11 @@ DEFAULT_START_TIMEOUT_S = 180.0
 DEFAULT_PROBE_TIMEOUT_S = 60.0
 DEFAULT_STOP_GRACE_S = 30.0
 
+# How long the store may stay unreadable before a worker stops watching its
+# lease. Long enough that a busy machine, a backup or a lock held by another
+# process is only a gap in the watch, not the end of it.
+LEASE_TROUBLE_S = 600.0
+
 # The longest a worker sleeps between looks at its own row. It decides how
 # quickly a stop request is noticed, so it is short enough for a person
 # waiting at a terminal and long enough to cost nothing over an hour.
@@ -106,6 +111,10 @@ class WorkerStartFailed(PoolError):
 
 class UnknownWorker(PoolError):
     """No live worker answers to that name."""
+
+
+class WorkerBusy(PoolError):
+    """That worker is already on another job."""
 
 
 @dataclass(frozen=True)
@@ -386,15 +395,18 @@ def start_worker(
         raise
     # From here the worker owns its own slot. The process that started it may
     # go away without taking the warm worker with it.
-    return store.set_worker_state(
+    record = store.set_worker_state(
         reserved.token,
-        "leased" if job_id else "running",
+        "running",
         session_id=str(entry["session_id"]),
         owner_pid=launched.pid,
         pid=launched.pid,
         pid_start=process_start_stamp(launched.pid),
         capabilities=capabilities,
     )
+    # A worker started for a job is taken the same way any other is, so the
+    # row says which process is holding it.
+    return store.lease_worker(record.token, job_id=job_id) if job_id else record
 
 
 def _token() -> str:
@@ -414,11 +426,18 @@ def find_worker(store: Store, handle: str) -> WorkerRecord:
 
 
 def reserve(store: Store, handle: str, *, job_id: str) -> WorkerRecord:
-    """Take a warm worker for one job. It is held until the job cleans up."""
+    """Take a warm worker for one job. It is held until the job cleans up.
+
+    Finding the worker and taking it are two steps, so the taking is the one
+    that decides: it is a single write that only lands on a worker no other
+    job holds. Two servers that both picked the same warm worker end with one
+    owner and one clear refusal.
+    """
     record = find_worker(store, handle)
-    if record.job_id not in (None, job_id):
-        raise PoolError(f"worker {record.alias} is already on job {record.job_id}")
-    return store.set_worker_state(record.token, "leased", job_id=job_id)
+    try:
+        return store.lease_worker(record.token, job_id=job_id)
+    except store_module.WorkerTaken as error:
+        raise WorkerBusy(str(error)) from error
 
 
 def release(store: Store, handle: str) -> WorkerRecord:
@@ -527,31 +546,67 @@ def watch_lease(
     stop: Any,
     interval_s: float | None = None,
     clock: Callable[[], float] = time.time,
+    trouble_s: float = LEASE_TROUBLE_S,
+    log: Callable[[str], None] | None = None,
 ) -> str:
     """Watch one worker's own row until it should end, and say why.
 
     This runs inside the worker, on a thread of its own, so nothing on the
-    machine has to stay alive to look after the pool. Four answers: `asked`
+    machine has to stay alive to look after the pool. Five answers: `asked`
     when a server set the row to stopping, `idle` when nobody has wanted this
     worker for long enough, `gone` when the row has been ended or removed
-    under it, and `stopped` when the process is going down for its own reasons.
+    under it, `stopped` when the process is going down for its own reasons,
+    and `unreadable` when the store has not been readable for a long time.
 
     A worker holding a job is never idle, however long the job runs.
+
+    A store that another process has locked for a moment, or a read that
+    failed once, is not a reason to stop watching: the pass is given up on,
+    said out loud, and tried again on the next tick. Only a store that stays
+    unreadable for `trouble_s` ends the watch, because a worker nobody can
+    reach through the store is a worker nobody can stop.
     """
     tick = lease_tick(max_idle_s) if interval_s is None else interval_s
+    note = log or (lambda _line: None)
+    trouble_since: float | None = None
     while True:
-        record = store.get_worker(token)
-        if record is None or record.state in store_module.WORKER_FINAL_STATES:
-            return "gone"
-        if record.state == "stopping":
-            store.release_worker(token, state="stopped")
-            return "asked"
-        idle_for = max(0.0, clock() - record.leased_at)
-        if record.job_id is None and max_idle_s > 0 and idle_for >= max_idle_s:
-            store.release_worker(token, state="stopped")
-            return "idle"
+        try:
+            reason = _lease_pass(store, token, max_idle_s=max_idle_s, clock=clock)
+        except store_module.StoreError as error:
+            if trouble_since is None:
+                trouble_since = clock()
+                note(f"the lease could not be read: {error}")
+            elif max(0.0, clock() - trouble_since) >= trouble_s:
+                note(f"the lease has not been readable for {trouble_s:g} seconds")
+                return "unreadable"
+            reason = None
+        else:
+            if trouble_since is not None:
+                note("the lease can be read again")
+                trouble_since = None
+        if reason is not None:
+            return reason
         if stop.wait(tick):
             return "stopped"
+
+
+def _lease_pass(
+    store: Store, token: str, *, max_idle_s: float, clock: Callable[[], float]
+) -> str | None:
+    """One look at the row. `None` means carry on watching."""
+    record = store.get_worker(token)
+    if record is None or record.state in store_module.WORKER_FINAL_STATES:
+        return "gone"
+    if record.state == "stopping":
+        store.release_worker(token, state="stopped")
+        return "asked"
+    # A clock that stepped backwards must not make a worker look fresh or
+    # old, so the age is never negative.
+    idle_for = max(0.0, clock() - record.leased_at)
+    if record.job_id is None and max_idle_s > 0 and idle_for >= max_idle_s:
+        store.release_worker(token, state="stopped")
+        return "idle"
+    return None
 
 
 # Section: what a person is shown

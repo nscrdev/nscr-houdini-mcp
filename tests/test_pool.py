@@ -266,8 +266,41 @@ def test_a_worker_on_a_job_is_not_offered_to_another(
 ) -> None:
     start(config, store, FakeLauncher(config.home), hython)
     pool.reserve(store, "w1", job_id="job-1")
-    with pytest.raises(pool.PoolError):
+    with pytest.raises(pool.WorkerBusy):
         pool.reserve(store, "w1", job_id="job-2")
+
+
+def test_two_servers_that_both_picked_one_worker_end_with_one_owner(
+    config: pool.PoolConfig, store: Store, hython: Path
+) -> None:
+    """Both look before either writes, which is how a lease used to be lost."""
+    start(config, store, FakeLauncher(config.home), hython)
+    with pool.open_store(config.home) as other:
+        assert pool.find_worker(store, "w1").job_id is None
+        assert pool.find_worker(other, "w1").job_id is None
+        pool.reserve(store, "w1", job_id="job-1")
+        with pytest.raises(pool.WorkerBusy):
+            pool.reserve(other, "w1", job_id="job-2")
+        assert pool.find_worker(other, "w1").job_id == "job-1"
+
+
+def test_a_worker_started_for_a_job_says_who_took_it(
+    config: pool.PoolConfig, store: Store, hython: Path
+) -> None:
+    record = start(config, store, FakeLauncher(config.home), hython, job_id="job-1")
+    assert (record.state, record.job_id) == ("leased", "job-1")
+    assert record.lessee_pid == os.getpid()
+
+
+def test_a_job_held_by_a_server_that_died_does_not_hold_the_worker(
+    config: pool.PoolConfig, store: Store, hython: Path
+) -> None:
+    record = start(config, store, FakeLauncher(config.home), hython)
+    store.lease_worker(record.token, job_id="job-1", lessee_pid=_pid_that_is_gone())
+    rows = pool.list_workers(store)
+    assert (rows[0]["state"], rows[0]["job"]) == ("running", "-")
+    # And it is a warm worker again, free for the next job.
+    assert pool.reserve(store, "w1", job_id="job-2").job_id == "job-2"
 
 
 def test_a_name_nothing_answers_to_says_so(store: Store) -> None:
@@ -333,6 +366,81 @@ def test_a_row_that_has_gone_ends_the_watch(home: Path, hython: Path) -> None:
         record = start(config, store, FakeLauncher(home), hython)
         store.release_worker(record.token)
         assert _watch_once(store, record.token, clock, threading.Event()) == "gone"
+
+
+class StoreThatTrips:
+    """A store that fails a read once, then behaves."""
+
+    def __init__(self, store: Store, failures: int = 1) -> None:
+        self._store = store
+        self.left = failures
+
+    def get_worker(self, token: str):
+        if self.left > 0:
+            self.left -= 1
+            raise store_module.StoreBusy("the store is locked by another process")
+        return self._store.get_worker(token)
+
+    def __getattr__(self, name: str):
+        return getattr(self._store, name)
+
+
+def test_one_store_hiccup_does_not_stop_a_worker_watching_its_lease(
+    home: Path, hython: Path
+) -> None:
+    clock = FakeClock()
+    with lease_store(home, clock) as store:
+        config = pool.PoolConfig(home=home, max_idle_s=60.0)
+        record = start(config, store, FakeLauncher(home), hython)
+        tripping = StoreThatTrips(store)
+        lines: list[str] = []
+        stop = threading.Event()
+        # The pass that failed is given up on, not the watch. The next tick
+        # reads the row and finds the worker has been asked to stop.
+        store.set_worker_state(record.token, "stopping")
+        reason = pool.watch_lease(
+            tripping,
+            record.token,
+            max_idle_s=60.0,
+            stop=stop,
+            interval_s=0.0,
+            clock=clock,
+            log=lines.append,
+        )
+    assert reason == "asked"
+    assert tripping.left == 0
+    assert any("could not be read" in line for line in lines)
+
+
+def test_a_store_that_stays_unreadable_ends_the_watch_with_a_reason(
+    home: Path, hython: Path
+) -> None:
+    clock = FakeClock()
+    with lease_store(home, clock) as store:
+        config = pool.PoolConfig(home=home, max_idle_s=60.0)
+        record = start(config, store, FakeLauncher(home), hython)
+        broken = StoreThatTrips(store, failures=1000)
+        lines: list[str] = []
+
+        class Waiting:
+            """Stands in for the stop flag, and moves the clock while waiting."""
+
+            def wait(self, _seconds: float) -> bool:
+                clock.tick(120.0)
+                return False
+
+        reason = pool.watch_lease(
+            broken,
+            record.token,
+            max_idle_s=60.0,
+            stop=Waiting(),
+            interval_s=0.0,
+            clock=clock,
+            trouble_s=600.0,
+            log=lines.append,
+        )
+    assert reason == "unreadable"
+    assert any("600" in line for line in lines)
 
 
 def _watch_once(store: Store, token: str, clock: FakeClock, stop: threading.Event) -> str | None:
