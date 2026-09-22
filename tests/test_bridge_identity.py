@@ -145,6 +145,27 @@ def test_the_watch_can_be_taken_off_again(scene: Scene) -> None:
     assert session.scene_epoch == 0
 
 
+def test_watching_twice_registers_one_callback(scene: Scene) -> None:
+    session = identity(scene)
+    session.watch()
+    session.watch()
+    assert len(scene.hipFile._callbacks) == 1
+    scene.hipFile.clear()
+    assert session.scene_epoch == 1
+
+
+def test_a_watch_taken_back_before_its_callback_came_off_is_not_registered_again(
+    scene: Scene,
+) -> None:
+    session = identity(scene)
+    session.watch()
+    session.unwatch()
+    session.watch()
+    assert len(scene.hipFile._callbacks) == 1
+    scene.hipFile.clear()
+    assert session.scene_epoch == 1
+
+
 def test_a_replacement_is_passed_on_with_the_new_epoch_and_file(scene: Scene) -> None:
     seen: list[tuple[int, str | None]] = []
     session = identity(scene, on_change=lambda epoch, path: seen.append((epoch, path)))

@@ -15,7 +15,7 @@ import support
 from fake_hou import Scene
 from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge import client as client_module
-from nscr_houdini_mcp.bridge import registry, security, signing
+from nscr_houdini_mcp.bridge import host, registry, security, signing
 from nscr_houdini_mcp.bridge.app import Bridge, BridgeConfig, BridgeStartError, houdini_lock
 from nscr_houdini_mcp.bridge.handlers import ToolRegistry, default_registry
 from nscr_houdini_mcp.bridge.serving import (
@@ -1264,6 +1264,137 @@ def test_stopping_during_a_cook_returns_at_once_and_says_nothing_to_houdini(
         assert bridge.scene_epoch == 0
     finally:
         scene.ui.stop()
+
+
+def _ours(scene: Scene) -> tuple[int, int]:
+    """What Houdini holds: scene event callbacks, then event loop callbacks."""
+    return len(scene.hipFile._callbacks), len(scene.ui.eventLoopCallbacks())
+
+
+@pytest.mark.parametrize("way", ["either", "post", "tick"])
+def test_a_stopped_gui_bridge_takes_its_callbacks_off_without_a_scene_event(
+    tmp_path: Path, way: str
+) -> None:
+    """The main thread's next visit takes everything of ours off.
+
+    Either the pulse's last tick or the runner's last post does it, whichever
+    lands first, and each is enough alone. No scene is loaded or cleared.
+    """
+    scene = Scene()
+    module = scene.module()
+    ui = scene.ui
+    if way == "post":
+        # No loop callbacks here, so the last post is the only way in.
+        module.ui = SimpleNamespace(postEventCallback=ui.postEventCallback)
+    elif way == "tick":
+        # Posts that never land, so the pulse is the only way in.
+        module.ui = SimpleNamespace(
+            postEventCallback=lambda callback: None,
+            addEventLoopCallback=ui.addEventLoopCallback,
+            removeEventLoopCallback=ui.removeEventLoopCallback,
+        )
+    baseline = _ours(scene)
+    bridge, _ = make_bridge(tmp_path, kind="gui", hou=module)
+    ui.start()
+    try:
+        bridge.start()
+        pulses = 0 if way == "post" else 1
+        assert _ours(scene) == (baseline[0] + 2, baseline[1] + pulses)
+        assert bridge.stop() == []
+        _wait_for(lambda: _ours(scene) == baseline, timeout_s=2.0)
+        assert host.leftovers(module) == 0
+        assert bridge.scene_epoch == 0
+    finally:
+        ui.stop()
+
+
+def test_bridges_started_and_stopped_in_turn_leave_nothing_behind(tmp_path: Path) -> None:
+    scene = Scene()
+    module = scene.module()
+    baseline = _ours(scene)
+    scene.ui.start()
+    try:
+        for _ in range(3):
+            bridge, _ = make_bridge(tmp_path, kind="gui", hou=module)
+            bridge.start()
+            assert _ours(scene) == (baseline[0] + 2, baseline[1] + 1)
+            assert bridge.stop() == []
+            _wait_for(lambda: _ours(scene) == baseline, timeout_s=2.0)
+        assert host.leftovers(module) == 0
+    finally:
+        scene.ui.stop()
+
+
+def test_a_bridge_started_before_the_main_thread_came_back_never_doubles_up(
+    tmp_path: Path,
+) -> None:
+    """A stop and a start in one go, as a script run on the main thread does.
+
+    The main thread has not visited in between, so the first bridge's
+    callbacks are still registered when the second starts. The second takes
+    them off before it registers its own.
+    """
+    scene = Scene()
+    module = scene.module()
+    baseline = _ours(scene)
+    first, _ = make_bridge(tmp_path, kind="gui", hou=module)
+    first.start()
+    assert first.stop() == []
+    assert _ours(scene) == (baseline[0] + 2, baseline[1] + 1)
+
+    second, _ = make_bridge(tmp_path, kind="gui", hou=module)
+    second.start()
+    try:
+        assert _ours(scene) == (baseline[0] + 2, baseline[1] + 1)
+        scene.hipFile.clear()
+        assert second.scene_epoch == 1
+        assert first.scene_epoch == 0
+    finally:
+        assert second.stop() == []
+
+    scene.ui.start()
+    try:
+        _wait_for(lambda: _ours(scene) == baseline, timeout_s=2.0)
+        assert host.leftovers(module) == 0
+    finally:
+        scene.ui.stop()
+
+
+def test_a_bridge_with_no_user_interface_takes_its_callbacks_off_as_it_stops(
+    tmp_path: Path,
+) -> None:
+    """No event loop holds the object model lock there, so nothing waits."""
+    scene = Scene()
+    module = scene.module()
+    baseline = _ours(scene)
+    bridge, _ = make_bridge(tmp_path, kind="hython", hou=module)
+    bridge.start()
+    assert _ours(scene)[0] == baseline[0] + 2
+    assert bridge.stop() == []
+    assert _ours(scene) == baseline
+    assert host.leftovers(module) == 0
+
+
+def test_a_quit_hook_installed_twice_or_taken_back_is_registered_once() -> None:
+    scene = Scene()
+    module = scene.module()
+    quits: list[bool] = []
+    hook = host.QuitHook(lambda: quits.append(True), hou=module)
+    assert hook.install() is True
+    assert hook.install() is True
+    assert len(scene.hipFile._callbacks) == 1
+
+    hook.remove()
+    assert host.leftovers(module) == 1
+    assert hook.install() is True
+    assert len(scene.hipFile._callbacks) == 1
+    assert host.leftovers(module) == 0
+
+    scene.hipFile._fire("BeforeQuit")
+    assert quits == [True]
+    hook.remove()
+    host.clear_leftovers(module)
+    assert scene.hipFile._callbacks == []
 
 
 def test_a_bridge_whose_pulse_cannot_install_still_starts_and_says_so(tmp_path: Path) -> None:

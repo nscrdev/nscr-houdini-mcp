@@ -128,7 +128,9 @@ class Identity:
         self._log = log or (lambda text: None)
         self._load_began: float | None = None
         self._counted_the_clear = False
-        self._remove_watch: Callable[[], None] | None = None
+        # The scene callback while it is registered with Houdini, whether or
+        # not it has been told to go.
+        self._on_event: Callable[..., None] | None = None
         # Read by the scene callback on the main thread. Cleared by `unwatch`
         # from whichever thread is stopping the bridge, which calls no `hou`.
         self._watching = False
@@ -288,10 +290,16 @@ class Identity:
         A load reports its own clear, and the clear is what moves the epoch,
         so the load that follows says what the scene is now without counting
         a second time. A load that never finishes has still been counted.
+
+        Watching twice registers one callback. A watch that was told to stop
+        but whose callback is still registered is taken back instead.
         """
         hou = self._hou
         if hou is None:
             return None
+        if self._on_event is not None and (self._watching or host.keep(self._on_event)):
+            self._watching = True
+            return self.unwatch
         try:
             events = hou.hipFileEventType
             before_load = events.BeforeLoad
@@ -305,7 +313,7 @@ class Identity:
             if not self._watching:
                 # Told to stop. Taking the callback off is a `hou` call, and
                 # this is the main thread, which is the only place it is free.
-                remove()
+                host.take_off_now(on_event)
                 return
             try:
                 if event_type == before_load:
@@ -326,30 +334,32 @@ class Identity:
             except Exception as error:  # noqa: BLE001 - never raise into Houdini's event loop
                 self._log(f"scene event: {type(error).__name__}: {error}")
 
-        def remove() -> None:
-            try:
-                hou.hipFile.removeEventCallback(on_event)
-            except Exception:  # noqa: BLE001 - the session may already be tearing down
-                pass
-
         try:
             hou.hipFile.addEventCallback(on_event)
         except Exception as error:  # noqa: BLE001 - no watch is better than no bridge
             self._log(f"could not watch the scene: {type(error).__name__}: {error}")
             return None
 
+        self._on_event = on_event
         self._watching = True
-        self._remove_watch = remove
-        return remove
+        return self.unwatch
 
     def unwatch(self) -> None:
         """Stop following scene changes, without calling into `hou` here.
 
         Taking the callback off waits on the object model lock from any thread
         but the main one, and the main thread holds that lock for the whole of
-        a cook. So this only sets a flag: the callback reads it on its next
-        scene event and takes itself off from the main thread. Until then it
-        does nothing at all.
+        a cook. So this only sets a flag and puts the callback on the list to
+        come off, which the main thread empties on its next visit. The callback
+        also takes itself off on its next scene event, whichever comes first.
+        Until then it does nothing at all.
         """
         self._watching = False
-        self._remove_watch = None
+        on_event, hou = self._on_event, self._hou
+        if on_event is None or hou is None:
+            return
+
+        def take_off() -> None:
+            hou.hipFile.removeEventCallback(on_event)
+
+        host.leave(hou, on_event, take_off)

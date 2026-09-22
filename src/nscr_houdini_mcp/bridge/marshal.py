@@ -306,7 +306,7 @@ class Pulse:
         if self._installed_at is not None:
             return
         self._retired = False
-        if self._hou is None:
+        if self._hou is None or not host.keep(self):
             hou.ui.addEventLoopCallback(self._tick)
             self._hou = hou
         self._installed_at = self._clock()
@@ -316,9 +316,12 @@ class Pulse:
 
         Taking the callback off is itself a `hou` call, and any thread but the
         main one waits on the object model lock to make it, which the main
-        thread holds for the whole of a cook. So stopping only sets a flag:
-        from here the pulse reports nothing, and the next tick takes the
-        callback off from the main thread, where that call costs nothing.
+        thread holds for the whole of a cook. So stopping only sets a flag and
+        puts the callback on the list of ours to come off: from here the pulse
+        reports nothing, and the next tick takes the callback off from the
+        main thread, where that call costs nothing. That same tick takes off
+        everything else on the list, such as the scene callbacks of a bridge
+        that has stopped.
 
         A session that never ticks again leaves one callback that does nothing
         but take itself off, and the process is going anyway.
@@ -326,10 +329,17 @@ class Pulse:
         self._retired = True
         self._installed_at = None
         self._at = None
+        hou = self._hou
+        if hou is not None:
+            host.leave(hou, self, self._retire)
 
     def _tick(self, *_rest: Any) -> None:
         """One visit from the main thread."""
         if self._retired:
+            hou = self._hou
+            if hou is not None:
+                # Everything of ours told to go, this callback included.
+                host.clear_leftovers(hou, log=self._log)
             self._retire()
             return
         self.mark()
@@ -439,17 +449,20 @@ class MainThreadRunner:
             )
             self._poster.start()
 
-    def stop(self) -> None:
+    def stop(self, *, last: Callable[[], None] | None = None) -> None:
         """Stop taking work, and do not wait for a poster stuck in `hou`.
 
         A poster inside a post call is waiting for the object model lock, which
         it gets when the cook ends; it then sees the session is closed and
         ends. Waiting for it here would hold the shutdown open for the length
         of the cook.
+
+        `last` is posted to the main thread once more on the way out, for
+        what has to happen there after the session is closed.
         """
         self._closed.set()
         self._queue.cancel_all()
-        self._kicks.put(None)
+        self._kicks.put(None if last is None else _Last(last))
         poster, self._poster = self._poster, None
         if poster is not None:
             poster.join(0.1)
@@ -471,8 +484,18 @@ class MainThreadRunner:
         """The poster thread: the only one here that calls into `hou`."""
         while True:
             item = self._kicks.get()
-            if item is None or self._closed.is_set():
+            if item is None:
                 return
+            if isinstance(item, _Last):
+                try:
+                    post_to_main_thread(item, hou=self._hou)
+                except BaseException as error:  # noqa: BLE001 - the thread is ending either way
+                    self._log(f"could not post to the main thread: {type(error).__name__}: {error}")
+                return
+            if self._closed.is_set():
+                # Kicks left over from before the stop. The end of the queue
+                # is still to come, and may carry one last thing to post.
+                continue
             if self._kick_in_flight.is_set():
                 # A kick is already on its way and will drain whatever is
                 # queued by the time it lands, so posting another would only
@@ -508,6 +531,16 @@ class MainThreadRunner:
             "kick_in_flight": self._kick_in_flight.is_set(),
             "poster_alive": poster is not None and poster.is_alive(),
         }
+
+
+class _Last:
+    """The one thing a stopping runner posts on its way out."""
+
+    def __init__(self, run: Callable[[], None]) -> None:
+        self._run = run
+
+    def __call__(self, *_rest: Any) -> None:
+        self._run()
 
 
 def post_to_main_thread(callback: Callable[..., None], *, hou: Any | None = None) -> None:

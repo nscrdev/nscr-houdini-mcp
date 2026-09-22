@@ -315,7 +315,7 @@ class Bridge:
         self._heartbeat_at = 0.0
         self._heartbeat_stop = threading.Event()
         self._heartbeat: threading.Thread | None = None
-        self._remove_quit_hook = None
+        self._quit_hook = host.QuitHook(self.stop, hou=self._hou)
         self._entry: dict[str, Any] = {}
         # One writer at a time for the session file, so two threads updating
         # different parts of it cannot land one on top of the other.
@@ -385,6 +385,13 @@ class Bridge:
 
             self._running = True
 
+        if self._hou is not None:
+            # Callbacks an earlier bridge in this process left to come off go
+            # now, so they are never registered next to this bridge's own.
+            # Like the steps below this calls into `hou`, which belongs here on
+            # the thread that starts the bridge while the session is idle.
+            _try(lambda: host.clear_leftovers(self._hou, log=self._log))
+
         if self.main_thread is not None:
             # Both steps call into `hou`, so they belong here on the thread
             # that starts the bridge while the session is idle, never on a
@@ -401,7 +408,7 @@ class Bridge:
         )
         self._heartbeat.start()
         atexit.register(self.stop)
-        self._remove_quit_hook = host.install_quit_hook(self.stop, hou=self._hou)
+        self._quit_hook.install()
         # From here the session follows its own scene: the first summary is
         # taken now, and the epoch moves whenever the scene is replaced.
         self.identity.refresh()
@@ -428,19 +435,18 @@ class Bridge:
         self.stopping.set()
         self._heartbeat_stop.set()
         self._leave_anyway()
-        hook, self._remove_quit_hook = self._remove_quit_hook, None
+        # The scene callbacks are told to go first, so the main thread's next
+        # visit, from the pulse or from the last post, finds them waiting.
         for what, step in (
-            (
-                "stop posting to the main thread",
-                None if self.main_thread is None else self.main_thread.stop,
-            ),
-            ("stop watching the main thread", self.pulse.uninstall),
             ("stop following the scene", self.identity.unwatch),
-            ("take the quit hook off", hook),
+            ("take the quit hook off", self._quit_hook.remove),
+            ("stop posting to the main thread", self._stop_posting),
+            ("stop watching the main thread", self.pulse.uninstall),
             ("stop being called at exit", lambda: atexit.unregister(self.stop)),
             ("end the session row", self._end_session_row),
             ("remove the session file", self._remove_session_file),
             ("stop the server", self._stop_backend),
+            ("take our callbacks off", self._take_callbacks_off),
         ):
             if step is None:
                 continue
@@ -451,6 +457,27 @@ class Bridge:
         for problem in problems:
             self._log(problem)
         return problems
+
+    def _stop_posting(self) -> None:
+        """Close the runner, posting the removal of our callbacks on the way out.
+
+        That post and the pulse's last tick both reach the main thread, and
+        whichever lands first takes the callbacks off. Neither waits for a
+        scene event.
+        """
+        if self.main_thread is None:
+            return
+        hou, log = self._hou, self._log
+        self.main_thread.stop(last=lambda: host.clear_leftovers(hou, log=log))
+
+    def _take_callbacks_off(self) -> None:
+        """Without a user interface, take our callbacks off here and now.
+
+        No event loop holds the object model lock in such a session, so the
+        call is free from this thread. With one, the main thread does it.
+        """
+        if self.main_thread is None and self._hou is not None:
+            host.clear_leftovers(self._hou, log=self._log)
 
     def _leave_anyway(self) -> None:
         """End the process by force if a call will not let go of it.
