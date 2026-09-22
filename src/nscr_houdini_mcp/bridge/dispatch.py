@@ -69,6 +69,9 @@ OPERATION_ID_BYTES = 8
 # The one tool that runs while another call holds the session.
 CANCEL_TOOL = "bridge.cancel"
 
+# Refusals a caller cannot act on without knowing what the scene is now.
+SCENE_CODES = ("SCENE_REPLACED", "OUTCOME_UNKNOWN")
+
 
 @dataclass
 class Running:
@@ -191,19 +194,26 @@ class Dispatcher:
             # another call is running. That is the whole point of it.
             return self._answer_now(tool, envelope.arguments, trace)
 
-        stale = self._scene_guard(envelope, trace)
-        if stale is not None:
-            return stale
-
+        # The receipt is asked first, because a call that has already run is
+        # answered from what it did, and a call that replaced the scene itself
+        # would otherwise be refused by the scene guard for its own doing.
         # A receipt only answers a retry when the caller chose the id, so a
         # call that named none takes none: a fresh id could answer nothing.
+        carried = envelope.scene_epoch
         wanted = envelope.operation_id if tool.mutating else None
         digest = _digest(tool, envelope.arguments) if wanted else None
         if wanted and digest:
-            peeked = self.receipts.peek(wanted, digest, scene_epoch=self.identity.scene_epoch)
+            peeked = self.receipts.peek(wanted, digest, current_epoch=self.identity.scene_epoch)
             early = self._receipt_reply(peeked, tool, trace)
             if early is not None:
                 return early
+
+        # The scene is checked here so a hopeless call is not queued at all,
+        # and again on the thread that runs the work, because the scene can be
+        # replaced while this call waits its turn.
+        stale = self._scene_guard(carried, trace)
+        if stale is not None:
+            return stale
 
         wait_s = self.wait_s if envelope.wait_s is None else envelope.wait_s
         timeout_s = _first(envelope.timeout_s, tool.timeout_s, self.timeout_s)
@@ -213,7 +223,14 @@ class Dispatcher:
             return self._busy(trace, waited=waited, wait_s=wait_s, cause="session busy")
 
         if wanted and digest:
-            verdict = self.receipts.claim(wanted, digest, scene_epoch=self.identity.scene_epoch)
+            # The id is bound to the scene the caller wrote the call against,
+            # not to whatever the scene has become while the call waited.
+            verdict = self.receipts.claim(
+                wanted,
+                digest,
+                scene_epoch=carried if carried is not None else self.identity.scene_epoch,
+                current_epoch=self.identity.scene_epoch,
+            )
             settled = self._receipt_reply(verdict, tool, trace)
             if settled is not None:
                 self._gate.leave()
@@ -232,7 +249,7 @@ class Dispatcher:
             stopping=self._stopping,
         )
 
-        work = marshal.Work(lambda: self._work(tool, envelope.arguments, context, running))
+        work = marshal.Work(lambda: self._work(tool, envelope.arguments, context, running, carried))
         runner = marshal.choose_runner(
             self.kind, mutating=tool.mutating, hou=self._hou, main_loop=self._main_loop
         )
@@ -241,7 +258,7 @@ class Dispatcher:
 
             pickup_s = max(MIN_PICKUP_S, wait_s - (time.monotonic() - waited))
             if not work.started.wait(pickup_s) and work.cancel():
-                self._release(running)
+                self._never_ran(wanted, running)
                 return self._busy(
                     trace,
                     waited=waited,
@@ -254,7 +271,7 @@ class Dispatcher:
             # staying busy with nothing running in it.
             self._log(f"could not hand {tool.name} over: {type(error).__name__}: {error}")
             if work.cancel():
-                self._release(running)
+                self._never_ran(wanted, running)
             return self._refuse(
                 BridgeError(
                     "TOOL_FAILED",
@@ -333,21 +350,24 @@ class Dispatcher:
 
     # Section: the scene and the receipt
 
-    def _scene_guard(self, envelope: Envelope, trace: Mapping[str, Any]) -> Reply | None:
+    def _scene_guard(self, carried: int | None, trace: Mapping[str, Any]) -> Reply | None:
         """Refuse a call written against a scene this session has thrown away."""
-        carried = envelope.scene_epoch
+        try:
+            self._still_the_same_scene(carried)
+        except BridgeError as replaced:
+            return self._refuse(replaced, trace)
+        return None
+
+    def _still_the_same_scene(self, carried: int | None) -> None:
+        """Raise when the scene is not the one the call was written against."""
         current = self.identity.scene_epoch
         if carried is None or carried == current:
-            return None
-        return self._refuse(
-            BridgeError(
-                "SCENE_REPLACED",
-                "this session has replaced its scene since that call was written",
-                {"carried_epoch": carried, "scene_epoch": current},
-                hint="read the scene again, then send the call with the new epoch",
-            ),
-            trace,
-            scene=True,
+            return
+        raise BridgeError(
+            "SCENE_REPLACED",
+            "this session has replaced its scene since that call was written",
+            {"carried_epoch": carried, "scene_epoch": current},
+            hint="read the scene again, then send the call with the new epoch",
         )
 
     def _receipt_reply(
@@ -454,9 +474,15 @@ class Dispatcher:
         arguments: Mapping[str, Any],
         context: ToolContext,
         running: Running,
+        carried: int | None = None,
     ) -> Any:
         """The whole of one call, on whichever thread it was given to."""
         try:
+            # The last look at the scene, here on the thread that is about to
+            # touch it. A call can wait a long time for its turn, and the
+            # session may have loaded another scene while it waited: the paths
+            # in its arguments would then mean something else entirely.
+            self._still_the_same_scene(carried)
             if not tool.mutating or self._hou is None:
                 return tool.run(arguments, context)
             outcome = run_in_undo_group(
@@ -471,6 +497,18 @@ class Dispatcher:
             return outcome.value
         finally:
             self._release(running)
+
+    def _never_ran(self, wanted: str | None, running: Running) -> None:
+        """Give the session back, and take back the receipt with it.
+
+        The work was cancelled before any thread took it, so the tool was
+        never reached. Leaving the receipt behind would answer every later
+        attempt at that id with an outcome nobody knows, for work that never
+        happened. The caller is free to send it again.
+        """
+        self._release(running)
+        if wanted:
+            self.receipts.drop(wanted)
 
     def _release(self, running: Running) -> None:
         """Note how the call ended and give the session to the next caller."""
@@ -532,7 +570,7 @@ class Dispatcher:
             **error_payload(safe.code, safe.message, hint=safe.hint, details=safe.details),
             **self._said(trace),
         }
-        if scene:
+        if scene or safe.code in SCENE_CODES:
             payload["scene"] = self.identity.scene()
         return Reply(200, payload)
 

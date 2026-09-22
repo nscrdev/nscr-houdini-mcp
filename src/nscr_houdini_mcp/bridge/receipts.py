@@ -51,6 +51,11 @@ UNKNOWN = "unknown"
 SCENE_REPLACED = "scene_replaced"
 SKIP = "skip"
 
+# Why an id is closed with no answer in it. The two cases are different and a
+# caller is told which one it met.
+ABANDONED_BY = "an earlier attempt stopped without recording an outcome"
+STILL_RUNNING = "another caller is running this id"
+
 
 @dataclass(frozen=True)
 class Verdict:
@@ -80,6 +85,21 @@ class Verdict:
             "started_at": record.created_at,
             "updated_at": record.updated_at,
         }
+
+
+def ended_epoch(record: store_module.OperationRecord) -> int | None:
+    """The scene this operation left behind when it finished.
+
+    The stored answer carries the epoch as of the moment it was given, which
+    is what an operation that replaced the scene itself has to be judged
+    against: its own load or new scene moved the counter, and that must not
+    stop it answering its own retry.
+    """
+    outcome = record.outcome
+    if not isinstance(outcome, Mapping):
+        return None
+    epoch = outcome.get("scene_epoch")
+    return epoch if isinstance(epoch, int) and not isinstance(epoch, bool) else None
 
 
 def digest_call(tool: str, arguments: Mapping[str, Any]) -> str:
@@ -122,31 +142,35 @@ class Receipts:
         """Whether there is anywhere to keep a receipt."""
         return self._store is not None
 
-    def peek(self, operation_id: str, digest: str, *, scene_epoch: int | None = None) -> Verdict:
+    def peek(self, operation_id: str, digest: str, *, current_epoch: int | None = None) -> Verdict:
         """Answer a repeat before it queues, without claiming anything.
 
         Only the answers that are certain without a transaction: a receipt
-        with different arguments, one from a scene that has been replaced, and
-        a finished one with the same arguments. Everything else waits for the
-        claim, which is the one that decides.
+        with different arguments, and one that has already finished.
+        Everything else waits for the claim, which is the one that decides.
         """
         record = self._read(lambda store: store.get_operation(operation_id))
         if record is None:
             return Verdict(RUN)
         if record.digest != digest:
             return Verdict(MISMATCH, record=record)
-        if (
-            scene_epoch is not None
-            and record.scene_epoch is not None
-            and record.scene_epoch != scene_epoch
-        ):
-            return Verdict(SCENE_REPLACED, record=record, recorded_epoch=record.scene_epoch)
-        if record.state in ("done", "failed"):
-            return Verdict(REPLAY, outcome=record.outcome, record=record)
-        return Verdict(RUN, record=record)
+        return self._settled(record, current_epoch)
 
-    def claim(self, operation_id: str, digest: str, *, scene_epoch: int | None = None) -> Verdict:
-        """Take the id, or say what it already did."""
+    def claim(
+        self,
+        operation_id: str,
+        digest: str,
+        *,
+        scene_epoch: int | None = None,
+        current_epoch: int | None = None,
+    ) -> Verdict:
+        """Take the id, or say what it already did.
+
+        `scene_epoch` is the scene the caller wrote the call against, which is
+        what the id is bound to and what a retry presents again.
+        `current_epoch` is the scene there is now, which decides whether a
+        stored answer still describes the scene a caller would get.
+        """
         store = self._open()
         if store is None:
             return Verdict(SKIP, reason="no receipt store")
@@ -158,6 +182,18 @@ class Receipts:
                 scene_epoch=scene_epoch,
                 owner_pid=self._owner_pid,
             )
+            if claim.claimed and not claim.outcome_unknown:
+                return Verdict(RUN, record=claim.record)
+            if claim.claimed:
+                # An earlier attempt held this id and stopped without
+                # recording anything. It may have changed the scene first, so
+                # the id is closed rather than run again by anybody.
+                return Verdict(
+                    UNKNOWN, record=self._abandon(store, operation_id), reason=ABANDONED_BY
+                )
+            if claim.outcome_unknown:
+                return Verdict(UNKNOWN, record=claim.record, reason=STILL_RUNNING)
+            return self._settled(claim.record, current_epoch)
         except store_module.OperationMismatch:
             return Verdict(MISMATCH)
         except store_module.SceneReplaced as replaced:
@@ -169,22 +205,36 @@ class Receipts:
             self._prune(store)
             store.close()
 
-        if claim.claimed and not claim.outcome_unknown:
-            return Verdict(RUN, record=claim.record)
-        if claim.claimed:
-            # An earlier attempt held this id and died without recording
-            # anything. It may have changed the scene first, so this id is not
-            # run again under any circumstances.
-            return Verdict(
-                UNKNOWN,
-                record=claim.record,
-                reason="an earlier attempt stopped without recording an outcome",
+    def _settled(self, record: store_module.OperationRecord, current_epoch: int | None) -> Verdict:
+        """What a receipt this caller may not run says for itself."""
+        if record.state == store_module.OPERATION_ABANDONED:
+            return Verdict(UNKNOWN, record=record, reason=ABANDONED_BY)
+        if record.state == "running":
+            return Verdict(RUN, record=record)
+        ended = ended_epoch(record)
+        if current_epoch is None or ended is None or ended == current_epoch:
+            return Verdict(REPLAY, outcome=record.outcome, record=record)
+        # The scene has moved on since this answer was given, and not by this
+        # operation, so replaying it would describe a scene that is gone.
+        return Verdict(SCENE_REPLACED, record=record, recorded_epoch=ended)
+
+    def _abandon(
+        self, store: store_module.Store, operation_id: str
+    ) -> store_module.OperationRecord | None:
+        """Close a receipt whose attempt stopped without recording anything.
+
+        It is a state of its own, so the next caller to present the id is told
+        what really happened rather than that somebody else is working on it.
+        """
+        try:
+            return store.finish_operation(
+                operation_id,
+                state=store_module.OPERATION_ABANDONED,
+                error={"reason": ABANDONED_BY},
             )
-        if claim.outcome_unknown:
-            return Verdict(
-                UNKNOWN, record=claim.record, reason="another caller is still running this id"
-            )
-        return Verdict(REPLAY, outcome=claim.record.outcome, record=claim.record)
+        except store_module.StoreError as error:
+            self._log(f"could not close {operation_id}: {type(error).__name__}: {error}")
+            return None
 
     def finish(self, operation_id: str, payload: Mapping[str, Any]) -> None:
         """Store the answer, so a retry with the same id is answered from it."""
@@ -197,6 +247,14 @@ class Receipts:
                 error=None if done else dict(payload.get("error") or {}),
             )
         )
+
+    def drop(self, operation_id: str) -> None:
+        """Take a receipt off a call that was refused before the tool ran.
+
+        Nothing happened under that id, so the next caller presenting it gets
+        a clean run rather than an outcome nobody knows.
+        """
+        self._write(lambda store: store.drop_operation(operation_id))
 
     def touch(self, operation_id: str) -> None:
         """Say the work is still going, so nobody else takes the receipt over."""

@@ -57,7 +57,10 @@ WORKER_STARTING_STATES = ("reserved", "starting")
 WORKER_FINAL_STATES = ("failed", "stopped")
 WORKER_STATES = frozenset(WORKER_ACTIVE_STATES + WORKER_FINAL_STATES)
 
-OPERATION_STATES = frozenset({"running", "done", "failed"})
+# A receipt whose attempt stopped without recording anything. It is final:
+# the work may have happened, so the id is never run again.
+OPERATION_ABANDONED = "abandoned"
+OPERATION_STATES = frozenset({"running", "done", "failed", OPERATION_ABANDONED})
 JOB_STATES = frozenset({"queued", "running", "done", "failed", "cancelled", "lost"})
 JOB_FINAL_STATES = frozenset({"done", "failed", "cancelled", "lost"})
 JOB_LIVE_STATES = ("queued", "running")
@@ -1170,6 +1173,17 @@ class Store:
         """One receipt by id."""
         row = self._read_one("SELECT * FROM operations WHERE operation_id = ?", (operation_id,))
         return None if row is None else OperationRecord._from_row(row)
+
+    def drop_operation(self, operation_id: str) -> bool:
+        """Take one receipt off, for work that turned out never to run.
+
+        A receipt claimed by an attempt that was refused before the tool was
+        reached would otherwise answer every later attempt with an outcome
+        nobody knows, although nothing ever happened.
+        """
+        with self._txn(write=True) as db:
+            written = db.execute("DELETE FROM operations WHERE operation_id = ?", (operation_id,))
+            return written.rowcount > 0
 
     def prune_operations(self, max_age_s: float) -> int:
         """Drop receipts older than the retention window. Returns the count."""

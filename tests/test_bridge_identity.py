@@ -8,6 +8,7 @@ integration tests.
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Iterator, Mapping
 from typing import Any
 
@@ -230,6 +231,72 @@ def test_a_call_carrying_no_epoch_at_all_runs(scene: Scene) -> None:
     assert reply.payload["ok"] is True
     assert reply.payload["scene_epoch"] == 1
     assert len(ran) == 1
+
+
+def test_a_scene_replaced_while_the_call_waited_is_caught_before_the_tool_runs(
+    scene: Scene,
+) -> None:
+    """The scene can go while a call sits in the queue.
+
+    The call was written against the scene that was open when it was sent, so
+    its paths mean nothing in the one that replaced it. The last look happens
+    on the thread that is about to touch the scene, not when the call arrived.
+    """
+    ran: list[Mapping[str, Any]] = []
+    session = identity(scene)
+    session.watch()
+    tools = counting_tools(ran)
+    holder = Holder()
+    tools.add("scene.hold", holder, mutating=True)
+    running = dispatcher(scene, session, tools)
+
+    first = threading.Thread(target=lambda: running.dispatch(Envelope(tool="scene.hold")))
+    first.start()
+    assert holder.started.wait(10.0)
+
+    answers: list[Any] = []
+    waiting = threading.Thread(
+        target=lambda: answers.append(
+            running.dispatch(Envelope(tool="scene.touch", scene_epoch=0, wait_s=20.0))
+        )
+    )
+    waiting.start()
+    _until(lambda: running.state()["queued"] == 1)
+
+    # The scene goes while that call is still waiting for its turn.
+    scene.hipFile.load("/scenes/other.hip")
+    holder.release.set()
+    first.join(20.0)
+    waiting.join(20.0)
+
+    error = answers[0].payload["error"]
+    assert error["code"] == "SCENE_REPLACED"
+    assert error["details"]["carried_epoch"] == 0
+    assert error["details"]["scene_epoch"] == 1
+    assert answers[0].payload["scene"]["hip_path"] == "/scenes/other.hip"
+    assert ran == []
+
+
+class Holder:
+    """A tool that holds the session until it is let go."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        self.started.set()
+        assert self.release.wait(20.0)
+        return {"held": True}
+
+
+def _until(ready: Any, timeout_s: float = 20.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if ready():
+            return
+        time.sleep(0.02)
+    raise AssertionError("waited too long")
 
 
 def test_every_reply_says_who_answered_and_which_scene_it_was(scene: Scene) -> None:

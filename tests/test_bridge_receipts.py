@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Iterator, Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -202,7 +203,11 @@ def test_an_id_another_caller_is_still_running_is_not_run_again(
 def test_an_id_left_behind_by_a_process_that_died_is_never_run_again(
     tmp_path: Path, scene: Scene
 ) -> None:
-    """The work may already be in the scene. Nothing here will guess."""
+    """The work may already be in the scene. Nothing here will guess.
+
+    The receipt is closed in a state of its own, so the caller after this one
+    is told what really happened rather than that somebody else is on it.
+    """
     running, counter, path = build(tmp_path, scene)
     digest = receipt_module.digest_call("scene.touch", {"what": "one"})
     with store_at(path) as store:
@@ -211,6 +216,17 @@ def test_an_id_left_behind_by_a_process_that_died_is_never_run_again(
     reply = running.dispatch(touch(operation_id="op-1"))
 
     assert reply.payload["error"]["code"] == "OUTCOME_UNKNOWN"
+    assert reply.payload["error"]["details"]["reason"] == receipt_module.ABANDONED_BY
+    assert counter.calls == []
+    with store_at(path) as store:
+        assert store.get_operation("op-1").state == store_module.OPERATION_ABANDONED
+
+    again = running.dispatch(touch(operation_id="op-1"))
+
+    details = again.payload["error"]["details"]
+    assert again.payload["error"]["code"] == "OUTCOME_UNKNOWN"
+    assert details["reason"] == receipt_module.ABANDONED_BY
+    assert details["receipt"]["state"] == store_module.OPERATION_ABANDONED
     assert counter.calls == []
 
 
@@ -219,7 +235,9 @@ def test_an_id_from_a_scene_that_has_been_replaced_is_refused(tmp_path: Path, sc
     digest = receipt_module.digest_call("scene.touch", {"what": "one"})
     with store_at(path) as store:
         store.begin_operation("op-1", digest, session_id=SESSION, scene_epoch=1)
-        store.finish_operation("op-1", state="done", outcome={"ok": True, "data": {"runs": 1}})
+        store.finish_operation(
+            "op-1", state="done", outcome={"ok": True, "data": {"runs": 1}, "scene_epoch": 1}
+        )
 
     reply = running.dispatch(touch(operation_id="op-1"))
 
@@ -228,6 +246,110 @@ def test_an_id_from_a_scene_that_has_been_replaced_is_refused(tmp_path: Path, sc
     assert error["details"]["recorded_epoch"] == 1
     assert error["details"]["scene_epoch"] == 2
     assert counter.calls == []
+
+
+def test_an_operation_that_replaced_the_scene_itself_still_answers_its_retry(
+    tmp_path: Path, scene: Scene
+) -> None:
+    """Its own load moved the epoch. That must not lock its answer away."""
+    path = tmp_path / "coord.sqlite"
+    session = Identity(session_id=SESSION, hou=scene.module())
+    session.watch()
+    tools = ToolRegistry()
+    loads: list[str] = []
+
+    def load(arguments: Mapping[str, Any]) -> dict[str, Any]:
+        loads.append("once")
+        scene.hipFile.load("/scenes/other.hip")
+        return {"loaded": scene.hipFile.path()}
+
+    tools.add("scene.load", load, mutating=True)
+    running = Dispatcher(
+        tools,
+        lock=threading.Lock(),
+        kind="hython",
+        session_id=SESSION,
+        identity=session,
+        receipts=receipt_module.Receipts(lambda: store_module.Store(path), session_id=SESSION),
+        hou=scene.module(),
+    )
+
+    first = running.dispatch(Envelope(tool="scene.load", operation_id="op-1", scene_epoch=0))
+    assert first.payload["ok"] is True, first.payload
+    assert first.payload["scene_epoch"] == 1
+
+    second = running.dispatch(Envelope(tool="scene.load", operation_id="op-1", scene_epoch=0))
+
+    assert second.payload["ok"] is True, second.payload
+    assert second.payload["replayed"] is True
+    assert second.payload["data"] == first.payload["data"]
+    assert loads == ["once"]
+
+
+# Section: a call that never reached its tool
+
+
+def unreachable(tmp_path: Path, scene: Scene, *, refuse_to_post: bool = False) -> tuple[Any, list]:
+    """A dispatcher whose main thread never picks anything up."""
+    path = tmp_path / "coord.sqlite"
+    tools = ToolRegistry()
+    counter = Counter()
+    tools.add("scene.touch", counter, mutating=True)
+    module = scene.module()
+    if refuse_to_post:
+        module.ui = SimpleNamespace(
+            postEventCallback=_refuse_to_post, removeEventCallback=lambda callback: None
+        )
+    running = Dispatcher(
+        tools,
+        lock=threading.Lock(),
+        kind="gui",
+        session_id=SESSION,
+        identity=Identity(session_id=SESSION),
+        receipts=receipt_module.Receipts(lambda: store_module.Store(path), session_id=SESSION),
+        hou=module,
+        wait_s=0.0,
+    )
+    return running, counter.calls
+
+
+def _refuse_to_post(callback: Any) -> None:
+    raise RuntimeError("the user interface is going down")
+
+
+def test_a_call_the_session_never_took_leaves_its_id_free(tmp_path: Path, scene: Scene) -> None:
+    """Nothing ran, so the id has to be as good as new.
+
+    The main thread here is not running, so the work is never picked up and
+    the call comes back busy. A receipt left behind would answer the retry
+    with an outcome nobody knows, for work that never happened.
+    """
+    running, calls = unreachable(tmp_path, scene)
+
+    refused = running.dispatch(touch(operation_id="op-1"))
+    assert refused.payload["error"]["code"] == "SESSION_BUSY"
+    assert calls == []
+    with store_at(tmp_path / "coord.sqlite") as store:
+        assert store.get_operation("op-1") is None
+
+    # The same id again, with the main thread running this time.
+    scene.ui.start()
+    answered = running.dispatch(touch(operation_id="op-1", wait_s=5.0))
+    assert answered.payload["ok"] is True, answered.payload
+    assert len(calls) == 1
+
+
+def test_a_call_the_session_could_not_take_at_all_leaves_its_id_free(
+    tmp_path: Path, scene: Scene
+) -> None:
+    running, calls = unreachable(tmp_path, scene, refuse_to_post=True)
+
+    refused = running.dispatch(touch(operation_id="op-1"))
+
+    assert refused.payload["error"]["code"] == "TOOL_FAILED"
+    assert calls == []
+    with store_at(tmp_path / "coord.sqlite") as store:
+        assert store.get_operation("op-1") is None
 
 
 # Section: what takes no receipt
@@ -297,7 +419,7 @@ def test_work_that_outlived_its_call_still_finishes_its_receipt(
         identity=Identity(session_id=SESSION),
         receipts=receipt_module.Receipts(lambda: store_module.Store(path), session_id=SESSION),
         hou=scene.module(),
-        timeout_s=0.2,
+        timeout_s=1.0,
     )
 
     gave_up = running.dispatch(touch(operation_id="op-1"))
