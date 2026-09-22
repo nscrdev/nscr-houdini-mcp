@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import threading
 import time
@@ -10,6 +11,7 @@ from typing import Any
 
 import pytest
 
+import support
 from fake_hou import Scene
 from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge import registry, security, signing
@@ -19,13 +21,79 @@ from nscr_houdini_mcp.bridge.serving import (
     CALL_PATH,
     HEALTH_PATH,
     JSON_TYPE,
+    Endpoint,
+    RawReply,
     RawRequest,
     RecordingBackend,
+    StdlibBackend,
 )
 
+SOCKET_TIMEOUT_S = 30.0
 
-def make_bridge(home: Path, **overrides: Any) -> tuple[Bridge, RecordingBackend]:
-    backend = RecordingBackend()
+
+class SocketDriver:
+    """The same seam, over a real socket.
+
+    It stands in for the recording backend in the tests that send requests, so
+    the pipeline is tried once in plain Python and once through the server
+    that answers the port: the headers, the length rules and the sizes are
+    then the ones a caller really meets.
+    """
+
+    def __init__(self) -> None:
+        self.backend = StdlibBackend()
+        self.port: int | None = None
+
+    def configure(self, *, address: str, port: int, max_port: int) -> None:
+        self.backend.configure(address=address, port=port, max_port=max_port)
+
+    def set_max_body(self, limit: int) -> None:
+        self.backend.set_max_body(limit)
+
+    def register(self, path: str, endpoint: Endpoint) -> None:
+        self.backend.register(path, endpoint)
+
+    def start(self, port: int, *, in_background: bool = True) -> int:
+        self.port = self.backend.start(port, in_background=in_background)
+        return self.port
+
+    def stop(self) -> None:
+        self.backend.stop()
+
+    def send(self, request: RawRequest) -> RawReply:
+        """Send one request exactly as it was built, and read the answer."""
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=SOCKET_TIMEOUT_S)
+        try:
+            connection.putrequest(
+                request.method, request.path, skip_host=True, skip_accept_encoding=True
+            )
+            headers = dict(request.headers)
+            if request.content_type:
+                headers["content-type"] = request.content_type
+            headers["content-length"] = str(len(request.body))
+            for name, value in headers.items():
+                connection.putheader(name, value)
+            connection.endheaders(request.body)
+            answer = connection.getresponse()
+            body = answer.read()
+            return RawReply(
+                answer.status,
+                body,
+                {str(name).lower(): str(value) for name, value in answer.getheaders()},
+                answer.headers.get("content-type", ""),
+            )
+        finally:
+            connection.close()
+
+
+@pytest.fixture(params=["recording", "stdlib"])
+def driver(request: Any) -> str:
+    """Run a pipeline test against both of the ways a request can arrive."""
+    return request.param
+
+
+def make_bridge(home: Path, *, driver: str = "recording", **overrides: Any) -> tuple[Bridge, Any]:
+    backend: Any = SocketDriver() if driver == "stdlib" else RecordingBackend()
     settings: dict[str, Any] = {
         "home": home,
         "kind": "hython",
@@ -33,6 +101,8 @@ def make_bridge(home: Path, **overrides: Any) -> tuple[Bridge, RecordingBackend]
         "heartbeat_s": 3600.0,
         "facts": {"houdini_version": "22.0.0", "hfs": "/hfs", "hip_path": None},
     }
+    if driver == "stdlib":
+        settings["port_range"] = support.APP_PORTS
     settings.update(overrides)
     hou = settings.pop("hou", None)
     bridge = Bridge(BridgeConfig(**settings), backend=backend, hou=hou)
@@ -263,8 +333,8 @@ def test_an_answer_is_only_held_back_where_the_self_check_lives(tmp_path: Path) 
         bridge.stop()
 
 
-def test_health_answers_from_memory(tmp_path: Path) -> None:
-    bridge, backend = make_bridge(tmp_path)
+def test_health_answers_from_memory(tmp_path: Path, driver: str) -> None:
+    bridge, backend = make_bridge(tmp_path, driver=driver)
     bridge.start()
     try:
         reply = send(bridge, backend, HEALTH_PATH)
@@ -282,8 +352,8 @@ def test_health_answers_from_memory(tmp_path: Path) -> None:
         bridge.stop()
 
 
-def test_a_call_reaches_its_tool_and_carries_the_trace_back(tmp_path: Path) -> None:
-    bridge, backend = make_bridge(tmp_path)
+def test_a_call_reaches_its_tool_and_carries_the_trace_back(tmp_path: Path, driver: str) -> None:
+    bridge, backend = make_bridge(tmp_path, driver=driver)
     bridge.start()
     try:
         reply = send(
@@ -307,8 +377,8 @@ def test_a_call_reaches_its_tool_and_carries_the_trace_back(tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize("path", [HEALTH_PATH, CALL_PATH])
-def test_an_unsigned_request_is_refused(tmp_path: Path, path: str) -> None:
-    bridge, backend = make_bridge(tmp_path)
+def test_an_unsigned_request_is_refused(tmp_path: Path, path: str, driver: str) -> None:
+    bridge, backend = make_bridge(tmp_path, driver=driver)
     bridge.start()
     try:
         reply = backend.send(build(bridge, path, envelope(), sign=False))
@@ -319,8 +389,8 @@ def test_an_unsigned_request_is_refused(tmp_path: Path, path: str) -> None:
         bridge.stop()
 
 
-def test_a_signature_from_another_token_is_refused(tmp_path: Path) -> None:
-    bridge, backend = make_bridge(tmp_path)
+def test_a_signature_from_another_token_is_refused(tmp_path: Path, driver: str) -> None:
+    bridge, backend = make_bridge(tmp_path, driver=driver)
     bridge.start()
     try:
         reply = send(bridge, backend, CALL_PATH, envelope(), token=security.mint_token())
@@ -329,8 +399,8 @@ def test_a_signature_from_another_token_is_refused(tmp_path: Path) -> None:
         bridge.stop()
 
 
-def test_a_signature_over_a_different_body_is_refused(tmp_path: Path) -> None:
-    bridge, backend = make_bridge(tmp_path)
+def test_a_signature_over_a_different_body_is_refused(tmp_path: Path, driver: str) -> None:
+    bridge, backend = make_bridge(tmp_path, driver=driver)
     bridge.start()
     try:
         request = build(bridge, CALL_PATH, envelope())
@@ -348,8 +418,8 @@ def test_a_signature_over_a_different_body_is_refused(tmp_path: Path) -> None:
         bridge.stop()
 
 
-def test_the_same_signature_cannot_be_sent_twice(tmp_path: Path) -> None:
-    bridge, backend = make_bridge(tmp_path)
+def test_the_same_signature_cannot_be_sent_twice(tmp_path: Path, driver: str) -> None:
+    bridge, backend = make_bridge(tmp_path, driver=driver)
     bridge.start()
     try:
         request = build(bridge, CALL_PATH, envelope())
@@ -359,8 +429,8 @@ def test_the_same_signature_cannot_be_sent_twice(tmp_path: Path) -> None:
         bridge.stop()
 
 
-def test_a_signature_from_outside_the_time_window_is_refused(tmp_path: Path) -> None:
-    bridge, backend = make_bridge(tmp_path)
+def test_a_signature_from_outside_the_time_window_is_refused(tmp_path: Path, driver: str) -> None:
+    bridge, backend = make_bridge(tmp_path, driver=driver)
     bridge.start()
     try:
         body = json.dumps(envelope()).encode("utf-8")
@@ -379,8 +449,10 @@ def test_a_signature_from_outside_the_time_window_is_refused(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize("header", ["Origin", "Referer", "origin"])
-def test_a_request_from_a_page_is_refused_even_when_signed(tmp_path: Path, header: str) -> None:
-    bridge, backend = make_bridge(tmp_path)
+def test_a_request_from_a_page_is_refused_even_when_signed(
+    tmp_path: Path, header: str, driver: str
+) -> None:
+    bridge, backend = make_bridge(tmp_path, driver=driver)
     bridge.start()
     try:
         reply = send(bridge, backend, CALL_PATH, envelope(), headers={header: "http://x.example"})
@@ -391,8 +463,8 @@ def test_a_request_from_a_page_is_refused_even_when_signed(tmp_path: Path, heade
 
 
 @pytest.mark.parametrize("host", ["evil.example:18100", "", "127.0.0.1", "127.0.0.1:1"])
-def test_another_host_is_refused_even_when_signed(tmp_path: Path, host: str) -> None:
-    bridge, backend = make_bridge(tmp_path)
+def test_another_host_is_refused_even_when_signed(tmp_path: Path, host: str, driver: str) -> None:
+    bridge, backend = make_bridge(tmp_path, driver=driver)
     bridge.start()
     try:
         reply = send(bridge, backend, CALL_PATH, envelope(), headers={"host": host})
@@ -402,8 +474,10 @@ def test_another_host_is_refused_even_when_signed(tmp_path: Path, host: str) -> 
 
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
-def test_this_machine_by_either_loopback_name_is_allowed(tmp_path: Path, host: str) -> None:
-    bridge, backend = make_bridge(tmp_path)
+def test_this_machine_by_either_loopback_name_is_allowed(
+    tmp_path: Path, host: str, driver: str
+) -> None:
+    bridge, backend = make_bridge(tmp_path, driver=driver)
     bridge.start()
     try:
         headers = {"host": f"{host}:{bridge.port}"}
@@ -412,8 +486,8 @@ def test_this_machine_by_either_loopback_name_is_allowed(tmp_path: Path, host: s
         bridge.stop()
 
 
-def test_a_form_post_is_refused_before_anything_is_read(tmp_path: Path) -> None:
-    bridge, backend = make_bridge(tmp_path)
+def test_a_form_post_is_refused_before_anything_is_read(tmp_path: Path, driver: str) -> None:
+    bridge, backend = make_bridge(tmp_path, driver=driver)
     bridge.start()
     try:
         reply = backend.send(
@@ -431,8 +505,8 @@ def test_a_form_post_is_refused_before_anything_is_read(tmp_path: Path) -> None:
         bridge.stop()
 
 
-def test_a_body_over_the_cap_is_refused_before_it_is_read(tmp_path: Path) -> None:
-    bridge, backend = make_bridge(tmp_path, max_body_bytes=1024)
+def test_a_body_over_the_cap_is_refused_before_it_is_read(tmp_path: Path, driver: str) -> None:
+    bridge, backend = make_bridge(tmp_path, driver=driver, max_body_bytes=1024)
     bridge.start()
     try:
         reply = backend.send(build(bridge, CALL_PATH, body=b"x" * 2048, sign=False))
@@ -441,8 +515,10 @@ def test_a_body_over_the_cap_is_refused_before_it_is_read(tmp_path: Path) -> Non
         bridge.stop()
 
 
-def test_a_body_nested_past_the_limit_is_refused_without_parsing(tmp_path: Path) -> None:
-    bridge, backend = make_bridge(tmp_path)
+def test_a_body_nested_past_the_limit_is_refused_without_parsing(
+    tmp_path: Path, driver: str
+) -> None:
+    bridge, backend = make_bridge(tmp_path, driver=driver)
     bridge.start()
     try:
         reply = backend.send(build(bridge, CALL_PATH, body=b"[" * 5000 + b"]" * 5000))
@@ -452,8 +528,8 @@ def test_a_body_nested_past_the_limit_is_refused_without_parsing(tmp_path: Path)
         bridge.stop()
 
 
-def test_brackets_inside_an_argument_do_not_count_as_nesting(tmp_path: Path) -> None:
-    bridge, backend = make_bridge(tmp_path)
+def test_brackets_inside_an_argument_do_not_count_as_nesting(tmp_path: Path, driver: str) -> None:
+    bridge, backend = make_bridge(tmp_path, driver=driver)
     bridge.start()
     try:
         code = "{" * 200 + "[" * 200
@@ -464,8 +540,8 @@ def test_brackets_inside_an_argument_do_not_count_as_nesting(tmp_path: Path) -> 
         bridge.stop()
 
 
-def test_a_method_other_than_post_is_refused(tmp_path: Path) -> None:
-    bridge, backend = make_bridge(tmp_path)
+def test_a_method_other_than_post_is_refused(tmp_path: Path, driver: str) -> None:
+    bridge, backend = make_bridge(tmp_path, driver=driver)
     bridge.start()
     try:
         assert backend.send(build(bridge, HEALTH_PATH, method="GET")).status == 405
@@ -489,8 +565,10 @@ def test_a_request_that_did_not_arrive_on_loopback_closes_the_bridge(tmp_path: P
         bridge.stop()
 
 
-def test_every_answer_is_signed_so_a_squatter_cannot_pass_for_the_bridge(tmp_path: Path) -> None:
-    bridge, backend = make_bridge(tmp_path)
+def test_every_answer_is_signed_so_a_squatter_cannot_pass_for_the_bridge(
+    tmp_path: Path, driver: str
+) -> None:
+    bridge, backend = make_bridge(tmp_path, driver=driver)
     bridge.start()
     try:
         request = build(bridge, HEALTH_PATH)
@@ -512,8 +590,10 @@ def test_every_answer_is_signed_so_a_squatter_cannot_pass_for_the_bridge(tmp_pat
 # Calls that reach dispatch
 
 
-def test_a_request_that_cannot_be_read_comes_back_as_a_bad_request(tmp_path: Path) -> None:
-    bridge, backend = make_bridge(tmp_path)
+def test_a_request_that_cannot_be_read_comes_back_as_a_bad_request(
+    tmp_path: Path, driver: str
+) -> None:
+    bridge, backend = make_bridge(tmp_path, driver=driver)
     bridge.start()
     try:
         reply = send(bridge, backend, CALL_PATH, {"tool": ""})
@@ -525,8 +605,9 @@ def test_a_request_that_cannot_be_read_comes_back_as_a_bad_request(tmp_path: Pat
 
 def test_another_session_id_and_an_unknown_tool_fail_without_failing_the_call(
     tmp_path: Path,
+    driver: str,
 ) -> None:
-    bridge, backend = make_bridge(tmp_path)
+    bridge, backend = make_bridge(tmp_path, driver=driver)
     bridge.start()
     try:
         wrong = send(bridge, backend, CALL_PATH, envelope(session_id="somebody-else"))
@@ -774,8 +855,8 @@ def test_a_port_that_could_not_be_proven_starts_and_says_so(
         bridge.stop()
 
 
-def test_handlers_cannot_be_added_once_the_server_runs(tmp_path: Path) -> None:
-    bridge, backend = make_bridge(tmp_path)
+def test_handlers_cannot_be_added_once_the_server_runs(tmp_path: Path, driver: str) -> None:
+    bridge, backend = make_bridge(tmp_path, driver=driver)
     bridge.start()
     try:
         with pytest.raises(RuntimeError):

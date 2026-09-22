@@ -30,6 +30,7 @@ without the test runner.
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 import queue as queue_module
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -42,6 +43,7 @@ from nscr_houdini_mcp.bridge import client, registry
 from nscr_houdini_mcp.bridge.launcher import HythonBridge, hython_available
 
 __all__ = [
+    "APP_PORTS",
     "BRIDGE_PORTS",
     "FAILURE_PORTS",
     "POOL_PORTS",
@@ -58,9 +60,25 @@ __all__ = [
 
 # Port ranges, one per file that starts a session. The default range a person
 # gets, 18100 to 18199, is not in this table and is never used by a test.
-BRIDGE_PORTS = (18300, 18349)
-POOL_PORTS = (18360, 18399)
-FAILURE_PORTS = (18410, 18429)
+#
+# A run can move all of them at once by setting the base variable to the first
+# port it may use, which is how two runs on one machine keep out of each
+# other's way. Every range then sits inside a hundred ports from that base.
+PORT_BASE_ENV_VAR = "NSCR_MCP_TEST_PORT_BASE"
+
+
+def _ports(default: tuple[int, int], offset: int, width: int) -> tuple[int, int]:
+    base = os.environ.get(PORT_BASE_ENV_VAR, "").strip()
+    if not base:
+        return default
+    start = int(base) + offset
+    return (start, start + width - 1)
+
+
+APP_PORTS = _ports((18200, 18249), 0, 15)
+BRIDGE_PORTS = _ports((18300, 18349), 15, 15)
+POOL_PORTS = _ports((18360, 18399), 30, 10)
+FAILURE_PORTS = _ports((18410, 18429), 40, 10)
 
 BARRIER_TIMEOUT_S = 60.0
 RESULT_TIMEOUT_S = 300.0
