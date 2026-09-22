@@ -149,6 +149,9 @@ class ToolSpec:
     title: str | None = None
     # One line for a result too long to repeat in the text block.
     summary: Callable[[Mapping[str, Any]], str] | None = None
+    # Whether a finished result still reports a failure, such as code that
+    # raised. The client then reads it as an error, with all of it.
+    failed: Callable[[Mapping[str, Any]], bool] | None = None
     _validator: Any = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:

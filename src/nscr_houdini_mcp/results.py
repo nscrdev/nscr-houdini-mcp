@@ -266,8 +266,15 @@ def ok_result(
     spill: Spill | None = None,
     tool: str = "result",
     summary: str | None = None,
+    is_error: bool = False,
 ) -> CallToolResult:
-    """A result, or the path to it when it is too large to return."""
+    """A result, or the path to it when it is too large to return.
+
+    `is_error` marks a result that is whole and still reports a failure, such
+    as code that ran and raised: the client reads it as an error and gets
+    everything the call has to say about it.
+    """
+    flag = bool(is_error)
     body = {**data, "trace": dict(trace)}
     try:
         text = json.dumps(body, separators=(",", ":"), ensure_ascii=False, default=_strictly)
@@ -286,12 +293,14 @@ def ok_result(
             f" Read that file for all of it. First part:\n{text[:PREVIEW_CHARS]}"
         )
         return CallToolResult(
-            content=[TextContent(type="text", text=line)], structured_content=body
+            content=[TextContent(type="text", text=line)], structured_content=body, is_error=flag
         )
     if len(text) > MIRROR_CHARS:
         line = summary or f"{tool}: {len(text)} characters, keys {', '.join(sorted(data))}"
         text = f"{line}\ntrace: {compact(dict(trace))}\nThe full result is in structuredContent."
-    return CallToolResult(content=[TextContent(type="text", text=text)], structured_content=body)
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)], structured_content=body, is_error=flag
+    )
 
 
 class Spill:
