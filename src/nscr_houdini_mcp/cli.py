@@ -31,6 +31,10 @@ HEALTH_TIMEOUT_S = 2.0
 # spent, the sessions left are reported as not asked.
 HEALTH_BUDGET_S = 5.0
 
+# What `worker start` exits with when the pool has no room. It is its own
+# code, so a script can tell it from a start that went wrong.
+POOL_FULL_EXIT = 3
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -244,9 +248,11 @@ def _worker_start(args: argparse.Namespace) -> int:
         with pool.open_store(config.home) as store:
             record = pool.start_worker(config, store, weight=args.weight, job_id=args.job)
     except store_module.PoolFull as error:
-        # One word first, so a person and an agent read the same thing.
+        # One word first, so a person and an agent read the same thing, and an
+        # exit code of its own, so a script can tell a full pool from a
+        # failure without reading the line.
         print(f"{pool.POOL_FULL}: {error}")
-        return 1
+        return POOL_FULL_EXIT
     except (pool.PoolError, store_module.StoreError) as error:
         print(str(error))
         return 1
@@ -267,6 +273,8 @@ def _worker_stop(args: argparse.Namespace) -> int:
         return 1
     how = "ended here" if stopped.killed else "stopped on request"
     print(f"{stopped.record.alias} {how}")
+    if stopped.note:
+        print(f"  {stopped.note}")
     if not stopped.ended:
         print("  the process is still there")
         return 1

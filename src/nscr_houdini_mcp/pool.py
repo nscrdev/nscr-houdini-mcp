@@ -42,7 +42,7 @@ from typing import Any
 from nscr_houdini_mcp import install as install_module
 from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge import app as bridge_app
-from nscr_houdini_mcp.bridge import client, registry
+from nscr_houdini_mcp.bridge import client, registry, security
 from nscr_houdini_mcp.bridge.net import DEFAULT_PORT_RANGE
 from nscr_houdini_mcp.store import (
     Store,
@@ -95,6 +95,24 @@ DEFAULT_WEIGHT = "light"
 
 # The tool a fresh worker is asked about itself with.
 CAPABILITIES_TOOL = "bridge.capabilities"
+
+# The worker's own token. It goes in the environment rather than on the
+# command line, because a command line is readable by every account on the
+# machine and the token is what proves who may move that reservation on.
+TOKEN_ENV_VAR = "NSCR_MCP_WORKER_TOKEN"
+
+# Houdini's own thread control, which the pool decides rather than inherits.
+THREADS_ENV_VAR = "HOUDINI_MAXTHREADS"
+
+# How large one worker's log may get before it is rolled over, and how many
+# rolled files are kept. A worker that runs for days and says something on
+# every job must not fill the state folder.
+LOG_MAX_BYTES = 8 * 1024 * 1024
+LOG_KEEP = 2
+
+# How long a process is given to go after it has been ended outright. The kill
+# is not a request, so this is short.
+KILL_WAIT_S = 5.0
 
 
 class PoolError(Exception):
@@ -159,6 +177,8 @@ class Stopped:
     record: WorkerRecord
     killed: bool
     ended: bool
+    # Why it was not ended, when it was not. Empty when there is nothing to say.
+    note: str = ""
 
 
 # Section: where things live
@@ -218,8 +238,13 @@ def hython_path(configured: Path | str | None = None) -> Path:
 # Section: starting a worker
 
 
-def worker_command(config: PoolConfig, *, alias: str, token: str, hython: Path) -> list[str]:
-    """The command line one worker is started with."""
+def worker_command(config: PoolConfig, *, alias: str, hython: Path) -> list[str]:
+    """The command line one worker is started with.
+
+    The token is not here. Anyone with an account on this machine can read
+    another account's command lines, and the token is what proves who owns the
+    reservation, so it travels in the environment instead.
+    """
     return [
         str(hython),
         "-m",
@@ -232,15 +257,26 @@ def worker_command(config: PoolConfig, *, alias: str, token: str, hython: Path) 
         str(config.port_range[1]),
         "--alias",
         alias,
-        "--worker-token",
-        token,
         "--max-idle-s",
         str(config.max_idle_s),
     ]
 
 
-def worker_env(config: PoolConfig, *, base: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The environment a worker is started in."""
+def worker_env(
+    config: PoolConfig,
+    *,
+    token: str | None = None,
+    weight: float | None = None,
+    base: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """The environment a worker is started in.
+
+    The rest of this process's environment is passed on deliberately: a worker
+    has to see the same licensing, path and package settings as the shell the
+    tool was started from, or it is a different Houdini from the artist's. The
+    few things the pool decides are decided here, and the thread cap is one of
+    them rather than whatever happened to be inherited.
+    """
     environment = dict(os.environ if base is None else base)
     # The package has to be importable inside Houdini's own interpreter.
     source_root = str(Path(__file__).resolve().parents[1])
@@ -249,11 +285,31 @@ def worker_env(config: PoolConfig, *, base: Mapping[str, str] | None = None) -> 
         source_root if not existing else os.pathsep.join([source_root, existing])
     )
     environment[store_module.HOME_ENV_VAR] = str(config.home)
-    if config.max_threads is not None:
-        environment["HOUDINI_MAXTHREADS"] = str(config.max_threads)
+    threads = thread_cap(config, weight)
+    if threads is None:
+        # Houdini's own default, whatever this shell was carrying.
+        environment.pop(THREADS_ENV_VAR, None)
+    else:
+        environment[THREADS_ENV_VAR] = str(threads)
+    if token is not None:
+        environment[TOKEN_ENV_VAR] = token
     if config.selfcheck:
         environment[bridge_app.SELFCHECK_ENV_VAR] = "1"
     return environment
+
+
+def thread_cap(config: PoolConfig, weight: float | None = None) -> int | None:
+    """How many threads one worker may use, or nothing for Houdini's default.
+
+    A configured cap is taken as given. Otherwise the weight decides: a heavy
+    worker is the one job that is meant to have the machine, and a light one
+    is left at the default rather than at whatever the shell was carrying.
+    """
+    if config.max_threads is not None:
+        return config.max_threads
+    if weight is not None and weight >= WEIGHTS["heavy"]:
+        return os.cpu_count() or 1
+    return None
 
 
 # The processes this one started. A worker outlives whoever started it, but
@@ -271,6 +327,31 @@ def reap_started() -> None:
             _STARTED.remove(process)
 
 
+def open_log(path: Path, *, max_bytes: int = LOG_MAX_BYTES, keep: int = LOG_KEEP) -> Path:
+    """Make sure a worker's log is there, private, and not growing for ever.
+
+    A worker can run for days, so the file is rolled over once it is large:
+    the current one becomes `.1`, the one before that `.2`, and the oldest is
+    dropped. The file is created here rather than by the child, so its
+    permissions are settled before anything is written into it.
+    """
+    security.private_dir(path.parent)
+    if path.is_file() and path.stat().st_size >= max_bytes:
+        oldest = path.with_suffix(f".{keep}{path.suffix}")
+        oldest.unlink(missing_ok=True)
+        for number in range(keep - 1, 0, -1):
+            older = path.with_suffix(f".{number}{path.suffix}")
+            if older.is_file():
+                older.replace(path.with_suffix(f".{number + 1}{path.suffix}"))
+        path.replace(path.with_suffix(f".1{path.suffix}"))
+    if not path.exists():
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_BINARY", 0)
+        os.close(os.open(path, flags, security.PRIVATE_FILE_MODE))
+    return path
+
+
 def spawn_detached(
     command: Sequence[str], *, log: Path, env: Mapping[str, str] | None = None
 ) -> Launched:
@@ -282,7 +363,7 @@ def spawn_detached(
     fills up and stops the process writing it, and there is nobody to read it
     once this process has gone.
     """
-    log.parent.mkdir(parents=True, exist_ok=True)
+    open_log(log)
     extra: dict[str, Any] = {}
     if sys.platform == "win32":
         creation = (
@@ -314,14 +395,23 @@ def wait_for_entry(
     home: Path | str,
     launched: Launched,
     *,
+    alias: str,
+    since: float,
     timeout_s: float = DEFAULT_START_TIMEOUT_S,
     poll_s: float = 0.25,
 ) -> dict[str, Any]:
-    """Watch for the session file the worker writes when it is ready."""
+    """Watch for the session file the worker writes when it is ready.
+
+    A file left by a session that crashed can name the same pid and the same
+    name as the worker being waited for, and adopting one would hand a caller
+    a port that anything could be answering on. So a file counts only when it
+    is this name, this process, written since this start, and its process is
+    not known to be gone.
+    """
     deadline = time.monotonic() + timeout_s
     while True:
         for entry in registry.list_entries(Path(home)):
-            if entry.get("pid") == launched.pid:
+            if _is_the_worker(entry, launched, alias=alias, since=since):
                 return entry
         code = launched.poll()
         if code is not None:
@@ -329,6 +419,18 @@ def wait_for_entry(
         if time.monotonic() >= deadline:
             raise WorkerStartFailed(f"no worker bridge after {timeout_s:g} seconds")
         time.sleep(poll_s)
+
+
+def _is_the_worker(
+    entry: Mapping[str, Any], launched: Launched, *, alias: str, since: float
+) -> bool:
+    """Whether one session file was written by the worker just started."""
+    if entry.get("pid") != launched.pid or entry.get("alias") != alias:
+        return False
+    started_at = entry.get("started_at")
+    if not isinstance(started_at, (int, float)) or started_at < since:
+        return False
+    return registry.entry_is_live(entry) is not False
 
 
 def probe_capabilities(
@@ -339,8 +441,13 @@ def probe_capabilities(
     A probe that comes back with nothing useful is not a failed start: the
     worker is there and works, and the row says what could not be read.
     """
-    session = client.Session.from_entry(entry)
-    answer = client.call(session, CAPABILITIES_TOOL, timeout_s=timeout_s)
+    try:
+        session = client.Session.from_entry(entry)
+        answer = client.call(session, CAPABILITIES_TOOL, timeout_s=timeout_s)
+    except (client.BridgeUnreachable, client.BridgeNotAuthentic, OSError, ValueError) as error:
+        # A worker that is running but did not answer this one read is still a
+        # worker. Losing its slot over a probe would be the worse answer.
+        return {"probe": f"the worker did not answer the capability tool: {error}"}
     payload = answer.payload if isinstance(answer.payload, dict) else {}
     data = payload.get("data")
     if answer.status != 200 or not isinstance(data, dict):
@@ -377,14 +484,17 @@ def start_worker(
     )
     try:
         store.set_worker_state(reserved.token, "starting")
+        since = time.time()
         launched = spawn(
-            worker_command(config, alias=reserved.alias, token=reserved.token, hython=chosen),
+            worker_command(config, alias=reserved.alias, hython=chosen),
             log=log_path(config.home, reserved.alias),
-            env=worker_env(config),
+            env=worker_env(config, token=reserved.token, weight=reserved.weight),
         )
         entry = wait_for_entry(
             config.home,
             launched,
+            alias=reserved.alias,
+            since=since,
             timeout_s=config.start_timeout_s if timeout_s is None else timeout_s,
         )
         capabilities = probe(entry)
@@ -463,9 +573,15 @@ def worker_is_alive(record: WorkerRecord) -> bool:
     return process_is_alive(record.pid) if answer is None else answer
 
 
-def kill_process(pid: int) -> bool:
-    """End a process that did not end itself. Returns whether it was asked."""
-    if pid <= 0:
+def kill_process(pid: int, pid_start: str | None = None) -> bool:
+    """End a process that did not end itself, if it is still that process.
+
+    Pid numbers are handed out again, so a kill goes ahead only when the
+    process running under that number is provably the one that was started.
+    Where that cannot be proved, nothing is ended: a worker left running is a
+    worker a person can end, and the wrong process ended is not undoable.
+    """
+    if pid <= 0 or same_process(pid, pid_start) is not True:
         return False
     if sys.platform == "win32":
         return _windows_kill(pid)
@@ -502,22 +618,28 @@ def stop_worker(
     """Ask a worker to stop, then make sure it has.
 
     The ask is its own row: the worker watches that row and ends itself, which
-    works from any process on the machine and needs no pipe to the worker.
-    A worker that has not gone when the grace period is over is ended here,
-    and its session file goes with it, because a file left behind names a port
+    works from any process on the machine and needs no pipe to the worker. A
+    worker that has not gone when the grace period is over is ended here, if
+    it can be proved to still be the same process. Once it has gone its
+    session file goes with it, because a file left behind names a port
     anything could be answering on.
     """
     record = find_worker(store, handle)
     store.set_worker_state(record.token, "stopping")
     _wait_for_the_end(record, grace_s, poll_s)
     killed = False
+    note = ""
     if worker_is_alive(record):
-        killed = kill_process(int(record.pid or 0))
-        _wait_for_the_end(record, grace_s, poll_s)
-    if killed and record.session_id:
+        killed = kill_process(int(record.pid or 0), record.pid_start)
+        if killed:
+            _wait_for_the_end(record, KILL_WAIT_S, poll_s)
+        else:
+            note = f"the process {record.pid} could not be shown to be this worker"
+    ended = not worker_is_alive(record)
+    if ended and record.session_id:
         registry.remove_entry(Path(config.home), record.session_id)
     stopped = store.release_worker(record.token, state="stopped")
-    return Stopped(stopped, killed=killed, ended=not worker_is_alive(record))
+    return Stopped(stopped, killed=killed, ended=ended, note=note)
 
 
 def _wait_for_the_end(record: WorkerRecord, grace_s: float, poll_s: float) -> None:

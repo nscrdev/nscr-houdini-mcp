@@ -10,9 +10,11 @@ worker with it, instead of leaving a Houdini running with nobody to talk to.
 
 A pool worker is the other case. It is started detached, with no input at all,
 because it has to outlive the server that asked for it. Such a worker is given
-`--worker-token`, and its lifetime is its lease in the coordination store: it
-watches its own row from a thread of its own and ends itself when a server
-asks it to or when nobody has wanted it for `--max-idle-s`.
+its reservation token in `NSCR_MCP_WORKER_TOKEN`, and its lifetime is its
+lease in the coordination store: it watches its own row from a thread of its
+own and ends itself when a server asks it to or when nobody has wanted it for
+`--max-idle-s`. The token arrives in the environment and never on the command
+line, which every account on the machine can read.
 
 The input is watched on a thread of its own, because the thread that owns the
 process has work to do: it runs the scene edits. Headless, an undo group only
@@ -23,6 +25,7 @@ give the artist no single step to undo and no way to roll a failed call back.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import threading
 from pathlib import Path
@@ -56,10 +59,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_DROP_REPLY_S,
         help="how long an answer is held when a call asks to lose it",
-    )
-    parser.add_argument(
-        "--worker-token",
-        help="the pool reservation this process is, which it then watches instead of its input",
     )
     parser.add_argument(
         "--max-idle-s",
@@ -120,10 +119,11 @@ def _start_watcher(args: argparse.Namespace, bridge: Bridge) -> threading.Thread
     the answer arrives as the same stop flag, and the thread that owns the
     process is left free to run scene edits.
     """
-    if args.worker_token:
+    token = os.environ.get(pool.TOKEN_ENV_VAR)
+    if token:
         return threading.Thread(
             target=_watch_lease,
-            args=(bridge, args.worker_token, args.max_idle_s),
+            args=(bridge, token, args.max_idle_s),
             name="nscr-mcp-lease",
             daemon=True,
         )

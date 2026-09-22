@@ -209,10 +209,25 @@ machine is busy even when a slot is free.
 A worker does not belong to the process that started it. It is started
 detached, with its output in `logs/worker-<name>.log` under the state folder,
 and it stays when its server exits, so a client restart does not throw the
-warm pool away. What ends it is its lease: it watches its own row and goes
-when a server asks it to, or when nobody has wanted it for half an hour.
-Routing a call to it renews the lease. `stop` asks first and ends the process
-itself only if the ask was not enough.
+warm pool away. The log is private to its owner and is rolled over when it
+grows, keeping the last two. What ends a worker is its lease: it watches its
+own row and goes when a server asks it to, or when nobody has wanted it for
+half an hour. Routing a call to it renews the lease. `stop` asks first and
+ends the process itself only if the ask was not enough, and never unless that
+process can be shown to still be the worker. `start` exits 3 when the pool is
+full and 1 when the start went wrong.
+
+A worker inherits this process's environment on purpose: it has to see the
+same licensing, path and package settings as the shell the tool was started
+from, or it is a different Houdini from the artist's. Three things are decided
+rather than inherited. Its state folder is the one the pool is using, its
+reservation token arrives in the environment and never on the command line,
+which every account on the machine can read, and its thread cap is either the
+one you named with `--max-threads` or the one the weight implies: a heavy
+worker gets the machine, a light one is left at Houdini's own default.
+
+The Windows side of this, the detached start, the kill and the start stamp,
+is written and read but has not been run on Windows yet.
 
 Each worker is asked once, when it comes up, what it can do: the build, the
 license it got, the renderers that are really installed, how it can make a

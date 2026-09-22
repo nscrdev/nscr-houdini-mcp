@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,7 @@ import pytest
 
 from nscr_houdini_mcp import pool
 from nscr_houdini_mcp import store as store_module
-from nscr_houdini_mcp.bridge import registry
+from nscr_houdini_mcp.bridge import client, registry
 from nscr_houdini_mcp.store import PoolFull, Store
 
 CAPABILITIES = {
@@ -63,29 +64,40 @@ class FakeLauncher:
         self.commands.append(list(command))
         self.logs.append(log)
         self.envs.append(dict(env))
-        log.parent.mkdir(parents=True, exist_ok=True)
+        pool.open_log(log)
         log.write_text("a worker said something\n", encoding="utf-8")
         if self.fails:
             return pool.Launched(pid=os.getpid(), poll=lambda: 1)
         session_id = f"session-{len(self.sessions) + 1}"
         self.sessions.append(session_id)
-        # The pid is this process, so every liveness check is true while the
-        # test runs, which is what a live worker looks like.
-        registry.write_entry(
-            self.home,
-            {
-                "session_id": session_id,
-                "alias": _alias(command),
-                "kind": "hython",
-                "pid": os.getpid(),
-                "port": 18400 + len(self.sessions),
-                "token": "not-a-real-token",
-            },
-        )
+        write_entry(self.home, session_id, _alias(command), port=18400 + len(self.sessions))
         return pool.Launched(pid=os.getpid())
 
     def probe(self, entry, **rest: Any) -> dict[str, Any]:
         return dict(CAPABILITIES)
+
+
+def write_entry(
+    home: Path, session_id: str, alias: str, *, port: int, started_at: float | None = None
+) -> Path:
+    """The session file a worker writes when it is ready.
+
+    The pid is this process, so every liveness check is true while the test
+    runs, which is what a live worker looks like.
+    """
+    return registry.write_entry(
+        home,
+        {
+            "session_id": session_id,
+            "alias": alias,
+            "kind": "hython",
+            "pid": os.getpid(),
+            "pid_start": store_module.process_start_stamp(),
+            "port": port,
+            "token": "not-a-real-token",
+            "started_at": time.time() if started_at is None else started_at,
+        },
+    )
 
 
 def _alias(command) -> str:
@@ -472,17 +484,27 @@ def test_a_thread_cap_reaches_the_worker(home: Path, store: Store, hython: Path)
     assert launcher.envs[0]["HOUDINI_MAXTHREADS"] == "4"
 
 
-def test_the_command_carries_the_token_and_the_idle_limit(
+def test_the_command_says_what_is_not_a_secret(
     config: pool.PoolConfig, store: Store, hython: Path
 ) -> None:
     launcher = FakeLauncher(config.home)
-    record = start(config, store, launcher, hython)
+    start(config, store, launcher, hython)
     command = launcher.commands[0]
     assert command[0] == str(hython)
     assert command[1:3] == ["-m", pool.WORKER_MODULE]
-    assert command[command.index("--worker-token") + 1] == record.token
     assert command[command.index("--max-idle-s") + 1] == str(config.max_idle_s)
     assert command[command.index("--alias") + 1] == "w1"
+
+
+def test_the_token_never_appears_on_the_command_line(
+    config: pool.PoolConfig, store: Store, hython: Path
+) -> None:
+    """Every account on the machine can read a command line."""
+    launcher = FakeLauncher(config.home)
+    record = start(config, store, launcher, hython)
+    assert record.token not in launcher.commands[0]
+    assert not any(record.token in part for part in launcher.commands[0])
+    assert launcher.envs[0][pool.TOKEN_ENV_VAR] == record.token
 
 
 def test_each_worker_writes_its_own_log_under_the_state_folder(
@@ -492,6 +514,127 @@ def test_each_worker_writes_its_own_log_under_the_state_folder(
     start(config, store, launcher, hython)
     assert launcher.logs[0] == config.home / "logs" / "worker-w1.log"
     assert launcher.logs[0].is_file()
+
+
+def test_a_session_file_left_by_a_crash_is_not_taken_for_the_new_worker(
+    config: pool.PoolConfig, store: Store, hython: Path
+) -> None:
+    """It can name the same process and the same name, and its port is free."""
+    write_entry(config.home, "session-old", "w1", port=18499, started_at=time.time() - 3600.0)
+    launcher = FakeLauncher(config.home)
+    record = start(config, store, launcher, hython, timeout_s=5.0)
+    assert record.session_id == "session-1"
+
+
+def test_a_worker_that_never_writes_its_file_is_a_failed_start(
+    config: pool.PoolConfig, store: Store, hython: Path
+) -> None:
+    def say_nothing(command, *, log: Path, env) -> pool.Launched:
+        pool.open_log(log)
+        return pool.Launched(pid=os.getpid())
+
+    with pytest.raises(pool.WorkerStartFailed):
+        pool.start_worker(
+            config, store, hython=hython, spawn=say_nothing, probe=lambda entry: {}, timeout_s=0.5
+        )
+    assert store.list_workers() == []
+
+
+def test_a_probe_that_could_not_be_sent_keeps_the_worker(
+    config: pool.PoolConfig, store: Store, hython: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker that is up and did not answer one read is still a worker."""
+
+    def refuse(*args: Any, **rest: Any):
+        raise client.BridgeUnreachable("nothing answered on that port")
+
+    monkeypatch.setattr(pool.client, "call", refuse)
+    record = pool.start_worker(config, store, hython=hython, spawn=FakeLauncher(config.home).spawn)
+    assert record.state == "running"
+    assert "did not answer" in record.capabilities["probe"]
+
+
+# Section: the environment a worker is given
+
+
+def test_a_light_worker_is_left_at_houdini_s_own_thread_default(
+    config: pool.PoolConfig, store: Store, hython: Path
+) -> None:
+    launcher = FakeLauncher(config.home)
+    start(config, store, launcher, hython, weight="light")
+    assert pool.THREADS_ENV_VAR not in launcher.envs[0]
+
+
+def test_an_inherited_thread_cap_does_not_reach_a_light_worker(config: pool.PoolConfig) -> None:
+    given = pool.worker_env(config, weight=1.0, base={pool.THREADS_ENV_VAR: "2"})
+    assert pool.THREADS_ENV_VAR not in given
+
+
+def test_a_heavy_worker_is_given_the_machine(home: Path, store: Store, hython: Path) -> None:
+    config = pool.PoolConfig(home=home)
+    launcher = FakeLauncher(home)
+    start(config, store, launcher, hython, weight="heavy")
+    assert launcher.envs[0][pool.THREADS_ENV_VAR] == str(os.cpu_count() or 1)
+
+
+def test_a_configured_thread_cap_beats_the_weight(home: Path) -> None:
+    config = pool.PoolConfig(home=home, max_threads=4)
+    assert pool.thread_cap(config, pool.WEIGHTS["heavy"]) == 4
+
+
+# Section: ending a worker that will not end itself
+
+
+def test_a_pid_that_cannot_be_shown_to_be_this_worker_is_not_killed(
+    config: pool.PoolConfig, store: Store
+) -> None:
+    """Numbers are handed out again, so the wrong process is never ended."""
+    store.reserve_worker(cap=config.cap, token="t1")
+    # A row with no start stamp: the pid is running, and nothing says it is
+    # still the process that was started under it.
+    store.set_worker_state("t1", "running", pid=os.getpid())
+    stopped = pool.stop_worker(config, store, "t1", grace_s=0.0, poll_s=0.0)
+    assert stopped.killed is False
+    assert stopped.ended is False
+    assert "could not be shown" in stopped.note
+    assert pool.kill_process(os.getpid(), None) is False
+    assert pool.kill_process(os.getpid(), "not-when-this-started") is False
+
+
+def test_the_session_file_goes_when_the_process_has(
+    config: pool.PoolConfig, store: Store, hython: Path
+) -> None:
+    launcher = FakeLauncher(config.home)
+    record = start(config, store, launcher, hython)
+    # It went by itself, cleanly or not, and left its file behind.
+    store.set_worker_state(record.token, "running", pid=_pid_that_is_gone(), pid_start="whenever")
+    stopped = pool.stop_worker(config, store, record.alias, grace_s=0.0, poll_s=0.0)
+    assert stopped.ended
+    assert stopped.killed is False
+    assert registry.find_entry(config.home, record.session_id, remove_stale=False) is None
+
+
+# Section: the log a worker writes
+
+
+def test_a_log_is_private_and_rolled_over_when_it_grows(home: Path) -> None:
+    path = pool.log_path(home, "w1")
+    pool.open_log(path)
+    path.write_text("x" * 100, encoding="utf-8")
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o600
+    pool.open_log(path, max_bytes=50, keep=2)
+    rolled = path.with_suffix(".1.log")
+    assert rolled.read_text(encoding="utf-8") == "x" * 100
+    assert path.read_text(encoding="utf-8") == ""
+    # The oldest is dropped rather than kept for ever.
+    path.write_text("y" * 100, encoding="utf-8")
+    pool.open_log(path, max_bytes=50, keep=2)
+    assert path.with_suffix(".2.log").read_text(encoding="utf-8") == "x" * 100
+    assert rolled.read_text(encoding="utf-8") == "y" * 100
+    path.write_text("z" * 100, encoding="utf-8")
+    pool.open_log(path, max_bytes=50, keep=2)
+    assert not path.with_suffix(".3.log").exists()
 
 
 # Section: hython lookup
