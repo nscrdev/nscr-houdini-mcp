@@ -138,22 +138,44 @@ nscr-houdini-mcp bridge status
 nscr-houdini-mcp bridge snippet
 ```
 
-It writes one file, `nscr_houdini_mcp.json`, into the packages folder of your
-Houdini preferences: `~/Library/Preferences/houdini/<version>/packages` on
-macOS, `Documents\houdini<version>\packages` on Windows, `~/houdini<version>`
-on Linux, or inside `HOUDINI_USER_PREF_DIR` when that is set. The file points
-`HOUDINI_PATH` at this project's `houdini/` folder and `PYTHONPATH` at its
-`src/`, both worked out from where this copy is running, so there is nothing
-to edit by hand. Every file it writes carries a marker: a package of the same
-name that this did not write is reported and left exactly as it is, and
-`uninstall` takes away only its own.
+It writes one file, `nscr_houdini_mcp.json`, into the packages folder Houdini
+reads. That folder is often not where a shell would guess, because a launcher,
+a line in `houdini.env`, another package or a synced documents folder can move
+it, so it is worked out in this order:
+
+1. `--packages-dir`, on `install`, `uninstall` and `status`.
+2. `HOUDINI_PACKAGE_DIR` in this shell. Houdini reads every folder it names,
+   so the first is written into and the rest are reported.
+3. A real Houdini, asked. One short script runs in `hython` with a ten second
+   cap and reports the home folder, `HOUDINI_PACKAGE_DIR`, `HOUDINI_USER_PREF_DIR`
+   and `HSITE` as Houdini itself sees them, after `houdini.env` and packages.
+   A Houdini that is missing or slow leaves a note and the lookup carries on.
+   `HSITE` is other people's, so it is reported and never written to.
+4. `HOUDINI_USER_PREF_DIR` in this shell, with `__HVER__` filled in.
+5. The usual folder for the system: `~/Library/Preferences/houdini/<version>`
+   on macOS, `Documents\houdini<version>` under the profile on Windows,
+   `~/houdini<version>` on Linux.
+
+Nothing is remembered between runs, and `bridge status` prints which of those
+decided and every folder it considered.
+
+The file points `HOUDINI_PATH` at this project's `houdini/` folder and
+`PYTHONPATH` at its `src/`, both worked out from where this copy is running,
+so there is nothing to edit by hand. Every file it writes carries a marker: a
+package of the same name that this did not write, or a link where the file
+should be, is reported and left exactly as it is, and `uninstall` takes away
+only its own, plus any folder it had to make and nothing else.
 
 Installing opens no port. Auto start is off unless you ask for it with
-`--autostart`, which sets `NSCR_MCP_AUTOSTART` to `1` in the package.
+`--autostart`, which sets `NSCR_MCP_AUTOSTART` to `1` in the package. The
+start hangs off `python3.13libs/ready.py`, which Houdini runs for every folder
+on its path, in a session with an interface and without, so this package takes
+nobody else's startup script away.
 
 `bridge status` lists the sessions running now with their ids, names, ports,
-scenes and whether each is busy, asks each one whether it is healthy, and says
-which Houdini versions have the package and where Houdini is installed.
+scenes and whether each is busy, asks each one whether it is healthy under one
+shared time budget, and says which folders have the package and where Houdini
+is installed.
 
 To start a bridge inside a Houdini that is already open, paste what `bridge
 snippet` prints into its Python shell. It works out the source path as it
