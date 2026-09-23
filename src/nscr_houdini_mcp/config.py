@@ -22,7 +22,8 @@ machine has is used.
 Pacing. `gui_min_pause_ms` and `gui_max_calls_per_s` limit how hard this
 server drives a Houdini with a user interface: the least time between one
 call ending and the next starting, and how many calls may start in any one
-second. Zero turns either off. `treat_workers_as_gui` paces workers the same
+second. Zero turns either off, and both at zero turn pacing off; a negative
+value is refused. `treat_workers_as_gui` paces workers the same
 way; it exists so the pacing can be tried against a headless Houdini, and is
 left out of the template on purpose.
 
@@ -155,11 +156,11 @@ python_timeout_cap_s = {DEFAULT_PYTHON_TIMEOUT_CAP_S}
 inline_wait_s = {DEFAULT_INLINE_WAIT_S}
 
 # Pacing for a Houdini with a user interface, so agents cannot keep its main
-# thread busy without a break. The least milliseconds between one call from
-# this server ending and the next starting, and the most calls from this
-# server that may start in any one second. A call past either waits its turn
-# and says how long in throttled_ms; it never fails for it. Workers are not
-# paced. 0 turns a rule off.
+# thread busy without a break: one call from this server out at a time, the
+# least milliseconds from one ending to the next starting, and the most that
+# may start in any one second. The wait comes out of a call's wait_s, and a
+# call whose turn is further off is answered SESSION_BUSY with retry_after_s.
+# Workers are not paced. 0 turns that rule off, and both at 0 turn pacing off.
 gui_min_pause_ms = {pacing.DEFAULT_MIN_PAUSE_MS}
 gui_max_calls_per_s = {pacing.DEFAULT_MAX_CALLS_PER_S}
 

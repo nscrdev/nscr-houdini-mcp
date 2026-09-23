@@ -483,19 +483,30 @@ It stops when its input closes, or on the word `stop`.
 In a session with a user interface every call runs on Houdini's main thread,
 the one that draws the interface. Calls sent back to back leave it no room,
 and an agent in a loop can send a great many, so the server paces the calls it
-sends to such a session. Two keys in `config.toml` set the pace:
+sends to such a session: one call out at a time, a pause after each one ends,
+and a cap on how many start in a second. Two keys in `config.toml` set the pace:
 
 ```toml
 gui_min_pause_ms = 50     # least time from one call ending to the next starting
 gui_max_calls_per_s = 10  # most calls that may start in any one second
 ```
 
-A call past either waits its turn and is never refused for it; its reply says
-how long it waited in the trace, as `throttled_ms`. Zero turns a rule off. The
-pace is kept per server process, which is one client, and per session, so two
-agents on one session each get their own allowance and together no more than
-twice it. Workers are headless and are not paced. A cancel is never paced
-either, since it runs beside the call it stops.
+A value of 0 turns that rule off, and both at 0 turn pacing off altogether;
+a negative value is refused.
+
+The wait for a turn comes out of the call's own `wait_s` (a second unless it
+says), and the bridge gets what is left. When the turn is further off than
+that, or the call passed `skip_if_busy`, it is answered at once with
+`SESSION_BUSY` and `retry_after_s`, and nothing is sent, so a caller that has
+given up never has its change made later. A call that did wait says how long
+in its trace, as `throttled_ms`, and when it was let through, as
+`admitted_at`.
+
+The pace is kept per server process and per session. Two agents sharing one
+server process share its one allowance; two server processes, one per
+client, each have their own, so together they get no more than twice it.
+Workers are headless and are not paced. A cancel is never paced either,
+since it runs beside the call it stops.
 
 The bridge has a limit of its own, whoever sends: it remembers the signed
 requests of the last two minutes, 20,000 at most, and refuses one more with

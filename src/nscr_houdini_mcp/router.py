@@ -27,12 +27,16 @@ routes to one. Reads count: a worker somebody is reading from is in use, so it
 is kept warm on purpose.
 
 Pacing. A call on its way to a session with a user interface waits here for
-its turn under the pacer's two rules, a minimum pause and a rate cap, so an
-agent in a loop cannot keep the artist's main thread busy without a break. The
-reply says how long the call waited in `throttled_ms`. A worker is not paced,
-unless the router is told to treat workers as sessions with an interface,
-which is for tests. A cancel is never paced: it runs beside the call it stops
-and never reaches the main thread.
+its turn under the pacer's rules, one call out at a time, a minimum pause
+after each and a rate cap, so an agent in a loop cannot keep the artist's main
+thread busy without a break. The wait comes out of the call's `wait_s`, and the
+bridge is given what is left. A call whose turn is further off than that, or
+that asked to be skipped when busy, is refused at once with `SESSION_BUSY` and
+`retry_after_s`, and nothing is sent. The reply says how long the call waited
+in `throttled_ms` and when it was let through in `admitted_at`. A worker is not
+paced, unless the router is told to treat workers as sessions with an
+interface, which is for tests. A cancel is never paced: it runs beside the
+call it stops and never reaches the main thread.
 
 The socket wait. When a call names no `timeout_s`, the bridge gives running
 work its own default of a minute, so this end waits on the socket for the
@@ -59,7 +63,7 @@ from nscr_houdini_mcp.bridge import client, registry
 from nscr_houdini_mcp.bridge.dispatch import DEFAULT_TIMEOUT_S as BRIDGE_TIMEOUT_S
 from nscr_houdini_mcp.bridge.dispatch import DEFAULT_WAIT_S as BRIDGE_WAIT_S
 from nscr_houdini_mcp.bridge.errors import did_you_mean
-from nscr_houdini_mcp.pacing import Pacer, throttled_ms
+from nscr_houdini_mcp.pacing import NoTurn, Pacer, throttled_ms
 from nscr_houdini_mcp.results import CallError
 from nscr_houdini_mcp.store import SessionRecord
 
@@ -79,8 +83,10 @@ STALE_CLIENT_CODES = frozenset({"SESSION_DEAD", "UNKNOWN_SESSION", "UNAUTHORIZED
 # Bridge tools that never reach the main thread, so are never paced.
 UNPACED_TOOLS = frozenset({"bridge.cancel"})
 
-# Where a reply says how long pacing held it.
+# Where a reply says how long pacing held it, and when, on the server's wall
+# clock in seconds, pacing let it through.
 THROTTLED_KEY = "throttled_ms"
+ADMITTED_KEY = "admitted_at"
 
 
 @dataclass(frozen=True)
@@ -423,8 +429,30 @@ class Router:
         once rather than a place in the queue, including behind a main thread
         that is away.
         """
-        paced = self.paces(target, tool)
-        waited = throttled_ms(self.pacer.admit(target.session_id)) if paced else 0
+        if not self.paces(target, tool):
+            return self._call(
+                target,
+                tool,
+                arguments,
+                operation_id=operation_id,
+                scene_epoch=scene_epoch,
+                wait_s=wait_s,
+                timeout_s=timeout_s,
+                socket_s=socket_s,
+                skip_if_busy=skip_if_busy,
+            )
+        # The turn is waited for out of the caller's own queueing budget, and
+        # the bridge is given what is left of it.
+        budget = BRIDGE_WAIT_S if wait_s is None else wait_s
+        try:
+            turn = self.pacer.admit(target.session_id, budget_s=budget, skip_if_busy=skip_if_busy)
+        except NoTurn as refused:
+            raise paced_busy(target, refused) from None
+        waited = throttled_ms(turn.waited_s)
+        said: dict[str, Any] = {ADMITTED_KEY: round(turn.at, 3)}
+        if waited:
+            said[THROTTLED_KEY] = waited
+            wait_s = max(0.0, budget - turn.waited_s)
         try:
             reply = self._call(
                 target,
@@ -438,15 +466,11 @@ class Router:
                 skip_if_busy=skip_if_busy,
             )
         except CallError as error:
-            if waited:
-                error.trace[THROTTLED_KEY] = waited
+            error.trace.update(said)
             raise
         finally:
-            if paced:
-                self.pacer.done(target.session_id)
-        if waited:
-            reply = {**reply, THROTTLED_KEY: waited}
-        return reply
+            self.pacer.done(target.session_id)
+        return {**reply, **said}
 
     def paces(self, target: Target, tool: str) -> bool:
         """Whether a call of this tool to this session waits its turn first."""
@@ -557,6 +581,31 @@ class Router:
             f"the answer on {target.record.alias}'s port was not signed by it",
             details={"session_id": target.session_id, "alias": target.record.alias},
         ) from error
+
+
+def paced_busy(target: Target, refused: NoTurn) -> CallError:
+    """`SESSION_BUSY` for a call whose turn would come too late for it, or
+    that asked not to wait. Nothing was sent, so nothing ran."""
+    waited = throttled_ms(refused.waited_s)
+    details: dict[str, Any] = {
+        "session_id": target.session_id,
+        "alias": target.record.alias,
+        "paced": True,
+        "reason": refused.reason,
+        "retry_after_s": refused.retry_after_s,
+        THROTTLED_KEY: waited,
+    }
+    return CallError(
+        "SESSION_BUSY",
+        f"this server paces its calls to {target.record.alias}, which has a user interface,"
+        f" and its next turn is {refused.retry_after_s:g} seconds away; nothing was sent",
+        hint=(
+            "call again after retry_after_s, or pass a wait_s longer than that to queue"
+            " for the turn"
+        ),
+        details=details,
+        trace={THROTTLED_KEY: waited} if waited else None,
+    )
 
 
 def socket_wait(wait_s: float | None, timeout_s: float | None) -> float:

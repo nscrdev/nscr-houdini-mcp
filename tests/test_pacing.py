@@ -1,14 +1,16 @@
-"""Pacing calls to a Houdini with a user interface, on a clock the test turns.
+"""Pacing calls to a Houdini with a user interface.
 
-The pacer's rules are checked on their own first, then through the router,
-which decides which calls are paced, and last through the server, whose reply
-says how long a call waited. Nothing here starts a Houdini or sleeps.
+The pacer's rules are checked on their own first, on a clock the test turns,
+then once on the real clock with callers side by side, then through the router,
+which decides which calls are paced and what the bridge is told, and last
+through the server, whose reply says how long a call waited.
 """
 
 from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -16,10 +18,9 @@ import pytest
 from mcp.client.client import Client
 
 from nscr_houdini_mcp import config as config_module
-from nscr_houdini_mcp import pacing
 from nscr_houdini_mcp.bridge import client
 from nscr_houdini_mcp.config import Config, ConfigError, parse_config
-from nscr_houdini_mcp.pacing import Pacer, throttled_ms
+from nscr_houdini_mcp.pacing import NoTurn, Pacer, throttled_ms
 from nscr_houdini_mcp.results import CallError
 from nscr_houdini_mcp.router import Router
 from nscr_houdini_mcp.server import _router_for, build_server
@@ -28,17 +29,17 @@ from test_router import FakeFiles, FakeStore, Sent, record
 
 
 class Clock:
-    """A clock that moves only when something sleeps on it, or the test says."""
+    """A clock that moves only when a caller waits on it, or the test says."""
 
     def __init__(self, now: float = 100.0) -> None:
         self.now = now
-        self.slept: list[float] = []
+        self.waits: list[float] = []
 
     def __call__(self) -> float:
         return self.now
 
-    def sleep(self, seconds: float) -> None:
-        self.slept.append(seconds)
+    def wait(self, condition: Any, seconds: float) -> None:
+        self.waits.append(seconds)
         self.now += seconds
 
     def pass_(self, seconds: float) -> None:
@@ -46,14 +47,22 @@ class Clock:
 
 
 def pacer(clock: Clock, *, pause_ms: int = 50, per_s: int = 10) -> Pacer:
-    return Pacer(min_pause_s=pause_ms / 1000.0, max_per_s=per_s, clock=clock, sleep=clock.sleep)
+    return Pacer(
+        min_pause_s=pause_ms / 1000.0,
+        max_per_s=per_s,
+        clock=clock,
+        wall=clock,
+        wait=clock.wait,
+    )
 
 
-def one_call(paced: Pacer, clock: Clock, key: str = "gui", *, runs_s: float = 0.0) -> float:
-    waited = paced.admit(key)
+def one_call(
+    paced: Pacer, clock: Clock, key: str = "gui", *, runs_s: float = 0.0, budget_s: float = 30.0
+) -> float:
+    turn = paced.admit(key, budget_s=budget_s)
     clock.pass_(runs_s)
     paced.done(key)
-    return waited
+    return turn.waited_s
 
 
 # Section: the rules
@@ -62,15 +71,14 @@ def one_call(paced: Pacer, clock: Clock, key: str = "gui", *, runs_s: float = 0.
 def test_the_first_call_goes_at_once() -> None:
     clock = Clock()
     assert one_call(pacer(clock), clock) == 0.0
-    assert clock.slept == []
+    assert clock.waits == []
 
 
-def test_a_call_straight_after_another_waits_out_the_pause() -> None:
+def test_the_pause_counts_from_the_end_of_the_last_call() -> None:
     clock = Clock()
     paced = pacer(clock)
     one_call(paced, clock, runs_s=0.2)
     assert one_call(paced, clock) == pytest.approx(0.05)
-    # The pause counts from the end of the last call, not from its start.
     assert clock.now == pytest.approx(100.25)
 
 
@@ -87,7 +95,7 @@ def test_no_more_than_the_cap_start_in_any_second() -> None:
     paced = pacer(clock, pause_ms=50, per_s=10)
     starts = []
     for _ in range(35):
-        paced.admit("gui")
+        paced.admit("gui", budget_s=30.0)
         starts.append(clock.now)
         paced.done("gui")
     for index, start in enumerate(starts):
@@ -100,12 +108,46 @@ def test_no_more_than_the_cap_start_in_any_second() -> None:
     assert min(gaps) >= 0.05 - 1e-9
 
 
-def test_a_long_call_leaves_room_for_the_next_without_a_wait_from_the_cap() -> None:
+def test_only_one_call_is_out_at_a_time() -> None:
+    clock = Clock()
+    paced = pacer(clock)
+    paced.admit("gui", budget_s=1.0)
+    # The first is still out: a second waits the whole of its budget for it,
+    # then is refused, with a floor of the pause for when to come back.
+    with pytest.raises(NoTurn) as refused:
+        paced.admit("gui", budget_s=0.3)
+    assert refused.value.waited_s == pytest.approx(0.3)
+    assert refused.value.retry_after_s == pytest.approx(0.05)
+    paced.done("gui")
+    assert paced.admit("gui", budget_s=1.0).waited_s == pytest.approx(0.05)
+
+
+def test_a_turn_further_off_than_the_wait_is_refused_at_once() -> None:
     clock = Clock()
     paced = pacer(clock, pause_ms=0, per_s=2)
-    assert one_call(paced, clock, runs_s=0.6) == 0.0
-    assert one_call(paced, clock, runs_s=0.6) == 0.0
-    assert one_call(paced, clock) == 0.0
+    one_call(paced, clock)
+    one_call(paced, clock)
+    before = list(clock.waits)
+    with pytest.raises(NoTurn) as refused:
+        paced.admit("gui", budget_s=0.5)
+    # Nothing was slept on: the turn is a second off and the caller gave half.
+    assert clock.waits == before
+    assert refused.value.waited_s == 0.0
+    assert refused.value.retry_after_s == pytest.approx(1.0)
+    # Nothing is left behind for the next caller to queue after.
+    assert paced.admit("gui", budget_s=2.0).waited_s == pytest.approx(1.0)
+
+
+def test_a_call_that_asked_to_be_skipped_is_refused_rather_than_held() -> None:
+    clock = Clock()
+    paced = pacer(clock)
+    one_call(paced, clock)
+    with pytest.raises(NoTurn) as refused:
+        paced.admit("gui", budget_s=30.0, skip_if_busy=True)
+    assert clock.waits == []
+    assert refused.value.retry_after_s == pytest.approx(0.05)
+    clock.pass_(0.05)
+    assert paced.admit("gui", budget_s=0.0, skip_if_busy=True).waited_s == 0.0
 
 
 def test_sessions_are_paced_apart() -> None:
@@ -116,24 +158,13 @@ def test_sessions_are_paced_apart() -> None:
     assert one_call(paced, clock, "one") == pytest.approx(0.05)
 
 
-def test_zero_turns_both_rules_off() -> None:
+def test_zero_turns_both_rules_off_and_lets_calls_out_side_by_side() -> None:
     clock = Clock()
     paced = pacer(clock, pause_ms=0, per_s=0)
     assert not paced.active
     for _ in range(50):
-        assert one_call(paced, clock) == 0.0
-    assert clock.slept == []
-
-
-def test_calls_sent_side_by_side_each_get_a_turn_of_their_own() -> None:
-    # Turns are handed out under the lock and slept outside it, so a second
-    # call asking while the first is still running is spaced from its start.
-    clock = Clock()
-    paced = Pacer(min_pause_s=0.05, max_per_s=10, clock=clock, sleep=lambda seconds: None)
-    first = paced.admit("gui")
-    second = paced.admit("gui")
-    third = paced.admit("gui")
-    assert (first, second, third) == (0.0, pytest.approx(0.05), pytest.approx(0.10))
+        paced.admit("gui", budget_s=0.0)
+    assert clock.waits == []
 
 
 def test_forgetting_a_session_lets_its_next_call_go_at_once() -> None:
@@ -151,7 +182,42 @@ def test_a_wait_is_reported_in_whole_milliseconds() -> None:
     assert throttled_ms(1.25) == 1250
 
 
-# Section: which calls are paced
+def test_callers_side_by_side_leave_the_session_the_whole_pause_between_calls() -> None:
+    # Twenty callers at once, each call taking a tenth of a second on a stand
+    # in bridge that runs one call at a time, as the real one does.
+    pause = 0.05
+    paced = Pacer(min_pause_s=pause, max_per_s=10)
+    bridge = threading.Lock()
+    spans: list[tuple[float, float]] = []
+    kept = threading.Lock()
+    go = threading.Barrier(20)
+
+    def caller() -> None:
+        go.wait()
+        paced.admit("gui", budget_s=30.0)
+        try:
+            with bridge:
+                began = time.monotonic()
+                time.sleep(0.1)
+                ended = time.monotonic()
+            with kept:
+                spans.append((began, ended))
+        finally:
+            paced.done("gui")
+
+    threads = [threading.Thread(target=caller) for _ in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+    assert len(spans) == 20
+    spans.sort()
+    gaps = [later[0] - earlier[1] for earlier, later in zip(spans, spans[1:], strict=False)]
+    # Every gap is the pause at least, so the main thread gets its break.
+    assert min(gaps) >= pause - 0.002, gaps
+
+
+# Section: which calls are paced, and what the bridge is told
 
 
 def router(rows: list, clock: Clock, *, pace_workers: bool = False, send: Any = None) -> Router:
@@ -174,6 +240,55 @@ def test_calls_to_a_session_with_an_interface_are_paced_and_say_how_long() -> No
     second = routed.call(target, "bridge.ping")
     assert "throttled_ms" not in first
     assert second["throttled_ms"] == 50
+    assert first["admitted_at"] == pytest.approx(100.0)
+    assert second["admitted_at"] == pytest.approx(100.05)
+
+
+def test_the_wait_comes_out_of_the_callers_wait_s() -> None:
+    clock = Clock()
+    sent = Sent()
+    routed = router([record("s-1", "scene", kind="gui")], clock, send=sent)
+    target = routed.resolve(None)
+    routed.call(target, "bridge.ping", wait_s=5.0)
+    routed.call(target, "bridge.ping", wait_s=5.0)
+    routed.call(target, "bridge.ping")
+    assert sent.calls[0]["wait_s"] == 5.0
+    assert sent.calls[1]["wait_s"] == pytest.approx(4.95)
+    # No wait named is the bridge's own second, and the wait comes out of that.
+    assert sent.calls[2]["wait_s"] == pytest.approx(0.95)
+
+
+def test_a_turn_past_the_wait_is_busy_at_once_and_nothing_is_sent() -> None:
+    clock = Clock()
+    sent = Sent()
+    routed = router([record("s-1", "scene", kind="gui")], clock, send=sent)
+    target = routed.resolve(None)
+    for _ in range(10):
+        routed.call(target, "bridge.ping", wait_s=5.0)
+    waits_before = list(clock.waits)
+    with pytest.raises(CallError) as refused:
+        routed.call(target, "python.run", wait_s=0.1, operation_id="op-late")
+    error = refused.value
+    assert error.code == "SESSION_BUSY"
+    assert error.details["paced"] is True
+    assert error.details["retry_after_s"] == pytest.approx(0.55)
+    assert error.details["throttled_ms"] == 0
+    assert "nothing was sent" in error.message
+    assert clock.waits == waits_before
+    assert [call["tool"] for call in sent.calls].count("python.run") == 0
+
+
+def test_a_call_that_asked_to_be_skipped_is_busy_at_once_with_what_it_waited() -> None:
+    clock = Clock()
+    sent = Sent()
+    routed = router([record("s-1", "scene", kind="gui")], clock, send=sent)
+    target = routed.resolve(None)
+    routed.call(target, "bridge.ping")
+    with pytest.raises(CallError) as refused:
+        routed.call(target, "bridge.ping", skip_if_busy=True)
+    assert refused.value.code == "SESSION_BUSY"
+    assert refused.value.details["retry_after_s"] == pytest.approx(0.05)
+    assert len(sent.calls) == 1
 
 
 def test_workers_are_not_paced_unless_told_to_be() -> None:
@@ -181,8 +296,8 @@ def test_workers_are_not_paced_unless_told_to_be() -> None:
     routed = router([record("s-1", "w1")], clock)
     target = routed.resolve(None)
     replies = [routed.call(target, "bridge.ping") for _ in range(20)]
-    assert all("throttled_ms" not in reply for reply in replies)
-    assert clock.slept == []
+    assert all("throttled_ms" not in reply and "admitted_at" not in reply for reply in replies)
+    assert clock.waits == []
 
     paced = router([record("s-1", "w1")], clock, pace_workers=True)
     target = paced.resolve(None)
@@ -210,6 +325,7 @@ def test_a_call_that_fails_after_its_wait_still_says_how_long() -> None:
         routed.call(target, "bridge.ping")
     assert refused.value.code == "SESSION_BUSY"
     assert refused.value.trace["throttled_ms"] == 50
+    assert refused.value.trace["admitted_at"] == pytest.approx(100.05)
 
 
 def test_a_lost_reply_still_ends_the_call_for_the_pause() -> None:
@@ -235,6 +351,7 @@ def test_the_pacing_keys_have_their_defaults() -> None:
     assert config.treat_workers_as_gui is False
     assert "gui_min_pause_ms = 50" in config_module.TEMPLATE
     assert "gui_max_calls_per_s = 10" in config_module.TEMPLATE
+    assert "0 turns that rule off" in config_module.TEMPLATE
     # For tests only, so a person never meets it in the template.
     assert "treat_workers_as_gui" not in config_module.TEMPLATE
 
@@ -246,6 +363,7 @@ def test_the_pacing_keys_are_read_and_checked() -> None:
     assert config.treat_workers_as_gui is True
     for bad in (
         {"gui_min_pause_ms": -1},
+        {"gui_max_calls_per_s": -1},
         {"gui_min_pause_ms": 1.5},
         {"gui_max_calls_per_s": 100_000},
         {"treat_workers_as_gui": "yes"},
@@ -267,15 +385,13 @@ def test_the_server_builds_its_router_with_the_configured_pace() -> None:
 # Section: through the server
 
 
-def test_the_reply_carries_throttled_ms_in_its_trace_when_it_waited() -> None:
+def test_the_reply_carries_throttled_ms_and_admitted_at_in_its_trace() -> None:
     clock = Clock()
     rows = [record("s-1", "scene", kind="gui")]
     sent = Sent()
-    lock = threading.Lock()
 
     def paced_router(config: Config) -> Router:
-        with lock:
-            return router(rows, clock, send=sent)
+        return router(rows, clock, send=sent)
 
     built = build_server(
         TOOLS,
@@ -291,5 +407,5 @@ def test_the_reply_carries_throttled_ms_in_its_trace_when_it_waited() -> None:
 
     first, second = asyncio.run(talk())
     assert "throttled_ms" not in first.structured_content["trace"]
+    assert first.structured_content["trace"]["admitted_at"] == pytest.approx(100.0)
     assert second.structured_content["trace"]["throttled_ms"] == 50
-    assert pacing.DEFAULT_MIN_PAUSE_MS == 50

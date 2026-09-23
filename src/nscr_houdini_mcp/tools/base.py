@@ -337,6 +337,11 @@ class Call:
             return self._operation_id
         return f"{self._operation_id}{OPERATION_ID_SEPARATOR}{self._changes}"
 
+    def note(self, said: Mapping[str, Any]) -> None:
+        """Take what a reply, or an error's trace, says into this call's trace,
+        for a tool that calls the router itself rather than through `bridge`."""
+        self._note(said)
+
     def _note(self, said: Mapping[str, Any]) -> None:
         """Take what a reply says about who answered and which scene it was."""
         for key in ("session_id", "alias", "scene_epoch"):
@@ -345,10 +350,14 @@ class Call:
         warnings = said.get("warnings")
         if warnings:
             self.trace["warnings"] = warnings
-        # Pacing waits add up over the bridge calls one tool call makes.
+        # Pacing waits add up over the bridge calls one tool call makes, and
+        # the moment pacing let the last of them through is kept.
         waited = said.get("throttled_ms")
         if isinstance(waited, int) and not isinstance(waited, bool) and waited > 0:
             self.trace["throttled_ms"] = int(self.trace.get("throttled_ms") or 0) + waited
+        admitted = said.get("admitted_at")
+        if isinstance(admitted, (int, float)) and not isinstance(admitted, bool):
+            self.trace["admitted_at"] = admitted
         # A caller that guards on the epoch is guarding on the scene, so a
         # later step of the same call follows a scene this call replaced.
         if self._epoch is not None and isinstance(said.get("scene_epoch"), int):

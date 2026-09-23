@@ -5,10 +5,11 @@ one real worker as fast as their answers come back. The worker stands in for a
 session with a user interface: each server's config sets
 `treat_workers_as_gui`, which exists for this, so the pacing applies to it.
 
-Paced, every call still succeeds, each client stays within its rate cap, and
-the calls that waited say so in `throttled_ms`. With the pacing turned off the
-same two clients go faster and nothing waits, which shows the cap is what
-held them. The numbers are printed for a run with its output shown.
+Paced, every call still succeeds within its `wait_s`, each client stays
+within its rate cap and its pause, counted from the admission times the server
+puts in the trace, and the calls that waited say so in `throttled_ms`. With
+the pacing turned off the same two clients go faster and nothing waits, which
+shows the cap is what held them. The numbers are printed for a run with its output shown.
 
 Skipped, not failed, when there is no Houdini on this machine. House rules as
 in the other checks that start a Houdini: one worker, in a state folder of this
@@ -116,19 +117,21 @@ async def hammer(home: Path, config: Path, alias: str, ready: asyncio.Barrier) -
         sent: list[float] = []
         waited: list[int] = []
         failed: list[str] = []
-        started = time.monotonic()
+        started = time.time()
         admitted: list[float] = []
         for _ in range(CALLS):
-            sent.append(time.monotonic())
-            result = await connected.call_tool("hou_ping", {"session": alias})
+            sent.append(time.time())
+            # A wait long enough for any turn, so none is refused as too far off.
+            result = await connected.call_tool("hou_ping", {"session": alias, "wait_s": 10})
             if result.is_error:
                 failed.append(result.content[0].text[:200])
                 continue
-            waited.append(int(result.structured_content["trace"].get("throttled_ms") or 0))
-            # When the server let the call through, as near as this side can
-            # tell: when it was sent, plus the time the server says it held it.
-            admitted.append(sent[-1] + waited[-1] / 1000.0)
-        ended = time.monotonic()
+            trace = result.structured_content["trace"]
+            waited.append(int(trace.get("throttled_ms") or 0))
+            # The server's own moment of letting the call through, on the wall
+            # clock both ends share. Unpaced calls have none: they went when sent.
+            admitted.append(float(trace.get("admitted_at") or sent[-1]))
+        ended = time.time()
     return {
         "sent": sent,
         "admitted": admitted,
@@ -146,13 +149,24 @@ async def two_clients(home: Path, config: Path, alias: str) -> list[dict[str, An
     )
 
 
+# How far a moment may sit from the edge of a second and still be taken as on
+# the other side: the wall clock read in two places, a little apart.
+EDGE_S = 0.02
+
+
 def busiest_second(times: list[float]) -> int:
-    """The most of these moments that fall inside any one second."""
+    """The most of these moments inside any one second, less the edge."""
     ordered = sorted(times)
     most = 0
     for index, start in enumerate(ordered):
-        most = max(most, sum(1 for other in ordered[index:] if other < start + 1.0))
+        inside = sum(1 for other in ordered[index:] if other < start + 1.0 - EDGE_S)
+        most = max(most, inside)
     return most
+
+
+def smallest_gap(times: list[float]) -> float:
+    ordered = sorted(times)
+    return min(later - earlier for earlier, later in zip(ordered, ordered[1:], strict=False))
 
 
 def summary(runs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -167,6 +181,7 @@ def summary(runs: list[dict[str, Any]]) -> dict[str, Any]:
                 "seconds": round(span, 3),
                 "calls_per_s": round(len(run["sent"]) / span, 2),
                 "busiest_second": busiest_second(run["admitted"]),
+                "smallest_gap_ms": round(smallest_gap(run["admitted"]) * 1000.0, 1),
                 "throttled_calls": len(paced),
                 "throttled_ms_mean": round(sum(paced) / len(paced), 1) if paced else 0,
                 "throttled_ms_max": max(paced, default=0),
@@ -195,17 +210,18 @@ def test_two_clients_on_one_session_are_each_held_to_the_cap_and_never_refused(
     print("unpaced: " + json.dumps(unpaced))
 
     for client in paced["clients"]:
-        # Past the cap a call waits; it never fails.
+        # Past the cap a call waits, inside its wait_s; none was refused.
         assert client["failed"] == 0
         assert client["calls"] == CALLS
-        # Told from this side, a moment of transport either way can move a
-        # call across the edge of a second, so one call of slack.
-        assert client["busiest_second"] <= PER_S + 1
+        # Counted from the server's own admission times.
+        assert client["busiest_second"] <= PER_S
+        # One call out at a time, and the pause after each before the next.
+        assert client["smallest_gap_ms"] >= PAUSE_MS - EDGE_S * 1000.0
         # Nearly every call after the first found the last one too recent.
         assert client["throttled_calls"] >= (CALLS - 1) * 0.8
         assert 0 < client["throttled_ms_max"] <= 1000
     # Two clients together get no more than their two allowances.
-    assert paced["together_busiest_second"] <= 2 * (PER_S + 1)
+    assert paced["together_busiest_second"] <= 2 * PER_S
 
     for client in unpaced["clients"]:
         assert client["failed"] == 0
