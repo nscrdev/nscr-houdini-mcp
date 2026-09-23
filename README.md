@@ -214,25 +214,33 @@ in `.agent/jobs/`. Jobs are kept for 7 days.
 `hou_docs` reads Houdini's own documentation for the build in use. `search`
 looks for `query` in page titles and first paragraphs and ranks a title that
 is the query first, then one that starts with it, then one that holds it,
-then a page whose first paragraph holds every word; a node's internal name,
-such as `attribwrangle`, counts as a title. `page` reads one page by its help
-path, such as `nodes/sop/attribwrangle`, and `vex` reads one VEX function's
-page by its name. Text comes `plain`, or `markdown` with its headings, lists
-and code kept; past `max_chars` (20,000 unless you say) it is cut, says
-`truncated`, and the whole page goes to the spill folder, named in
-`spill_path`.
+then a page whose first paragraph holds every word. For nodes, VEX functions
+and Python classes the internal name, such as `attribwrangle`, counts as a
+title. Among equals the current version of a page comes before older and
+deprecated ones, and release notes come last. `page` reads one page by its
+help path, such as `nodes/sop/attribwrangle`, or by a node type with its
+namespace or version, such as `nodes/sop/copytopoints::2.0`; `vex` reads one
+VEX function's page by its name. A page says its `version` when it has one.
+Text comes `plain`, or `markdown` with its headings, lists and code kept;
+table rows stay on one line. Past `max_chars` (20,000 unless you say) the
+text is cut, says `truncated`, and the whole page goes to the spill folder,
+named in `spill_path`.
 
-Pages come from the help server of the session a call reaches first. The
-server asks the session for its address once and then reads from it directly
-over loopback with a two second timeout, so a session busy cooking still
-answers; a session too busy to say where its help server is is not waited
-for. When that fails, or with no session at all, the pages come from the
-install's own `houdini/help` folder: the session's install, or the one
+Pages come from the install's own `houdini/help` folder first, which answers
+in a few milliseconds and needs nothing from the session. With a session, that
+is only a folder of exactly the session's build; with no session, the install
 `hython` or `houdini_build` names in `config.toml`, or the newest on this
-machine. `source` says which answered, and `HELP_UNAVAILABLE` says neither
-could. Pages read from the folder are kept in a small cache under the state
-folder, and search uses an index of every page built once per build and kept
-beside it; the first result's `note` says how long that took.
+machine. The session's help server is read only for a build with no folder
+here, or for a page the folder does not have. It runs inside the session, so
+it is slow and stops answering while the session cooks or runs code: asking
+where it is never waits behind other work, each request has two seconds from
+start to finish, redirects are refused, and a help server that timed out is
+left alone for a minute. `source` says which answered and `build` which build
+was read; `HELP_UNAVAILABLE` says neither could. Pages from both are kept in
+a small cache under the state folder, and search uses an index of every page,
+built once per build and kept beside it; the first result's `note` says how
+long that took. The cache holds at most 64 MB across builds, the builds used
+least recently going first, and a build whose install has gone is removed.
 
 ### The Houdini side
 
