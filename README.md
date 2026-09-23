@@ -593,14 +593,16 @@ says), and the bridge gets what is left. Calls sent side by side queue and go
 out one after another, however long the call out may run. A call is answered
 at once with `SESSION_BUSY` when the pause and the cap alone would hold it
 past its wait, when it passed `skip_if_busy`, or when the queue is full; one
-whose wait runs out in the queue gets the same answer then. Nothing of it is
-sent, so a caller that has given up never has its change made later. The
-answer carries `retry_after_s`, an estimate from the calls queued ahead and
-how long the session's last few calls took, between the pause and 30
-seconds, and `queued_ahead`, how many calls waited ahead. A call that did wait
-says how long
-in its trace, as `throttled_ms`, and when it was let through, as
-`admitted_at`.
+whose wait runs out in the queue gets the same answer then. So a call may be
+refused up front when the calls queued ahead of it, at the rate cap, already
+fill its `wait_s`, and `retry_after_s` says when to come back. Nothing of a
+refused call is sent, so a caller that has given up never has its change made
+later. `retry_after_s` is an estimate from the calls queued ahead and how
+long the session's last few calls took, between the pause and 30 seconds; a
+call out longer than usual is guessed to run as long again. The answer also
+carries `queued_ahead`, how many calls waited ahead. A call that did wait
+says how long in its trace, as `throttled_ms`, and when it was let through,
+as `admitted_at`.
 
 The pace is kept per server process and per session. Two agents sharing one
 server process share its one allowance; two server processes, one per

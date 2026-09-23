@@ -114,11 +114,12 @@ def test_only_one_call_is_out_at_a_time() -> None:
     paced = pacer(clock)
     paced.admit("gui", budget_s=1.0)
     # The first is still out: a second waits the whole of its budget for it,
-    # then is refused, with a floor of the pause for when to come back.
+    # then is refused. Out past the quarter second assumed before any call
+    # has ended, it is guessed to run as long again, and the pause follows.
     with pytest.raises(NoTurn) as refused:
         paced.admit("gui", budget_s=0.3)
     assert refused.value.waited_s == pytest.approx(0.3)
-    assert refused.value.retry_after_s == pytest.approx(0.05)
+    assert refused.value.retry_after_s == pytest.approx(0.35)
     paced.done("gui")
     assert paced.admit("gui", budget_s=1.0).waited_s == pytest.approx(0.05)
 
@@ -237,14 +238,104 @@ def test_a_full_queue_says_when_a_place_would_come_from_the_depth() -> None:
     assert refused.value.retry_after_s == pytest.approx(0.08 + 0.05 + 4 * 0.15)
 
 
-def test_a_call_out_past_its_estimate_gives_the_pause_as_the_floor() -> None:
+def test_a_call_out_past_its_estimate_is_guessed_to_run_as_long_again() -> None:
     clock = Clock()
     paced = pacer(clock)
     paced.admit("gui", budget_s=1.0)
+
+    def retry() -> float:
+        with pytest.raises(NoTurn) as refused:
+            paced.admit("gui", budget_s=30.0, skip_if_busy=True)
+        return refused.value.retry_after_s
+
+    # Inside the estimate: what is left of it, then the pause.
+    clock.pass_(0.1)
+    assert retry() == pytest.approx(0.2)
+    # Past it, the guess grows with the time out, rather than falling to the
+    # pause, and stops at the cap.
+    clock.pass_(4.9)
+    assert retry() == pytest.approx(5.05)
     clock.pass_(5.0)
+    assert retry() == pytest.approx(10.05)
+    clock.pass_(40.0)
+    assert retry() == pytest.approx(30.0)
+
+
+def test_a_refusal_up_front_says_so_on_the_real_clock() -> None:
+    paced = Pacer(min_pause_s=0.0, max_per_s=1)
+    paced.admit("gui", budget_s=1.0)
+    paced.done("gui")
+    started = time.monotonic()
     with pytest.raises(NoTurn) as refused:
-        paced.admit("gui", budget_s=30.0, skip_if_busy=True)
-    assert refused.value.retry_after_s == pytest.approx(0.05)
+        paced.admit("gui", budget_s=0.5)
+    assert time.monotonic() - started < 0.25
+    assert refused.value.reason == "the turn is past the wait"
+    assert refused.value.waited_s < 0.25
+    # A call that did wait before it was refused says its wait ran out.
+    queued = Pacer(min_pause_s=0.0, max_per_s=4)
+    queued.admit("gui", budget_s=1.0)
+    with pytest.raises(NoTurn) as refused:
+        queued.admit("gui", budget_s=0.2)
+    assert refused.value.reason == "the wait ran out"
+    assert refused.value.waited_s >= 0.15
+
+
+def test_a_turn_given_back_unused_holds_nobody_up() -> None:
+    clock = Clock()
+    paced = pacer(clock, per_s=1)
+    one_call(paced, clock)
+    clock.pass_(1.0)
+    paced.admit("gui", budget_s=30.0)
+    paced.done("gui", ran=False)
+    # Nothing reached the session: no pause after it, and no start counted.
+    assert paced.admit("gui", budget_s=30.0).waited_s == 0.0
+    paced.done("gui")
+    # A turn that ran still counts both.
+    assert paced.admit("gui", budget_s=30.0).waited_s == pytest.approx(1.0)
+
+
+def test_a_caller_woken_after_its_deadline_is_not_let_through() -> None:
+    clock = Clock()
+
+    def oversleep(condition: Any, seconds: float) -> None:
+        clock.waits.append(seconds)
+        clock.now += seconds + 1.0
+
+    paced = Pacer(min_pause_s=0.05, max_per_s=10, clock=clock, wall=clock, wait=oversleep)
+    one_call(paced, clock)
+    with pytest.raises(NoTurn) as refused:
+        paced.admit("gui", budget_s=0.5)
+    assert refused.value.reason == "the wait ran out"
+    assert refused.value.waited_s == pytest.approx(1.05)
+    pace = paced._paces["gui"]
+    assert not pace.out and not pace.queue
+
+
+def test_a_forgotten_session_ends_its_queue_and_goes_with_the_last_call() -> None:
+    paced = Pacer(min_pause_s=0.05, max_per_s=10)
+    paced.admit("gui", budget_s=1.0)
+    seen: list[NoTurn] = []
+
+    def waiter() -> None:
+        try:
+            paced.admit("gui", budget_s=30.0)
+        except NoTurn as refused:
+            seen.append(refused)
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    deadline = time.monotonic() + 5.0
+    while not paced._paces["gui"].queue and time.monotonic() < deadline:
+        time.sleep(0.005)
+    started = time.monotonic()
+    paced.forget("gui")
+    thread.join(5)
+    assert time.monotonic() - started < 1.0
+    assert [refused.reason for refused in seen] == ["the session has gone"]
+    # The call out is still out, so the session is kept until it ends.
+    assert "gui" in paced._paces
+    paced.done("gui")
+    assert "gui" not in paced._paces
 
 
 def test_retry_after_is_capped() -> None:
@@ -877,8 +968,9 @@ def test_a_call_behind_one_out_past_its_wait_waits_its_wait_then_says_when() -> 
         assert error.code == "SESSION_BUSY"
         assert error.details["reason"] == "the wait ran out"
         assert error.details["queued_ahead"] == 0
-        # Out past what calls usually take, so the pause is all there is to say.
-        assert error.details["retry_after_s"] == pytest.approx(0.05)
+        # Out past what calls usually take, so it is guessed to run as long
+        # again as it has, then the pause.
+        assert took <= error.details["retry_after_s"] <= 3.1
         assert error.details["throttled_ms"] >= 900
         assert bridge.tools == ["python.run"]
     finally:

@@ -22,12 +22,15 @@ turn past that wait: the pause after each call ahead of it and the rate cap
 alone come too late, however quickly those calls run. Otherwise it queues,
 however long the call out may still run, and is refused only if its wait runs
 out first. A call that asked to be skipped when the session is busy is
-refused at once when anything stands in its way.
+refused at once when anything stands in its way. So a call may be refused up
+front when the calls queued ahead of it, at the rate cap, already fill its
+`wait_s`, and `retry_after_s` says when to come back.
 
 A refusal says when to come back, in `retry_after_s`: an estimate from the
 calls queued ahead, the median time of the session's last few calls, the
 pause and the cap, never less than the pause and never more than
-`RETRY_CAP_S`. A timeout a call names is a ceiling, not an estimate, so it
+`RETRY_CAP_S`. A call out longer than that median is guessed to run as long
+again as it has so far. A timeout a call names is a ceiling, not an estimate, so it
 plays no part in this.
 
 A call sent again under the operation id of the call that is out skips the
@@ -118,6 +121,8 @@ class _Pace:
     queue: deque[int] = field(default_factory=deque)
     # How long the last few calls held their turns, for the estimates.
     durations: deque[float] = field(default_factory=lambda: deque(maxlen=DURATIONS_KEPT))
+    # The session has gone: the last call to leave drops what is kept.
+    forgotten: bool = False
 
 
 class Pacer:
@@ -175,6 +180,9 @@ class Pacer:
             return Turn(0.0, self._wall())
         with self._ready:
             pace = self._paces.setdefault(key, _Pace())
+            if pace.forgotten:
+                now = self._clock()
+                raise self._refuse(pace, now, now, len(pace.queue), "the session has gone")
             if len(pace.queue) >= self.max_queued:
                 now = self._clock()
                 raise self._refuse(pace, now, now, len(pace.queue), "too many calls are queued")
@@ -183,6 +191,7 @@ class Pacer:
             started = self._clock()
             deadline = started + max(0.0, budget_s)
             granted = False
+            waited = False
             try:
                 while True:
                     now = self._clock()
@@ -191,6 +200,14 @@ class Pacer:
                     turn = self._earliest(pace, now)
                     if cancelled is not None and cancelled():
                         raise self._refuse(pace, started, now, ahead, "the caller went away")
+                    if pace.forgotten:
+                        raise self._refuse(pace, started, now, ahead, "the session has gone")
+                    # A caller woken late may find its deadline already gone:
+                    # it has given up, so it is not let through. One that has
+                    # not waited yet is still on its way in, however small
+                    # its budget, and may go if nothing stands in its way.
+                    if waited and now > deadline:
+                        raise self._refuse(pace, started, now, ahead, "the wait ran out")
                     if first and not pace.out and turn <= now:
                         granted = True
                         break
@@ -202,9 +219,7 @@ class Pacer:
                     # each and the cap still stand between this call and its
                     # turn. When those alone come past the wait, stop now.
                     if self._soonest(pace, now, ahead) > deadline:
-                        reason = (
-                            "the wait ran out" if now > started else "the turn is past the wait"
-                        )
+                        reason = "the wait ran out" if waited else "the turn is past the wait"
                         raise self._refuse(pace, started, now, ahead, reason)
                     if now >= deadline:
                         raise self._refuse(pace, started, now, ahead, "the wait ran out")
@@ -212,15 +227,19 @@ class Pacer:
                     if cancelled is not None:
                         until = min(until, now + CANCEL_POLL_S)
                     self._wait(self._ready, max(0.0, until - now))
+                    waited = True
             finally:
                 if not granted:
                     pace.queue.remove(ticket)
+                    self._drop_if_forgotten(key, pace)
                     self._ready.notify_all()
             pace.queue.popleft()
             pace.out = True
             pace.out_id = operation_id
             pace.out_since = now
             if self.max_per_s > 0:
+                # The start this pushes out is a window old already, or the
+                # cap would not have let this one through, so it is not kept.
                 pace.starts.append(now)
                 while len(pace.starts) > self.max_per_s:
                     pace.starts.popleft()
@@ -229,20 +248,28 @@ class Pacer:
     def done(self, key: str, *, ran: bool = True) -> None:
         """Mark the end of a call that had a turn, and wake whoever is next.
 
-        `ran` is false for a turn given back unused, which says nothing about
-        how long the session's calls take.
+        `ran` is false for a turn given back unused. Nothing reached the
+        session, so the turn neither counts against the cap nor starts a
+        pause, and says nothing about how long the session's calls take.
         """
         if not self.active:
             return
         with self._ready:
-            pace = self._paces.setdefault(key, _Pace())
+            pace = self._paces.get(key)
+            if pace is None:
+                return
             now = self._clock()
-            if ran and pace.out and pace.out_since is not None:
-                pace.durations.append(max(0.0, now - pace.out_since))
+            if pace.out and pace.out_since is not None:
+                if ran:
+                    pace.durations.append(max(0.0, now - pace.out_since))
+                elif pace.starts and pace.starts[-1] == pace.out_since:
+                    pace.starts.pop()
+            if ran:
+                pace.last_end = now
             pace.out = False
             pace.out_id = None
             pace.out_since = None
-            pace.last_end = now
+            self._drop_if_forgotten(key, pace)
             self._ready.notify_all()
 
     def holds(self, key: str, operation_id: str | None) -> bool:
@@ -255,11 +282,19 @@ class Pacer:
 
     def forget(self, key: str) -> None:
         """Drop what is kept for a session that has gone, what its calls took
-        with the rest, when nothing waits on it."""
+        with the rest. With a call out or queued it is dropped when the last
+        of them leaves, and the queued ones are refused at once."""
         with self._ready:
             pace = self._paces.get(key)
-            if pace is not None and not pace.out and not pace.queue:
-                del self._paces[key]
+            if pace is None:
+                return
+            pace.forgotten = True
+            self._drop_if_forgotten(key, pace)
+            self._ready.notify_all()
+
+    def _drop_if_forgotten(self, key: str, pace: _Pace) -> None:
+        if pace.forgotten and not pace.out and not pace.queue and self._paces.get(key) is pace:
+            del self._paces[key]
 
     def _earliest(self, pace: _Pace, now: float) -> float:
         """The first moment the pause and the cap allow, the call out aside."""
@@ -296,8 +331,10 @@ class Pacer:
         left = 0.0
         if pace.out:
             since = now if pace.out_since is None else pace.out_since
-            # The call out has to end first, and then the pause runs.
-            left = max(0.0, took - (now - since)) + self.min_pause_s
+            out_for = max(0.0, now - since)
+            # The call out has to end first, and then the pause runs. Past
+            # what calls usually take, it is guessed to run as long again.
+            left = (took - out_for if out_for < took else out_for) + self.min_pause_s
         guess = max(
             left + ahead * (took + self.min_pause_s),
             self._soonest(pace, now, ahead) - now,
