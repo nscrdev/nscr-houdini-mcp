@@ -76,8 +76,22 @@ def repo_root() -> Path:
     return Path(git("rev-parse", "--show-toplevel").strip())
 
 
-def load_terms(root: Path) -> tuple[list[str], re.Pattern[str]] | None:
+def terms_file(root: Path) -> Path:
+    """The term list beside this checkout, or beside the main checkout when
+    this is a linked worktree: the list is untracked, so a worktree has none
+    of its own."""
     path = root / TERMS_PATH
+    if path.is_file():
+        return path
+    try:
+        common = Path(git("rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+    except (subprocess.CalledProcessError, OSError):
+        return path
+    return common.parent / TERMS_PATH
+
+
+def load_terms(root: Path) -> tuple[list[str], re.Pattern[str]] | None:
+    path = terms_file(root)
     if not path.is_file():
         return None
     try:
