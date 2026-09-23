@@ -212,6 +212,49 @@ def test_an_alias_template_takes_the_lowest_free_name(store: Store) -> None:
     assert third.alias == "shot-1"
 
 
+def test_a_renamed_session_takes_the_scene_file_and_keeps_its_old_name(store: Store) -> None:
+    store.register_session(
+        "s1", kind="gui", pid=LIVE_PID, alias_template="untitled-{n}", hip_path="/u/untitled.hip"
+    )
+    store.register_session("s2", kind="gui", pid=LIVE_PID, alias="shot-1")
+
+    renamed = store.rename_session("s1", alias_template="shot-{n}", hip_path="/s/shot.hip")
+
+    assert renamed.alias == "shot-2"
+    assert renamed.previous_alias == "untitled-1"
+    assert renamed.hip_path == "/s/shot.hip"
+    assert store.resolve_session("shot-2").session_id == "s1"
+    # The old name still finds it, because nobody else can have it meanwhile.
+    assert store.resolve_session("untitled-1").session_id == "s1"
+    # Its own names do not count against it.
+    again = store.rename_session("s1", alias_template="shot-{n}")
+    assert (again.alias, again.previous_alias) == ("shot-2", "untitled-1")
+
+
+def test_a_renamed_session_holds_its_old_name_until_it_ends(store: Store) -> None:
+    """A caller that read the old name must never reach another Houdini by it."""
+    store.register_session("s1", kind="gui", pid=LIVE_PID, alias_template="untitled-{n}")
+    store.rename_session("s1", alias_template="shot-{n}")
+
+    second = store.register_session("s2", kind="gui", pid=LIVE_PID, alias_template="untitled-{n}")
+    assert second.alias == "untitled-2"
+    with pytest.raises(AliasInUse):
+        store.register_session("s3", kind="gui", pid=LIVE_PID, alias="untitled-1")
+    assert store.rename_session("s2", alias_template="untitled-{n}").alias == "untitled-2"
+
+    store.end_session("s1")
+    later = store.register_session("s4", kind="gui", pid=LIVE_PID, alias_template="untitled-{n}")
+    assert later.alias == "untitled-1"
+
+
+def test_a_session_that_is_gone_or_unknown_cannot_be_renamed(store: Store) -> None:
+    store.register_session("s1", kind="gui", pid=LIVE_PID, alias="shot-1")
+    store.end_session("s1")
+    for session_id in ("s1", "nope"):
+        with pytest.raises(UnknownRecord):
+            store.rename_session(session_id, alias_template="other-{n}")
+
+
 def test_a_name_held_by_a_session_that_crashed_is_free_again(store: Store) -> None:
     """A crash cannot end its own row, so the next start ends it instead."""
     store.register_session("s1", kind="hython", pid=DEAD_PID, alias="w1")

@@ -222,6 +222,201 @@ def test_a_worker_is_never_said_to_have_drifted(scene: Scene) -> None:
     assert "warnings" not in session.trace()
 
 
+class Namer:
+    """Stands in for the store: hands out the scene's name, or fails."""
+
+    def __init__(self, fails: bool = False) -> None:
+        self.asked: list[str] = []
+        self.fails = fails
+
+    def __call__(self, hip_path: str) -> str:
+        self.asked.append(hip_path)
+        if self.fails:
+            raise RuntimeError("the store is locked")
+        return f"{hip_stem(hip_path)}-1"
+
+
+def untitled(scene: Scene, namer: Namer, **overrides: Any) -> Identity:
+    """A session with a user interface that came up before its scene did."""
+    scene.hipFile.setName("untitled.hip")
+    settings: dict[str, Any] = {
+        "alias": "untitled-1",
+        "hip_path": "untitled.hip",
+        "tracks_hip": True,
+        "on_rename": namer,
+    }
+    settings.update(overrides)
+    session = identity(scene, **settings)
+    session.watch()
+    return session
+
+
+def test_a_session_that_came_up_before_its_scene_takes_the_scene_name_on_load(
+    scene: Scene,
+) -> None:
+    namer = Namer()
+    session = untitled(scene, namer)
+    assert session.provisional is True
+
+    scene.hipFile.load("/scenes/gui_v001.hip")
+
+    assert namer.asked == ["/scenes/gui_v001.hip"]
+    assert session.alias == "gui_v001-1"
+    assert session.drift() is None
+    assert "warnings" not in session.trace()
+    assert session.provisional is False
+    # The epoch still moved: every path from the untitled scene is gone.
+    assert session.scene_epoch == 1
+
+
+def test_a_provisional_name_moves_once(scene: Scene) -> None:
+    namer = Namer()
+    session = untitled(scene, namer)
+    scene.hipFile.load("/scenes/gui_v001.hip")
+
+    scene.hipFile.load("/scenes/shot_020.hip")
+
+    assert namer.asked == ["/scenes/gui_v001.hip"]
+    assert session.alias == "gui_v001-1"
+    assert session.drift()["hip_stem"] == "shot_020"
+
+
+def test_a_provisional_name_follows_the_first_save_too(scene: Scene) -> None:
+    namer = Namer()
+    session = untitled(scene, namer)
+
+    scene.hipFile.save("/scenes/layout_v001.hip")
+
+    assert session.alias == "layout_v001-1"
+    assert session.drift() is None
+    assert session.scene_epoch == 0
+
+
+def test_a_clear_leaves_a_provisional_name_waiting(scene: Scene) -> None:
+    namer = Namer()
+    session = untitled(scene, namer)
+
+    scene.hipFile.clear()
+
+    assert namer.asked == []
+    assert session.provisional is True
+
+
+def test_once_a_call_has_reached_the_session_its_name_stays(scene: Scene) -> None:
+    """A caller may be holding the name from its first call on."""
+    namer = Namer()
+    session = untitled(scene, namer)
+    session.keep_name()
+
+    scene.hipFile.load("/scenes/gui_v001.hip")
+
+    assert namer.asked == []
+    assert session.alias == "untitled-1"
+    assert session.drift()["hip_stem"] == "gui_v001"
+
+
+def test_a_session_that_started_with_a_file_is_never_renamed(scene: Scene) -> None:
+    namer = Namer()
+    session = identity(scene, tracks_hip=True, on_rename=namer)
+    session.watch()
+    assert session.provisional is False
+
+    scene.hipFile.load("/scenes/shot_020.hip")
+
+    assert namer.asked == []
+    assert session.alias == "example-1"
+
+
+def test_a_worker_never_takes_a_provisional_name(scene: Scene) -> None:
+    namer = Namer()
+    session = untitled(scene, namer, kind="hython", alias="w1", tracks_hip=False)
+    scene.hipFile.load("/scenes/gui_v001.hip")
+    assert namer.asked == []
+    assert session.alias == "w1"
+
+
+class SlowNamer(Namer):
+    """A store write that takes as long as the test says."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(self, hip_path: str) -> str:
+        self.entered.set()
+        assert self.release.wait(20.0)
+        return super().__call__(hip_path)
+
+
+def _load_in_background(scene: Scene, path: str) -> threading.Thread:
+    loading = threading.Thread(target=scene.hipFile.load, args=(path,), daemon=True)
+    loading.start()
+    return loading
+
+
+def test_a_reply_made_during_the_rename_carries_the_new_name(scene: Scene) -> None:
+    """Never the old name with a warning telling the caller the name is stale."""
+    namer = SlowNamer()
+    session = untitled(scene, namer)
+    loading = _load_in_background(scene, "/scenes/gui_v001.hip")
+    assert namer.entered.wait(20.0)
+
+    # Mid rename there is no drift to report: the name is on its way.
+    assert session.drift() is None
+    replies: list[dict[str, Any]] = []
+    replying = threading.Thread(target=lambda: replies.append(session.trace()), daemon=True)
+    replying.start()
+    time.sleep(0.2)
+    assert replies == []
+    namer.release.set()
+    replying.join(20.0)
+    loading.join(20.0)
+
+    [trace] = replies
+    assert trace["alias"] == "gui_v001-1"
+    assert "warnings" not in trace
+
+
+def test_a_rename_that_takes_too_long_holds_a_reply_back_only_so_long(
+    scene: Scene, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(identity_module, "RENAME_WAIT_S", 0.2)
+    namer = SlowNamer()
+    session = untitled(scene, namer)
+    loading = _load_in_background(scene, "/scenes/gui_v001.hip")
+    assert namer.entered.wait(20.0)
+    try:
+        began = time.monotonic()
+        trace = session.trace()
+        assert time.monotonic() - began < 5.0
+        # The old name, and nothing that tells the caller to rename anything.
+        assert trace["alias"] == "untitled-1"
+        assert "warnings" not in trace
+    finally:
+        namer.release.set()
+        loading.join(20.0)
+    assert session.trace()["alias"] == "gui_v001-1"
+
+
+def test_the_drift_warning_never_asks_the_caller_to_rename(scene: Scene) -> None:
+    session = identity(scene, tracks_hip=True)
+    session.watch()
+    scene.hipFile.load("/scenes/shot_020.hip")
+    assert "rename" not in session.drift()["hint"]
+
+
+def test_a_rename_the_store_refuses_leaves_the_old_name_and_says_why(scene: Scene) -> None:
+    said: list[str] = []
+    session = untitled(scene, Namer(fails=True), log=said.append)
+
+    scene.hipFile.load("/scenes/gui_v001.hip")
+
+    assert session.alias == "untitled-1"
+    assert session.drift()["hip_stem"] == "gui_v001"
+    assert any("could not name the session after its scene" in line for line in said)
+
+
 # Section: what a call carrying an old epoch gets
 
 

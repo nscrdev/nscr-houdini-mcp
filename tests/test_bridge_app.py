@@ -1332,6 +1332,102 @@ def test_stopping_during_a_cook_returns_at_once_and_says_nothing_to_houdini(
         scene.ui.stop()
 
 
+def _untitled_gui_bridge(tmp_path: Path) -> tuple[Bridge, Any, Scene]:
+    """A bridge started with Houdini, before the file on its command line loads."""
+    scene = Scene()
+    scene.hipFile.setName("untitled.hip")
+    bridge, backend = make_bridge(
+        tmp_path,
+        kind="gui",
+        hou=scene.module(),
+        facts={"houdini_version": "22.0.0", "hfs": "/hfs", "hip_path": "untitled.hip"},
+    )
+    scene.ui.start()
+    return bridge, backend, scene
+
+
+def test_a_gui_session_started_before_its_scene_takes_the_scene_name(tmp_path: Path) -> None:
+    bridge, backend, scene = _untitled_gui_bridge(tmp_path)
+    record = bridge.start()
+    try:
+        assert record.alias == "untitled-1"
+
+        scene.hipFile.load("/scenes/layout_v003.hip")
+
+        assert bridge.alias == "layout_v003-1"
+        with store_module.Store(bridge.store_path) as store:
+            row = store.get_session(bridge.session_id)
+        assert row.alias == "layout_v003-1"
+        assert row.scene_epoch == 1
+        entry = registry.read_entry(registry.entry_path(tmp_path, bridge.session_id))
+        assert entry["alias"] == "layout_v003-1"
+
+        health = body_of(send(bridge, backend, HEALTH_PATH))["data"]
+        assert health["alias"] == "layout_v003-1"
+        assert health["alias_drift"] is None
+        reply = body_of(send(bridge, backend, CALL_PATH, envelope()))
+        assert reply["ok"] is True, reply
+        assert reply["alias"] == "layout_v003-1"
+        assert "warnings" not in reply
+        # A scene load is not a problem, and neither is the name following it.
+        assert [line for line in bridge.problems if "scene" in line] == []
+    finally:
+        bridge.stop()
+        scene.ui.stop()
+
+
+def test_a_gui_session_renamed_by_its_first_save_records_the_file_too(tmp_path: Path) -> None:
+    bridge, _, scene = _untitled_gui_bridge(tmp_path)
+    bridge.start()
+    try:
+        scene.hipFile.save("/scenes/layout_v001.hip")
+
+        assert bridge.alias == "layout_v001-1"
+        with store_module.Store(bridge.store_path) as store:
+            row = store.get_session(bridge.session_id)
+        assert (row.alias, row.previous_alias) == ("layout_v001-1", "untitled-1")
+        assert row.hip_path == "/scenes/layout_v001.hip"
+        entry = registry.read_entry(registry.entry_path(tmp_path, bridge.session_id))
+        assert entry["hip_path"] == "/scenes/layout_v001.hip"
+    finally:
+        bridge.stop()
+        scene.ui.stop()
+
+
+def test_a_gui_session_a_call_reached_first_keeps_its_name(tmp_path: Path) -> None:
+    bridge, backend, scene = _untitled_gui_bridge(tmp_path)
+    bridge.start()
+    try:
+        assert body_of(send(bridge, backend, CALL_PATH, envelope()))["ok"] is True
+
+        scene.hipFile.load("/scenes/layout_v003.hip")
+
+        assert bridge.alias == "untitled-1"
+        with store_module.Store(bridge.store_path) as store:
+            assert store.get_session(bridge.session_id).alias == "untitled-1"
+        reply = body_of(send(bridge, backend, CALL_PATH, envelope()))
+        assert [warning["code"] for warning in reply["warnings"]] == ["ALIAS_DRIFT"]
+    finally:
+        bridge.stop()
+        scene.ui.stop()
+
+
+def test_a_replaced_scene_is_logged_but_is_not_a_problem(tmp_path: Path) -> None:
+    scene = Scene()
+    bridge, _ = make_bridge(tmp_path, kind="gui", hou=scene.module())
+    scene.ui.start()
+    bridge.start()
+    try:
+        scene.hipFile.load("/scenes/other.hip")
+        scene.hipFile.clear()
+        assert bridge.scene_epoch == 2
+        assert [line for line in bridge.problems if "scene" in line] == []
+        assert "the scene was replaced, epoch 2" in bridge.log_path().read_text(encoding="utf-8")
+    finally:
+        bridge.stop()
+        scene.ui.stop()
+
+
 def _ours(scene: Scene) -> tuple[int, int]:
     """What Houdini holds: scene event callbacks, then event loop callbacks."""
     return len(scene.hipFile._callbacks), len(scene.ui.eventLoopCallbacks())

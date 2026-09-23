@@ -253,14 +253,18 @@ class Bridge:
         self.session_id = secrets.token_hex(SESSION_ID_BYTES)
         # The name is settled once, at start, and never changes afterwards.
         # A scene saved under another name makes the name out of date, which
-        # every reply says, rather than moving it under a caller's feet.
+        # every reply says, rather than moving it under a caller's feet. The
+        # one exception is a name taken from a scene that had no file yet,
+        # which follows the scene's first file until a call has reached it.
+        tracks_hip = self.kind == host.GUI and not self.config.alias
         self.identity = Identity(
             session_id=self.session_id,
             kind=self.kind,
             hip_path=self.facts.get("hip_path"),
-            tracks_hip=self.kind == host.GUI and not self.config.alias,
+            tracks_hip=tracks_hip,
             hou=self._hou,
             on_change=self._scene_replaced,
+            on_rename=self._rename if tracks_hip and not self.config.alias_template else None,
             log=self._log,
         )
         self.port: int | None = None
@@ -344,10 +348,27 @@ class Bridge:
         Called from Houdini's own scene event, on the main thread, so it does
         the least it can: one store row and one file.
         """
-        self._log(f"the scene was replaced, epoch {epoch}")
+        # A new scene is news, not a problem, so it goes to the log alone.
+        self._log(f"the scene was replaced, epoch {epoch}", problem=False)
         with self._open_store() as store:
             store.set_scene_epoch(self.session_id, epoch, hip_path=hip_path)
         self._write_entry(scene_epoch=epoch, hip_path=hip_path)
+
+    def _rename(self, hip_path: str) -> str:
+        """Take the scene's name in the store and the session file.
+
+        Called from the scene event, on the main thread, for a session whose
+        name was taken before its scene had a file. Returns the new name.
+        """
+        with self._open_store() as store:
+            record = store.rename_session(
+                self.session_id,
+                alias_template=alias_template(self.kind, hip_path),
+                hip_path=hip_path,
+            )
+        self._write_entry(alias=record.alias, hip_path=hip_path)
+        self._log(f"named after the scene now: {record.alias}", problem=False)
+        return record.alias
 
     # Lifetime
 
@@ -678,6 +699,8 @@ class Bridge:
                     "scene_epoch": self.scene_epoch,
                 },
             )
+        # From the first call on, a caller may be holding this session's name.
+        self.identity.keep_name()
         return self.dispatcher.dispatch(envelope)
 
     # The front of every request
@@ -969,9 +992,13 @@ class Bridge:
         """Where this session's detail goes. The token is never written here."""
         return self.home / LOG_DIR_NAME / f"{self.session_id}.log"
 
-    def _log(self, text: str) -> None:
-        """Append one note to the session log, and never fail over it."""
-        self._note(text.splitlines()[0] if text else "")
+    def _log(self, text: str, *, problem: bool = True) -> None:
+        """Append one note to the session log, and never fail over it.
+
+        A note is also kept as a problem unless it says it is not one.
+        """
+        if problem:
+            self._note(text.splitlines()[0] if text else "")
         try:
             path = self.log_path()
             path.parent.mkdir(parents=True, exist_ok=True)

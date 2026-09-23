@@ -450,22 +450,22 @@ class MainThreadRunner:
             self._poster.start()
 
     def stop(self, *, last: Callable[[], None] | None = None) -> None:
-        """Stop taking work, and do not wait for a poster stuck in `hou`.
+        """Stop taking work, and do not wait for the poster at all.
 
         A poster inside a post call is waiting for the object model lock, which
         it gets when the cook ends; it then sees the session is closed and
         ends. Waiting for it here would hold the shutdown open for the length
-        of the cook.
+        of the cook. An idle poster ends by itself too, once it has posted
+        `last`, and posting takes that same lock, so even a short wait for it
+        is spent in full whenever the main thread is busy.
 
         `last` is posted to the main thread once more on the way out, for
-        what has to happen there after the session is closed.
+        what has to happen there after the session is closed. The poster is
+        kept, so `state` says whether it is still alive until it has ended.
         """
         self._closed.set()
         self._queue.cancel_all()
         self._kicks.put(None if last is None else _Last(last))
-        poster, self._poster = self._poster, None
-        if poster is not None:
-            poster.join(0.1)
 
     @property
     def pending(self) -> int:

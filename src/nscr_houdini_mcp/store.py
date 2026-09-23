@@ -45,7 +45,7 @@ APP_DIR_NAME = "nscr-houdini-mcp"
 HOME_ENV_VAR = "NSCR_MCP_HOME"
 STORE_FILE_NAME = "coord.sqlite"
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 SESSION_KINDS = frozenset({"gui", "hython"})
 SESSION_STATES = frozenset({"live", "busy", "unresponsive", "crashed", "gone"})
@@ -486,6 +486,9 @@ class SessionRecord:
     # How an ended session ended: `gone` when it ended its own row, `crashed`
     # when its process was found missing. Nothing while it is running.
     ended_as: str | None = None
+    # The name a session had before it took its scene's. Held for it while it
+    # runs, so a caller still using that name never reaches another session.
+    previous_alias: str | None = None
 
     @classmethod
     def _from_row(cls, row: sqlite3.Row) -> SessionRecord:
@@ -505,6 +508,7 @@ class SessionRecord:
             transport_ok=_flag(row["transport_ok"]),
             transport_checked_at=row["transport_checked_at"],
             ended_as=row["ended_as"],
+            previous_alias=row["previous_alias"],
         )
 
 
@@ -965,6 +969,9 @@ _SCHEMA_11 = (
     "CREATE INDEX runs_by_job ON runs(job_id)",
 )
 
+# The name a renamed session had, held for it while it runs.
+_SCHEMA_12 = ("ALTER TABLE sessions ADD COLUMN previous_alias TEXT",)
+
 MIGRATIONS = (
     _SCHEMA_1,
     _SCHEMA_2,
@@ -977,6 +984,7 @@ MIGRATIONS = (
     _SCHEMA_9,
     _SCHEMA_10,
     _SCHEMA_11,
+    _SCHEMA_12,
 )
 
 
@@ -1174,18 +1182,13 @@ class Store:
         with self._txn(write=True) as db:
             self._reclaim_sessions(db, now)
             if alias_template is not None:
-                taken = {
-                    row["alias"]
-                    for row in db.execute(
-                        "SELECT alias FROM sessions WHERE state <> ?", (SESSION_GONE,)
-                    )
-                }
-                name = _first_free_alias(alias_template, taken)
+                name = _first_free_alias(alias_template, _names_held(db))
             else:
                 name = alias
                 row = db.execute(
-                    "SELECT session_id FROM sessions WHERE alias = ? AND state <> ?",
-                    (name, SESSION_GONE),
+                    "SELECT session_id FROM sessions"
+                    " WHERE (alias = ? OR previous_alias = ?) AND state <> ?",
+                    (name, name, SESSION_GONE),
                 ).fetchone()
                 if row is not None:
                     raise AliasInUse(f"alias {name} belongs to session {row['session_id']}")
@@ -1212,18 +1215,56 @@ class Store:
                 db.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
             )
 
+    def rename_session(
+        self, session_id: str, *, alias_template: str, hip_path: str | None = None
+    ) -> SessionRecord:
+        """Give a live session the lowest free name the template makes.
+
+        For a session that came up before its scene did, and takes the scene's
+        name once it arrives, along with the scene's file. The name it had is
+        kept as its previous name and held for it until it ends, so no other
+        session is handed a name a caller may still be using for this one.
+        """
+        now = self._now()
+        with self._txn(write=True) as db:
+            self._reclaim_sessions(db, now)
+            row = db.execute(
+                "SELECT alias FROM sessions WHERE session_id = ? AND state <> ?",
+                (session_id, SESSION_GONE),
+            ).fetchone()
+            if row is None:
+                raise UnknownRecord(f"no live session {session_id}")
+            name = _first_free_alias(alias_template, _names_held(db, but=session_id))
+            previous = None if name == row["alias"] else row["alias"]
+            db.execute(
+                "UPDATE sessions SET alias = ?, previous_alias = COALESCE(?, previous_alias),"
+                " hip_path = COALESCE(?, hip_path) WHERE session_id = ?",
+                (name, previous, hip_path, session_id),
+            )
+            return SessionRecord._from_row(
+                db.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+            )
+
     def get_session(self, session_id: str) -> SessionRecord | None:
         """Session by id, gone or not. Ids are never reused."""
         row = self._read_one("SELECT * FROM sessions WHERE session_id = ?", (session_id,))
         return None if row is None else SessionRecord._from_row(row)
 
     def resolve_session(self, handle: str) -> SessionRecord | None:
-        """Session by id, or by the alias of a session that is not gone."""
+        """Session by id, or by the alias of a session that is not gone.
+
+        A name a session had before it was renamed still finds it while it
+        runs, since nobody else can be given that name meanwhile.
+        """
         found = self.get_session(handle)
         if found is not None:
             return found
         row = self._read_one(
             "SELECT * FROM sessions WHERE alias = ? AND state <> ?"
+            " ORDER BY started_at DESC, rowid DESC",
+            (handle, SESSION_GONE),
+        ) or self._read_one(
+            "SELECT * FROM sessions WHERE previous_alias = ? AND state <> ?"
             " ORDER BY started_at DESC, rowid DESC",
             (handle, SESSION_GONE),
         )
@@ -2810,6 +2851,21 @@ def _settle(given: Any, stored: Any) -> Any:
     if isinstance(given, _Clear):
         return None
     return given
+
+
+def _names_held(db: sqlite3.Connection, *, but: str | None = None) -> set[str]:
+    """Every name a session that has not ended answers to, now or from before a rename."""
+    held: set[str] = set()
+    for row in db.execute(
+        "SELECT session_id, alias, previous_alias FROM sessions WHERE state <> ?",
+        (SESSION_GONE,),
+    ):
+        if row["session_id"] == but:
+            continue
+        held.add(row["alias"])
+        if row["previous_alias"]:
+            held.add(row["previous_alias"])
+    return held
 
 
 def _first_free_alias(template: str, taken: Iterable[str]) -> str:

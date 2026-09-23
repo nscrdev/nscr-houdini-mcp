@@ -211,14 +211,19 @@ def test_stop_does_not_wait_for_a_blocked_poster(scene: Scene, runners: Any) -> 
     poster = runner._poster
 
     began = time.monotonic()
-    runner.stop()
-    assert time.monotonic() - began < 0.3
+    runner.stop(last=lambda: None)
+    # Not even a short wait: the poster is posting `last`, which waits for the
+    # cook, so any wait for it here would be spent in full.
+    assert time.monotonic() - began < 0.05
     assert work.cancelled is True
 
     # The poster is still inside the post call, and ends when the cook does.
+    # What the runner says about it is what is true.
     assert poster is not None
+    assert runner.state()["poster_alive"] is poster.is_alive()
     poster.join(5.0)
     assert poster.is_alive() is False
+    assert runner.state()["poster_alive"] is False
 
 
 # Section: the pulse

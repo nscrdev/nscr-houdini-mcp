@@ -1072,3 +1072,13 @@ def test_a_page_token_is_read_only_exactly_as_this_server_writes_it(bench: Bench
     for token in bad:
         error = refused(jobs(bench, action="list", limit=1, page=token))
         assert error["code"] == "BAD_CURSOR", token
+
+
+def test_a_jobs_filter_by_the_name_a_session_had_finds_that_session(tmp_path: Path) -> None:
+    with store_module.Store(tmp_path / "coord.sqlite") as store:
+        store.register_session("s-1", kind="gui", pid=os.getpid(), alias_template="untitled-{n}")
+        store.rename_session("s-1", alias_template="shot_010-{n}")
+        store.register_session("s-2", kind="gui", pid=os.getpid(), alias_template="untitled-{n}")
+        assert jobs_tool.sessions_named(store, "untitled-1") == ["s-1"]
+        assert jobs_tool.sessions_named(store, "shot_010-1") == ["s-1"]
+        assert jobs_tool.sessions_named(store, "untitled-2") == ["s-2"]

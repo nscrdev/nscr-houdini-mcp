@@ -27,6 +27,7 @@ def record(
     started_at: float = 1.0,
     scene_epoch: int = 0,
     hip_path: str | None = None,
+    previous_alias: str | None = None,
 ) -> SessionRecord:
     return SessionRecord(
         session_id=session_id,
@@ -41,6 +42,7 @@ def record(
         capabilities=None,
         started_at=started_at,
         heartbeat_at=started_at,
+        previous_alias=previous_alias,
     )
 
 
@@ -203,6 +205,65 @@ def test_an_alias_reaches_the_newest_process_under_it() -> None:
         record("s-new", "w1", started_at=2.0),
     ]
     assert choose(rows, "w1").session_id == "s-new"
+
+
+def test_the_name_a_renamed_session_had_still_reaches_it_and_says_so() -> None:
+    """The same process the caller meant, so the call goes on, with a warning."""
+    rows = [
+        record("s-old", "untitled-1", state="gone", kind="gui", started_at=0.5),
+        record("s-1", "shot_010-1", kind="gui", previous_alias="untitled-1"),
+        record("s-2", "untitled-2", kind="gui", started_at=2.0),
+    ]
+    assert choose(rows, "untitled-1").session_id == "s-1"
+
+    router, _, _, _ = router_for(rows)
+    target = router.resolve("untitled-1")
+    assert target.session_id == "s-1"
+    [warning] = target.trace()["warnings"]
+    assert warning["code"] == "ALIAS_RENAMED"
+    assert warning["alias"] == "shot_010-1"
+    assert warning["previous_alias"] == "untitled-1"
+    # Named as it is now, or by id, there is nothing to say.
+    assert "warnings" not in router.resolve("shot_010-1").trace()
+    assert "warnings" not in router.resolve("s-1").trace()
+
+
+def test_a_session_that_holds_a_name_now_wins_over_one_that_held_it_before() -> None:
+    rows = [
+        record("s-1", "shot_010-1", previous_alias="untitled-1", state="gone"),
+        record("s-2", "untitled-1", started_at=2.0),
+    ]
+    assert choose(rows, "untitled-1").session_id == "s-2"
+
+
+def test_the_old_name_of_a_renamed_session_that_ended_names_that_session() -> None:
+    """Not unknown, and not an older session that once held the same name."""
+    rows = [
+        record("s-0", "untitled-1", state="gone", kind="gui", started_at=1.0),
+        record(
+            "s-1",
+            "shot_010-1",
+            state="gone",
+            kind="gui",
+            started_at=2.0,
+            previous_alias="untitled-1",
+        ),
+    ]
+    for known in (rows, rows[1:]):
+        with pytest.raises(CallError) as caught:
+            choose(known, "untitled-1")
+        assert caught.value.code == "SESSION_DEAD"
+        assert caught.value.details["session_id"] == "s-1"
+
+
+def test_a_later_holder_of_an_old_name_is_the_one_it_means() -> None:
+    rows = [
+        record("s-1", "shot_010-1", state="gone", started_at=2.0, previous_alias="untitled-1"),
+        record("s-3", "untitled-1", state="gone", started_at=3.0),
+    ]
+    with pytest.raises(CallError) as caught:
+        choose(rows, "untitled-1")
+    assert caught.value.details["session_id"] == "s-3"
 
 
 def test_an_unresponsive_session_is_refused_with_the_others_listed() -> None:
