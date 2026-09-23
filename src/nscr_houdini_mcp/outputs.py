@@ -58,11 +58,22 @@ OUTPUT_KINDS = (
     "capture",
     "compare",
     "job",
+    "reference",
+    "check",
+    "spill",
 )
 
 # Kinds whose path is only ever for a record the server or a session writes
 # itself, never one handed out to a caller's code.
 RECORD_KINDS = ("job",)
+
+# Results too large to return, kept in the server's own spill folder. That is
+# a folder on this machine and outside any scene, so a spill path is never
+# written on a node and never handed to code running in a session.
+SPILL_KIND = "spill"
+
+# What `mcp.output_path` hands to code running in a session.
+CODE_KINDS = tuple(kind for kind in OUTPUT_KINDS if kind not in (*RECORD_KINDS, SPILL_KIND))
 
 # Every token a template may use. Anything else fails on load, so a typo is a
 # clear message and not a literal `<nmae>` in a file name.
@@ -82,6 +93,7 @@ TOKENS = (
     "hipfamily",
     "frame",
     "ext",
+    "spill_root",
 )
 
 # Houdini variables a template may hold, and the only ones this server fills
@@ -106,6 +118,9 @@ DEFAULT_GRAMMAR = {
     "capture": "<output_root>/.agent/captures/<date>/<time>_<name>_<run_id>.<ext>",
     "compare": "<output_root>/.agent/compare/<date>_<name>/<ver>_<run_id>/",
     "job": "<output_root>/.agent/jobs/<name>.<ext>",
+    "reference": "<output_root>/.agent/reference/<name>_<run_id>.<ext>",
+    "check": "<output_root>/.agent/checks/<date>/<time>_<name>_<run_id>.<ext>",
+    "spill": "<spill_root>/<date_iso>/<time>-<name>-<run_id>.<ext>",
 }
 
 DEFAULT_EXTENSIONS = {
@@ -118,6 +133,9 @@ DEFAULT_EXTENSIONS = {
     "capture": "png",
     "compare": "",
     "job": "json",
+    "reference": "png",
+    "check": "png",
+    "spill": "json",
 }
 
 # Roots are templates too, so a studio can point a kind somewhere else without
@@ -145,6 +163,8 @@ PROJECT_TABLES = ("outputs", "conventions")
 SIDECAR_NAME = "_run.json"
 CLAIM_SUFFIX = ".claim"
 SCRATCH_ROOT = f"$HOUDINI_TEMP_DIR/{store_module.APP_DIR_NAME}"
+# The server's spill folder when nobody names one: the config's own default.
+SPILL_DIR_NAME = "spill"
 UNTITLED_FAMILY = "untitled"
 
 # A name that already carries something a version tool would read as a version.
@@ -174,6 +194,10 @@ NAME_HASH_LENGTH = 6
 # Stands in for the version while the shape of a line is worked out. It is not
 # a legal name character, so it can never come from a name or a date.
 _VERSION_MARK = "\x00ver\x00"
+
+# Stands in for the spill folder while a spill line is filled, for the same
+# reason: a folder that starts at a root must keep it.
+_SPILL_MARK = "\x00spill\x00"
 
 
 class OutputError(Exception):
@@ -542,6 +566,15 @@ def _check_template(kind: str, template: str) -> None:
     unknown = sorted({name for name in _TOKEN.findall(template) if name not in TOKENS})
     if unknown:
         raise ConventionError(f"the {kind} template uses unknown tokens: {', '.join(unknown)}")
+    if kind == SPILL_KIND:
+        # The spill folder is this server's, not the scene's, so the line
+        # starts there and names no Houdini variable.
+        if not template.startswith("<spill_root>/"):
+            raise ConventionError("the spill template must start at <spill_root>/")
+        if "$" in template:
+            raise ConventionError("the spill template must not use Houdini variables")
+    elif "<spill_root>" in template:
+        raise ConventionError(f"only the spill template may use <spill_root>, not {kind}")
     _check_variables(f"the {kind} template", template)
 
 
@@ -597,6 +630,7 @@ def plan_path(
     conventions: Conventions | None = None,
     when: datetime | None = None,
     scratch_root: str | Path | None = None,
+    spill_root: str | Path | None = None,
 ) -> OutputPlan:
     """Work out the line and the path for one output, without touching disk.
 
@@ -605,6 +639,9 @@ def plan_path(
     on a node that has no run yet. The parameter value for this run is the
     expanded path: the server owns a run once it has started, and a rename
     while a render is going must not send half the frames somewhere else.
+
+    A spill goes to the server's spill folder, `spill_root`, whatever the
+    scene is, so its line holds that folder as it is on this machine.
     """
     table = conventions or DEFAULT_CONVENTIONS_TABLE
     template = table.template_for(kind)
@@ -622,7 +659,13 @@ def plan_path(
         )
 
     unsaved = hip_path is None
-    if unsaved:
+    spill_folder = None
+    if kind == SPILL_KIND:
+        spill_folder = _spill_folder(spill_root)
+        # A stand in until the line is filled, so the folder keeps its root.
+        root_template = _SPILL_MARK
+        hip_dir, hip_stem = (None, UNTITLED_FAMILY) if unsaved else split_hip(hip_path)
+    elif unsaved:
         root_template = f"{SCRATCH_ROOT}/{sanitize_name(session_id or 'session')}"
         warnings.append("the scene has not been saved, so this run goes to a scratch folder")
         hip_stem = UNTITLED_FAMILY
@@ -649,9 +692,14 @@ def plan_path(
         "ext": extension,
         "output_root": root_template,
         "cache_root": root_template,
+        "spill_root": root_template,
     }
     line = _fill(template, dict(common, name="${OS}" if from_node else chosen))
     literal = _fill(template, dict(common, name=chosen))
+    if spill_folder is not None:
+        line = line.replace(_SPILL_MARK, spill_folder)
+        literal = literal.replace(_SPILL_MARK, spill_folder)
+        root_template = spill_folder
 
     temp_dir = _temp_dir(scratch_root) if unsaved else None
     root = _normalize(expand(root_template, hip_dir=hip_dir, temp_dir=temp_dir))
@@ -826,6 +874,13 @@ def _sidecar(frozen: str, directory: str, version_dir: str | None, is_dir: bool,
     return f"{directory}/{leaf}{SIDECAR_NAME}"
 
 
+def _spill_folder(spill_root: str | Path | None) -> str:
+    """The server's spill folder: the one named, or the config's default."""
+    if spill_root is not None:
+        return _posix(spill_root)
+    return _posix(store_module.default_home() / SPILL_DIR_NAME)
+
+
 def _temp_dir(scratch_root: str | Path | None) -> str:
     """Where a scene with no folder of its own writes.
 
@@ -875,6 +930,98 @@ def record_path(
     return plan
 
 
+# -- reading outputs back -------------------------------------------------
+
+
+def scene_key(hip_path: str | Path | None) -> str | None:
+    """One spelling of a scene file's path, so records can be matched to it.
+
+    Houdini writes its paths with forward slashes on every system, and a
+    Windows path compares without case, so both are settled here.
+    """
+    if hip_path is None:
+        return None
+    text = str(hip_path).strip().replace("\\", "/")
+    if not text:
+        return None
+    return text.lower() if os.name == "nt" else text
+
+
+def is_machine_path(text: str) -> bool:
+    """Whether a value starts at a root or a drive rather than at a variable."""
+    value = str(text).strip()
+    return value.startswith(("/", "\\")) or bool(_DRIVE.match(value))
+
+
+def has_version(text: str) -> bool:
+    """Whether a path carries a version a person or a tool can step."""
+    return bool(VERSION_IN_NAME.search(str(text)))
+
+
+def managed_roots(
+    conventions: Conventions | None,
+    *,
+    hip_path: str | Path | None,
+    session_id: str | None = None,
+    scratch_root: str | Path | None = None,
+) -> list[str]:
+    """The folders this server writes one scene's outputs under, expanded.
+
+    For a saved scene, the output root and the cache root; for one never
+    saved, its scratch folder. A root whose variable has no value here, such
+    as `$JOB` when nothing sets it, is left out.
+    """
+    table = conventions or DEFAULT_CONVENTIONS_TABLE
+    if hip_path is None:
+        scratch = f"{SCRATCH_ROOT}/{sanitize_name(session_id or 'session')}"
+        return [_normalize(expand(scratch, temp_dir=_temp_dir(scratch_root)))]
+    hip_dir, _ = split_hip(hip_path)
+    roots: list[str] = []
+    for template in (table.output_root, table.cache_root):
+        if not template:
+            continue
+        try:
+            roots.append(_normalize(expand(template, hip_dir=hip_dir)))
+        except OutputError:
+            continue
+    return roots
+
+
+def inside_roots(roots: Iterable[str], path: str) -> bool:
+    """Whether an expanded path is under one of the roots, read as text."""
+    folded = os.name == "nt"
+    target = _normalize(str(path).replace("\\", "/"))
+    if folded:
+        target = target.lower()
+    for root in roots:
+        if _inside(root.lower() if folded else root, target):
+            return True
+    return False
+
+
+_FRAME_IN_PATH = re.compile(r"\$\{?F\d*\}?")
+
+
+def on_disk(path: str) -> bool:
+    """Whether an output is there: its file or folder, or any frame of a sequence."""
+    text = str(path).rstrip("/")
+    if not text:
+        return False
+    if not _FRAME_IN_PATH.search(text):
+        return os.path.exists(text)
+    folder, _, leaf = text.rpartition("/")
+    if _FRAME_IN_PATH.search(folder):
+        return False
+    pattern = re.compile(
+        "^" + r"-?\d+".join(re.escape(piece) for piece in _FRAME_IN_PATH.split(leaf)) + "$"
+    )
+    try:
+        names = os.listdir(folder or ".")
+    except OSError:
+        return False
+    return any(pattern.match(name) for name in names)
+
+
 # -- allocation -----------------------------------------------------------
 
 
@@ -892,6 +1039,7 @@ def allocate(
     conventions: Conventions | None = None,
     when: datetime | None = None,
     scratch_root: str | Path | None = None,
+    spill_root: str | Path | None = None,
     above: int = 0,
 ) -> OutputPlan:
     """Take a version, claim it on disk, record the run and write the sidecar.
@@ -927,6 +1075,7 @@ def allocate(
         ext=ext,
         when=when,
         scratch_root=scratch_root,
+        spill_root=spill_root,
         above=above,
     )
 
@@ -999,6 +1148,7 @@ def _claim(
     ext: str | None,
     when: datetime | None,
     scratch_root: str | Path | None,
+    spill_root: str | Path | None = None,
     above: int = 0,
 ) -> OutputPlan:
     """One plan whose place on disk is this run's, and nobody else's."""
@@ -1012,6 +1162,7 @@ def _claim(
         "conventions": table,
         "when": when,
         "scratch_root": scratch_root,
+        "spill_root": spill_root,
     }
     if not table.is_versioned(kind):
         plan = plan_path(kind, version=None, **options)

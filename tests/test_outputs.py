@@ -127,8 +127,11 @@ def test_a_name_given_by_hand_stays_written_out_when_it_matches_the_node() -> No
 
 
 def test_a_template_never_holds_a_machine_path() -> None:
+    # A spill is the one kind that lives on this machine, and it never goes on
+    # a node; it has checks of its own below.
     for kind in outputs.OUTPUT_KINDS:
-        assert plan(kind, version=1).template.startswith("$HIP/")
+        if kind != outputs.SPILL_KIND:
+            assert plan(kind, version=1).template.startswith("$HIP/")
 
 
 def test_a_frame_token_is_kept_until_something_asks_for_a_frame() -> None:
@@ -720,3 +723,148 @@ def test_a_job_record_of_an_untitled_scene_goes_to_the_scratch_folder(tmp_path: 
     assert made.unsaved_hip is True
     assert Path(made.path).parent.is_dir()
     assert Path(made.path).is_relative_to(tmp_path / "temp")
+
+
+# -- references, checks and spills ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("reference", "$HIP/.agent/reference/beauty_run-abc123.png"),
+        ("check", "$HIP/.agent/checks/20260921/143005_beauty_run-abc123.png"),
+    ],
+)
+def test_references_and_checks_are_agent_artifacts_beside_the_scene(
+    kind: str, expected: str
+) -> None:
+    made = plan(kind)
+    assert made.template == expected
+    assert made.version is None
+    assert made.path == expected.replace("$HIP", "/shots/sq010")
+
+
+def test_a_spill_goes_to_the_servers_spill_folder_whatever_the_scene(tmp_path: Path) -> None:
+    folder = tmp_path / "spill"
+    saved = plan("spill", spill_root=folder)
+    unsaved = plan("spill", hip_path=None, spill_root=folder)
+    for made in (saved, unsaved):
+        assert Path(made.path).is_relative_to(folder)
+        assert made.path.endswith("/2026-09-21/143005-beauty-run-abc123.json")
+        assert made.template == made.path
+        assert made.root == folder.as_posix()
+    # A scene never saved still spills where the server spills, with no word
+    # about a scratch folder.
+    assert unsaved.warnings == ()
+
+
+def test_a_spill_on_a_windows_drive_keeps_its_drive() -> None:
+    made = plan("spill", spill_root="C:\\Users\\a\\spill")
+    assert made.path.startswith("C:/Users/a/spill/2026-09-21/")
+
+
+def test_a_spill_is_claimed_and_recorded_like_any_other_run(store: Store, tmp_path: Path) -> None:
+    made = outputs.allocate(
+        store,
+        "spill",
+        name="big answer",
+        hip_path=None,
+        session_id="s1",
+        spill_root=tmp_path / "spill",
+        when=WHEN,
+    )
+    assert Path(made.sidecar).is_file()
+    assert store.get_run(made.run_id).kind == "spill"
+    assert "big_answer" in made.path
+
+
+def test_code_is_handed_every_kind_but_records_and_spills() -> None:
+    assert set(outputs.CODE_KINDS) == set(outputs.OUTPUT_KINDS) - {"job", "spill"}
+    assert {"reference", "check"} <= set(outputs.CODE_KINDS)
+
+
+@pytest.mark.parametrize(
+    ("line", "why"),
+    [
+        ('spill = "$HIP/spill/<name>.<ext>"', "must start at <spill_root>"),
+        ('spill = "<spill_root>/$HIP/<name>.<ext>"', "must not use Houdini variables"),
+        ('render = "<spill_root>/<name>_v<ver>.<ext>"', "only the spill template"),
+    ],
+)
+def test_the_spill_line_is_the_only_one_that_starts_at_the_spill_folder(
+    home: Path, line: str, why: str
+) -> None:
+    (home / "config.toml").write_text(f"[outputs.grammar]\n{line}\n", encoding="utf-8")
+    with pytest.raises(outputs.ConventionError, match=why):
+        outputs.load_conventions(home=home)
+
+
+def test_a_reference_line_can_be_moved_like_any_other(home: Path) -> None:
+    text = '[outputs.grammar]\nreference = "<output_root>/refs/<name>.<ext>"\n'
+    (home / "config.toml").write_text(text, encoding="utf-8")
+    table = outputs.load_conventions(home=home)
+    assert plan("reference", conventions=table).template == "$HIP/refs/beauty.png"
+
+
+# -- reading outputs back -------------------------------------------------
+
+
+def test_a_scene_key_reads_one_file_the_same_however_it_is_written() -> None:
+    assert outputs.scene_key(None) is None
+    assert outputs.scene_key("") is None
+    assert outputs.scene_key("/a/b/shot.hip") == "/a/b/shot.hip"
+    key = outputs.scene_key("C:\\Shots\\Shot.hip")
+    assert key == ("c:/shots/shot.hip" if os.name == "nt" else "C:/Shots/Shot.hip")
+
+
+@pytest.mark.parametrize(
+    ("value", "machine"),
+    [
+        ("/Users/somebody/render/a.exr", True),
+        ("C:/render/a.exr", True),
+        ("\\\\server\\share\\a.exr", True),
+        ("$HIP/render/a.exr", False),
+        ("render/a.exr", False),
+    ],
+)
+def test_a_machine_path_starts_at_a_root_or_a_drive(value: str, machine: bool) -> None:
+    assert outputs.is_machine_path(value) is machine
+
+
+def test_the_managed_roots_of_a_scene_are_its_output_and_cache_roots(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("JOB", raising=False)
+    assert outputs.managed_roots(None, hip_path="/shots/shot.hip") == ["/shots"]
+    (home / "config.toml").write_text('[outputs]\ncache_root = "$JOB/cache"\n', encoding="utf-8")
+    table = outputs.load_conventions(home=home)
+    # A root whose variable has no value here is left out, not guessed at.
+    assert outputs.managed_roots(table, hip_path="/shots/shot.hip") == ["/shots"]
+    monkeypatch.setenv("JOB", "/jobs/show")
+    assert outputs.managed_roots(table, hip_path="/shots/shot.hip") == [
+        "/shots",
+        "/jobs/show/cache",
+    ]
+    scratch = outputs.managed_roots(None, hip_path=None, session_id="s1", scratch_root="/tmp/h")
+    assert scratch == ["/tmp/h/nscr-houdini-mcp/s1"]
+
+
+def test_a_path_is_inside_the_roots_only_when_it_stays_there() -> None:
+    roots = ["/shots"]
+    assert outputs.inside_roots(roots, "/shots/render/a.exr")
+    assert not outputs.inside_roots(roots, "/shots/../elsewhere/a.exr")
+    assert not outputs.inside_roots(roots, "/shotsmore/a.exr")
+    assert not outputs.inside_roots(roots, "render/a.exr")
+
+
+def test_an_output_is_on_disk_when_its_file_or_any_frame_is(tmp_path: Path) -> None:
+    folder = tmp_path / "v001"
+    folder.mkdir()
+    sequence = f"{folder.as_posix()}/beauty_v001.$F4.exr"
+    assert outputs.on_disk(sequence) is False
+    (folder / "beauty_v001.1001.exr").write_bytes(b"x")
+    assert outputs.on_disk(sequence) is True
+    assert outputs.on_disk(f"{folder.as_posix()}/other.$F.exr") is False
+    assert outputs.on_disk(f"{folder.as_posix()}/beauty_v001.1001.exr") is True
+    assert outputs.on_disk(f"{tmp_path.as_posix()}/gone/$F4/x.exr") is False
+    assert outputs.on_disk("") is False
