@@ -63,14 +63,19 @@ Run the server on stdio:
 nscr-houdini-mcp
 ```
 
-Five tools so far. `hou_ping` says which session a call reaches and that it
+Six tools so far. `hou_ping` says which session a call reaches and that it
 answers. `hou_sessions` lists every session with its state (`live`, `busy`,
 `unresponsive`, `crashed` or `gone`) and starts and stops workers under the
 pool's rules; it never closes a Houdini with a user interface. `hou_scene`
 reads the scene, opens a file and reports what it could not resolve as data,
 saves in place, and saves the next `<name>_v###` without writing over
 anything. A scene open in a user interface with unsaved changes is not
-replaced unless the call says to throw them away.
+replaced unless the call says to throw them away. `info` says whether the
+scene has unsaved changes and where that answer came from: Houdini itself in
+a session with a user interface, and in a worker, which answers yes whatever
+it holds, the bridge's own mark. That mark is clean after a save or a load,
+dirty after any call that changes the scene or a merge, and unknown at start
+or after code that saved or loaded by itself, when it cannot tell.
 Opening a scene runs the code that scene file carries, as Houdini always
 does, so only open files you trust.
 
@@ -157,11 +162,20 @@ taking a whole call back is for a person in a session with a user interface.
 The receipt is bound to the arguments the caller sent, so a lost reply sent
 again with the same operation id is answered from it, even by a server
 started since and even when the call named no namespace, and the answer names
-the namespace the code ran in. A call that runs past `timeout_s` (a minute
-unless you say; anything above `python_timeout_cap_s` in `config.toml`, at
-most an hour, is lowered to it) answers `TIMEOUT` with `still_running`; the
-code carries on, and the same operation id fetches its answer once it ends,
-also when sent while the code is still running.
+the namespace the code ran in.
+
+Every call is also a job, with a `job_id` made from its operation id, so a
+reply that never arrived can still be followed. `background` says how long
+the call itself waits. `auto`, the default, waits up to `inline_wait_s` from
+`config.toml` (ten seconds unless you say, from 1 to 300, and never longer
+than `timeout_s`): code that finishes in that time answers as usual with its
+`state`, and slower code answers with the job to follow at that moment and
+carries on. `true` answers with the job as soon as the session has taken the
+call. `false` waits up to `timeout_s` (a minute unless you say; anything above
+`python_timeout_cap_s`, at most an hour, is lowered to it) and then answers
+`TIMEOUT` with `still_running` and the `job_id`. The code is never stopped by
+any of these, and the same operation id fetches its answer once it ends, also
+when sent while the code is still running.
 
 `mcp` in every namespace has three things, made afresh for each call and
 answering only on that call's thread while it runs. `mcp.output_path(kind,
@@ -169,9 +183,32 @@ name, ext)` hands out a managed path for this session and scene from the
 output table below, for `render`, `flipbook`, `comp`, `cache`, `usd`, `hip`,
 `capture` or `compare`. `mcp.progress(done, total, message)` leaves a note,
 finite numbers only, that health and `hou_ping` show while the call runs.
+The same note is written to the call's job, at most once a second.
 `mcp.cancelled()` says whether the call should stop, for a long loop to look
-at between pieces of work. Today it turns true when the session is going
-down; a tool that asks a running call to stop comes with background jobs.
+at between pieces of work. It turns true when `hou_jobs` cancels the job or
+the session is going down. Code that stops once it has seen it ends
+`cancelled`; code that never looks runs to the end and ends `done`, with the
+request still on the job.
+
+`hou_jobs` follows long running work by id. `status`, the default, reads one
+job: its state (`queued`, `running`, `done`, `failed`, `cancelled` or
+`lost`), progress, outputs, error, when it started and ended, the scene epoch
+it ran against and whether a cancel was asked for. With `wait_s` (up to 50)
+the call is held until the state or the progress changes, and says so with
+`changed`, so there is no need to poll with sleeps. For a Python job that has
+ended, `outputs` is the answer the call would have given. `cancel` writes the
+request where the session reads it within two seconds and also asks the
+session directly, and says whether that direct request got there. In a
+session with a user interface a cancel is best effort: the code runs on
+Houdini's main thread, and only code that looks at `mcp.cancelled()` stops.
+`list` gives jobs newest first, by session and state, with `next_page`.
+
+Jobs live in the coordination store, so any server can answer for any job,
+including one started after the call that began it. A job whose session ends,
+whether stopped or found gone, is `lost` with the progress and outputs it had
+written, and so is one its session has said nothing about for fifteen
+minutes. A job that ends leaves a readable copy of itself beside the scene,
+in `.agent/jobs/`. Jobs are kept for 7 days.
 
 ### The Houdini side
 
@@ -373,7 +410,11 @@ usd       $HIP/usd/<name>/v<ver>/<name>_v<ver>.usd
 hip       $HIP/<name>_v<ver>.hip
 capture   $HIP/.agent/captures/<date>/<time>_<name>_<run_id>.png
 compare   $HIP/.agent/compare/<date>_<name>/<ver>_<run_id>/
+job       $HIP/.agent/jobs/<job_id>.json
 ```
+
+A `job` path is only ever written by a session or the server, for the record
+of a job that has ended; it is never handed out to code.
 
 Each output comes with two lines. The template keeps its Houdini variables and
 uses `${OS}` for a name that came from the node, so it reads well and a scene
