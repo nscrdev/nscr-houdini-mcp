@@ -295,18 +295,24 @@ def _open_store(path: Path) -> store_module.Store | None:
 
 
 class _Shared:
-    """A store handle lent inside `Router.one_store`: leaving it does not close it."""
+    """A store handle lent inside `Router.one_store`: leaving it does not close it.
 
-    __slots__ = ("_store",)
+    While a caller is inside its `with`, the handle is in use, and a wait on
+    a session does not close it under that caller.
+    """
 
-    def __init__(self, store: Any) -> None:
+    __slots__ = ("_held", "_store")
+
+    def __init__(self, store: Any, held: Any) -> None:
         self._store = store
+        self._held = held
 
     def __enter__(self) -> Any:
+        self._held.lent += 1
         return self._store
 
     def __exit__(self, *exc: object) -> None:
-        return None
+        self._held.lent -= 1
 
     def close(self) -> None:
         return None
@@ -417,14 +423,17 @@ class Router:
         each time costs more than the reads. Inside this, the first open is
         kept and handed out again until the call waits on a session, which
         closes it, and it is closed when the call ends, so no handle is held
-        while Houdini works or outlives the call that opened it. Each read still runs in its own
-        short transaction and sees what other processes have written since.
+        while Houdini works or outlives the call that opened it. A caller that
+        holds the store across a call of its own keeps it open, as it would a
+        handle of its own. Each read still runs in its own short transaction
+        and sees what other processes have written since.
         """
         if getattr(self._held, "active", False):
             yield
             return
         self._held.active = True
         self._held.store = None
+        self._held.lent = 0
         try:
             yield
         finally:
@@ -441,7 +450,9 @@ class Router:
         long time, or after its caller has gone. The next read opens again.
         """
         kept = getattr(self._held, "store", None)
-        if kept is not None:
+        # A caller that holds the store across its own call keeps it open,
+        # as it would with a handle of its own.
+        if kept is not None and not self._held.lent:
             self._held.store = None
             kept.__exit__(None, None, None)
 
@@ -455,7 +466,7 @@ class Router:
             if kept is None:
                 return None
             self._held.store = kept
-        return _Shared(kept)
+        return _Shared(kept, self._held)
 
     def cached(self) -> list[str]:
         """The session ids a client is kept for."""

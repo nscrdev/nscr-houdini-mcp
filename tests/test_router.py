@@ -568,3 +568,15 @@ def test_a_store_that_is_not_there_yet_is_not_kept() -> None:
         assert router.records() == []
         assert router.records() == []
     assert len(opened) == 2
+
+
+def test_a_store_held_across_a_call_is_not_closed_under_its_holder() -> None:
+    stores = CountedStores([record("s-1", "w1")])
+    router = counted_router(stores)
+    with router.one_store():
+        target = router.resolve(None)
+        with router.store() as store:
+            router.call(target, "bridge.ping")
+            assert stores.closed == 0
+            assert store.list_sessions() == stores.rows
+    assert stores.opened == stores.closed
