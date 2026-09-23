@@ -382,12 +382,26 @@ class _KnownStarts:
     TRIES = 2
 
     def __init__(self) -> None:
+        self.forget_in_child()
+
+    def forget_in_child(self) -> None:
+        """Start empty, without closing anything: for a fresh or forked process.
+
+        A forked child inherits the numbers of the parent's watches but not
+        the watches, and may already have given those numbers to files of its
+        own, so they are dropped rather than closed. The lock is made again
+        because the parent may have held it at the moment of the fork.
+        """
+        self._owner = os.getpid()
         self._lock = threading.Lock()
         self._kept: dict[int, tuple[str, Any]] = {}
         self._reading: dict[int, threading.Event] = {}
         self._slots = threading.BoundedSemaphore(self.READING)
 
     def stamp(self, pid: int) -> str | None:
+        if self._owner != os.getpid():
+            # A fork the hook did not see, such as one made without it.
+            self.forget_in_child()
         while True:
             with self._lock:
                 kept = self._kept.get(pid)
@@ -416,7 +430,10 @@ class _KnownStarts:
             try:
                 watch = _watch_exit(pid)
                 if watch is _GONE:
-                    return None
+                    # The kernel will not watch it, yet the pid is taken, as
+                    # by a process that has exited and not been reaped: the
+                    # listing still tells a different process apart.
+                    return _ps_start(pid) if process_is_alive(pid) else None
                 stamp = _ps_start(pid)
                 if watch is None:
                     return stamp
@@ -492,6 +509,8 @@ def _has_exited(queue: Any) -> bool:
 
 
 _known_starts = _KnownStarts()
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_known_starts.forget_in_child)
 
 
 def _windows_start(pid: int) -> str | None:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import select
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -314,6 +316,65 @@ def test_a_pid_taken_again_while_it_is_read_is_read_under_a_new_watch(monkeypatc
 @needs_exit_watch
 def test_a_pid_with_no_process_gives_no_stamp() -> None:
     assert store_module._KnownStarts().stamp(DEAD_PID) is None
+
+
+def test_a_pid_the_kernel_will_not_watch_but_is_taken_is_read_from_the_listing(
+    monkeypatch,
+) -> None:
+    # A zombie of some other process now holding the pid: no watch, but the
+    # listing still names the process, so a stale row is told apart.
+    monkeypatch.setattr(store_module, "_watch_exit", lambda pid: store_module._GONE)
+    monkeypatch.setattr(store_module, "_ps_start", lambda pid: "another process")
+    monkeypatch.setattr(store_module, "process_is_alive", lambda pid: True)
+    known = store_module._KnownStarts()
+    assert known.stamp(7) == "another process"
+    assert 7 not in known._kept
+    monkeypatch.setattr(store_module, "process_is_alive", lambda pid: False)
+    assert known.stamp(7) is None
+
+
+def test_a_forked_child_drops_the_kept_stamps_without_closing_them(monkeypatch) -> None:
+    watches: dict[int, list[FakeWatch]] = {}
+    watching(monkeypatch, lambda pid: f"stamp {pid}", watches)
+    known = store_module._KnownStarts()
+    assert known.stamp(7) == "stamp 7"
+    # As a child made without the hook sees it: another pid than the owner.
+    known._owner = -1
+    assert known.stamp(8) == "stamp 8"
+    assert list(known._kept) == [8]
+    assert watches[7][0].closed is False
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="no fork on this system")
+# The runner has threads of its own, which is the case the hook is for.
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_real_fork_starts_the_child_with_no_kept_stamps() -> None:
+    parent = os.getpid()
+    assert store_module.process_start_stamp(parent)
+    read, write = os.pipe()
+    child = os.fork()
+    if child == 0:  # pragma: no cover - runs in the child
+        ok = 1
+        try:
+            os.close(read)
+            known = store_module._known_starts
+            # Something of the child's own takes the lowest free numbers.
+            mine = [os.open(os.devnull, os.O_RDONLY) for _ in range(4)]
+            clean = known._kept == {} and known._owner == os.getpid()
+            answer = store_module.process_start_stamp(parent)
+            still_open = all(os.fstat(fd) is not None for fd in mine)
+            ok = 0 if clean and answer and still_open else 1
+        finally:
+            os.write(write, bytes([ok]))
+            os._exit(0)
+    os.close(write)
+    ready, _, _ = select.select([read], [], [], 30.0)
+    said = os.read(read, 1) if ready else b""
+    os.close(read)
+    if not ready:
+        os.kill(child, signal.SIGKILL)
+    os.waitpid(child, 0)
+    assert said == b"\x00"
 
 
 def test_one_read_per_pid_is_under_way_and_the_rest_wait_for_it(monkeypatch) -> None:
