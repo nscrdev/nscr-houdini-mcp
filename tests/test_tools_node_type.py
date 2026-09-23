@@ -644,10 +644,11 @@ def test_arguments_that_cannot_work_are_refused_before_anything_is_sent(
     assert bench.sent.calls == []
 
 
-def test_the_tool_is_listed_last_as_read_only(bench: Bench) -> None:
+def test_the_tool_is_listed_after_hou_jobs_as_read_only(bench: Bench) -> None:
     listed, _ = talk(bench.serve())
-    assert listed.tools[-1].name == "hou_node_type"
-    tool = listed.tools[-1]
+    names = [tool.name for tool in listed.tools]
+    assert names.index("hou_node_type") > names.index("hou_jobs")
+    [tool] = [tool for tool in listed.tools if tool.name == "hou_node_type"]
     assert tool.annotations.read_only_hint is True
     assert tool.annotations.open_world_hint is False
 
@@ -759,7 +760,7 @@ def test_help_labels_skip_directives_and_notes_and_stop_at_the_count(bench: Benc
 
 def test_the_description_says_help_labels_are_approximate(bench: Bench) -> None:
     listed, _ = talk(bench.serve())
-    tool = listed.tools[-1]
+    [tool] = [tool for tool in listed.tools if tool.name == "hou_node_type"]
     assert "help" in tool.description and "approximate" in tool.description
 
 

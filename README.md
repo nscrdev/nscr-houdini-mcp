@@ -257,6 +257,37 @@ what it found with `stopped`. When the shipped help is missing or cannot be
 read, the answer says `help_available: false`, and it is tried again a
 minute later.
 
+`hou_docs` reads Houdini's own documentation for the build in use. `search`
+looks for `query` in page titles and first paragraphs and ranks a title that
+is the query first, then one that starts with it, then one that holds it,
+then a page whose first paragraph holds every word. For nodes, VEX functions
+and Python classes the internal name, such as `attribwrangle`, counts as a
+title. Among equals the current version of a page comes before older and
+deprecated ones, and release notes come last. `page` reads one page by its
+help path, such as `nodes/sop/attribwrangle`, or by a node type with its
+namespace or version, such as `nodes/sop/copytopoints::2.0`; `vex` reads one
+VEX function's page by its name. A page says its `version` when it has one.
+Text comes `plain`, or `markdown` with its headings, lists and code kept;
+table rows stay on one line. Past `max_chars` (20,000 unless you say) the
+text is cut, says `truncated`, and the whole page goes to the spill folder,
+named in `spill_path`.
+
+Pages come from the install's own `houdini/help` folder first, which answers
+in a few milliseconds and needs nothing from the session. With a session, that
+is only a folder of exactly the session's build; with no session, the install
+`hython` or `houdini_build` names in `config.toml`, or the newest on this
+machine. The session's help server is read only for a build with no folder
+here, or for a page the folder does not have. It runs inside the session, so
+it is slow and stops answering while the session cooks or runs code: asking
+where it is never waits behind other work, each request has two seconds from
+start to finish, redirects are refused, and a help server that timed out is
+left alone for a minute. `source` says which answered and `build` which build
+was read; `HELP_UNAVAILABLE` says neither could. Pages from both are kept in
+a small cache under the state folder, and search uses an index of every page,
+built once per build and kept beside it; the first result's `note` says how
+long that took. The cache holds at most 64 MB across builds, the builds used
+least recently going first, and a build whose install has gone is removed.
+
 ### The Houdini side
 
 `nscr_houdini_mcp.bridge` runs inside Houdini's own Python. It serves two

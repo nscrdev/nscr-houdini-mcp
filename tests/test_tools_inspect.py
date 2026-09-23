@@ -61,6 +61,7 @@ class Through:
             operation_id=rest.get("operation_id"),
             wait_s=rest.get("wait_s"),
             timeout_s=rest.get("timeout_s"),
+            skip_if_busy=bool(rest.get("skip_if_busy")),
         )
         return client.Answer(200, dict(self.dispatcher.dispatch(envelope).payload), {})
 

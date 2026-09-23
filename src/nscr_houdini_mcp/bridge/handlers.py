@@ -336,5 +336,12 @@ def default_registry(
         job_kind="python",
         job_spec=python_job_spec,
     )
+    registry.add(
+        "help.server",
+        tool_module.help_server,
+        arguments=(),
+        context=True,
+        summary="where this session serves its help pages",
+    )
     registry.add_report("namespaces", namespaces.state)
     return registry
