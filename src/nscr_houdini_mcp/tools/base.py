@@ -217,12 +217,14 @@ class Call:
         *,
         transport: str = "stdio",
         config: Config | None = None,
+        progress: Callable[[float, float | None, str | None], None] | None = None,
     ) -> None:
         self.spec = spec
         self.arguments = dict(arguments)
         self.router = router
         self.transport = transport
         self.config = config
+        self._progress = progress
         self.trace: dict[str, Any] = empty_trace()
         self._target: Target | None = None
         self._epoch: int | None = self.arguments.get("scene_epoch")
@@ -238,6 +240,19 @@ class Call:
             if named:
                 self.trace["operation_id"] = named
         return self._target
+
+    def progress(self, done: float, total: float | None = None, message: str | None = None) -> None:
+        """Tell the client how a long call is getting on, when it asked to hear.
+
+        Nothing depends on it arriving: a client that sent no progress token
+        hears nothing, and a note that cannot be sent is dropped.
+        """
+        if self._progress is None:
+            return
+        try:
+            self._progress(done, total, message)
+        except Exception:  # noqa: BLE001 - a note that cannot be sent is not a failed call
+            pass
 
     def health(self) -> dict[str, Any]:
         """What the session says about itself. Answers while it is busy."""

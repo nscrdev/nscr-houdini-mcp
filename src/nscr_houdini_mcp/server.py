@@ -106,8 +106,17 @@ class Runtime:
             assert self._router is not None
             return self._config, self._router
 
-    def run(self, name: str, arguments: Mapping[str, Any] | None) -> CallToolResult:
-        """Run one tool call to a finished result. Never raises."""
+    def run(
+        self,
+        name: str,
+        arguments: Mapping[str, Any] | None,
+        progress: Callable[[float, float | None, str | None], None] | None = None,
+    ) -> CallToolResult:
+        """Run one tool call to a finished result. Never raises.
+
+        `progress` sends a progress note to the client, for a call that holds
+        on purpose; it does nothing when the client asked for none.
+        """
         arguments = dict(arguments or {})
         spec = self.tools.get(name)
         if spec is None:
@@ -127,7 +136,14 @@ class Runtime:
         call: Call | None = None
         try:
             config, router = self.settings()
-            call = Call(spec, arguments, router, transport=config.transport, config=config)
+            call = Call(
+                spec,
+                arguments,
+                router,
+                transport=config.transport,
+                config=config,
+                progress=progress,
+            )
             data = spec.handler(call)
             summary = spec.summary(data) if spec.summary else None
             spill = Spill(config.spill_folder, config.spill_over_bytes)
@@ -208,7 +224,27 @@ class HoudiniServer(MCPServer):
     async def call_tool(
         self, name: str, arguments: dict[str, Any], context: Any = None
     ) -> CallToolResult:
-        return await in_daemon_thread(self.runtime.run, name, arguments)
+        return await in_daemon_thread(self.runtime.run, name, arguments, notifier(context))
+
+
+def notifier(context: Any) -> Callable[[float, float | None, str | None], None] | None:
+    """A way for a call's thread to send the client a progress note.
+
+    The note goes out on the protocol loop and is waited for here, briefly. A
+    client that sent no progress token gets nothing, which the SDK decides.
+    """
+    report = getattr(context, "report_progress", None)
+    if context is None or report is None:
+        return None
+    token = anyio.lowlevel.current_token()
+
+    def send(done: float, total: float | None, message: str | None) -> None:
+        try:
+            anyio.from_thread.run(report, done, total, message, token=token)
+        except Exception:  # noqa: BLE001 - a note nobody can take is dropped
+            pass
+
+    return send
 
 
 def build_server(
