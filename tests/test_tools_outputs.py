@@ -803,10 +803,11 @@ def test_a_set_that_fails_puts_the_expression_back_and_leaves_no_record(
     karma(scene.node("/out"))
     picture(scene).setExpression('chs("../karma2/picture")', "hscript")
     code = (
+        "import os\n"
         "parm = hou.node('/out/karma1').parm('picture')\n"
         "keep = parm.set\n"
         "def refuse(value):\n"
-        "    if str(value).startswith('/'):\n"
+        "    if os.path.isabs(str(value)):\n"
         "        raise RuntimeError('the disk said no')\n"
         "    keep(value)\n"
         "parm.set = refuse\n"
