@@ -225,7 +225,10 @@ keyword: the exact name first, then a name that starts with it, one that
 holds it, the label and the help line. Hidden types come only with `include`
 `hidden`. A name that is not there is `TYPE_NOT_FOUND` with up to five near
 names, or with the contexts that have it. Parameters and search rows page the
-way `hou_inspect` does, and a page after an asset changed says `changed`.
+way `hou_inspect` does, and a page after any row or the asset's library
+changed says `changed`. A page token is state the caller holds and can edit,
+as with the other tools, not proof that this tool wrote it: it is checked for
+shape and tied to its session and arguments, and no more.
 
 Everything comes from the node type itself: nothing is cooked or made. An
 asset's input labels come from its dialog script, and a type built into
@@ -236,7 +239,13 @@ asset's own embedded help, or a page from the `nodes.zip` Houdini ships or
 from any `help/nodes` folder on Houdini's search path, which is where
 packages keep theirs. A search with no context leaves out data recipes,
 managers and the networks that only hold other contexts, and equally close
-matches come in context order, SOPs first.
+matches come in context order, SOPs first. Search ranks by the shipped and
+package help pages only: an asset's embedded help is read for one card, or
+for the rows a page returns, and never changes the order. A query is at most
+200 characters and 16 different words, and a search asked to stop hands back
+what it found with `stopped`. When the shipped help is missing or cannot be
+read, the answer says `help_available: false`, and it is tried again a
+minute later.
 
 ### The Houdini side
 
