@@ -365,47 +365,99 @@ class _KnownStarts:
     ended. A pid that has been given to a new process is read afresh. Where the
     kernel offers no such watch, or refuses one, nothing is kept and every
     question goes to the listing as before.
+
+    A process that ends while it is being read has no stamp to give: the
+    listing may have read it or whatever took its pid after it, so the pid is
+    read once more under a new watch, and the answer is nothing when that
+    races too. One read per pid is under way at a time, and the others asking
+    for the same pid wait for it. Only a few watches are opened at once; a
+    read beyond that asks the listing without one.
     """
 
     # Each kept stamp holds one open watch, so the number is bounded.
     LIMIT = 64
+    # Watches opened for reads under way at once.
+    READING = 8
+    # Tries at a pid whose process ends while it is read.
+    TRIES = 2
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._kept: dict[int, tuple[str, Any]] = {}
+        self._reading: dict[int, threading.Event] = {}
+        self._slots = threading.BoundedSemaphore(self.READING)
 
     def stamp(self, pid: int) -> str | None:
-        with self._lock:
-            kept = self._kept.get(pid)
-            if kept is not None:
-                if not _has_exited(kept[1]):
-                    return kept[0]
-                del self._kept[pid]
-                kept[1].close()
-        watch = _watch_exit(pid)
-        stamp = _ps_start(pid)
-        if watch is None:
-            return stamp
-        if stamp is None or _has_exited(watch):
-            # The listing may have read a different process under this pid.
-            watch.close()
-            return stamp
+        while True:
+            with self._lock:
+                kept = self._kept.get(pid)
+                if kept is not None:
+                    if not _has_exited(kept[1]):
+                        return kept[0]
+                    del self._kept[pid]
+                    kept[1].close()
+                under_way = self._reading.get(pid)
+                if under_way is None:
+                    self._reading[pid] = threading.Event()
+                    break
+            # Another thread is reading this pid: its answer is kept for this
+            # one, or, when it could not be kept, this one reads next.
+            under_way.wait(PS_TIMEOUT_S + 1.0)
+        try:
+            return self._read(pid)
+        finally:
+            with self._lock:
+                self._reading.pop(pid).set()
+
+    def _read(self, pid: int) -> str | None:
+        for _ in range(self.TRIES):
+            if not self._slots.acquire(blocking=False):
+                return _ps_start(pid)
+            try:
+                watch = _watch_exit(pid)
+                if watch is _GONE:
+                    return None
+                stamp = _ps_start(pid)
+                if watch is None:
+                    return stamp
+                if stamp is None:
+                    watch.close()
+                    return None
+                if _has_exited(watch):
+                    # The listing may have read the process that ended or one
+                    # that took its pid since: neither stamp can be trusted.
+                    watch.close()
+                    continue
+                self._keep(pid, stamp, watch)
+                return stamp
+            finally:
+                self._slots.release()
+        return None
+
+    def _keep(self, pid: int, stamp: str, watch: Any) -> None:
         with self._lock:
             replaced = self._kept.pop(pid, None)
             if replaced is not None:
                 replaced[1].close()
             # Processes that have ended go first, then the oldest kept. A read
             # happens once per new process, so the sweep is rare.
-            for ended in [key for key, (_, kept) in self._kept.items() if _has_exited(kept)]:
+            for ended in [key for key, (_, held) in self._kept.items() if _has_exited(held)]:
                 self._kept.pop(ended)[1].close()
             while len(self._kept) >= self.LIMIT:
                 self._kept.pop(next(iter(self._kept)))[1].close()
             self._kept[pid] = (stamp, watch)
-        return stamp
+
+
+# What `_watch_exit` says when there is no such process to watch.
+_GONE = object()
 
 
 def _watch_exit(pid: int) -> Any:
-    """A kernel queue that will hold an event once `pid` exits, or nothing."""
+    """A kernel queue that will hold an event once `pid` exits.
+
+    `_GONE` when no process has that pid, and nothing when this system has no
+    such watch or will not open one now, such as when it is out of handles.
+    """
     make = getattr(select, "kqueue", None)
     if make is None:
         return None
@@ -421,6 +473,9 @@ def _watch_exit(pid: int) -> Any:
             fflags=select.KQ_NOTE_EXIT,
         )
         queue.control([event], 0, 0)
+    except ProcessLookupError:
+        queue.close()
+        return _GONE
     except (OSError, ValueError, OverflowError):
         queue.close()
         return None

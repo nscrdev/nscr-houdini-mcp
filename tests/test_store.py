@@ -5,7 +5,10 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -212,7 +215,9 @@ def test_a_kept_start_stamp_is_dropped_when_its_process_exits(monkeypatch) -> No
     finally:
         child.kill()
         child.wait(timeout=30)
-    assert known.stamp(child.pid) == "someone else"
+    # The kernel says no process has the pid now, so there is no stamp, and
+    # the listing is not asked.
+    assert known.stamp(child.pid) is None
     assert child.pid not in known._kept
 
 
@@ -260,6 +265,117 @@ def test_kept_start_stamps_drop_ended_processes_first_then_the_oldest(monkeypatc
         known.stamp(pid)
         watches[pid].exited = True
     assert [pid for pid in known._kept if pid < 100] == [5, 6, 7]
+
+
+def watching(monkeypatch, listing, watches: dict[int, list[FakeWatch]]) -> None:
+    """Stand in watches, kept in `watches`, and a listing the test writes."""
+
+    def watch(pid: int) -> FakeWatch:
+        made = FakeWatch()
+        watches.setdefault(pid, []).append(made)
+        return made
+
+    monkeypatch.setattr(store_module, "_watch_exit", watch)
+    monkeypatch.setattr(store_module, "_has_exited", lambda made: made.exited)
+    monkeypatch.setattr(store_module, "_ps_start", listing)
+
+
+def test_a_process_that_ends_while_it_is_read_gives_no_stamp(monkeypatch) -> None:
+    watches: dict[int, list[FakeWatch]] = {}
+
+    def listing(pid: int) -> str:
+        # The watched process exits while the listing is being read.
+        watches[pid][-1].exited = True
+        return "the old stamp"
+
+    watching(monkeypatch, listing, watches)
+    known = store_module._KnownStarts()
+    assert known.stamp(7) is None
+    assert 7 not in known._kept
+    assert all(made.closed for made in watches[7])
+    assert len(watches[7]) == store_module._KnownStarts.TRIES
+
+
+def test_a_pid_taken_again_while_it_is_read_is_read_under_a_new_watch(monkeypatch) -> None:
+    said = iter(["the old stamp", "the new stamp"])
+    watches: dict[int, list[FakeWatch]] = {}
+
+    def listing(pid: int) -> str:
+        if len(watches[pid]) == 1:
+            watches[pid][-1].exited = True
+        return next(said)
+
+    watching(monkeypatch, listing, watches)
+    known = store_module._KnownStarts()
+    assert known.stamp(7) == "the new stamp"
+    assert known._kept[7][0] == "the new stamp"
+
+
+@needs_exit_watch
+def test_a_pid_with_no_process_gives_no_stamp() -> None:
+    assert store_module._KnownStarts().stamp(DEAD_PID) is None
+
+
+def test_one_read_per_pid_is_under_way_and_the_rest_wait_for_it(monkeypatch) -> None:
+    reads: list[int] = []
+
+    def listing(pid: int) -> str:
+        reads.append(pid)
+        time.sleep(0.05)
+        return f"stamp {pid}"
+
+    watching(monkeypatch, listing, {})
+    known = store_module._KnownStarts()
+    answers: list[str | None] = []
+    threads = [threading.Thread(target=lambda: answers.append(known.stamp(7))) for _ in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert answers == ["stamp 7"] * 20
+    assert reads == [7]
+
+
+def test_only_a_few_watches_are_open_for_reads_at_once(monkeypatch) -> None:
+    lock = threading.Lock()
+    open_now = [0, 0]  # now, most
+
+    class Counted(FakeWatch):
+        def __init__(self) -> None:
+            super().__init__()
+            with lock:
+                open_now[0] += 1
+                open_now[1] = max(open_now[1], open_now[0])
+
+    def listing(pid: int) -> str:
+        time.sleep(0.05)
+        return f"stamp {pid}"
+
+    monkeypatch.setattr(store_module, "_watch_exit", lambda pid: Counted())
+    monkeypatch.setattr(store_module, "_has_exited", lambda made: made.exited)
+    monkeypatch.setattr(store_module, "_ps_start", listing)
+    known = store_module._KnownStarts()
+    real_keep = known._keep
+
+    def keep(pid: int, stamp: str, watch: Any) -> None:
+        # A kept watch is no longer one in flight.
+        with lock:
+            open_now[0] -= 1
+        real_keep(pid, stamp, watch)
+
+    known._keep = keep  # type: ignore[method-assign]
+    answers: dict[int, str | None] = {}
+    threads = [
+        threading.Thread(target=lambda pid=pid: answers.update({pid: known.stamp(pid)}))
+        for pid in range(40)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    # Every pid has its stamp, whether it was read under a watch or without.
+    assert answers == {pid: f"stamp {pid}" for pid in range(40)}
+    assert open_now[1] <= store_module._KnownStarts.READING
 
 
 def test_same_process_tells_a_reused_pid_apart_after_the_first_look() -> None:
