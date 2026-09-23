@@ -31,6 +31,7 @@ from fake_hou import (
     Scene,
     SceneViewerTab,
     Tab,
+    Vector3,
     Window,
 )
 from nscr_houdini_mcp import outputs
@@ -42,7 +43,30 @@ from nscr_houdini_mcp.bridge.errors import BridgeError
 from nscr_houdini_mcp.bridge.handlers import default_registry
 from nscr_houdini_mcp.bridge.identity import Identity
 
-TYPES = ("geo", "null", "cam", "box", "flipbook", "copnet", "fractalnoise", "img", "file")
+TYPES = (
+    "geo",
+    "null",
+    "cam",
+    "box",
+    "flipbook",
+    "copnet",
+    "fractalnoise",
+    "img",
+    "file",
+    "subnet",
+    "hlight::2.0",
+    "control",
+    "instance",
+    "dopnet",
+    "pathcv",
+    "path",
+    "handle",
+    "muscle",
+    "merge",
+    "convert",
+)
+# The box every geometry node in the stand in draws, as framing reads it.
+UNIT = ((-0.5, -0.5, -0.5), (0.5, 0.5, 0.5))
 
 
 @pytest.fixture
@@ -345,7 +369,7 @@ def test_a_view_applied_for_the_capture_is_put_back_exactly(scene: Scene, home: 
     [seen] = scene.capture.seen
     assert seen["type"] == "Top"
     assert seen["shading"] == {"SceneObject": "Wire", "DisplayModel": "Wire"}
-    assert viewport.framed == ["all"]
+    assert viewport.framed == [UNIT]
     after = view_state(viewport)
     assert after == before
     translation, rotation, pivot, ortho_width = viewport._default.state()
@@ -904,10 +928,251 @@ def test_framing_while_looking_through_a_camera_leaves_the_camera_alone(
     said = take(scene, home, kind="gui", frame_target="all")
     [seen] = scene.capture.seen
     assert seen["camera"] is None
-    assert viewer.viewport.framed == ["all"]
+    assert viewer.viewport.framed == [UNIT]
     assert said["views"][0]["camera"]["left_camera"] is True
     assert view_state(viewer.viewport) == before
     assert viewer.viewport.camera() is shot_cam
+
+
+# Section: what framing everything goes around, and what is drawn
+
+# The shape a stock guide object draws, by its type, as a real 22.0 makes it.
+STOCK = {"null": "control", "cam": "box", "hlight::2.0": "box"}
+
+
+def guide_shape(scene: Scene, parent: str, type_name: str, name: str, at: tuple) -> Any:
+    """An object that draws a shape of its own, as a real camera, light or null does."""
+    made = scene.node(parent).createNode(type_name, name)
+    made.parmTuple("t").set(at)
+    shape = made.createNode(STOCK.get(type_name, "box"), "shape")
+    shape.bounds = UNIT
+    shape.setDisplayFlag(True)
+    return made
+
+
+def busy_scene(scene: Scene) -> None:
+    """The box, with a shown camera, light and null far from it, a hidden object,
+    and a second box inside a subnet beside a camera."""
+    guide_shape(scene, "/obj", "cam", "shotcam", (20.0, 10.0, 40.0))
+    guide_shape(scene, "/obj", "hlight::2.0", "key", (-30.0, 15.0, 0.0))
+    guide_shape(scene, "/obj", "null", "handle", (0.0, -25.0, 0.0))
+    guide_shape(scene, "/obj", "geo", "hidden", (50.0, 0.0, 0.0)).hidden = True
+    group = scene.node("/obj").createNode("subnet", "group")
+    guide_shape(scene, "/obj/group", "geo", "inner", (2.0, 0.0, 0.0))
+    guide_shape(scene, "/obj/group", "cam", "rigcam", (0.0, 0.0, -60.0))
+    group.createNode("subnet", "off").hidden = True
+    guide_shape(scene, "/obj/group/off", "geo", "tucked", (0.0, 80.0, 0.0))
+    scene.undos.labels.clear()
+
+
+GUIDES_LEFT_OUT = "* ^/obj/shotcam ^/obj/group/rigcam ^/obj/key ^/obj/handle"
+
+
+def test_framing_all_goes_around_geometry_not_cameras_lights_or_nulls(
+    scene: Scene, home: Path
+) -> None:
+    busy_scene(scene)
+    viewer = viewer_scene(scene)
+    said = take(scene, home, kind="gui", camera={"orbit": 90, "elevation": 20})
+    assert viewer.viewport.framed == [((-0.5, -0.5, -0.5), (2.5, 0.5, 0.5))]
+    assert said["views"][0]["camera"]["target"] == "all"
+    assert not any("nothing to frame" in item for item in said["warnings"])
+    [seen] = scene.capture.seen
+    # Everything is drawn but the guides, which are left out by name.
+    assert seen["settings"]["visibleObjects"] == GUIDES_LEFT_OUT
+
+
+def test_a_fitted_camera_frames_the_same_geometry_whatever_else_is_shown(
+    scene: Scene, home: Path
+) -> None:
+    take(scene, home, resolution=[320, 180], frame_target="all")
+    alone = scene.capture.seen[-1]
+    busy_scene(scene)
+    scene.node("/obj/group/inner").hidden = True
+    take(scene, home, resolution=[320, 180], frame_target="all")
+    crowded = scene.capture.seen[-1]
+    assert crowded["t"] == alone["t"]
+    assert crowded["vobjects"] == GUIDES_LEFT_OUT
+    assert alone["vobjects"] == "*"
+
+
+def test_a_null_with_geometry_of_its_own_is_framed_and_drawn(scene: Scene, home: Path) -> None:
+    viewer = viewer_scene(scene)
+    null = scene.node("/obj").createNode("null", "holder")
+    null.parmTuple("t").set((3.0, 0.0, 0.0))
+    null.createNode("box", "mine").setDisplayFlag(True)
+    take(scene, home, kind="gui", frame_target="all")
+    assert viewer.viewport.framed == [((-0.5, -0.5, -0.5), (3.5, 0.5, 0.5))]
+    assert scene.capture.seen[-1]["settings"]["visibleObjects"] == "*"
+
+
+def test_framing_reads_the_frames_captured_not_the_scene_s(scene: Scene, home: Path) -> None:
+    viewer = viewer_scene(scene)
+    geo = scene.node("/obj/boxgeo")
+    geo.moves = lambda frame: (frame, 0.0, 0.0)
+    late = guide_shape(scene, "/obj", "geo", "late", (0.0, 10.0, 0.0))
+    late.shown_at = {20.0}
+    take(scene, home, kind="gui", frame_target="all", frame=10)
+    assert viewer.viewport.framed[-1] == ((9.5, -0.5, -0.5), (10.5, 0.5, 0.5))
+    # A sequence is framed on its first and last frames together.
+    take(scene, home, kind="gui", frame_target="all", frames=[10, 20, 5])
+    assert viewer.viewport.framed[-1] == ((-0.5, -0.5, -0.5), (20.5, 10.5, 0.5))
+
+
+def test_a_simulation_is_drawn_but_not_framed(scene: Scene, home: Path) -> None:
+    viewer = viewer_scene(scene)
+    sim = scene.node("/obj").createNode("geo", "sim")
+    sim.parmTuple("t").set((40.0, 0.0, 0.0))
+    # A simulation network's display node is not a geometry node: it has no
+    # geometry to read.
+    sim.displayNode = lambda: SimpleNamespace(path=lambda: "/obj/sim/output")
+    said = take(scene, home, kind="gui", frame_target="all")
+    assert viewer.viewport.framed == [UNIT]
+    assert not any("nothing to frame" in item for item in said["warnings"])
+    assert scene.capture.seen[-1]["settings"]["visibleObjects"] == "*"
+
+
+def test_an_instance_object_is_framed_around_what_it_copies(scene: Scene, home: Path) -> None:
+    viewer = viewer_scene(scene)
+    scene.node("/obj/boxgeo").hidden = True
+    placed = scene.node("/obj").createNode("instance", "copies")
+    placed.createNode("box", "points").setDisplayFlag(True)
+    placed.children()[0].bounds = ((0.0, 0.0, 0.0), (4.0, 0.0, 0.0))
+    placed.parm = lambda name: SimpleNamespace(
+        evalAsNodeAtFrame=lambda frame: scene.node("/obj/boxgeo")
+    )
+    take(scene, home, kind="gui", frame_target="all")
+    assert viewer.viewport.framed == [((-0.5, -0.5, -0.5), (4.5, 0.5, 0.5))]
+
+
+def test_a_viewer_away_from_objects_keeps_houdini_s_frame_all(scene: Scene, home: Path) -> None:
+    busy_scene(scene)
+    viewer = viewer_scene(scene)
+    viewer.network = scene.node("/obj/boxgeo")
+    take(scene, home, kind="gui", frame_target="all")
+    assert viewer.viewport.framed == ["all"]
+    assert scene.capture.seen[-1]["settings"]["visibleObjects"] == "*"
+
+
+def test_guides_draw_every_object(scene: Scene, home: Path) -> None:
+    busy_scene(scene)
+    viewer_scene(scene)
+    take(scene, home, kind="gui", guides=True)
+    assert scene.capture.seen[-1]["settings"]["visibleObjects"] == "*"
+    take(scene, home, guides=True)
+    assert scene.capture.seen[-1]["vobjects"] == "*"
+
+
+def test_a_scene_with_no_geometry_frames_the_origin_and_hides_the_guides(
+    scene: Scene, home: Path
+) -> None:
+    scene.node("/obj/boxgeo").destroy()
+    guide_shape(scene, "/obj", "cam", "shotcam", (20.0, 10.0, 40.0))
+    guide_shape(scene, "/obj", "null", "handle", (0.0, -25.0, 0.0))
+    viewer = viewer_scene(scene)
+    said = take(scene, home, kind="gui", frame_target="all")
+    assert viewer.viewport.framed == [UNIT]
+    assert "nothing to frame was found, so the view frames the origin" in said["warnings"]
+    mask = "* ^/obj/shotcam ^/obj/handle"
+    assert scene.capture.seen[-1]["settings"]["visibleObjects"] == mask
+    said = take(scene, home, frame_target="all")
+    assert "nothing to frame was found, so the camera frames the origin" in said["warnings"]
+    assert scene.capture.seen[-1]["vobjects"] == mask
+    assert scene.capture.seen[-1]["t"] == pytest.approx(
+        capture.fit_camera(
+            UNIT,
+            orbit=45.0,
+            elevation=25.0,
+            ortho=False,
+            aspect=1280 / 720,
+            focal=50.0,
+            aperture=41.4214,
+        )["t"]
+    )
+
+
+def test_framing_stops_at_the_cap_and_says_so(
+    scene: Scene, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    busy_scene(scene)
+    monkeypatch.setattr(capture, "MAX_FRAMED", 1)
+    viewer = viewer_scene(scene)
+    said = take(scene, home, kind="gui", frame_target="all")
+    assert viewer.viewport.framed == [UNIT]
+    assert capture.TOO_MANY_TO_FRAME in said["warnings"]
+
+
+def test_bounds_read_vectors_by_index(scene: Scene, home: Path) -> None:
+    busy_scene(scene)
+    viewer_scene(scene)
+    Vector3.overreads = 0
+    take(scene, home, kind="gui", frame_target="all")
+    take(scene, home, frame_target="all")
+    assert Vector3.overreads == 0
+
+
+def test_framing_fits_the_picture_s_shape_not_the_viewport_s(scene: Scene, home: Path) -> None:
+    viewer = viewer_scene(scene)
+    viewer.viewport.box = (0, 0, 950, 653)
+    take(scene, home, kind="gui", camera="top", resolution=[1280, 720])
+    grow = (1280 / 720) / (950 / 653)
+    [(low, high)] = viewer.viewport.framed
+    assert low == pytest.approx((-0.5 * grow,) * 3)
+    assert high == pytest.approx((0.5 * grow,) * 3)
+
+
+def test_guide_types_that_draw_their_stock_shape_are_left_out(scene: Scene, home: Path) -> None:
+    viewer = viewer_scene(scene)
+    for type_name, shape in (
+        ("pathcv", "control"),
+        ("path", "convert"),
+        ("handle", "merge"),
+        ("muscle", "muscle"),
+    ):
+        made = scene.node("/obj").createNode(type_name, f"stock_{type_name}")
+        made.parmTuple("t").set((30.0, 0.0, 0.0))
+        drawn = made.createNode(shape, "shape")
+        drawn.bounds = UNIT
+        drawn.setDisplayFlag(True)
+    # A path whose display flag is on geometry of its own is geometry.
+    own = scene.node("/obj").createNode("path", "own_path")
+    own.parmTuple("t").set((3.0, 0.0, 0.0))
+    own.createNode("box", "mine").setDisplayFlag(True)
+    take(scene, home, kind="gui", frame_target="all")
+    assert viewer.viewport.framed == [((-0.5, -0.5, -0.5), (3.5, 0.5, 0.5))]
+    assert scene.capture.seen[-1]["settings"]["visibleObjects"] == (
+        "* ^/obj/stock_pathcv ^/obj/stock_path ^/obj/stock_handle ^/obj/stock_muscle"
+    )
+
+
+def test_the_walk_stays_in_object_networks_and_is_made_once(scene: Scene, home: Path) -> None:
+    viewer = viewer_scene(scene)
+    sim = scene.node("/obj").createNode("dopnet", "f_dopnet")
+    sim.hidden = True
+    # A node inside a simulation of a type Houdini counts as geometry.
+    guide_shape(scene, "/obj/f_dopnet", "geo", "inside", (40.0, 0.0, 0.0))
+    guide_shape(scene, "/obj/f_dopnet", "null", "marker", (40.0, 0.0, 0.0))
+    scene.globbed = 0
+    take(scene, home, kind="gui", frame_target="all")
+    assert viewer.viewport.framed == [UNIT]
+    assert scene.capture.seen[-1]["settings"]["visibleObjects"] == "*"
+    # One filtered walk for each of geometry, cameras and lights.
+    assert scene.globbed == 3
+    scene.globbed = 0
+    take(scene, home, frame_target="all")
+    assert scene.globbed == 3
+
+
+def test_the_ortho_width_is_put_back_after_framing_a_perspective_view(
+    scene: Scene, home: Path
+) -> None:
+    viewer = viewer_scene(scene)
+    viewport = viewer.viewport
+    viewport.keeps_ortho_width = True
+    viewport._default.setOrthoWidth(7.7)
+    take(scene, home, kind="gui", frame_target="all")
+    assert viewport.framed == [UNIT]
+    assert viewport._default.orthoWidth() == 7.7
 
 
 # Section: grabbing a pane that is not the current tab

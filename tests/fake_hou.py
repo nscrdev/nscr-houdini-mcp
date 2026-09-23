@@ -65,18 +65,25 @@ for _kind in (Error, OperationFailed, ObjectWasDeleted, InvalidInput, Permission
 
 
 class Vector3:
-    """A vector reads as a sequence, and has no `asTuple`, as in Houdini 22."""
+    """A vector reads by index, and has no iterator and no `asTuple`, as in Houdini 22.
+
+    Anything that iterates it reads on until an index fails, which is slow in
+    a real session; each such read is counted.
+    """
+
+    # How many reads went past the last item.
+    overreads = 0
 
     def __init__(self, *values: float) -> None:
         self._values = tuple(float(value) for value in values)
-
-    def __iter__(self) -> Any:
-        return iter(self._values)
 
     def __len__(self) -> int:
         return len(self._values)
 
     def __getitem__(self, index: int) -> float:
+        if not -len(self._values) <= index < len(self._values):
+            Vector3.overreads += 1
+            raise IndexError("vector index out of range")
         return self._values[index]
 
 
@@ -882,9 +889,12 @@ class Node:
         scene._next_sid = getattr(scene, "_next_sid", 0) + 1
         self._sid = scene._next_sid
         self.parm_state_updates = 0
-        # What a capture reads: whether an object is hidden, and the box a
-        # geometry node draws when it is not a box.
+        # What a capture reads: whether an object is hidden, the frames it is
+        # shown at when that is animated, how far it moves at a frame, and the
+        # box a geometry node draws when it is not a box.
         self.hidden = False
+        self.shown_at: set[float] | None = None
+        self.moves: Any = None
         self.bounds: tuple[tuple[float, ...], tuple[float, ...]] | None = None
 
     def name(self) -> str:
@@ -1064,7 +1074,10 @@ class Node:
         return tuple(self.stickies)
 
     def childTypeCategory(self) -> Any:  # noqa: N802 - the name is Houdini's
-        return SimpleNamespace(nodeTypes=lambda: dict.fromkeys(self._scene.types, None))
+        return SimpleNamespace(
+            nodeTypes=lambda: dict.fromkeys(self._scene.types, None),
+            name=lambda: _category(self),
+        )
 
     # Section: what a capture reads and changes
 
@@ -1108,17 +1121,42 @@ class Node:
         return next((child for child in self._children if "Display" in child.flags), None)
 
     def isObjectDisplayed(self) -> bool:  # noqa: N802 - the name is Houdini's
+        # An object in a hidden subnet is hidden with it.
+        if self._parent is not None and self._parent._type.name() == "subnet":
+            return not self.hidden and self._parent.isObjectDisplayed()
         return not self.hidden
+
+    def recursiveGlob(self, pattern: str, filter: str) -> tuple[Node, ...]:  # noqa: A002, N802
+        """Every node below of the kind asked for, as `nodeTypeFilter` names it."""
+        assert pattern == "*", pattern
+        self._scene.globbed += 1
+        wanted = OBJECT_KINDS[filter]
+        return tuple(node for node in self.allSubChildren() if node._type.name() in wanted)
+
+    def isObjectDisplayedAtFrame(self, frame: float) -> bool:  # noqa: N802 - the name is Houdini's
+        if self.shown_at is not None and float(frame) not in self.shown_at:
+            return False
+        return self.isObjectDisplayed()
 
     def worldTransform(self) -> Matrix4:  # noqa: N802 - the name is Houdini's
         t = self.parmTuple("t")
         return Matrix4.translation(*(float(parm.eval()) for parm in t)) if t else Matrix4(0.0)
+
+    def worldTransformAtTime(self, time: float) -> Matrix4:  # noqa: N802 - the name is Houdini's
+        t = self.parmTuple("t")
+        if t is None:
+            return Matrix4(0.0)
+        moved = self.moves(time_to_frame(time)) if self.moves else (0.0, 0.0, 0.0)
+        return Matrix4.translation(*(float(p.eval()) + d for p, d in zip(t, moved, strict=True)))
 
     def geometry(self) -> Geometry:
         bounds = self.bounds
         if bounds is None and self._type.name() == "box":
             bounds = UNIT_BOX
         return Geometry(bounds)
+
+    def geometryAtFrame(self, frame: float) -> Geometry:  # noqa: N802 - the name is Houdini's
+        return self.geometry()
 
     def render(self, frame_range: Any = None, **rest: Any) -> None:
         """What a flipbook render node does: one picture per frame, at the picture's path."""
@@ -1153,6 +1191,33 @@ class Node:
         return node
 
 
+def time_to_frame(time: float) -> float:
+    return time * 24.0 + 1.0
+
+
+# Houdini's kinds of object, by the types `nodeTypeFilter` matches, as a real
+# 22.0 sorts them: a null, a bone and a subnet count as geometry too.
+OBJECT_KINDS = {
+    "ObjGeometry": (
+        "geo",
+        "null",
+        "subnet",
+        "bone",
+        "rivet",
+        "fetch",
+        "blend",
+        "instance",
+        "dopnet",
+        "path",
+        "pathcv",
+        "handle",
+        "muscle",
+    ),
+    "ObjCamera": ("cam",),
+    "ObjLight": ("hlight::2.0", "envlight", "ambient"),
+}
+
+
 def _category(parent: Node | None) -> str:
     """Which network a node lives in, which is what decides its category."""
     if parent is None:
@@ -1164,6 +1229,10 @@ def _category(parent: Node | None) -> str:
         return "Cop"
     if kind in ("img", "cop2net"):
         return "Cop2"
+    if kind == "subnet" and parent._type.category().name() == "Object":
+        return "Object"
+    if kind == "dopnet":
+        return "Dop"
     return {"/obj": "Object", "/out": "Driver", "/stage": "Lop"}.get(parent.path(), "Sop")
 
 
@@ -1742,8 +1811,10 @@ class Scene:
         self.types = types
         self.undos = Undos()
         self.ui = MainThread()
-        # How many times any node was asked for its children.
+        # How many times any node was asked for its children, and how many
+        # filtered walks of a network were made.
         self.listed = 0
+        self.globbed = 0
         self.root = Node(self, "", "root", None)
         self._counts: dict[str, int] = {}
         # What a person has selected in the interface.
@@ -1908,6 +1979,8 @@ class Scene:
             imageLayerStorageType=SimpleNamespace(Fixed8="Fixed8", Float32="Float32"),
             ImageLayer=ImageLayer,
             BoundingBox=BoundingBox,
+            nodeTypeFilter=SimpleNamespace(**{kind: kind for kind in OBJECT_KINDS}),
+            frameToTime=lambda frame: (float(frame) - 1.0) / 24.0,
             hmath=SimpleNamespace(buildRotate=build_rotate),
             Vector3=Vector3,
             Matrix4=Matrix4,
@@ -2056,6 +2129,10 @@ class Viewport:
         self.framed: list[Any] = []
         # Set to make putting the viewport's own camera back fail.
         self.refuse_default = False
+        # Set to have a perspective view keep its ortho width when given a camera.
+        self.keeps_ortho_width = False
+        # Where the viewport sits in its pane, and its width and height.
+        self.box: tuple[int, int, int, int] | None = None
 
     def type(self) -> str:
         return self._type
@@ -2075,15 +2152,26 @@ class Viewport:
         self._camera = None
 
     def defaultCamera(self) -> ViewCamera:  # noqa: N802 - the name is Houdini's
-        return self._default.stash()
+        # The viewport's own camera, not a copy: what is set on it is set.
+        return self._default
 
     def setDefaultCamera(self, view: ViewCamera) -> None:  # noqa: N802 - the name is Houdini's
         if self.refuse_default:
             raise OperationFailed("the viewport would not take its camera")
+        width = self._default.orthoWidth()
         self._default = view.stash()
+        if self._type == "Perspective" and self.keeps_ortho_width:
+            # As a real 22.0.429 perspective view was seen to do: the ortho
+            # width it had stays, whatever the camera given says.
+            self._default.setOrthoWidth(width)
 
     def settings(self) -> ViewportSettings:
         return self._settings
+
+    def size(self) -> tuple[int, int, int, int]:
+        if self.box is None:
+            raise OperationFailed("the viewport has no size yet")
+        return self.box
 
     def frameAll(self) -> None:  # noqa: N802 - the name is Houdini's
         self.framed.append("all")
@@ -2095,8 +2183,10 @@ class Viewport:
         self._default.setTranslation((6.0, 6.0, 6.0))
 
     def frameBoundingBox(self, box: BoundingBox) -> None:  # noqa: N802 - the name is Houdini's
-        self.framed.append((tuple(box.minvec()), tuple(box.maxvec())))
+        low, high = box.minvec(), box.maxvec()
+        self.framed.append(((low[0], low[1], low[2]), (high[0], high[1], high[2])))
         self._default.setTranslation((7.0, 7.0, 7.0))
+        self._default.setOrthoWidth(5.03)
 
     def viewTransform(self) -> Matrix4:  # noqa: N802 - the name is Houdini's
         translation = self._default.translation()
@@ -2223,6 +2313,11 @@ class SceneViewerTab(Tab):
         super().__init__(scene, PaneTabType.SceneViewer, name)
         self.viewport = Viewport()
         self.settings = FlipbookSettings()
+        # The network the viewer shows.
+        self.network = scene.node("/obj")
+
+    def pwd(self) -> Node | None:
+        return self.network
 
     def curViewport(self) -> Viewport:  # noqa: N802 - the name is Houdini's
         return self.viewport
@@ -2441,9 +2536,13 @@ class CaptureStandIn:
     def shown_objects(self, vobjects: str = "*", forced: str = "") -> list[Node]:
         root = self.scene.node("/obj")
         objects = [] if root is None else list(root._children)
-        wanted = set(vobjects.split())
+        wanted = {item for item in vobjects.split() if not item.startswith("^")}
+        left_out = {item[1:] for item in vobjects.split() if item.startswith("^")}
         picked = [
-            node for node in objects if ("*" in wanted and not node.hidden) or node.path() in wanted
+            node
+            for node in objects
+            if node.path() not in left_out
+            and (("*" in wanted and not node.hidden) or node.path() in wanted)
         ]
         picked += [node for node in objects if node.path() in forced.split()]
         return [node for node in picked if node._type.name() != "cam"]
@@ -2540,7 +2639,7 @@ class CaptureStandIn:
         )
         if not self.writes:
             return
-        shown = self.anything_shown(self.shown_objects())
+        shown = self.anything_shown(self.shown_objects(str(values["visibleObjects"])))
         frame = float(start)
         while frame <= float(end):
             path = str(values["output"]).replace("$F4", f"{int(frame):04d}")

@@ -295,3 +295,213 @@ def test_quad_and_a_two_frame_sequence(place: dict[str, Any]) -> None:
     assert all(is_png(item) for item in frames["paths"])
     plausible(frames["image_stats"])
     assert look(place) == before
+
+
+# A shown camera, light and null away from the box, with the null's cross in
+# front of the box where a capture would draw it.
+AROUND = """
+obj = hou.node('/obj')
+cam = obj.createNode('cam', 'sidecam')
+cam.parmTuple('t').set((6, 3, 0))
+light = obj.createNode('hlight::2.0', 'sidelight')
+light.parmTuple('t').set((-5, 4, 2))
+marker = obj.createNode('null', 'marker')
+marker.parmTuple('t').set((0.3, 0.3, 0.9))
+result = [cam.path(), light.path(), marker.path()]
+"""
+
+
+def green(path: str) -> int:
+    """How many drawn pixels are the green a null's cross is drawn in."""
+    with Image.open(path) as image:
+        data = image.convert("RGBA").tobytes()
+    pixels = (data[index : index + 4] for index in range(0, len(data), 4))
+    return sum(1 for r, g, b, a in pixels if a and g > r + 40 and g > b + 40)
+
+
+def test_framing_all_leaves_out_cameras_lights_and_nulls(place: dict[str, Any]) -> None:
+    before = look(place)
+    [made] = run(place, ("hou_python", {"code": AROUND}))
+    extras = ok(made)["result"]
+    try:
+        plain, guided = run(
+            place,
+            ("hou_capture", {"frame_target": "all", "resolution": [320, 180]}),
+            ("hou_capture", {"frame_target": "all", "guides": True, "resolution": [320, 180]}),
+        )
+    finally:
+        gone = "\n".join(f"hou.node({path!r}).destroy()" for path in extras)
+        run(place, ("hou_python", {"code": gone}))
+    body = ok(plain)
+    assert body["camera"]["target"] == "all"
+    assert not any("nothing to frame" in item for item in body.get("warnings", []))
+    framed(body["path"])
+    assert green(body["path"]) == 0
+    # With guides the null's cross is drawn, and the framing is the same.
+    framed(ok(guided)["path"])
+    assert green(ok(guided)["path"]) > 20
+    after = look(place)
+    assert after["obj"] == before["obj"]
+    assert after["out"] == []
+
+
+def around(place: dict[str, Any], code: str, *calls: tuple[str, dict]) -> list[Any]:
+    """Captures in a scene with more in it, which is taken away again after.
+
+    `code` returns the paths it made; the box's object is shown again after,
+    whatever the code did with it.
+    """
+    before = look(place)
+    [made] = run(place, ("hou_python", {"code": code}))
+    extras = ok(made)["result"]
+    try:
+        return run(place, *calls)
+    finally:
+        gone = "\n".join(f"hou.node({path!r}).destroy()" for path in extras)
+        gone += "\nhou.node('/obj/boxgeo').setDisplayFlag(True)"
+        run(place, ("hou_python", {"code": gone}))
+        after = look(place)
+        assert after["obj"] == before["obj"]
+        assert after["out"] == []
+
+
+def drawn_box(path: str) -> tuple[float, float]:
+    """The width and height of what is drawn, as shares of the frame."""
+    with Image.open(path) as image:
+        width, height = image.size
+        left, top, right, bottom = image.getchannel("A").getbbox()
+    return (right - left) / width, (bottom - top) / height
+
+
+# A simulation network shown, as every shelf simulation makes one.
+SIMULATION = """
+dop = hou.node('/obj').createNode('dopnet', 'sim')
+dop.setDisplayFlag(True)
+result = [dop.path()]
+"""
+
+
+def test_a_shown_simulation_does_not_stop_a_capture_of_all(place: dict[str, Any]) -> None:
+    [result] = around(
+        place,
+        SIMULATION,
+        ("hou_capture", {"frame_target": "all", "resolution": [320, 180]}),
+    )
+    body = ok(result)
+    assert body["route"] == "flipbook_rop"
+    framed(body["path"])
+
+
+# An instance object copying a ball onto its point, beside the box. The ball's
+# own object is hidden; the copy is drawn anyway.
+INSTANCES = """
+obj = hou.node('/obj')
+source = obj.createNode('geo', 'ballsource')
+source.createNode('sphere').setDisplayFlag(True)
+source.setDisplayFlag(False)
+placed = obj.createNode('instance', 'copies')
+placed.parm('instancepath').set(source.path())
+placed.parm('ptinstance').set('on')
+placed.parmTuple('t').set((2.5, 0, 0))
+result = [placed.path(), source.path()]
+"""
+
+
+def test_an_instance_object_is_drawn_and_framed(place: dict[str, Any]) -> None:
+    [result] = around(
+        place,
+        INSTANCES,
+        ("hou_capture", {"camera": "front", "frame_target": "all", "resolution": [320, 180]}),
+    )
+    body = ok(result)
+    framed(body["path"])
+    # The box and the ball side by side: four units across, two up.
+    across, up = drawn_box(body["path"])
+    assert across * 320 / (up * 180) > 1.6, (across, up)
+
+
+# A ball above the box, shown only at frame 10, while the scene is at frame 1.
+LATE = """
+obj = hou.node('/obj')
+late = obj.createNode('geo', 'late')
+late.createNode('sphere').setDisplayFlag(True)
+late.parmTuple('t').set((0, 3, 0))
+late.parm('tdisplay').set(True)
+late.parm('display').setExpression('$F == 10')
+hou.setFrame(1)
+result = [late.path()]
+"""
+
+
+def test_an_object_shown_only_at_the_frame_captured_is_drawn_and_framed(
+    place: dict[str, Any],
+) -> None:
+    [result] = around(
+        place,
+        LATE,
+        (
+            "hou_capture",
+            {"camera": "front", "frame_target": "all", "frame": 10, "resolution": [320, 180]},
+        ),
+    )
+    body = ok(result)
+    framed(body["path"])
+    # The box and the ball above it: two units across, four and a half up.
+    across, up = drawn_box(body["path"])
+    assert up * 180 / (across * 320) > 1.6, (across, up)
+
+
+# Nothing but a null: the box's object is hidden for the call.
+ONLY_A_NULL = """
+hou.node('/obj/boxgeo').setDisplayFlag(False)
+marker = hou.node('/obj').createNode('null', 'marker')
+result = [marker.path()]
+"""
+
+
+def test_a_scene_with_only_a_null_draws_no_cross_without_guides(place: dict[str, Any]) -> None:
+    plain, guided = around(
+        place,
+        ONLY_A_NULL,
+        ("hou_capture", {"frame_target": "all", "resolution": [320, 180]}),
+        ("hou_capture", {"frame_target": "all", "guides": True, "resolution": [320, 180]}),
+    )
+    # Without guides nothing is drawn, so there is no picture to give.
+    assert plain.is_error
+    assert "CAPTURE_EMPTY" in plain.content[0].text
+    body = ok(guided)
+    assert any("frames the origin" in item for item in body["warnings"])
+    assert green(body["path"]) > 20
+
+
+# Fifteen hundred boxes, then the time framing all of them takes in the worker,
+# cooked once first, as a capture would find them.
+MANY = """
+import time
+from nscr_houdini_mcp.bridge import capture
+obj = hou.node('/obj')
+made = []
+for index in range(1500):
+    geo = obj.createNode('geo', f'many{index}')
+    geo.createNode('box').setDisplayFlag(True)
+    geo.parmTuple('t').set((index % 50, index // 50, 0))
+    made.append(geo)
+nodes, capped = capture.drawn_objects(hou, (1.0,))
+capture.world_bounds(hou, nodes, (1.0,))
+started = time.perf_counter()
+bounds = capture.world_bounds(hou, nodes, (1.0,))
+took = time.perf_counter() - started
+for geo in made:
+    geo.destroy()
+result = {'took': took, 'count': len(nodes), 'capped': capped, 'bounds': bounds}
+"""
+
+
+def test_framing_many_objects_is_quick(place: dict[str, Any]) -> None:
+    [said] = run(place, ("hou_python", {"code": MANY}))
+    result = ok(said)["result"]
+    assert result["count"] == 1501 and result["capped"] is False
+    assert result["bounds"][1][:2] == [49.5, 29.5]
+    # About 10 microseconds an object, 17 ms in all; reading the vectors with
+    # list() took 0.3 s here. The bound leaves room for a busy machine.
+    assert result["took"] < 0.15, result["took"]
