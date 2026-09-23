@@ -45,7 +45,15 @@ crop it to the pane. Nothing here walks the widget tree.
 
 Everything made for a capture, the render node, a fitted camera and a moved
 display flag, is made and taken away with undo turned off, so the artist's
-undo history is as it was. A route that finishes without writing a file, or
+undo history is as it was. Every step that puts something back is tried,
+whatever the one before it did; a step that fails makes a capture that
+worked `CLEANUP_FAILED`, and goes in the details of one that did not. A
+viewport sequence is flipbooked a few frames at a time, so it can be stopped
+between them and says how far it got. The job row names each run, where its
+files go and which frames are written, from the moment a place is handed
+out, so a session that dies part way leaves a record of what it wrote.
+
+A route that finishes without writing a file, or
 writes an empty one, counts as a route that did not work, and the next one is
 tried, and whatever frames it wrote are taken away. When a route that
 applies ran and Houdini stopped it with an error, the answer is
@@ -136,6 +144,38 @@ PANE_HINT = "a pane exists only in a session with a user interface"
 
 class Unavailable(Exception):
     """This route cannot make the picture here. The next one is tried."""
+
+
+class Stopped(Exception):
+    """The call was asked to stop before any frame was written."""
+
+
+# How many frames one viewport flipbook call writes, so a long sequence can be
+# stopped, and reports how far it got, between calls.
+FLIPBOOK_PIECE = 8
+
+
+class Attempt:
+    """One route's try: the clean up steps that failed, and a note of each file written.
+
+    Every clean up step is tried, whatever the one before it did, and a step
+    that fails is kept rather than swallowed, so a capture never says it went
+    well while it left something of the scene or the view changed.
+    """
+
+    def __init__(self, wrote: Callable[[list[str]], Any] | None = None) -> None:
+        self.failures: list[dict[str, str]] = []
+        self._wrote = wrote
+
+    def attempt(self, step: str, action: Callable[[], Any]) -> None:
+        try:
+            action()
+        except Exception as error:  # noqa: BLE001 - every step is tried; each failure is kept
+            self.failures.append({"step": step, "error": _reason(error)})
+
+    def wrote(self, files: Sequence[str]) -> None:
+        if self._wrote is not None:
+            _quiet(lambda: self._wrote(list(files)))
 
 
 # Section: what was asked for
@@ -349,6 +389,7 @@ def capture_image(arguments: Mapping[str, Any], context: ToolContext) -> dict[st
     warnings: list[str] = []
     unsaved = False
     stopped = False
+    written = JobOutputs(context)
     for label, camera in wanted:
         if shots and context.should_stop():
             stopped = True
@@ -358,22 +399,44 @@ def capture_image(arguments: Mapping[str, Any], context: ToolContext) -> dict[st
         unsaved = unsaved or bool(plan.unsaved_hip)
         warnings.extend(item for item in plan.warnings if item not in warnings)
         path = sequence_path(plan.path) if spec.sequence else plan.path
+        index = written.planned(label, plan, path)
         try:
-            shot = shoot(hou, context, spec, camera, path, frames, gui)
+            shot = shoot(
+                hou,
+                context,
+                spec,
+                camera,
+                path,
+                frames,
+                gui,
+                lambda files, index=index: written.wrote(index, files),
+            )
+        except BridgeError as error:
+            files = list(getattr(error, "files", ()))
+            if files:
+                # The picture is there; only the clean up went wrong.
+                _record(context, plan, files)
+            else:
+                _release(context, plan)
+            raise
         except BaseException:
             # Nothing was written under this place, so its claim and record go.
             _release(context, plan)
             raise
-        _record(context, plan, shot["files"])
+        if shot["files"]:
+            _record(context, plan, shot["files"])
+        else:
+            _release(context, plan)
+        written.wrote(index, shot["files"])
         warnings.extend(item for item in shot.pop("warnings", ()) if item not in warnings)
         if shot.get("stopped_early"):
             stopped = True
             kept = "the frames written before the stop are kept, and listed"
-            if kept not in warnings:
+            if shot["files"] and kept not in warnings:
                 warnings.append(kept)
         shots.append({"view": label, "run_id": plan.run_id, "template": plan.template, **shot})
     sheet = None
-    if len(wanted) > 1 and len(shots) == len(wanted):
+    if len(wanted) > 1 and len(shots) == len(wanted) and not stopped:
         plan = output_plan(context, hou, "capture", f"{spec.name}_sheet", "png")
         sheet = {"path": plan.path, "run_id": plan.run_id, "template": plan.template}
     return {
@@ -388,6 +451,62 @@ def capture_image(arguments: Mapping[str, Any], context: ToolContext) -> dict[st
         "warnings": warnings,
         "region": _region(arguments.get("region")),
     }
+
+
+class JobOutputs:
+    """What the capture has written so far, kept on its job row as it goes.
+
+    Written as soon as each place is handed out and again after every frame,
+    so a job whose session dies part way still says which runs it had, where
+    their files go and which frames are there, for whoever reports on it or
+    clears it away. The row takes the capture's answer in place of this when
+    the call ends. Best effort: a store that cannot be written costs the note,
+    never the capture.
+    """
+
+    def __init__(self, context: ToolContext) -> None:
+        from nscr_houdini_mcp import jobs as job_rules
+
+        self._context = context
+        self._job_id = (
+            job_rules.job_id_for(context.operation_id)
+            if context.operation_id and context.open_store is not None
+            else None
+        )
+        self.runs: list[dict[str, Any]] = []
+
+    def planned(self, view: str, plan: Any, path: str) -> int:
+        self.runs.append(
+            {
+                "view": view,
+                "run_id": plan.run_id,
+                "path": path,
+                "sidecar": plan.sidecar,
+                "files": [],
+            }
+        )
+        self._write()
+        return len(self.runs) - 1
+
+    def wrote(self, index: int, files: Sequence[str]) -> None:
+        self.runs[index]["files"] = list(files)
+        self._write()
+
+    def _write(self) -> None:
+        if self._job_id is None:
+            return
+        outputs = {
+            "capture": {
+                "runs": self.runs,
+                "frames_done": sum(len(run["files"]) for run in self.runs),
+            }
+        }
+
+        def write() -> None:
+            with self._context.open_store() as store:
+                store.update_job(self._job_id, outputs=outputs)
+
+        _quiet(write)
 
 
 def _record(context: ToolContext, plan: Any, files: Sequence[str]) -> None:
@@ -477,23 +596,45 @@ def shoot(
     path: str,
     frames: Sequence[float],
     gui: bool,
+    wrote: Callable[[list[str]], Any] | None = None,
 ) -> dict[str, Any]:
-    """One view, by the first route that writes it."""
+    """One view, by the first route that writes it.
+
+    A route that fails takes its frames with it. A clean up step that failed
+    on any route is reported: as `CLEANUP_FAILED` when a route then wrote the
+    picture, and in the details of the error when none did.
+    """
     tried: list[dict[str, Any]] = []
+    cleanup: list[dict[str, str]] = []
     for route, run in routes_for(spec.source, gui):
+        attempt = Attempt(wrote)
         try:
-            shot = run(hou, context, spec, camera, path, frames, gui)
+            shot = run(hou, context, spec, camera, path, frames, gui, attempt)
+        except Stopped:
+            cleanup += attempt.failures
+            shot = {"files": [], "frames": [], "camera": None, "native": None}
+            shot.update(route=route, stopped_early=True)
+            if cleanup:
+                raise cleanup_failed(spec, route, cleanup, shot) from None
+            return shot
         except Unavailable as reason:
             discard(frame_files(path, frames, spec.sequence))
+            cleanup += attempt.failures
             tried.append({"route": route, "reason": str(reason)})
             continue
         except BaseException as error:
             # A route that failed part way leaves nothing behind it.
             discard(frame_files(path, frames, spec.sequence))
-            if isinstance(error, BridgeError) or not _is_hou_error(error):
+            cleanup += attempt.failures
+            if isinstance(error, BridgeError):
+                if cleanup:
+                    error.details["cleanup"] = cleanup
+                raise
+            if not _is_hou_error(error):
                 raise
             tried.append({"route": route, "reason": _reason(error), "failed": True})
             continue
+        cleanup += attempt.failures
         written = [item for item in shot["files"] if _written(item)]
         if not written or len(written) < len(shot["files"]):
             discard(frame_files(path, frames, spec.sequence))
@@ -502,12 +643,17 @@ def shoot(
         shot["route"] = route
         if tried:
             shot["tried"] = tried
+        if cleanup:
+            raise cleanup_failed(spec, route, cleanup, shot)
         return shot
+    details: dict[str, Any] = {"source": spec.source, "tried": tried}
+    if cleanup:
+        details["cleanup"] = cleanup
     if tried and all(item["reason"] == NO_FILE for item in tried):
         raise BridgeError(
             "CAPTURE_EMPTY",
             "every route ran and none wrote an image",
-            {"source": spec.source, "tried": tried},
+            details,
             hint="check the camera and the node shown, then capture again",
         )
     failed = [item for item in tried if item.get("failed")]
@@ -516,16 +662,36 @@ def shoot(
         raise BridgeError(
             "CAPTURE_FAILED",
             "the capture ran and Houdini stopped it with an error",
-            {"source": spec.source, "error": failed[-1]["reason"], "tried": tried},
+            {**details, "error": failed[-1]["reason"]},
             hint="check the camera and the node shown, and the error in the details",
         )
     hint = {"network": NETWORK_HINT, "pane": PANE_HINT}.get(spec.source)
     raise BridgeError(
         "UI_UNAVAILABLE",
         f"no route could capture the {spec.source} in this session",
-        {"source": spec.source, "gui": gui, "tried": tried},
+        {**details, "gui": gui},
         hint=hint or "use a source this session can show, or a session with a user interface",
     )
+
+
+def cleanup_failed(
+    spec: Spec, route: str, cleanup: list[dict[str, str]], shot: Mapping[str, Any]
+) -> BridgeError:
+    """The picture was made and something the capture changed was not put back."""
+    error = BridgeError(
+        "CLEANUP_FAILED",
+        "the capture was written, and part of what it changed could not be put back",
+        {
+            "source": spec.source,
+            "route": route,
+            "cleanup": cleanup,
+            "frames": list(shot.get("frames") or ()),
+        },
+        hint="look at the scene and the view for the steps named in the details",
+    )
+    # The files written, for the run record; never sent in the error itself.
+    error.files = list(shot.get("files") or ())  # type: ignore[attr-defined]
+    return error
 
 
 def routes(hou: Any) -> list[str]:
@@ -578,17 +744,31 @@ def scene_viewers(hou: Any) -> list[Any]:
 
 
 def viewport_route(
-    hou: Any, context: ToolContext, spec: Spec, camera: Any, path: str, frames: Any, gui: bool
+    hou: Any,
+    context: ToolContext,
+    spec: Spec,
+    camera: Any,
+    path: str,
+    frames: Any,
+    gui: bool,
+    attempt: Attempt,
 ) -> dict[str, Any]:
     """The Scene Viewer that is showing."""
     showing = [tab for tab in scene_viewers(hou) if _quiet(tab.isCurrentTab)]
     if not showing:
         raise Unavailable("no Scene Viewer is showing")
-    return flipbook_viewer(hou, spec, camera, showing[0], path, frames)
+    return flipbook_viewer(hou, context, spec, camera, showing[0], path, frames, attempt)
 
 
 def viewport_tab_route(
-    hou: Any, context: ToolContext, spec: Spec, camera: Any, path: str, frames: Any, gui: bool
+    hou: Any,
+    context: ToolContext,
+    spec: Spec,
+    camera: Any,
+    path: str,
+    frames: Any,
+    gui: bool,
+    attempt: Attempt,
 ) -> dict[str, Any]:
     """A Scene Viewer made the current tab of its pane for the capture, then put back."""
     tabs = scene_viewers(hou)
@@ -601,20 +781,34 @@ def viewport_tab_route(
     previous = _quiet(pane.currentTab) if pane is not None else None
     tab.setIsCurrentTab()
     try:
-        return flipbook_viewer(hou, spec, camera, tab, path, frames)
+        return flipbook_viewer(hou, context, spec, camera, tab, path, frames, attempt)
     finally:
         if previous is not None and previous is not tab:
-            _quiet(previous.setIsCurrentTab)
+            attempt.attempt("make the tab that was showing current again", previous.setIsCurrentTab)
 
 
 def flipbook_viewer(
-    hou: Any, spec: Spec, camera: Any, viewer: Any, path: str, frames: Sequence[float]
+    hou: Any,
+    context: ToolContext,
+    spec: Spec,
+    camera: Any,
+    viewer: Any,
+    path: str,
+    frames: Sequence[float],
+    attempt: Attempt,
 ) -> dict[str, Any]:
-    """Flipbook one viewer's current viewport, with its view put back after."""
+    """Flipbook one viewer's current viewport, with its view put back after.
+
+    A sequence goes a few frames per flipbook, looking between them at
+    whether the call should stop and saying how far it has got, since one
+    flipbook cannot be stopped from here once it has begun.
+    """
     viewport = viewer.curViewport()
     if viewport is None:
         raise Unavailable("the Scene Viewer has no viewport")
     saved = ViewState.save(hou, viewport)
+    done: list[float] = []
+    stopped = False
     try:
         described, warnings = apply_view(hou, spec, camera, viewport)
         settings, unset = flipbook_settings(hou, viewer, spec, path, frames)
@@ -623,16 +817,33 @@ def flipbook_viewer(
                 "these flipbook settings could not be set and keep the artist's: "
                 + ", ".join(unset)
             )
-        viewer.flipbook(viewport=viewport, settings=settings, open_dialog=False)
+        for start in range(0, len(frames), FLIPBOOK_PIECE):
+            if context.should_stop():
+                if not done:
+                    raise Stopped
+                stopped = True
+                break
+            piece = list(frames[start : start + FLIPBOOK_PIECE])
+            settings.frameRange((piece[0], piece[-1]))
+            viewer.flipbook(viewport=viewport, settings=settings, open_dialog=False)
+            done += piece
+            attempt.wrote(frame_files(path, done, spec.sequence))
+            if len(frames) > 1 and context.progress is not None:
+                context.progress(
+                    {"done": len(done), "total": len(frames), "message": f"frame {piece[-1]:g}"}
+                )
     finally:
-        saved.restore(hou, viewport)
-    return {
-        "files": frame_files(path, frames, spec.sequence),
-        "frames": list(frames),
+        saved.restore(hou, viewport, attempt)
+    shot = {
+        "files": frame_files(path, done, spec.sequence),
+        "frames": done,
         "camera": described,
         "native": list(spec.resolution),
         "warnings": warnings,
     }
+    if stopped:
+        shot["stopped_early"] = True
+    return shot
 
 
 # A setting whose value this build does not name.
@@ -720,21 +931,29 @@ class ViewState:
             shading=shading,
         )
 
-    def restore(self, hou: Any, viewport: Any) -> None:
+    def restore(self, hou: Any, viewport: Any, attempt: Attempt) -> None:
         """Put each thing back on its own, so one that fails leaves the rest done."""
         if self.kind is not None:
-            _quiet(lambda: viewport.changeType(self.kind))
+            attempt.attempt("put the view type back", lambda: viewport.changeType(self.kind))
         if self.camera is not None:
-            _quiet(lambda: viewport.setCamera(self.camera))
+            attempt.attempt(
+                "look through the camera again", lambda: viewport.setCamera(self.camera)
+            )
         else:
-            _quiet(viewport.useDefaultCamera)
-        _quiet(lambda: viewport.setDefaultCamera(self.default))
-        settings = _quiet(viewport.settings)
+            attempt.attempt("look through the viewport's own camera", viewport.useDefaultCamera)
+        attempt.attempt(
+            "put the viewport's camera back", lambda: viewport.setDefaultCamera(self.default)
+        )
         for name, mode in self.shading.items():
             kind = getattr(hou.displaySetType, name, None)
             if kind is None or mode is None:
                 continue
-            _quiet(lambda kind=kind, mode=mode: settings.displaySet(kind).setShadedMode(mode))
+            attempt.attempt(
+                f"put the {name} shading back",
+                lambda kind=kind, mode=mode: (
+                    viewport.settings().displaySet(kind).setShadedMode(mode)
+                ),
+            )
 
 
 def apply_view(
@@ -805,6 +1024,7 @@ def rop_route(
     path: str,
     frames: Sequence[float],
     gui: bool,
+    attempt: Attempt,
 ) -> dict[str, Any]:
     """Render through a flipbook render node made for the capture and taken away after."""
     parent = _quiet(lambda: hou.node(ROP_PARENT))
@@ -815,7 +1035,7 @@ def rop_route(
         raise Unavailable(f"this build has no {ROP_TYPE} render node")
     isolated = hou.node(spec.path) if spec.source == "node" else None
     made: list[Any] = []
-    put_back: list[Callable[[], Any]] = []
+    put_back: list[tuple[str, Callable[[], Any]]] = []
     done: list[float] = []
     stopped = False
     scale: float | None = 1.0
@@ -831,7 +1051,7 @@ def rop_route(
                 # A pool worker draws offscreen at one pixel to a point. A
                 # session with a user interface, or a hython started some
                 # other way, draws at its screen's ratio.
-                scale = drawing_scale(hou, parent, os.path.dirname(path))
+                scale = drawing_scale(hou, parent, os.path.dirname(path), attempt)
             camera_path, described, warnings = rop_camera(
                 hou, spec, camera, targets, made, scale or 1.0
             )
@@ -851,20 +1071,23 @@ def rop_route(
                 _set(rop, "vobjects", " ".join(objects))
                 _set(rop, "forceobjects", " ".join(objects))
             for index, frame in enumerate(frames):
-                if done and context.should_stop():
+                if context.should_stop():
+                    if not done:
+                        raise Stopped
                     stopped = True
                     break
                 rop.render(frame_range=(frame, frame))
                 done.append(frame)
+                attempt.wrote(frame_files(path, done, spec.sequence))
                 if len(frames) > 1 and context.progress is not None:
                     context.progress(
                         {"done": index + 1, "total": len(frames), "message": f"frame {frame:g}"}
                     )
         finally:
-            for step in reversed(put_back):
-                _quiet(step)
+            for label, step in reversed(put_back):
+                attempt.attempt(label, step)
             for node in reversed(made):
-                _quiet(node.destroy)
+                attempt.attempt(f"take away {_quiet(node.path)}", node.destroy)
     shot: dict[str, Any] = {
         "files": frame_files(path, done, spec.sequence),
         "frames": done,
@@ -937,7 +1160,7 @@ def needs_scale(hou: Any) -> bool:
     return screen_ratio(hou) != 1.0
 
 
-def drawing_scale(hou: Any, parent: Any, folder: str) -> float | None:
+def drawing_scale(hou: Any, parent: Any, folder: str, attempt: Attempt) -> float | None:
     """How much larger than asked the render node draws, in a session with a user interface.
 
     On a screen whose pixels are denser than its points, Qt can make a render
@@ -988,7 +1211,7 @@ def drawing_scale(hou: Any, parent: Any, folder: str) -> float | None:
         scale = None
     finally:
         for node in reversed(made):
-            _quiet(node.destroy)
+            attempt.attempt(f"take away {_quiet(node.path)}", node.destroy)
         discard([probe_file])
     if scale is not None:
         _found[:] = [hou, ratio, platform, scale]
@@ -1119,20 +1342,33 @@ def _free_name(parent: Any, base: str) -> str:
     return f"{base}{index}"
 
 
-def isolate(node: Any) -> tuple[list[str], list[Callable[[], Any]]]:
+def isolate(node: Any) -> tuple[list[str], list[tuple[str, Callable[[], Any]]]]:
     """Show one node alone: its object, and the node carrying the display flag.
 
     Returns the objects the render draws and the steps that put the flags
-    back, which run after the capture whatever happened.
+    back, which run after the capture whatever happened: the node that had
+    the flag gets it again, and when none had it the node gives it up.
     """
     owner = _object_of(node)
-    put_back: list[Callable[[], Any]] = []
+    put_back: list[tuple[str, Callable[[], Any]]] = []
     if owner is not node:
         previous = _quiet(owner.displayNode)
         if previous is None or _quiet(previous.path) != _quiet(node.path):
             node.setDisplayFlag(True)
             if previous is not None:
-                put_back.append(lambda: previous.setDisplayFlag(True))
+                put_back.append(
+                    (
+                        f"give the display flag back to {_quiet(previous.path)}",
+                        lambda: previous.setDisplayFlag(True),
+                    )
+                )
+            else:
+                put_back.append(
+                    (
+                        f"take the display flag off {_quiet(node.path)}",
+                        lambda: node.setDisplayFlag(False),
+                    )
+                )
     return [owner.path()], put_back
 
 
@@ -1408,7 +1644,14 @@ def _category(node: Any) -> str | None:
 
 
 def cop_layer_route(
-    hou: Any, context: ToolContext, spec: Spec, camera: Any, path: str, frames: Any, gui: bool
+    hou: Any,
+    context: ToolContext,
+    spec: Spec,
+    camera: Any,
+    path: str,
+    frames: Any,
+    gui: bool,
+    attempt: Attempt,
 ) -> dict[str, Any]:
     """A Copernicus node's image layer, written as an 8 bit PNG."""
     node = hou.node(spec.path)
@@ -1427,7 +1670,14 @@ def cop_layer_route(
 
 
 def cop2_route(
-    hou: Any, context: ToolContext, spec: Spec, camera: Any, path: str, frames: Any, gui: bool
+    hou: Any,
+    context: ToolContext,
+    spec: Spec,
+    camera: Any,
+    path: str,
+    frames: Any,
+    gui: bool,
+    attempt: Attempt,
 ) -> dict[str, Any]:
     """An older COP's image, saved by its own writer."""
     node = hou.node(spec.path)
@@ -1463,10 +1713,16 @@ def write_png(path: str, width: int, height: int, rgba: bytes, *, bottom_up: boo
         + _chunk(b"IDAT", zlib.compress(raw, 6))
         + _chunk(b"IEND", b"")
     )
-    partial = f"{path}.part"
-    with open(partial, "wb") as handle:
-        handle.write(body)
-    os.replace(partial, path)
+    from nscr_houdini_mcp import outputs
+
+    partial = outputs.temporary_beside(path)
+    try:
+        with open(partial, "wb") as handle:
+            handle.write(body)
+        os.replace(partial, path)
+    except BaseException:
+        discard([partial])
+        raise
 
 
 def _chunk(tag: bytes, body: bytes) -> bytes:
@@ -1478,7 +1734,14 @@ def _chunk(tag: bytes, body: bytes) -> bytes:
 
 
 def network_route(
-    hou: Any, context: ToolContext, spec: Spec, camera: Any, path: str, frames: Any, gui: bool
+    hou: Any,
+    context: ToolContext,
+    spec: Spec,
+    camera: Any,
+    path: str,
+    frames: Any,
+    gui: bool,
+    attempt: Attempt,
 ) -> dict[str, Any]:
     """The network editor's own window, cropped to the editor."""
     kind = hou.paneTabType.NetworkEditor
@@ -1495,15 +1758,22 @@ def network_route(
             # Whether the editor has laid the new network out by the time it
             # is grabbed is not something this route can see.
             shot["framing_unverified"] = True
-        shot["native"] = grab_pane(editor, path)
+        shot["native"] = grab_pane(editor, path, attempt)
     finally:
         if previous is not None:
-            _quiet(lambda: editor.setPwd(previous))
+            attempt.attempt("show the network the editor showed", lambda: editor.setPwd(previous))
     return shot
 
 
 def pane_route(
-    hou: Any, context: ToolContext, spec: Spec, camera: Any, path: str, frames: Any, gui: bool
+    hou: Any,
+    context: ToolContext,
+    spec: Spec,
+    camera: Any,
+    path: str,
+    frames: Any,
+    gui: bool,
+    attempt: Attempt,
 ) -> dict[str, Any]:
     """One pane tab by name, grabbed from its own window."""
     tab = _quiet(lambda: hou.ui.findPaneTab(spec.path))
@@ -1516,7 +1786,8 @@ def pane_route(
             did_you_mean=did_you_mean(str(spec.path), names),
             panes=names[:50],
         )
-    return {"files": [path], "frames": [frames[0]], "camera": None, "native": grab_pane(tab, path)}
+    native = grab_pane(tab, path, attempt)
+    return {"files": [path], "frames": [frames[0]], "camera": None, "native": native}
 
 
 def process_events() -> None:
@@ -1537,7 +1808,7 @@ def process_events() -> None:
         return
 
 
-def grab_pane(tab: Any, path: str) -> list[int]:
+def grab_pane(tab: Any, path: str, attempt: Attempt) -> list[int]:
     """Grab the window one pane tab lives in and keep the part that is the pane.
 
     The tab is made the current one of its pane for the grab, so it is the
@@ -1569,7 +1840,7 @@ def grab_pane(tab: Any, path: str) -> list[int]:
             raise Unavailable(NO_FILE)
     finally:
         if previous is not None and previous is not tab:
-            _quiet(previous.setIsCurrentTab)
+            attempt.attempt("make the tab that was showing current again", previous.setIsCurrentTab)
     return [right - left, bottom - top]
 
 

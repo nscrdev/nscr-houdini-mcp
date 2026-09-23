@@ -699,6 +699,8 @@ class Node:
         return self._parent
 
     def destroy(self) -> None:
+        if self._type.name() in self._scene.capture.undestroyable:
+            raise OperationFailed("the node cannot be deleted")
         parent = self._parent
         if parent is None or self not in parent._children:
             raise ObjectWasDeleted("the node is gone")
@@ -1380,6 +1382,8 @@ class Viewport:
         self._default = ViewCamera()
         self._settings = ViewportSettings()
         self.framed: list[Any] = []
+        # Set to make putting the viewport's own camera back fail.
+        self.refuse_default = False
 
     def type(self) -> str:
         return self._type
@@ -1402,6 +1406,8 @@ class Viewport:
         return self._default.stash()
 
     def setDefaultCamera(self, view: ViewCamera) -> None:  # noqa: N802 - the name is Houdini's
+        if self.refuse_default:
+            raise OperationFailed("the viewport would not take its camera")
         self._default = view.stash()
 
     def settings(self) -> ViewportSettings:
@@ -1713,6 +1719,10 @@ class CaptureStandIn:
         # How much larger than asked a render node draws, and the renders
         # that worked it out, kept apart from the ones a check looks at.
         self.backing = 1.0
+        # Node types whose nodes refuse to be taken away, and a call made
+        # after each frame a render writes.
+        self.undestroyable: set[str] = set()
+        self.after_frame: Any = None
         # A frame at which a render raises after writing it, as a failed cook does.
         self.fail_at_frame: float | None = None
         self.probes: list[dict[str, Any]] = []
@@ -1829,6 +1839,8 @@ class CaptureStandIn:
             )
             if self.writes:
                 self.draw(picture, size, self.anything_shown(objects), camera)
+            if self.after_frame is not None:
+                self.after_frame(frame)
             if self.fail_at_frame is not None and frame >= self.fail_at_frame:
                 raise OperationFailed("the render stopped with an error")
             frame += step

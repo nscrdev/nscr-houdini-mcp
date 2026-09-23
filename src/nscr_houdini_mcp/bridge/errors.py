@@ -44,6 +44,7 @@ CODES: dict[str, str] = {
     "CAPTURE_EMPTY": "the capture wrote no usable image",
     "UI_UNAVAILABLE": "no way to make that picture works in this session",
     "CAPTURE_FAILED": "the capture ran and Houdini stopped it with an error",
+    "CLEANUP_FAILED": "the work was done and part of what it changed could not be put back",
     "FILE_NOT_FOUND": "no file at that path",
     "FILE_EXISTS": "a file is already at that path and is never written over",
     "UNSAVED_CHANGES": "the scene has changes that are not saved",

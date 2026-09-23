@@ -10,6 +10,7 @@ checked by hand with a person present, and nothing here stands for that.
 
 from __future__ import annotations
 
+import json
 import math
 import threading
 from collections.abc import Iterator
@@ -964,3 +965,151 @@ def test_a_bridge_started_by_hand_draws_offscreen_unless_told(
     with pytest.raises(_Stopped):
         bridge_main.main(["--home", str(tmp_path)])
     assert os.environ[bridge_main.QT_PLATFORM_ENV_VAR] == expected
+
+
+# Section: the display flag a node capture borrows
+
+
+def test_a_node_whose_object_showed_nothing_gives_the_flag_up_after(
+    scene: Scene, home: Path
+) -> None:
+    geo = scene.node("/obj").createNode("geo", "bare")
+    lone = geo.createNode("box", "lone")
+    scene.undos.labels.clear()
+    assert geo.displayNode() is None
+    take(scene, home, source="node", path="/obj/bare/lone")
+    [seen] = scene.capture.seen
+    assert seen["displayed"] == {"/obj/bare": "/obj/bare/lone"}
+    assert geo.displayNode() is None
+    assert not lone.isDisplayFlagSet()
+
+
+@pytest.mark.parametrize("had_one", [True, False])
+def test_the_display_flag_goes_back_when_the_render_fails(
+    scene: Scene, home: Path, had_one: bool
+) -> None:
+    geo = scene.node("/obj/boxgeo")
+    if not had_one:
+        geo.displayNode().flags.discard("Display")
+    other = geo.createNode("box", "box2")
+    scene.capture.fail_at_frame = 1.0
+    error = refused(scene, home, source="node", path="/obj/boxgeo/box2")
+    assert error.code == "CAPTURE_FAILED"
+    shown = geo.displayNode()
+    assert (shown.path() if shown else None) == ("/obj/boxgeo/box1" if had_one else None)
+    assert not other.isDisplayFlagSet()
+
+
+# Section: clean up that does not go as it should
+
+
+def test_a_render_node_that_will_not_go_is_cleanup_failed(scene: Scene, home: Path) -> None:
+    scene.capture.undestroyable = {"flipbook"}
+    error = refused(scene, home, frames=[1, 2, 1])
+    assert error.code == "CLEANUP_FAILED"
+    [step] = error.details["cleanup"]
+    assert step["step"] == "take away /out/nscr_capture"
+    assert step["error"].startswith("OperationFailed")
+    assert error.details["frames"] == [1.0, 2.0]
+    # Every other step still ran: the fitted camera is gone.
+    assert names(scene, "/obj") == ["boxgeo"]
+    # The frames are there, and the run record names them.
+    [record] = (home.parent / ".agent" / "captures").rglob("*_run.json")
+    files = json.loads(record.read_text(encoding="utf-8"))["paths"]["files"]
+    assert len(files) == 2 and all(Path(item).is_file() for item in files)
+
+
+def test_clean_up_that_fails_beside_a_failed_render_is_in_its_details(
+    scene: Scene, home: Path
+) -> None:
+    scene.capture.undestroyable = {"flipbook"}
+    scene.capture.fail_at_frame = 1.0
+    error = refused(scene, home)
+    assert error.code == "CAPTURE_FAILED"
+    assert error.details["cleanup"][0]["step"] == "take away /out/nscr_capture"
+
+
+def test_a_view_that_will_not_go_back_is_cleanup_failed_and_the_rest_goes_back(
+    scene: Scene, home: Path
+) -> None:
+    viewer = viewer_scene(scene)
+    viewer.viewport.refuse_default = True
+    error = refused(scene, home, kind="gui", camera="top", display="wire")
+    assert error.code == "CLEANUP_FAILED"
+    assert [step["step"] for step in error.details["cleanup"]] == ["put the viewport's camera back"]
+    assert viewer.viewport.type() == "Perspective"
+    assert viewer.viewport.shading() == {"SceneObject": "Smooth", "DisplayModel": "Smooth"}
+
+
+# Section: a viewport sequence, a few frames at a time
+
+
+def test_a_viewport_sequence_goes_in_pieces_with_progress(scene: Scene, home: Path) -> None:
+    viewer_scene(scene)
+    run = Run(scene, home, "gui")
+    said = capture.capture_image({"frames": [1, 20, 1], "resolution": [32, 18]}, run.context)
+    ranges = [seen["settings"]["frameRange"] for seen in scene.capture.seen]
+    assert ranges == [(1.0, 8.0), (9.0, 16.0), (17.0, 20.0)]
+    assert [note["done"] for note in run.notes] == [8, 16, 20]
+    assert len(said["views"][0]["files"]) == 20
+
+
+def test_a_viewport_sequence_stops_between_pieces(scene: Scene, home: Path) -> None:
+    viewer_scene(scene)
+    run = Run(scene, home, "gui")
+
+    def note(said: dict[str, Any]) -> None:
+        run.notes.append(said)
+        run.cancel.set()
+
+    context = tools.ToolContext(**{**run.context.__dict__, "progress": note})
+    said = capture.capture_image({"frames": [1, 20, 1], "resolution": [32, 18]}, context)
+    [shot] = said["views"]
+    assert len(scene.capture.seen) == 1
+    assert len(shot["files"]) == 8
+    assert said["stopped_early"] is True
+
+
+def test_a_capture_stopped_before_its_first_frame_writes_nothing(scene: Scene, home: Path) -> None:
+    viewer_scene(scene)
+    run = Run(scene, home, "gui")
+    run.cancel.set()
+    said = capture.capture_image({"frames": [1, 4, 1]}, run.context)
+    [shot] = said["views"]
+    assert shot["files"] == [] and shot["stopped_early"] is True
+    assert scene.capture.seen == []
+    assert list((home.parent / ".agent" / "captures").rglob("*_run.json")) == []
+
+
+# Section: what the job row knows while a sequence runs
+
+
+def test_the_job_row_names_the_run_and_each_frame_as_it_goes(scene: Scene, home: Path) -> None:
+    store_path = home / store_module.STORE_FILE_NAME
+    module = scene.module()
+    dispatcher = Dispatcher(
+        default_registry(),
+        lock=threading.Lock(),
+        kind="hython",
+        session_id="s-1",
+        identity=Identity(session_id="s-1", kind="hython", alias="w1", hou=module),
+        receipts=receipts.Receipts(lambda: store_module.Store(store_path), session_id="s-1"),
+        hou=module,
+        wait_s=5.0,
+        timeout_s=10.0,
+        home=home,
+        open_store=lambda: store_module.Store(store_path),
+    )
+    rows: list[Any] = []
+
+    def look(frame: float) -> None:
+        with store_module.Store(store_path) as store:
+            rows.append(store.get_job("job-seq-1").outputs)
+
+    scene.capture.after_frame = look
+    envelope = Envelope(tool="capture.image", arguments={"frames": [1, 3, 1]}, operation_id="seq-1")
+    assert dispatcher.dispatch(envelope).payload["ok"] is True
+    runs = [row["capture"]["runs"][0] for row in rows]
+    assert all(run["run_id"].startswith("run-") and "$F4" in run["path"] for run in runs)
+    assert [len(run["files"]) for run in runs] == [0, 1, 2]
+    assert [row["capture"]["frames_done"] for row in rows] == [0, 1, 2]
