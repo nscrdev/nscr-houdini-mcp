@@ -1262,6 +1262,29 @@ def test_freezing_the_same_parm_again_still_owes_the_value_from_before_the_first
     assert [row.run_id for row in store.list_frozen_parms()] == ["run-2"]
 
 
+def test_a_frozen_parm_table_from_an_earlier_shape_is_made_again(tmp_path: Path) -> None:
+    path = tmp_path / "coord.sqlite"
+    with Store(path):
+        pass
+    raw = sqlite3.connect(str(path))
+    raw.execute("DROP TABLE frozen_parms")
+    raw.execute(
+        "CREATE TABLE frozen_parms (session_id TEXT, node_path TEXT, parm_name TEXT,"
+        " template TEXT, frozen TEXT, run_id TEXT, hip_key TEXT, created_at REAL)"
+    )
+    raw.execute(
+        "INSERT INTO frozen_parms VALUES ('s1', '/out/a', 'picture', 't', 'f', 'r', 'h', 1)"
+    )
+    raw.commit()
+    raw.close()
+    with Store(path) as opened:
+        columns = {row[1] for row in opened._conn.execute("PRAGMA table_info(frozen_parms)")}
+        assert store_module.FROZEN_PARM_COLUMNS <= columns
+        assert opened.list_frozen_parms() == []
+        _freeze(opened, token="a")
+        assert opened.get_frozen_parm("s1", "/out/karma1", "picture").token == "a"
+
+
 def test_a_parm_held_under_one_token_is_refused_to_another(store: Store) -> None:
     held = _freeze(store, token="a")
     assert held.state == store_module.FROZEN_PREPARED

@@ -912,7 +912,7 @@ _SCHEMA_9 = (
 
 # Output parameters a run has set to its own path, each owed its own value back
 # when the run is over, and the index a scene's list of its runs reads by.
-_SCHEMA_10 = (
+_FROZEN_PARMS_TABLE = (
     """
     CREATE TABLE frozen_parms (
         session_id TEXT NOT NULL,
@@ -933,6 +933,29 @@ _SCHEMA_10 = (
     )
     """,
     "CREATE INDEX frozen_parms_by_scene ON frozen_parms(hip_key)",
+)
+
+FROZEN_PARM_COLUMNS = frozenset(
+    {
+        "session_id",
+        "node_path",
+        "parm_name",
+        "template",
+        "frozen",
+        "run_id",
+        "hip_key",
+        "created_at",
+        "node_sid",
+        "original",
+        "original_expression",
+        "original_language",
+        "token",
+        "state",
+    }
+)
+
+_SCHEMA_10 = (
+    *_FROZEN_PARMS_TABLE,
     "CREATE INDEX runs_by_family ON runs(hip_family, created_at)",
 )
 
@@ -980,6 +1003,7 @@ class Store:
             self._retry_while_busy(lambda: self._conn.execute("PRAGMA journal_mode=WAL"))
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._retry_while_busy(self._apply_migrations)
+            self._retry_while_busy(self._settle_frozen_parms)
         except BaseException:
             # An open that did not finish leaves no handle on the file.
             self._conn.close()
@@ -1059,6 +1083,21 @@ class Store:
                 for statement in statements:
                     db.execute(statement)
                 db.execute(f"PRAGMA user_version={step}")
+
+    def _settle_frozen_parms(self) -> None:
+        """Make the frozen parameter table again when it is short of columns.
+
+        A store opened by a build from before the table had its last shape
+        has the table without them. It holds records that last as long as a
+        run, so it is made again rather than moved forward.
+        """
+        with self._txn(write=True) as db:
+            have = {row["name"] for row in db.execute("PRAGMA table_info(frozen_parms)")}
+            if not have or FROZEN_PARM_COLUMNS <= have:
+                return
+            db.execute("DROP TABLE frozen_parms")
+            for statement in _FROZEN_PARMS_TABLE:
+                db.execute(statement)
 
     def schema_version(self) -> int:
         """Schema version of the open file."""
