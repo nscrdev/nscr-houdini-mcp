@@ -151,6 +151,20 @@ VEXpression:
 
 \"\"\"The older way to copy geometry onto points.\"\"\"
 """,
+        "sop/guide.txt": """= Guide =
+
+#type: node
+#version: 3.0
+
+\"\"\"The current guide.\"\"\"
+""",
+        "sop/guide-.txt": """= Guide =
+
+#type: node
+#version: 1.5
+
+\"\"\"The guide before.\"\"\"
+""",
         "sop/labs--grid-1.1.txt": """= Labs Grid =
 
 #type: node
@@ -676,7 +690,7 @@ def test_versioned_and_namespaced_node_types(lone: Bench) -> None:
     assert plain["version"] == "2.0"
     older = ok(docs(lone, path="nodes/sop/copytopoints-"))
     assert "The older way" in older["text"]
-    assert "version" not in older
+    assert older["version"] == "older"
     labs = ok(docs(lone, path="nodes/sop/labs::grid::1.1"))
     assert labs["title"] == "Labs Grid"
     assert labs["version"] == "1.1"
@@ -684,6 +698,22 @@ def test_versioned_and_namespaced_node_types(lone: Bench) -> None:
     assert helpdocs.tidy_path("nodes/sop/kinefx::rigattribwrangle") == (
         "nodes/sop/kinefx--rigattribwrangle"
     )
+
+
+def test_an_older_version_is_found_in_the_file_with_no_number(lone: Bench) -> None:
+    # The older page says no version: it stands for any version below the
+    # current page's.
+    older = ok(docs(lone, path="nodes/sop/copytopoints::1.0"))
+    assert "The older way" in older["text"]
+    assert older["path"] == "nodes/sop/copytopoints-1.0"
+    assert older["version"] == "1.0"
+    # The older page says its version: only that one finds it.
+    guide = ok(docs(lone, path="nodes/sop/guide::1.5"))
+    assert "The guide before." in guide["text"]
+    assert guide["version"] == "1.5"
+    assert "The current guide." in ok(docs(lone, path="nodes/sop/guide::3.0"))["text"]
+    failed(docs(lone, path="nodes/sop/guide::1.0"), "DOC_NOT_FOUND")
+    failed(docs(lone, path="nodes/sop/box::1.0"), "DOC_NOT_FOUND")
 
 
 def test_a_page_read_twice_comes_from_the_cache(
@@ -857,7 +887,8 @@ def test_search_prefers_the_current_version(lone: Bench) -> None:
     rows = ok(docs(lone, query="copy to points"))["results"]
     assert [row["path"] for row in rows] == ["nodes/sop/copytopoints", "nodes/sop/copytopoints-"]
     assert rows[0]["version"] == "2.0"
-    assert "version" not in rows[1]
+    # The older page says no version of its own, and still reads as older.
+    assert rows[1]["version"] == "older"
 
 
 def test_the_index_is_built_once_and_kept(lone: Bench) -> None:

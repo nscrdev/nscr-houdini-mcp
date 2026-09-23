@@ -176,6 +176,24 @@ def file_stem(name: str) -> str:
     return f"{stem}-{version}" if version else stem
 
 
+def _below(version: str, other: str) -> bool:
+    """Whether one version number is lower than another, part by part."""
+    return tuple(int(part) for part in version.split(".")) < tuple(
+        int(part) for part in other.split(".")
+    )
+
+
+def version_label(path: str, version: str | None) -> str | None:
+    """The version to show for a page: what it says, else what its file name
+    says, else `older` for an older page whose file carries no number."""
+    if version:
+        return version
+    versioned = _VERSIONED_FILE.match(path.rsplit("/", 1)[-1])
+    if versioned is None:
+        return None
+    return versioned.group(2) or "older"
+
+
 def is_old(path: str) -> bool:
     """Whether a path names a version of a page other than the current one."""
     return bool(_VERSIONED_FILE.match(path.rsplit("/", 1)[-1]))
@@ -307,8 +325,14 @@ class Corpus:
     def read(self, path: str) -> str | None:
         """One page's markup, or nothing when the corpus has no such page.
 
-        A version asked for by number that has no file of its own is the
-        current page when that page says it is that version.
+        A version asked for by number that has no file of its own, such as
+        `copytopoints-1.0`, is found where Houdini keeps it instead:
+
+        - the current page, `copytopoints`, when it says it is that version;
+        - the older page with no number, `copytopoints-`, when it says it is
+          that version;
+        - that older page when it says no version and the version asked for
+          is below the current page's, since it holds the version before.
         """
         clean = tidy_path(path)
         if clean is None:
@@ -318,10 +342,22 @@ class Corpus:
             return text
         folder, _, name = clean.rpartition("/")
         versioned = _VERSIONED_FILE.match(name)
-        if versioned and versioned.group(2):
-            current = self._find(f"{folder}/{versioned.group(1)}" if folder else versioned.group(1))
-            if current is not None and version_of(current) == versioned.group(2):
-                return current
+        if not (versioned and versioned.group(2)):
+            return None
+        wanted = versioned.group(2)
+        stem = f"{folder}/{versioned.group(1)}" if folder else versioned.group(1)
+        current = self._find(stem)
+        current_version = version_of(current) if current is not None else None
+        if current is not None and current_version == wanted:
+            return current
+        older = self._find(stem + "-")
+        if older is None:
+            return None
+        older_version = version_of(older)
+        if older_version == wanted:
+            return older
+        if older_version is None and current_version and _below(wanted, current_version):
+            return older
         return None
 
     def _find(self, path: str) -> str | None:

@@ -421,8 +421,9 @@ def finish(
         "build": place.build_of(found.source),
         "truncated": len(text) > budget,
     }
-    if found.version:
-        result["version"] = found.version
+    version = helpdocs.version_label(path, found.version)
+    if version:
+        result["version"] = version
     if len(text) > budget:
         cut = text[:budget]
         line_end = cut.rfind("\n")
@@ -540,8 +541,9 @@ def search_server(call: Call, place: Place, query: str, limit: int) -> list[dict
 
 def _row(path: str, title: str, excerpt: str, source: str, version: str | None) -> dict[str, Any]:
     row: dict[str, Any] = {"path": path, "title": title, "excerpt": excerpt, "source": source}
-    if version:
-        row["version"] = version
+    label = helpdocs.version_label(path, version)
+    if label:
+        row["version"] = label
     return row
 
 

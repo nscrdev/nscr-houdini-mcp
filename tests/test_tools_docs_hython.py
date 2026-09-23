@@ -233,10 +233,22 @@ def test_docs_with_a_live_worker_a_busy_one_and_none(
 
     # The session is gone: the configured install's folder answers.
     answered = run(
-        place, SEARCH, ("hou_docs", {"mode": "page", "path": "nodes/sop/box"}), WRANGLE, NOISE
+        place,
+        SEARCH,
+        ("hou_docs", {"mode": "page", "path": "nodes/sop/box"}),
+        WRANGLE,
+        NOISE,
+        ("hou_docs", {"mode": "page", "path": "nodes/sop/copytopoints::1.0"}),
+        ("hou_docs", {"mode": "search", "query": "copy to points"}),
     )
-    (found, _), (box, cold_s), (wrangle, warm_s), (noise, _) = answered
+    (found, _), (box, cold_s), (wrangle, warm_s), (noise, _), (older, _), (copies, _) = answered
     found, box, wrangle, noise = ok(found), ok(box), ok(wrangle), ok(noise)
+    # The version before the current one lives in the file with no number.
+    assert ok(older)["title"] == "Copy to Points"
+    assert ok(older)["version"] == "1.0"
+    versions = {row["path"]: row.get("version") for row in ok(copies)["results"]}
+    assert versions["nodes/sop/copytopoints"] == "2.0"
+    assert versions["nodes/sop/copytopoints-"] == "older"
     assert wrangle["source"] == "corpus"
     assert wrangle["trace"]["session_id"] is None
     check_wrangle(wrangle)
