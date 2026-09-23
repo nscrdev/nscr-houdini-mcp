@@ -66,5 +66,5 @@ The closing message contains:
 - Build and change things, filtering inside Houdini so only the answer comes back: `hou_python`. Inside it, `mcp.output_path` hands out a managed path for a render, cache or capture, `mcp.progress` reports how far a long loop has got, and `mcp.cancelled` says when to stop.
 - Wait on long work instead of sleeping, read a finished job's result, or cancel it: `hou_jobs`.
 - Managed output paths, and a lint of where a scene writes: `hou_outputs`. A candidate image beside the reference, with the differences as pictures and numbers: `hou_compare`.
-- Arriving, use it once it appears: `hou_capture` for views and flipbooks.
+- See what a session shows, from one view, four views, a turntable or a flipbook, as saved pictures you then look at: `hou_capture`.
 - With a different Houdini server, use its tools for the same jobs; nothing above depends on these names. With no Houdini tools at all, say so plainly and continue with planning only: the mechanism, the system, its boundaries, and the checks you would run.

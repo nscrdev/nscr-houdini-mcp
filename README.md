@@ -2,7 +2,10 @@
 
 An MCP server and a small set of agent skills for SideFX Houdini 22.
 
-Status: early. Nothing here is usable yet.
+Status: 0.1.0, the first release. The eleven tools described below work
+against a real Houdini 22 on macOS; see [Tested on](#tested-on) for what has
+and has not been run where. Names and arguments may still change before 1.0,
+and [CHANGELOG.md](CHANGELOG.md) says what changed.
 
 ## Goals
 
@@ -13,6 +16,15 @@ Status: early. Nothing here is usable yet.
 - Renders, caches and captures go to managed folders next to the scene file.
 - Plain `SKILL.md` skills that help an agent build scenes a person can read, change and reuse. You can edit them to fit how you work.
 - Runs on macOS, Windows and Linux.
+
+## Tested on
+
+- macOS on Apple silicon (arm64), with Houdini 22.0.368 and 22.0.429: the unit
+  tests, the tests that start a real hython, and GUI sessions driven through
+  one MCP client.
+- Windows and Linux: the unit tests run in CI, on Python 3.11 and 3.13, for
+  every push to main and every pull request. Neither has been run against a
+  real Houdini yet, so treat Houdini on either as untried.
 
 ## Development
 
@@ -69,7 +81,7 @@ Run the server on stdio:
 nscr-houdini-mcp
 ```
 
-Eleven tools so far. `hou_ping` says which session a call reaches and that it
+Eleven tools. `hou_ping` says which session a call reaches and that it
 answers. `hou_sessions` lists every session with its state (`live`, `busy`,
 `unresponsive`, `crashed` or `gone`) and starts and stops workers under the
 pool's rules; it never closes a Houdini with a user interface. `hou_scene`
@@ -882,6 +894,42 @@ A scene that has never been saved has no `$HIP`, so its runs go under
 `$HOUDINI_TEMP_DIR/nscr-houdini-mcp/<session>/` and every result says
 `unsaved_hip`, which is the cue to save and run again. The template keeps the
 variable, so saving that scene later leaves nothing about this machine in it.
+
+## Logs
+
+Every log lives in the `logs` folder of the state folder:
+
+| System  | Folder                                                                       |
+|---------|------------------------------------------------------------------------------|
+| macOS   | `~/Library/Application Support/nscr-houdini-mcp/logs`                        |
+| Windows | `%LOCALAPPDATA%\nscr-houdini-mcp\logs`                                       |
+| Linux   | `$XDG_STATE_HOME/nscr-houdini-mcp/logs`, or `~/.local/state/nscr-houdini-mcp/logs` |
+
+`NSCR_MCP_HOME` moves the whole state folder, and `state_home` in the config
+file moves it for the server. Keep the server and the bridges pointing at the
+same one.
+
+What goes where:
+
+- `server.log`: the MCP server. It also writes the same lines to standard
+  error, which a client that starts the server over stdio usually keeps.
+  Every call that ends in an error leaves one warning here with the tool and
+  the error code, for example `hou_scene refused: SESSION_BUSY: ...`. Each
+  line carries the process id, since several servers can share the file. The
+  file starts again at `server.log.1` when a server starts and finds it over
+  five megabytes.
+- `<session id>.log`: one bridge inside one Houdini. What went wrong in a
+  call, with its trace, stays here and never reaches the caller.
+- `worker-<name>.log`: what a worker's hython printed, for a worker started
+  from the pool.
+- `autostart.log`: a bridge that failed to start with Houdini, when
+  `NSCR_MCP_HOME` is set in that Houdini. Without it the one line goes to
+  Houdini's own console.
+
+`NSCR_MCP_LOG_LEVEL` sets how much the server writes: `debug`, `info`,
+`warning` (the default) or `error`. Set it in the environment the client
+starts the server with. It does not reach the bridge, worker and autostart
+logs, which have no level and are written whatever it says.
 
 ## Skills
 
