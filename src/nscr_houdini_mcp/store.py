@@ -1096,6 +1096,12 @@ class Store:
         has the table without them. It holds records that last as long as a
         run, so it is made again rather than moved forward.
         """
+        # Read first: a store open must not wait on another process's write
+        # lock when the table already has its shape, which is nearly always.
+        with self._txn(write=False) as db:
+            have = {row["name"] for row in db.execute("PRAGMA table_info(frozen_parms)")}
+        if not have or FROZEN_PARM_COLUMNS <= have:
+            return
         with self._txn(write=True) as db:
             have = {row["name"] for row in db.execute("PRAGMA table_info(frozen_parms)")}
             if not have or FROZEN_PARM_COLUMNS <= have:
