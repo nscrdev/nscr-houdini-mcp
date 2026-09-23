@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import sqlite3
 import threading
 import time
 from collections.abc import Iterator
@@ -73,8 +75,6 @@ def made_bench(tmp_path: Path, module: Any) -> Bench:
 @pytest.fixture(autouse=True)
 def fresh_sweeps(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every check sweeps as if this process had never swept before."""
-    monkeypatch.setattr(jobs_tool, "_swept", {})
-    monkeypatch.setattr(jobs_tool, "_pruned", {})
     monkeypatch.setattr(jobs_tool, "SWEEP_EVERY_S", 0.0)
 
 
@@ -332,15 +332,18 @@ def test_a_session_stopped_on_purpose_loses_its_unfinished_jobs(bench: Bench) ->
     assert states == {"job-a": "lost", "job-b": "lost", "job-c": "done"}
 
 
-def test_a_job_nobody_has_heard_from_for_too_long_is_lost(
-    bench: Bench, monkeypatch: pytest.MonkeyPatch
+def test_a_job_nobody_has_heard_from_is_never_lost_while_its_session_is_there(
+    bench: Bench,
 ) -> None:
-    with bench.store() as store:
-        store.create_job("job-quiet", kind="python", session_id="s-1", state="running")
-    monkeypatch.setattr(job_rules, "SILENCE_S", -1.0)
+    hour = 3600.0
+    with bench.store(clock=lambda: time.time() - 5 * hour) as store:
+        store.create_job(
+            "job-quiet", kind="python", session_id="s-1", state="running", worker_pid=os.getpid()
+        )
     status = job(bench, "job-quiet")
-    assert status["state"] == "lost"
-    assert status["error"]["code"] == "JOB_SILENT"
+    assert status["state"] == "running"
+    assert status["error"] is None
+    assert status["silent_s"] >= 5 * hour - 60
 
 
 # Section: keeping and listing
@@ -850,3 +853,35 @@ def test_a_retry_of_a_job_still_running_is_answered_at_once_with_the_job(
     replayed = ok(python(bench, code=code, operation_id="op-again"))
     assert replayed["result"] == "once"
     assert replayed["state"] == "done"
+
+
+def test_a_held_status_ends_on_time_while_another_process_holds_the_store(
+    bench: Bench, module: Any
+) -> None:
+    handle = in_the_background(bench, "hou.gate.wait(20)")
+    support.wait_until(lambda: row(bench, handle["job_id"]).state == "running", timeout_s=5.0)
+    locker = sqlite3.connect(str(bench.store_path), timeout=0.1, isolation_level=None)
+    locker.execute("BEGIN IMMEDIATE")
+    try:
+        began = time.monotonic()
+        held = job(bench, handle["job_id"], wait_s=1.0)
+        taken = time.monotonic() - began
+    finally:
+        locker.execute("ROLLBACK")
+        locker.close()
+    assert taken < 2.5, taken
+    assert held["state"] == "running"
+    assert held["changed"] is False
+    module.gate.set()
+    idle(bench)
+
+
+def test_a_cancel_waits_on_the_session_no_longer_than_a_health_check(
+    bench: Bench, module: Any
+) -> None:
+    handle = in_the_background(bench, "hou.gate.wait(20)")
+    job(bench, handle["job_id"], action="cancel")
+    [sent] = [call for call in through(bench).calls if call["tool"] == "bridge.cancel"]
+    assert sent["http_timeout_s"] == jobs_tool.CANCEL_SOCKET_S == 2.0
+    module.gate.set()
+    idle(bench)

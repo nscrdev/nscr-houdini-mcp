@@ -210,6 +210,14 @@ def test_a_killed_worker_leaves_its_job_lost(place: dict[str, Any]) -> None:
     )
     job_id = ok(started)["job_id"]
     pid = ok(info)["session"]["pid"]
+
+    def progressed() -> bool:
+        with pool.open_store(place["home"]) as store:
+            record = store.get_job(job_id)
+        return record is not None and bool(record.progress)
+
+    # The progress the job has written by then is what it leaves behind.
+    support.wait_until(progressed, timeout_s=30.0)
     assert isinstance(pid, int) and pid != os.getpid()
     with pool.open_store(place["home"]) as store:
         [worker] = [w for w in store.list_workers() if w.pid == pid]
@@ -221,3 +229,7 @@ def test_a_killed_worker_leaves_its_job_lost(place: dict[str, Any]) -> None:
     assert body["state"] == "lost"
     assert body["error"]["code"] == "SESSION_ENDED"
     assert body["ended_at"] is not None
+    assert body["progress"]["message"] == "looping"
+    assert body["progress"]["done"] >= 10
+    # A Python job writes its outputs when it ends, and this one never did.
+    assert body["outputs"] is None

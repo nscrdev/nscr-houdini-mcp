@@ -953,6 +953,11 @@ class Store:
                 delay = min(delay * 2, 0.1)
 
     def _apply_migrations(self) -> None:
+        # A file that is already current is only read, so opening the store
+        # takes no write lock and a reader is never held up by a writer.
+        current = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+        if current == len(MIGRATIONS):
+            return
         with self._txn(write=True) as db:
             current = int(db.execute("PRAGMA user_version").fetchone()[0])
             if current > len(MIGRATIONS):

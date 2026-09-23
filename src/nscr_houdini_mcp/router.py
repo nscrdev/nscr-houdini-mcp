@@ -390,11 +390,14 @@ class Router:
         scene_epoch: int | None = None,
         wait_s: float | None = None,
         timeout_s: float | None = None,
+        socket_s: float | None = None,
     ) -> dict[str, Any]:
         """Send one bridge call and hand back the reply, or raise `CallError`.
 
         A call that carries an `operation_id` is sent once more if its reply is
-        lost, with the same id, which the client does on its own.
+        lost, with the same id, which the client does on its own. `socket_s`
+        caps the wait on the socket, for a call that answers at once or not
+        at all, such as a cancel.
         """
         try:
             answer = self._send(
@@ -406,7 +409,7 @@ class Router:
                 operation_id=operation_id,
                 wait_s=wait_s,
                 timeout_s=timeout_s,
-                http_timeout_s=socket_wait(wait_s, timeout_s),
+                http_timeout_s=socket_s if socket_s is not None else socket_wait(wait_s, timeout_s),
             )
         except client.BridgeUnreachable as error:
             self._lost(target, operation_id, error)
