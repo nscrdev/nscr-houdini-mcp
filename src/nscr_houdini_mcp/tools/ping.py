@@ -22,6 +22,7 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
+from nscr_houdini_mcp import version as version_module
 from nscr_houdini_mcp.bridge import marshal
 from nscr_houdini_mcp.results import CallError
 from nscr_houdini_mcp.tools.base import SESSION, WAIT_S, Call, ToolSpec, inputs, outputs
@@ -73,6 +74,7 @@ def ping(call: Call) -> Mapping[str, Any]:
     if busy is not None:
         said["busy"] = True
         said.update(busy)
+    warn_if_other_version(call, health)
     return {
         "session_id": call.trace["session_id"],
         "alias": call.trace["alias"],
@@ -88,6 +90,15 @@ def ping(call: Call) -> Mapping[str, Any]:
         "call": answered,
         "scene_epoch": call.trace["scene_epoch"],
     }
+
+
+def warn_if_other_version(call: Call, health: Mapping[str, Any]) -> None:
+    """Say so when the bridge runs another version of this package than the server."""
+    warning = version_module.mismatch(health.get("package_version"), health.get("protocol"))
+    if warning is not None:
+        held = list(call.trace.get("warnings") or [])
+        if warning not in held:
+            call.trace["warnings"] = held + [warning]
 
 
 def ask(call: Call, wait_s: float) -> dict[str, Any]:

@@ -39,6 +39,7 @@ from typing import Any
 
 from nscr_houdini_mcp import pool
 from nscr_houdini_mcp import store as store_module
+from nscr_houdini_mcp import version as version_module
 from nscr_houdini_mcp.bridge import marshal
 from nscr_houdini_mcp.bridge.app import LOG_DIR_NAME
 from nscr_houdini_mcp.config import Config, ConfigError, resolve_hython
@@ -259,6 +260,10 @@ def session_row(
         "scene_epoch": health.get("scene_epoch", record.scene_epoch),
         "capabilities": pool.capability_summary(capabilities),
     }
+    if state not in ("gone", "crashed"):
+        warning = other_version(health, capabilities)
+        if warning is not None:
+            row["warning"] = warning
     if state == "busy":
         row["current_op"] = health.get("current_op")
         away = main_thread_away_s(health)
@@ -288,6 +293,14 @@ def session_row(
     if worker is not None:
         row["worker"] = {"state": worker.state, "weight": worker.weight, "job": worker.job_id}
     return row
+
+
+def other_version(health: Mapping[str, Any], capabilities: Any) -> dict[str, Any] | None:
+    """The version warning for a session, from what it says now or said at start."""
+    source: Mapping[str, Any] = health if "package_version" in health else {}
+    if not source and isinstance(capabilities, Mapping):
+        source = capabilities
+    return version_module.mismatch(source.get("package_version"), source.get("protocol"))
 
 
 def _version(target: Target | None, capabilities: Any) -> str | None:

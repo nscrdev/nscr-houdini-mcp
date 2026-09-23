@@ -25,6 +25,7 @@ from mcp.shared.inbound import find_invalid_x_mcp_header
 
 from fake_hou import Scene
 from nscr_houdini_mcp import store as store_module
+from nscr_houdini_mcp import version as version_module
 from nscr_houdini_mcp.bridge import client as bridge_client
 from nscr_houdini_mcp.bridge import marshal
 from nscr_houdini_mcp.config import Config, ConfigError
@@ -60,6 +61,8 @@ HEALTH = {
         "queued": 0,
         "heartbeat_age_s": 1.5,
         "last_self_check_ok": True,
+        "package_version": version_module.VERSION,
+        "protocol": version_module.PROTOCOL,
     },
 }
 
@@ -202,6 +205,37 @@ def test_hou_ping_reaches_the_only_session_and_echoes_the_trace() -> None:
     assert sent["tool"] == "bridge.ping"
     # A read carries no operation id, so a lost reply is not sent twice.
     assert sent["operation_id"] is None
+
+
+def test_hou_ping_warns_when_the_bridge_runs_another_version() -> None:
+    stage = Stage([record("s-1", "w1", scene_epoch=4)], replies=(pong(),))
+    health_saying(stage, package_version="0.0.9")
+    _, [result] = talk(serve(stage), ("hou_ping", {}))
+    assert not result.is_error
+    [warning] = result.structured_content["trace"]["warnings"]
+    assert warning["code"] == version_module.MISMATCH_CODE
+    assert warning["bridge_version"] == "0.0.9"
+    assert warning["server_version"] == version_module.VERSION
+    assert warning["hint"] == ("run nscr-houdini-mcp bridge install again, then restart Houdini")
+
+
+def test_hou_ping_warns_when_the_bridge_reports_no_version_at_all() -> None:
+    stage = Stage([record("s-1", "w1", scene_epoch=4)], replies=(pong(),))
+    data = {k: v for k, v in HEALTH["data"].items() if k not in ("package_version", "protocol")}
+    stage.health = lambda session, **rest: bridge_client.Answer(  # type: ignore[method-assign]
+        200, {"ok": True, "data": data}, {}
+    )
+    _, [result] = talk(serve(stage), ("hou_ping", {}))
+    [warning] = result.structured_content["trace"]["warnings"]
+    assert warning["message"] == f"the bridge runs no version, this server {version_module.VERSION}"
+
+
+def test_hou_ping_warns_when_only_the_protocol_differs() -> None:
+    stage = Stage([record("s-1", "w1", scene_epoch=4)], replies=(pong(),))
+    health_saying(stage, protocol=version_module.PROTOCOL + 1)
+    _, [result] = talk(serve(stage), ("hou_ping", {}))
+    codes = [w["code"] for w in result.structured_content["trace"]["warnings"]]
+    assert codes == [version_module.MISMATCH_CODE]
 
 
 def test_hou_ping_of_a_busy_session_reports_busy_rather_than_failing() -> None:

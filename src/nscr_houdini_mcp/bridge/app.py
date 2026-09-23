@@ -65,6 +65,7 @@ from pathlib import Path
 from typing import Any
 
 from nscr_houdini_mcp import store as store_module
+from nscr_houdini_mcp import version as version_module
 from nscr_houdini_mcp.bridge import (
     client,
     host,
@@ -596,6 +597,8 @@ class Bridge:
                         "alias_drift": self.identity.drift(),
                         "started_at": self.started_at,
                         "heartbeat_age_s": round(max(0.0, now - self._heartbeat_at), 3),
+                        "package_version": version_module.VERSION,
+                        "protocol": version_module.PROTOCOL,
                         **self.transport_state(),
                         "privacy": self.privacy,
                         "tools": self.tools.names(),
@@ -855,6 +858,8 @@ class Bridge:
                     "houdini_version": self.facts.get("houdini_version"),
                     "hfs": self.facts.get("hfs"),
                     "privacy": self.privacy,
+                    "package_version": version_module.VERSION,
+                    "protocol": version_module.PROTOCOL,
                 },
             )
         self.identity.settle_alias(record.alias)
@@ -871,6 +876,8 @@ class Bridge:
             "token": self._token,
             "scene_epoch": self.scene_epoch,
             "started_at": self.started_at,
+            "package_version": version_module.VERSION,
+            "protocol": version_module.PROTOCOL,
             **self.transport_state(),
             **self.facts,
         }

@@ -61,8 +61,12 @@ inside Houdini, and one agent skill.
   another Python, and every other library there, loaded in place of Houdini's
   own and broke Houdini's own tools on start. Houdini is now given a folder
   holding this package alone: `src/` in a checkout, and otherwise a copy made
-  under the state folder, refreshed on every install and removed on uninstall.
-  Workers the pool starts, and `bridge snippet`, get the same.
+  under the state folder, which Houdini's path takes the startup files from
+  too. Copies are named after what they hold and never change, old ones go a
+  week after they were last used, and uninstall removes them. Workers the
+  pool starts, and `bridge snippet`, get the same.
+- A bridge reports the version it runs, and `hou_ping`, `hou_sessions` and
+  `bridge status` say when it is not the server's.
 
 ### The skill
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ import pytest
 
 from nscr_houdini_mcp import pool
 from nscr_houdini_mcp import store as store_module
+from nscr_houdini_mcp import version as version_module
 from nscr_houdini_mcp.bridge import client, registry
 from nscr_houdini_mcp.config import Config
 from nscr_houdini_mcp.router import Router
@@ -26,7 +28,7 @@ from nscr_houdini_mcp.server import build_server
 from nscr_houdini_mcp.store import SessionRecord, Store, WorkerRecord, process_start_stamp
 from nscr_houdini_mcp.tools import sessions as sessions_tool
 from nscr_houdini_mcp.tools.registry import TOOLS
-from test_router import Sent
+from test_router import Sent, record
 from test_server import talk, text_of
 
 # A pid no system hands out, so the process behind the row is gone.
@@ -707,3 +709,37 @@ def test_stop_by_the_name_a_session_had_says_what_it_answers_to_now(bench: Bench
     assert result.structured_content["error"]["code"] == "NOT_A_WORKER"
     [warning] = result.structured_content["trace"]["warnings"]
     assert (warning["code"], warning["alias"]) == ("ALIAS_RENAMED", "shot_010-1")
+
+
+# Section: which version each session runs
+
+
+def _row(state: str, health: dict[str, Any] | None, capabilities: Any = None) -> dict[str, Any]:
+    found = replace(record("s-1", "w1"), capabilities=capabilities)
+    return sessions_tool.session_row(found, state, None, None, health, now=time.time(), full=False)
+
+
+SAME = {"package_version": version_module.VERSION, "protocol": version_module.PROTOCOL}
+
+
+def test_a_session_running_this_version_carries_no_warning() -> None:
+    assert "warning" not in _row("idle", SAME)
+
+
+def test_a_session_running_another_version_says_so_with_the_fix() -> None:
+    row = _row("idle", {**SAME, "package_version": "0.0.9"})
+    assert row["warning"]["code"] == version_module.MISMATCH_CODE
+    assert row["warning"]["bridge_version"] == "0.0.9"
+    assert row["warning"]["hint"] == (
+        "run nscr-houdini-mcp bridge install again, then restart Houdini"
+    )
+
+
+def test_a_session_that_does_not_answer_is_judged_by_what_it_said_at_start() -> None:
+    older = {**SAME, "package_version": "0.0.9"}
+    assert _row("unresponsive", None, older)["warning"]["bridge_version"] == "0.0.9"
+    assert "warning" not in _row("unresponsive", None, SAME)
+
+
+def test_an_ended_session_is_not_warned_about() -> None:
+    assert "warning" not in _row("gone", None, {"package_version": "0.0.9"})

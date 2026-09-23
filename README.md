@@ -685,19 +685,27 @@ it, so it is worked out in this order:
 Nothing is remembered between runs, and `bridge status` prints which of those
 decided and every folder it considered.
 
-The file points `HOUDINI_PATH` at this copy's `houdini/` folder (inside the
-package in an installed copy) and puts a folder that holds `nscr_houdini_mcp`
-and nothing else in front of Houdini's `PYTHONPATH`. In a checkout that is
-`src/`, as it stands, so an edit there reaches the next Houdini. An installed
-copy never names its site-packages folder: every other library of the
-environment is there too, and numpy, Pillow or anything else in it would load
-in place of Houdini's own and break Houdini's own tools. Instead the install
-copies the package alone into `houdini-python/` under the state folder and
-names that copy. It is made again on every `bridge install`, so run the
-install again after upgrading, and `bridge status` says when a copy is older
-than the package it came from. Inside Houdini the bridge needs only the
-standard library, `hou` and, for reading images, the numpy, OpenImageIO and
-OpenColorIO Houdini ships.
+The file points `HOUDINI_PATH` at this copy's `houdini/` folder and puts a
+folder that holds `nscr_houdini_mcp` and nothing else in front of Houdini's
+`PYTHONPATH`. In a checkout those are `houdini/` and `src/`, as they stand, so
+an edit there reaches the next Houdini. An installed copy never names its
+site-packages folder: every other library of the environment is there too,
+and numpy, Pillow or anything else in it would load in place of Houdini's own
+and break Houdini's own tools. Instead the install copies the package alone
+into `houdini-python/` under the state folder, and both paths name that copy,
+so the startup files and the bridge they start are always one version.
+
+A copy is named after what it holds and never changes once made. After an
+upgrade, run `bridge install` again and restart Houdini: the new version gets
+a copy of its own, and the old one stays for a week for a Houdini still
+running from it. The copies made for workers the pool starts follow the same
+rules, and one no worker has asked for in a week is taken away. `bridge
+status` says when a package file's copy is another version than the server,
+and when a package file an older install wrote names a whole site-packages
+folder. Each bridge also reports the version it runs, and `hou_ping` and
+`hou_sessions` warn with `BRIDGE_VERSION_MISMATCH` when it is not the
+server's. Inside Houdini the bridge needs only the standard library, `hou`
+and, for reading images, the numpy, OpenImageIO and OpenColorIO Houdini ships.
 
 Every path is worked out from where this copy is running, so there is nothing
 to edit by hand. Every file it writes carries a marker: a package of the same

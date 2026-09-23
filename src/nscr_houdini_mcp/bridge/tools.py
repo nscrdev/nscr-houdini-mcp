@@ -53,6 +53,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
+from nscr_houdini_mcp import version as version_module
 from nscr_houdini_mcp.bridge import encoding
 from nscr_houdini_mcp.bridge.errors import (
     MAX_HINTS,
@@ -241,6 +242,8 @@ def capabilities(arguments: Mapping[str, Any], context: ToolContext) -> dict[str
         "cancellation": True,
         "max_threads": _quiet(lambda: hou.expandString("$HOUDINI_MAXTHREADS")) or None,
         "platform": sys.platform,
+        "package_version": version_module.VERSION,
+        "protocol": version_module.PROTOCOL,
     }
 
 
