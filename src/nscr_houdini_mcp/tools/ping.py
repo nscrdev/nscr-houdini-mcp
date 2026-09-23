@@ -2,11 +2,12 @@
 
 It asks the session's health endpoint, which answers from memory even in the
 middle of a cook. When health says the session is busy, running another call
-or with a main thread the bridge itself calls away, the ping answers
-from health at once: busy, since when, and what the session is doing. Only a
-session that looks free is also sent one signed call through the same path
-every other tool uses, with a short wait for its turn, so a cook that health
-has not seen yet costs the ping a fraction of a second rather than a second.
+or with a main thread the bridge itself calls away, and says so again when
+asked twice, the ping answers from health at once: busy, since when, and what
+the session is doing. Only a session that looks free is also sent one signed
+call through the same path every other tool uses, with a short wait for its
+turn, so a cook that health has not seen yet costs the ping a fraction of a
+second rather than a second.
 A caller that names a `wait_s` above zero is sent the call whatever health
 says, and it waits that long, as with any other tool.
 
@@ -33,12 +34,24 @@ BRIDGE_TRANSPORT = "loopback http, signed"
 # It covers an idle session's pickup with a sleeping display, and a paced turn.
 PING_WAIT_S = 0.5
 
+# The wait a caller may name. Without one, a busy session answers from health
+# and a free one is asked within `PING_WAIT_S`.
+PING_WAIT = {
+    **WAIT_S,
+    "description": "Seconds to queue for a busy session. Default: health answers for it.",
+}
+
 
 def ping(call: Call) -> Mapping[str, Any]:
     target = call.target()
     health = call.health()
     busy = busy_with(health, now=time.time())
     wait_s = call.arguments.get("wait_s")
+    if busy is not None and not wait_s:
+        # A snapshot taken as a call ended would skip a session that is free
+        # now; a second look costs about a millisecond.
+        health = call.health()
+        busy = busy_with(health, now=time.time())
     if busy is not None and not wait_s:
         answered: dict[str, Any] = {
             "ok": False,
@@ -146,7 +159,7 @@ HOU_PING = ToolSpec(
         "session_id, alias, kind (gui or hython), Houdini build, transport, health and "
         "scene_epoch. Reads no scene. Any call to a worker keeps it warm."
     ),
-    input_schema=inputs({"session": SESSION, "wait_s": WAIT_S}),
+    input_schema=inputs({"session": SESSION, "wait_s": PING_WAIT}),
     output_schema=outputs(
         {
             "session_id": {"type": "string"},

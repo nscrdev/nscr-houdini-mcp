@@ -705,3 +705,32 @@ def test_a_flood_refusal_tells_a_change_to_keep_its_id_and_a_read_nothing_more()
     with pytest.raises(CallError) as refused:
         read.bridge("python.run")
     assert refused.value.hint == "wait 30 seconds, then call again"
+
+
+def test_hou_ping_looks_again_before_it_calls_a_session_busy() -> None:
+    # The first look was taken as the running call ended; the second finds
+    # the session free, so it is asked rather than skipped.
+    stage = Stage([record("s-1", "w1")], replies=(pong(),))
+    looks = iter(
+        [
+            {**HEALTH["data"], "busy": True, "current_op": "python.run"},
+            {**HEALTH["data"], "busy": False},
+        ]
+    )
+    stage.health = lambda session, **rest: bridge_client.Answer(  # type: ignore[method-assign]
+        200, {"ok": True, "data": next(looks)}, {}
+    )
+    _, [result] = talk(serve(stage), ("hou_ping", {}))
+    body = result.structured_content
+    assert body["call"]["ok"] is True
+    assert body["health"]["busy"] is False
+    [sent] = stage.sent.calls
+    assert sent["wait_s"] == ping_tool.PING_WAIT_S
+
+
+def test_hou_ping_says_what_its_wait_does_by_default() -> None:
+    listed, _ = talk(serve(Stage([])))
+    [tool] = [tool for tool in listed.tools if tool.name == "hou_ping"]
+    said = tool.input_schema["properties"]["wait_s"]["description"]
+    assert "Default 1" not in said
+    assert "health" in said
