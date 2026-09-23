@@ -543,9 +543,11 @@ def pages_asked(served: HelpServer) -> list[str]:
 # Section: the tool list
 
 
-def test_hou_docs_is_listed_last_and_read_only() -> None:
-    assert TOOLS[-1].name == "hou_docs"
-    tool = TOOLS[-1].as_tool()
+def test_hou_docs_is_listed_after_hou_jobs_and_read_only() -> None:
+    names = [spec.name for spec in TOOLS]
+    assert names.index("hou_docs") > names.index("hou_jobs")
+    [spec] = [spec for spec in TOOLS if spec.name == "hou_docs"]
+    tool = spec.as_tool()
     assert tool.annotations is not None
     assert tool.annotations.read_only_hint is True
     assert tool.input_schema["additionalProperties"] is False

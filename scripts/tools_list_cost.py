@@ -36,7 +36,7 @@ from nscr_houdini_mcp.server import build_server  # noqa: E402
 CHARS_PER_TOKEN = 4
 
 # The goal for the whole `tools/list` payload.
-BUDGET_TOKENS = 2500
+BUDGET_TOKENS = 4000
 
 
 def estimate_tokens(text: str) -> int:

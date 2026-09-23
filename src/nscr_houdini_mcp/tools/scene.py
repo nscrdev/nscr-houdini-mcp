@@ -3,7 +3,8 @@
 Four actions.
 
 - `info` reads the scene through `scene.info`. `full` adds what the scene
-  points at that is not on this machine. `unsaved` comes from Houdini in a
+  points at that is not on this machine, and the names of the reference
+  images registered for it with `hou_compare`. `unsaved` comes from Houdini in a
   session with a user interface and from the bridge's own mark in a worker,
   which cannot say for itself, and `unsaved_source` says which; it is nothing
   when the mark cannot tell.
@@ -43,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from nscr_houdini_mcp import outputs as outputs_module
+from nscr_houdini_mcp import references
 from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge.tools import HIP_SUFFIXES, LICENSE_SUFFIX, UNDO_NOTE
 from nscr_houdini_mcp.results import CallError
@@ -100,8 +102,23 @@ def scene_info(call: Call) -> dict[str, Any]:
     if full:
         for key in ("houdini_version", "undo_entries", "kind", "dependencies"):
             result[key] = data.get(key)
+        result["references"] = reference_names(call, data)
     result["scene_epoch"] = call.trace.get("scene_epoch")
     return result
+
+
+def reference_names(call: Call, data: Mapping[str, Any]) -> list[str]:
+    """The reference images registered for this scene, so a fresh context finds the goal."""
+    hip = None if data.get("untitled") else data.get("hip_path")
+    home = call.router.home
+    scratch = None if os.environ.get("HOUDINI_TEMP_DIR") else Path(home) / "temp"
+    try:
+        place = references.folder(
+            home=home, hip_path=hip, session_id=call.trace.get("session_id"), scratch_root=scratch
+        )
+    except outputs_module.OutputError:
+        return []
+    return references.names(place)
 
 
 def version_of(hip_name: Any) -> int | None:

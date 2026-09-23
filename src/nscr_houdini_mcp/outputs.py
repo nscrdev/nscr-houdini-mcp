@@ -58,11 +58,18 @@ OUTPUT_KINDS = (
     "capture",
     "compare",
     "job",
+    "reference",
 )
 
 # Kinds whose path is only ever for a record the server or a session writes
 # itself, never one handed out to a caller's code.
 RECORD_KINDS = ("job",)
+
+# Kinds whose folder is fixed per scene, because their records are found by
+# looking in it: the folder part of the line may not change from one run to
+# the next. The file name may.
+FIXED_FOLDER_KINDS = ("reference",)
+FOLDER_VARYING_TOKENS = ("name", "run_id", "date", "date_iso", "time", "ver", "session")
 
 # Every token a template may use. Anything else fails on load, so a typo is a
 # clear message and not a literal `<nmae>` in a file name.
@@ -106,6 +113,7 @@ DEFAULT_GRAMMAR = {
     "capture": "<output_root>/.agent/captures/<date>/<time>_<name>_<run_id>.<ext>",
     "compare": "<output_root>/.agent/compare/<date>_<name>/<ver>_<run_id>/",
     "job": "<output_root>/.agent/jobs/<name>.<ext>",
+    "reference": "<output_root>/.agent/reference/<name>_<run_id>.<ext>",
 }
 
 DEFAULT_EXTENSIONS = {
@@ -118,6 +126,7 @@ DEFAULT_EXTENSIONS = {
     "capture": "png",
     "compare": "",
     "job": "json",
+    "reference": "png",
 }
 
 # Roots are templates too, so a studio can point a kind somewhere else without
@@ -475,6 +484,8 @@ def _merge(layers: list[tuple[Path, dict[str, Any]]]) -> Conventions:
         raise ConventionError("conventions.output_marker_type must name a node type")
     for kind, template in grammar.items():
         _check_template(kind, template)
+    for kind in FIXED_FOLDER_KINDS:
+        _check_fixed_folder(kind, grammar[kind])
     for key in ("output_root", "cache_root"):
         _check_root(key, str(outputs[key]))
     _check_producer(str(outputs["producer"]))
@@ -543,6 +554,17 @@ def _check_template(kind: str, template: str) -> None:
     if unknown:
         raise ConventionError(f"the {kind} template uses unknown tokens: {', '.join(unknown)}")
     _check_variables(f"the {kind} template", template)
+
+
+def _check_fixed_folder(kind: str, template: str) -> None:
+    """A kind whose records are looked up in one folder may not move that folder."""
+    folder = template.rstrip("/").rpartition("/")[0]
+    for token in _TOKEN.findall(folder):
+        if token in FOLDER_VARYING_TOKENS:
+            raise ConventionError(
+                f"the {kind} folder is fixed per scene, so its template may use <{token}> "
+                "only in the file name, not in a folder"
+            )
 
 
 def _check_root(label: str, root: str) -> None:
@@ -838,6 +860,15 @@ def _temp_dir(scratch_root: str | Path | None) -> str:
     if from_env:
         return _posix(from_env)
     return _posix(store_module.default_home() / "temp")
+
+
+def inside(plan: OutputPlan, relative: str) -> str:
+    """A path for a file a run writes inside its own folder, checked to stay there."""
+    base = _normalize(plan.directory.replace("\\", "/"))
+    target = _normalize(f"{base}/{relative}")
+    if target == base or not _inside(base, target):
+        raise ConventionError(f"{relative} would leave the folder of run {plan.run_id}")
+    return target
 
 
 def record_path(

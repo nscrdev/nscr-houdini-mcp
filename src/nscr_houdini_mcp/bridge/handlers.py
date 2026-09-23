@@ -18,7 +18,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from nscr_houdini_mcp.bridge import node_types
+from nscr_houdini_mcp.bridge import images, node_types
 from nscr_houdini_mcp.bridge import tools as tool_module
 from nscr_houdini_mcp.bridge.tools import ToolContext
 
@@ -342,6 +342,14 @@ def default_registry(
         arguments=(),
         context=True,
         summary="where this session serves its help pages",
+    )
+    registry.add(
+        "compare.read_exr",
+        images.read_exr,
+        arguments=images.ARGUMENTS,
+        required=images.ARGUMENTS,
+        context=True,
+        summary="read a scene linear image through the display transform, for a compare",
     )
     registry.add_report("namespaces", namespaces.state)
     return registry

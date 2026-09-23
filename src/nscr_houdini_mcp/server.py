@@ -149,7 +149,13 @@ class Runtime:
             spill = Spill(config.spill_folder, config.spill_over_bytes)
             failed = bool(spec.failed(data)) if spec.failed else False
             return ok_result(
-                data, call.trace, spill=spill, tool=name, summary=summary, is_error=failed
+                data,
+                call.trace,
+                spill=spill,
+                tool=name,
+                summary=summary,
+                is_error=failed,
+                extra=call.content,
             )
         except CallError as error:
             return error_result(error, call.trace if call else None)

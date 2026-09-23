@@ -29,7 +29,7 @@ import hashlib
 import json
 import secrets
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -66,6 +66,10 @@ SERVER_CODES: dict[str, str] = {
     "JOB_UNKNOWN": "no job is kept under that id",
     "HELP_UNAVAILABLE": "no help server and no help folder for this Houdini",
     "DOC_NOT_FOUND": "the help has no page at that path",
+    "NOT_YET_AVAILABLE": "this build does not offer that yet",
+    "IMAGE_UNREADABLE": "the file is not an image this can read",
+    "IMAGE_TOO_LARGE": "the image has more pixels than this reads",
+    "REFERENCE_UNKNOWN": "no reference is registered under that name",
 }
 
 CODES: dict[str, str] = {**BRIDGE_CODES, **SERVER_CODES}
@@ -129,6 +133,10 @@ HINTS: dict[str, str] = {
         " that has its houdini/help folder"
     ),
     "DOC_NOT_FOUND": "use one of the paths in did_you_mean, or find the page with mode search",
+    "NOT_YET_AVAILABLE": "use what the details name instead, or pass the image as a file",
+    "IMAGE_UNREADABLE": "export the image as PNG, JPEG, TIFF or EXR and pass that file",
+    "IMAGE_TOO_LARGE": "pass a smaller copy of the image, or crop it to the part that matters",
+    "REFERENCE_UNKNOWN": "pass a registered name from list_references, or a file path",
 }
 
 # The largest result whose text block repeats the whole JSON. Larger ones get a
@@ -140,6 +148,15 @@ DETAILS_CHARS = 1500
 
 # How much of a spilled result comes back as a preview.
 PREVIEW_CHARS = 2000
+
+# The most one reply may add up to: the structured result, the text block and
+# any other blocks, such as a picture. A block that would go over it is left
+# out, and the text says so. A tool that sends a picture sizes it to fit first.
+REPLY_BUDGET_BYTES = 1024 * 1024
+
+# More than the text block of a result can be: the mirrored result, or the
+# first part of a spilled one, with the line around it.
+TEXT_BLOCK_CAP = 8192
 
 
 class CallError(Exception):
@@ -300,13 +317,18 @@ def ok_result(
     tool: str = "result",
     summary: str | None = None,
     is_error: bool = False,
+    extra: Sequence[Any] = (),
 ) -> CallToolResult:
     """A result, or the path to it when it is too large to return.
 
     `is_error` marks a result that is whole and still reports a failure, such
     as code that ran and raised: the client reads it as an error and gets
-    everything the call has to say about it.
+    everything the call has to say about it. `extra` is content that goes
+    after the text block, such as a picture, and goes whether or not the
+    result itself was spilled, as long as the text and the blocks together
+    stay within `REPLY_BUDGET_BYTES`.
     """
+    blocks = list(extra)
     flag = bool(is_error)
     body = {**data, "trace": dict(trace)}
     try:
@@ -330,15 +352,63 @@ def ok_result(
             f" {spill.over_bytes}, so it was written to {spilled['path']}."
             f" Read that file for all of it. First part:\n{text[:PREVIEW_CHARS]}"
         )
+        line, kept = within_budget(line, blocks, structured=body)
         return CallToolResult(
-            content=[TextContent(type="text", text=line)], structured_content=body, is_error=flag
+            content=[TextContent(type="text", text=line), *kept],
+            structured_content=body,
+            is_error=flag,
         )
     if len(text) > MIRROR_CHARS:
         line = summary or f"{tool}: {len(text)} characters, keys {', '.join(sorted(data))}"
         text = f"{line}\ntrace: {compact(dict(trace))}\nThe full result is in structuredContent."
+    text, kept = within_budget(text, blocks, structured=body)
     return CallToolResult(
-        content=[TextContent(type="text", text=text)], structured_content=body, is_error=flag
+        content=[TextContent(type="text", text=text), *kept],
+        structured_content=body,
+        is_error=flag,
     )
+
+
+def block_size(block: Any) -> int:
+    """The bytes a content block adds to a reply: its text or its encoded data."""
+    for field in ("data", "text"):
+        value = getattr(block, field, None)
+        if isinstance(value, str):
+            return len(value.encode("utf-8"))
+    return 0
+
+
+def structured_size(body: Mapping[str, Any]) -> int:
+    """The bytes a structured result adds to a reply."""
+    text = json.dumps(body, separators=(",", ":"), ensure_ascii=False, default=str)
+    return len(text.encode("utf-8"))
+
+
+def within_budget(
+    text: str, blocks: Sequence[Any], *, structured: Mapping[str, Any] | None = None
+) -> tuple[str, list[Any]]:
+    """The blocks that fit beside the text and the structured result in one reply.
+
+    The text says what did not fit.
+    """
+    used = len(text.encode("utf-8"))
+    if structured is not None:
+        used += structured_size(structured)
+    kept: list[Any] = []
+    dropped = 0
+    for block in blocks:
+        size = block_size(block)
+        if used + size > REPLY_BUDGET_BYTES:
+            dropped += size
+            continue
+        used += size
+        kept.append(block)
+    if dropped:
+        text += (
+            f"\nA {dropped} byte block was left out to keep the reply within"
+            f" {REPLY_BUDGET_BYTES} bytes."
+        )
+    return text, kept
 
 
 class Spill:
