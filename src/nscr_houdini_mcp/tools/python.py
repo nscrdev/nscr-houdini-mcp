@@ -57,7 +57,13 @@ The `mcp` helper in every namespace:
 
 - `mcp.output_path(kind, name=None, ext=None)`: a managed path for this
   session and scene, from the output table: render, flipbook, comp, cache,
-  usd, hip, capture or compare. Never a path the code makes up.
+  usd, hip, capture, compare, reference or check. Never a path the code
+  makes up, and never a spill, which is the server's own.
+- `mcp.freeze_parm(parm, path)`: puts a path this call was handed on an
+  output parameter, a `hou.Parm` or its path, for as long as the call runs.
+  When the call ends, however it ends, the parameter gets the path's `$HIP`
+  template back, and `restored_parms` in the answer says so. One changed by
+  the code in between is left as the code left it.
 - `mcp.progress(done, total=None, message=None)`: a note health and
   `hou_ping` show while the call runs. Finite numbers only.
 - `mcp.cancelled()`: whether the call should stop, for a long loop to look
@@ -221,6 +227,8 @@ def shape(
         said.update(spill(call, result=result, stdout=stdout, dropped=dropped, error=error))
     if error is not None:
         said["error"] = error
+    if data.get("restored_parms"):
+        said["restored_parms"] = data["restored_parms"]
     said["duration_ms"] = data.get("duration_ms")
     undo = reply.get("undo") if isinstance(reply.get("undo"), Mapping) else {}
     said["undo_label"] = undo.get("label") or label

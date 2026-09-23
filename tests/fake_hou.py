@@ -113,6 +113,8 @@ class ParmTemplate:
         tags: dict[str, str] | None = None,
         folder: str = "",
         menu: tuple[str, ...] = (),
+        string_type: str = "Regular",
+        file_type: str = "Any",
     ) -> None:
         self._kind = TemplateType(kind)
         self._label = label
@@ -120,6 +122,8 @@ class ParmTemplate:
         self._tags = dict(tags or {})
         self._folder = folder
         self._menu = menu
+        self._string_type = string_type
+        self._file_type = file_type
 
     def type(self) -> TemplateType:
         return self._kind
@@ -135,6 +139,13 @@ class ParmTemplate:
 
     def menuItems(self) -> tuple[str, ...]:  # noqa: N802 - the name is Houdini's
         return self._menu
+
+    def stringType(self) -> str:  # noqa: N802 - the name is Houdini's
+        # Houdini hands back an enum value that prints this way.
+        return f"stringParmType.{self._string_type}"
+
+    def fileType(self) -> str:  # noqa: N802 - the name is Houdini's
+        return f"fileType.{self._file_type}"
 
     def defaultValue(self) -> tuple[Any, ...]:  # noqa: N802 - the name is Houdini's
         return self.default
@@ -167,6 +178,8 @@ class Parm:
         self._expression: str | None = None
         self._language = "hscript"
         self.locked = False
+        # Whether a disable rule on the node turns this parameter off.
+        self.disabled = False
         self._instance_of = instance_of
         self._index = index
         self._spare = spare
@@ -254,6 +267,13 @@ class Parm:
             raise OperationFailed("Only string parms have unexpanded strings")
         return str(self.value)
 
+    def isDisabled(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return self.disabled
+
+    def deleteAllKeyframes(self) -> None:  # noqa: N802 - the name is Houdini's
+        self.keys = []
+        self._expression = None
+
     def isLocked(self) -> bool:  # noqa: N802 - the name is Houdini's
         return self.locked
 
@@ -336,7 +356,64 @@ TYPE_PARMS: dict[str, tuple[tuple[str, str, tuple[str, ...], Any, dict[str, Any]
         ("group", "String", ("group",), "", {}),
         ("numattr", "Folder", ("numattr",), 1, {"folder": "MultiparmBlock"}),
     ),
-    "file": (("file", "String", ("file",), "default.bgeo", {}),),
+    "file": (
+        (
+            "file",
+            "String",
+            ("file",),
+            "default.bgeo",
+            {"string_type": "FileReference", "tags": {"filechooser_mode": "read_and_write"}},
+        ),
+    ),
+    # Output nodes, with the parameters their types mark as written to, as
+    # read from a real session: a render's picture, a geometry output and a
+    # cache's file. A script run before a render is read, never written, and
+    # a folder for temporary tiles is not an output.
+    "karma": (
+        (
+            "picture",
+            "String",
+            ("picture",),
+            "$HIP/render/$HIPNAME.$OS.$F4.exr",
+            {"string_type": "FileReference", "tags": {"filechooser_mode": "write"}},
+        ),
+        (
+            "prerender",
+            "String",
+            ("prerender",),
+            "",
+            {"string_type": "FileReference", "tags": {"filechooser_mode": "read"}},
+        ),
+        (
+            "husk_tiletempdir",
+            "String",
+            ("husk_tiletempdir",),
+            "$HOUDINI_TEMP_DIR",
+            {
+                "string_type": "FileReference",
+                "file_type": "Directory",
+                "tags": {"filechooser_mode": "write"},
+            },
+        ),
+    ),
+    "rop_geometry": (
+        (
+            "sopoutput",
+            "String",
+            ("sopoutput",),
+            "$HIP/geo/$HIPNAME.$OS.$F.bgeo.sc",
+            {"string_type": "FileReference", "tags": {"filechooser_mode": "write"}},
+        ),
+    ),
+    "filecache": (
+        (
+            "file",
+            "String",
+            ("file",),
+            "$HIP/geo/$HIPNAME.$OS.$F.bgeo.sc",
+            {"string_type": "FileReference", "tags": {"filechooser_mode": "write"}},
+        ),
+    ),
 }
 
 # What each instance of a multiparm holds, by the multiparm's name.

@@ -638,6 +638,24 @@ def test_a_kind_the_table_does_not_have_is_an_exception_in_the_code(bench: Bench
     assert error["type"] == "UnknownKind"
 
 
+@pytest.mark.parametrize(("kind", "folder"), [("reference", "reference"), ("check", "checks")])
+def test_references_and_checks_are_handed_to_code(
+    bench: Bench, scene: Scene, tmp_path: Path, kind: str, folder: str
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    scene.hipFile.setName(str(project / "shot.hip"))
+    result = ok(python(bench, code=f"result = mcp.output_path('{kind}', 'look')"))["result"]
+    assert Path(result).is_relative_to(project / ".agent" / folder)
+
+
+@pytest.mark.parametrize("kind", ["spill", "job"])
+def test_the_servers_own_kinds_are_never_handed_to_code(bench: Bench, kind: str) -> None:
+    error = raised(python(bench, code=f"mcp.output_path('{kind}', 'x')"))["error"]
+    assert error["type"] == "UnknownKind"
+    assert "not handed to code" in error["message"]
+
+
 # Section: arguments
 
 
