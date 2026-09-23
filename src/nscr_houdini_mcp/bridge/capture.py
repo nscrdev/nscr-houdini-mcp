@@ -26,21 +26,28 @@ The routes for a view, in order, and the first that writes a file wins:
   `framing_unverified`. It is the only route a session without one has.
   `node` isolates the node: its object alone is drawn, the node carries the
   display flag for the capture, and the flag goes back to where it was.
-  On a display whose pixels are denser than its points, this node draws the
-  frame larger than asked and keeps only its bottom left corner. A tiny
-  render of a known box says by how much, once per process, and the camera's
-  screen window is widened by that much for the capture and put back after.
+  It always looks through a camera made for the capture: one fitted to the
+  target, or one that follows a named camera as its child and reads its lens
+  and window by reference, so a named camera is never written. A worker
+  draws at one pixel to a point because the pool starts it on Qt's offscreen
+  screen plugin. In a session with a user interface a tiny render of a known
+  box says whether the render node draws larger than asked, read again when
+  the screen's pixel ratio changes, and the made camera's window makes up for
+  it.
 
 `cop` reads the COP's image layer and writes it as an 8 bit PNG, or saves an
 older COP's image with its own writer. `network` and `pane` grab the pane's
-own window through Qt, reached from that one pane tab, and crop it to the
-pane. Nothing here walks the widget tree.
+own window through Qt, reached from that one pane tab, made the current tab
+for the grab and put back after, with pending paints let through first, and
+crop it to the pane. Nothing here walks the widget tree.
 
 Everything made for a capture, the render node, a fitted camera and a moved
 display flag, is made and taken away with undo turned off, so the artist's
 undo history is as it was. A route that finishes without writing a file, or
 writes an empty one, counts as a route that did not work, and the next one is
-tried. Only when every route that applies fails is the answer
+tried, and whatever frames it wrote are taken away. A capture stopped on
+request keeps the frames it wrote and lists them. Only when every route that
+applies fails is the answer
 `UI_UNAVAILABLE`, or `CAPTURE_EMPTY` when every one ran and wrote nothing.
 
 This module reads `hou` only through the objects it is handed. Its numbers
@@ -347,9 +354,19 @@ def capture_image(arguments: Mapping[str, Any], context: ToolContext) -> dict[st
         unsaved = unsaved or bool(plan.unsaved_hip)
         warnings.extend(item for item in plan.warnings if item not in warnings)
         path = sequence_path(plan.path) if spec.sequence else plan.path
-        shot = shoot(hou, context, spec, camera, path, frames, gui)
+        try:
+            shot = shoot(hou, context, spec, camera, path, frames, gui)
+        except BaseException:
+            # Nothing was written under this place, so its claim and record go.
+            _release(context, plan)
+            raise
+        _record(context, plan, shot["files"])
         warnings.extend(item for item in shot.pop("warnings", ()) if item not in warnings)
-        stopped = stopped or bool(shot.get("stopped_early"))
+        if shot.get("stopped_early"):
+            stopped = True
+            kept = "the frames written before the stop are kept, and listed"
+            if kept not in warnings:
+                warnings.append(kept)
         shots.append({"view": label, "run_id": plan.run_id, "template": plan.template, **shot})
     sheet = None
     if len(wanted) > 1 and len(shots) == len(wanted):
@@ -367,6 +384,27 @@ def capture_image(arguments: Mapping[str, Any], context: ToolContext) -> dict[st
         "warnings": warnings,
         "region": _region(arguments.get("region")),
     }
+
+
+def _record(context: ToolContext, plan: Any, files: Sequence[str]) -> None:
+    """Name the files this run wrote in its record and beside its output. Best effort."""
+    from nscr_houdini_mcp import outputs
+
+    def write() -> None:
+        with context.open_store() as store:
+            outputs.record_files(store, plan, files)
+
+    _quiet(write)
+
+
+def _release(context: ToolContext, plan: Any) -> None:
+    from nscr_houdini_mcp import outputs
+
+    def give_back() -> None:
+        with context.open_store() as store:
+            outputs.release(store, plan)
+
+    _quiet(give_back)
 
 
 def views_of(spec: Spec) -> list[tuple[str, Any]]:
@@ -442,17 +480,19 @@ def shoot(
         try:
             shot = run(hou, context, spec, camera, path, frames, gui)
         except Unavailable as reason:
+            discard(frame_files(path, frames, spec.sequence))
             tried.append({"route": route, "reason": str(reason)})
             continue
-        except BridgeError:
-            raise
-        except Exception as error:  # noqa: BLE001 - a Houdini refusal moves on to the next route
-            if not _is_hou_error(error):
+        except BaseException as error:
+            # A route that failed part way leaves nothing behind it.
+            discard(frame_files(path, frames, spec.sequence))
+            if isinstance(error, BridgeError) or not _is_hou_error(error):
                 raise
             tried.append({"route": route, "reason": _reason(error)})
             continue
         written = [item for item in shot["files"] if _written(item)]
         if not written or len(written) < len(shot["files"]):
+            discard(frame_files(path, frames, spec.sequence))
             tried.append({"route": route, "reason": NO_FILE})
             continue
         shot["route"] = route
@@ -492,6 +532,15 @@ def routes(hou: Any) -> list[str]:
     if ui:
         found += [NETWORK_GRAB, PANE_GRAB]
     return found
+
+
+def discard(files: Iterable[str]) -> None:
+    """Take away the files of a route that did not finish. A missing one is fine."""
+    for item in files:
+        try:
+            os.remove(item)
+        except OSError:
+            pass
 
 
 def _written(path: str) -> bool:
@@ -555,15 +604,12 @@ def flipbook_viewer(
     saved = ViewState.save(hou, viewport)
     try:
         described, warnings = apply_view(hou, spec, camera, viewport)
-        settings = viewer.flipbookSettings().stash()
-        settings.outputToMPlay(False)
-        settings.output(path)
-        settings.frameRange((frames[0], frames[-1]))
-        if len(frames) > 1:
-            settings.frameIncrement(frames[1] - frames[0])
-        settings.useResolution(True)
-        settings.resolution(spec.resolution)
-        settings.beautyPassOnly(not spec.guides)
+        settings, unset = flipbook_settings(hou, viewer, spec, path, frames)
+        if unset:
+            warnings.append(
+                "these flipbook settings could not be set and keep the artist's: "
+                + ", ".join(unset)
+            )
         viewer.flipbook(viewport=viewport, settings=settings, open_dialog=False)
     finally:
         saved.restore(hou, viewport)
@@ -574,6 +620,66 @@ def flipbook_viewer(
         "native": list(spec.resolution),
         "warnings": warnings,
     }
+
+
+# A setting whose value this build does not name.
+_NO_VALUE = object()
+
+
+def flipbook_settings(
+    hou: Any, viewer: Any, spec: Spec, path: str, frames: Sequence[float]
+) -> tuple[Any, list[str]]:
+    """A copy of the viewer's flipbook settings with every one this capture needs set.
+
+    The copy starts from the artist's dialog, so nothing is left to it: an
+    object filter, a contact sheet, motion blur, depth of field, a background
+    image or a colour transform the artist left on would all come along.
+    Returns the settings and the names that could not be set.
+    """
+    settings = viewer.flipbookSettings().stash()
+    kinds = getattr(hou, "flipbookObjectType", None)
+    smoothing = getattr(hou, "flipbookAntialias", None)
+    wanted = (
+        ("outputToMPlay", False),
+        ("output", path),
+        ("frameRange", (frames[0], frames[-1])),
+        ("frameIncrement", _step(frames)),
+        ("useResolution", True),
+        ("resolution", spec.resolution),
+        ("beautyPassOnly", not spec.guides),
+        ("visibleObjects", "*"),
+        ("visibleTypes", getattr(kinds, "Visible", _NO_VALUE)),
+        ("useSheetSize", False),
+        ("useMotionBlur", False),
+        ("useDepthOfField", False),
+        ("leaveFrameAtEnd", False),
+        ("appendFramesToCurrent", False),
+        ("backgroundImage", ""),
+        ("overrideGamma", False),
+        ("overrideLUT", False),
+        ("initializeSimulations", False),
+        ("renderAllViewports", False),
+        ("scopeChannelKeyframesOnly", False),
+        ("audioFilename", ""),
+        ("outputZoom", 100),
+        ("cropOutMaskOverlay", True),
+        ("antialias", getattr(smoothing, "UseDefault", _NO_VALUE)),
+        ("setUseFrameTimeLimit", False),
+        ("setUseFrameProgressLimit", False),
+    )
+    unset: list[str] = []
+    for name, value in wanted:
+        setter = getattr(settings, name, None)
+        if setter is None or value is _NO_VALUE:
+            unset.append(name)
+            continue
+        try:
+            setter(value)
+        except Exception as error:  # noqa: BLE001 - a setting this build refuses is named
+            if not _is_hou_error(error) and not isinstance(error, (TypeError, ValueError)):
+                raise
+            unset.append(name)
+    return settings, unset
 
 
 @dataclass
@@ -652,6 +758,12 @@ def apply_view(
     if target is None and camera is not None and through is None:
         # A view turned for the capture is framed on everything unless told.
         target = "all"
+    if target is not None and camera is None and _quiet(viewport.camera) is not None:
+        # Framing while looking through a camera node, with the camera locked
+        # to the view, would move that camera. The viewport's own camera is
+        # framed instead, and the camera node is looked through again after.
+        viewport.useDefaultCamera()
+        described["left_camera"] = True
     if target is not None:
         if through is not None:
             warnings.append("a camera node's view is not moved, so frame_target was not applied")
@@ -702,13 +814,15 @@ def rop_route(
             if isolated is not None:
                 objects, put_back = isolate(isolated)
             targets = [isolated] if isolated is not None else _targets(hou, spec.frame_target)
-            camera_path, described, warnings = rop_camera(hou, spec, camera, targets, made)
-            scale = drawing_scale(hou, parent, path)
+            if gui:
+                # A worker's render nodes draw at one pixel to a point; a
+                # session with a user interface draws at its screen's ratio.
+                scale = drawing_scale(hou, parent, os.path.dirname(path))
+            camera_path, described, warnings = rop_camera(
+                hou, spec, camera, targets, made, scale or 1.0
+            )
             if scale is None:
                 warnings.append("the render node's drawing scale could not be read")
-            elif scale != 1.0:
-                put_back.extend(widen_window(hou.node(camera_path), scale))
-                described["window_scaled"] = scale
             _set(rop, "camera", camera_path)
             _set(rop, "picture", path)
             _set(rop, "mkpath", 1)
@@ -753,30 +867,41 @@ def rop_route(
     return shot
 
 
-# The drawing scale, worked out once for the `hou` it was read in.
+# The drawing scale, worked out for the `hou` and the screen ratio it was read at.
 _found: list[Any] = []
 
 # The calibration: a unit box seen by an orthographic camera two units wide,
-# in a square picture. Drawn right, the box's left edge is a quarter of the
-# way across.
-PROBE_SIZE = 32
+# in a square picture. Drawn right, the box covers the middle half each way.
+PROBE_SIZE = 64
 PROBE_NAME = "nscr_capture_probe"
+# How far the edges may disagree, as a share of the box, before the reading is
+# thrown away.
+PROBE_SLACK = 0.1
 
 
-def drawing_scale(hou: Any, parent: Any, path: str) -> float | None:
-    """How much larger than asked the render node draws, as a camera window sees it.
+def screen_ratio(hou: Any) -> float | None:
+    """The main window's device pixel ratio, or nothing when the build will not say."""
+    window = _quiet(lambda: hou.ui.mainQtWindow())
+    ratio = _quiet(window.devicePixelRatioF) if window is not None else None
+    return float(ratio) if ratio else None
 
-    On a display whose pixels are denser than its points, a render node in a
-    session without a user interface draws the frame that many times larger
-    and keeps only the corner it was asked the size of, so the picture shows
-    the bottom left of the view. A small render of a known box says by how
-    much, once per process, and the camera's window makes up for it. Nothing
-    when the picture could not be read, which leaves the framing unverified.
+
+def drawing_scale(hou: Any, parent: Any, folder: str) -> float | None:
+    """How much larger than asked the render node draws, in a session with a user interface.
+
+    On a screen whose pixels are denser than its points, Qt can make a render
+    node draw the frame that many times larger and keep only the corner it was
+    asked the size of. A small render of a known box says by how much. It is
+    read again whenever the main window's pixel ratio has changed, which is
+    what moving Houdini to another screen does. Nothing when the picture could
+    not be read or its edges disagree, which leaves the framing unverified.
     """
-    if _found and _found[0] is hou:
-        return _found[1]
+    ratio = screen_ratio(hou)
+    if _found and _found[0] is hou and _found[1] == ratio:
+        return _found[2]
     obj = hou.node(CAMERA_PARENT)
-    probe_file = f"{path}.probe.png"
+    # A fixed name: the capture's own path can hold a frame token.
+    probe_file = os.path.join(folder, f"{PROBE_NAME}_{os.getpid()}.probe.png")
     made: list[Any] = []
     scale: float | None = None
     try:
@@ -802,9 +927,7 @@ def drawing_scale(hou: Any, parent: Any, path: str) -> float | None:
         _set(rop, "vobjects", holder.path())
         _set(rop, "forceobjects", holder.path())
         rop.render(frame_range=(1.0, 1.0))
-        box = alpha_box(probe_file)
-        if box is not None and box[0] > 0:
-            scale = round(box[0] / (PROBE_SIZE / 4) * 4) / 4
+        scale = scale_from_box(alpha_box(probe_file), PROBE_SIZE)
     except (Unavailable, OSError, ValueError, zlib.error):
         scale = None
     except Exception as error:  # noqa: BLE001 - a Houdini refusal leaves the scale unknown
@@ -814,32 +937,34 @@ def drawing_scale(hou: Any, parent: Any, path: str) -> float | None:
     finally:
         for node in reversed(made):
             _quiet(node.destroy)
-        try:
-            os.remove(probe_file)
-        except OSError:
-            pass
+        discard([probe_file])
     if scale is not None:
-        _found[:] = [hou, scale]
+        _found[:] = [hou, ratio, scale]
     return scale
 
 
-def widen_window(camera: Any, scale: float) -> list[Callable[[], Any]]:
-    """Grow a camera's screen window so the whole view lands in the corner that is kept.
+def scale_from_box(box: tuple[int, int, int, int] | None, size: int) -> float | None:
+    """The drawing scale from where the calibration box landed, or nothing.
 
-    The window keeps its bottom left corner and grows by the scale, which
-    moves its centre by half of what it grew. Returns the steps that put the
-    camera's own window back.
+    Drawn at scale `s`, the box's left edge is at `s` quarters of the width
+    and its bottom edge the same distance up from the bottom, since the corner
+    kept is the bottom left. Its width is half the frame times `s` when its
+    right edge is inside the picture. All three have to agree.
     """
-    names = ("winx", "winy", "winsizex", "winsizey")
-    parms = {name: _quiet(lambda name=name: camera.parm(name)) for name in names}
-    if any(parm is None for parm in parms.values()):
-        raise Unavailable("the camera has no screen window to widen")
-    kept = {name: parm.eval() for name, parm in parms.items()}
-    for axis in ("x", "y"):
-        size = float(kept[f"winsize{axis}"])
-        parms[f"win{axis}"].set(float(kept[f"win{axis}"]) + size * (scale - 1.0) / 2.0)
-        parms[f"winsize{axis}"].set(size * scale)
-    return [lambda name=name, value=value: parms[name].set(value) for name, value in kept.items()]
+    if box is None:
+        return None
+    left, _, right, bottom = box
+    quarter = size / 4.0
+    from_left = left / quarter
+    from_bottom = (size - bottom) / quarter
+    readings = [from_left, from_bottom]
+    if right < size:
+        readings.append((right - left) / (2.0 * quarter))
+    if from_left <= 0 or max(readings) - min(readings) > PROBE_SLACK * 4:
+        return None
+    middle = sum(readings) / len(readings)
+    # To the nearest quarter, halves rounding up rather than to even.
+    return math.floor(middle * 4.0 + 0.5) / 4.0
 
 
 def alpha_box(path: str) -> tuple[int, int, int, int] | None:
@@ -968,14 +1093,29 @@ def _targets(hou: Any, target: str | None) -> list[Any] | None:
 
 
 def rop_camera(
-    hou: Any, spec: Spec, camera: Any, targets: list[Any] | None, made: list[Any]
+    hou: Any,
+    spec: Spec,
+    camera: Any,
+    targets: list[Any] | None,
+    made: list[Any],
+    scale: float = 1.0,
 ) -> tuple[str, dict[str, Any], list[str]]:
-    """The camera the render node looks through: the one named, or one fitted for it."""
+    """The camera the render node looks through, always one made for the capture.
+
+    A named camera is followed rather than used: a camera made beside it takes
+    it as its parent, with no move of its own, and reads its lens and window
+    through channel references, so an animated camera is followed frame by
+    frame and nothing on it is ever written. Otherwise a camera is fitted to
+    the target. On a render node that draws larger than asked, the made
+    camera's window is widened to make up for it.
+    """
     warnings: list[str] = []
     if isinstance(camera, str) and camera.startswith("/"):
         if spec.frame_target is not None:
             warnings.append("a camera node's view is not moved, so frame_target was not applied")
-        return camera, {"kind": "node", "path": camera}, warnings
+        named = hou.node(camera)
+        follower = follow_camera(named, made, scale)
+        return follower.path(), {"kind": "node", "path": camera}, warnings
     if isinstance(camera, Mapping):
         orbit, elevation, ortho = camera["orbit"], camera["elevation"], False
         view = "orbit"
@@ -1010,6 +1150,10 @@ def rop_camera(
     if ortho:
         _set_camera(fitted, "projection", "ortho")
         _set_camera(fitted, "orthowidth", fit["orthowidth"])
+    if scale != 1.0:
+        for axis in ("x", "y"):
+            _set_camera(fitted, f"win{axis}", (scale - 1.0) / 2.0)
+            _set_camera(fitted, f"winsize{axis}", scale)
     described = {
         "kind": "fitted",
         "view": view,
@@ -1018,7 +1162,56 @@ def rop_camera(
         "projection": "ortho" if ortho else "perspective",
         "target": spec.path if spec.source == "node" else (spec.frame_target or "all"),
     }
+    if scale != 1.0:
+        described["window_scaled"] = scale
     return fitted.path(), described, warnings
+
+
+# What a camera made to follow a named one reads from it, by channel reference.
+FOLLOWED = (
+    "focal",
+    "aperture",
+    "aspect",
+    "orthowidth",
+    "near",
+    "far",
+    "resx",
+    "resy",
+    "winx",
+    "winy",
+    "winsizex",
+    "winsizey",
+)
+# Menus, copied by their value: a reference would read the item's number.
+COPIED = ("projection", "focalunits")
+
+
+def follow_camera(named: Any, made: list[Any], scale: float) -> Any:
+    """A camera beside a named one that sees what it sees and writes nothing on it."""
+    network = named.parent()
+    follower = network.createNode(CAMERA_TYPE, _free_name(network, CAMERA_NAME))
+    made.append(follower)
+    follower.setInput(0, named)
+    source = f"../{named.name()}"
+    for name in FOLLOWED:
+        if _quiet(lambda name=name: named.parm(name)) is None:
+            continue
+        mine = _quiet(lambda name=name: follower.parm(name))
+        if mine is None:
+            continue
+        expression = f'ch("{source}/{name}")'
+        if scale != 1.0 and name in ("winx", "winy"):
+            axis = name[-1]
+            expression += f' + ch("{source}/winsize{axis}") * {(scale - 1.0) / 2.0!r}'
+        elif scale != 1.0 and name in ("winsizex", "winsizey"):
+            expression += f" * {scale!r}"
+        mine.setExpression(expression)
+    for name in COPIED:
+        theirs = _quiet(lambda name=name: named.parm(name))
+        mine = _quiet(lambda name=name: follower.parm(name))
+        if theirs is not None and mine is not None:
+            mine.set(theirs.evalAsString())
+    return follower
 
 
 def _set_camera(node: Any, name: str, value: Any) -> None:
@@ -1243,19 +1436,17 @@ def network_route(
     showing = [tab for tab in editors if _quiet(tab.isCurrentTab)]
     editor = (showing or editors)[0]
     shot: dict[str, Any] = {"files": [path], "frames": [frames[0]], "camera": None}
-    if spec.path:
-        previous = _quiet(editor.pwd)
-        editor.setPwd(hou.node(spec.path))
-        # The editor draws the new network on its next paint, which a grab
-        # in the same breath may not see.
-        shot["framing_unverified"] = True
-        try:
-            shot["native"] = grab_pane(editor, path)
-        finally:
-            if previous is not None:
-                _quiet(lambda: editor.setPwd(previous))
-    else:
+    previous = _quiet(editor.pwd) if spec.path else None
+    try:
+        if spec.path:
+            editor.setPwd(hou.node(spec.path))
+            # Whether the editor has laid the new network out by the time it
+            # is grabbed is not something this route can see.
+            shot["framing_unverified"] = True
         shot["native"] = grab_pane(editor, path)
+    finally:
+        if previous is not None:
+            _quiet(lambda: editor.setPwd(previous))
     return shot
 
 
@@ -1276,26 +1467,57 @@ def pane_route(
     return {"files": [path], "frames": [frames[0]], "camera": None, "native": grab_pane(tab, path)}
 
 
+def process_events() -> None:
+    """Let the interface paint what has changed, so a grab reads what is shown.
+
+    User input is left queued, so nothing the artist does runs in the middle
+    of a capture.
+    """
+    for binding in ("PySide6", "PySide2"):
+        try:
+            widgets = __import__(f"{binding}.QtWidgets", fromlist=["QApplication"])
+            core = __import__(f"{binding}.QtCore", fromlist=["QEventLoop"])
+        except ImportError:
+            continue
+        application = widgets.QApplication.instance()
+        if application is not None:
+            application.processEvents(core.QEventLoop.ExcludeUserInputEvents)
+        return
+
+
 def grab_pane(tab: Any, path: str) -> list[int]:
-    """Grab the window one pane tab lives in and keep the part that is the pane."""
-    window = _quiet(tab.qtParentWindow)
-    geometry = _quiet(tab.qtScreenGeometry)
-    if window is None or geometry is None:
-        raise Unavailable("the pane has no window to grab")
-    pixmap = window.grab()
-    origin = window.mapToGlobal(window.rect().topLeft())
-    box = crop_box(
-        (geometry.x(), geometry.y(), geometry.width(), geometry.height()),
-        (origin.x(), origin.y()),
-        (pixmap.width(), pixmap.height()),
-        float(_quiet(pixmap.devicePixelRatio) or 1.0),
-    )
-    if box is None:
-        raise Unavailable("the pane is not inside its window on screen")
-    left, top, right, bottom = box
-    piece = pixmap.copy(left, top, right - left, bottom - top)
-    if not piece.save(path, "PNG"):
-        raise Unavailable(NO_FILE)
+    """Grab the window one pane tab lives in and keep the part that is the pane.
+
+    The tab is made the current one of its pane for the grab, so it is the
+    one drawn, and the tab that was current is put back after.
+    """
+    pane = _quiet(tab.pane)
+    previous = _quiet(pane.currentTab) if pane is not None else None
+    if not _quiet(tab.isCurrentTab):
+        tab.setIsCurrentTab()
+    try:
+        window = _quiet(tab.qtParentWindow)
+        geometry = _quiet(tab.qtScreenGeometry)
+        if window is None or geometry is None:
+            raise Unavailable("the pane has no window to grab")
+        process_events()
+        pixmap = window.grab()
+        origin = window.mapToGlobal(window.rect().topLeft())
+        box = crop_box(
+            (geometry.x(), geometry.y(), geometry.width(), geometry.height()),
+            (origin.x(), origin.y()),
+            (pixmap.width(), pixmap.height()),
+            float(_quiet(pixmap.devicePixelRatio) or 1.0),
+        )
+        if box is None:
+            raise Unavailable("the pane is not inside its window on screen")
+        left, top, right, bottom = box
+        piece = pixmap.copy(left, top, right - left, bottom - top)
+        if not piece.save(path, "PNG"):
+            raise Unavailable(NO_FILE)
+    finally:
+        if previous is not None and previous is not tab:
+            _quiet(previous.setIsCurrentTab)
     return [right - left, bottom - top]
 
 

@@ -14,6 +14,7 @@ import math
 import threading
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -21,6 +22,7 @@ from PIL import Image
 
 from fake_hou import (
     Desktop,
+    FlipbookSettings,
     NetworkEditorTab,
     OperationFailed,
     Pane,
@@ -142,14 +144,29 @@ def test_the_viewport_in_hython_is_a_fitted_camera_through_the_flipbook_rop(
     assert said["unsaved_hip"] is False
 
 
-def test_a_named_camera_is_used_as_it_is(scene: Scene, home: Path) -> None:
+def camera_state(camera: Any) -> list[tuple[Any, ...]]:
+    return [
+        (parm.name(), parm.value, parm._expression, tuple(parm.keys), parm.locked)
+        for parm in camera.parms()
+    ]
+
+
+def test_a_named_camera_is_followed_and_never_written(scene: Scene, home: Path) -> None:
     shot_cam = scene.node("/obj").createNode("cam", "shotcam")
+    shot_cam.parm("focal").set(35.0)
+    shot_cam.parm("tx").setKeyframes([(1.0, "3", "hscript")])
+    shot_cam.parm("winx").locked = True
+    scene.undos.labels.clear()
+    before = camera_state(shot_cam)
     said = take(scene, home, camera="/obj/shotcam")
     [seen] = scene.capture.seen
-    assert seen["camera"] == "/obj/shotcam"
+    assert seen["camera"].startswith("/obj/nscr_capture_cam")
+    assert seen["follows"] == "/obj/shotcam"
+    assert seen["focal"] == 35.0
     assert said["views"][0]["camera"] == {"kind": "node", "path": "/obj/shotcam"}
+    assert camera_state(shot_cam) == before
     assert names(scene, "/obj") == ["boxgeo", "shotcam"]
-    assert shot_cam.parmTuple("t")[0].eval() == 0.0
+    assert scene.undos.undoLabels() == []
 
 
 def test_quad_writes_four_views_and_names_a_sheet(scene: Scene, home: Path) -> None:
@@ -643,43 +660,100 @@ def test_through_the_dispatcher_nothing_lands_on_undo_and_a_retry_is_the_receipt
 # Section: a render node that draws larger than asked
 
 
-def test_a_dense_display_is_worked_out_and_the_camera_window_makes_up_for_it(
+def gui_without_viewer(scene: Scene) -> None:
+    """A session with a user interface whose only route is the render node."""
+    desktop(scene)
+
+
+def test_a_dense_screen_is_worked_out_and_the_made_camera_makes_up_for_it(
     scene: Scene, home: Path
 ) -> None:
+    gui_without_viewer(scene)
     scene.capture.backing = 2.0
-    said = take(scene, home, resolution=[320, 160])
+    said = take(scene, home, kind="gui", resolution=[320, 160])
     [shot] = said["views"]
     assert shot["camera"]["window_scaled"] == 2.0
-    assert "framing_unverified" not in shot
     [seen] = scene.capture.seen
     assert seen["window"] == (0.5, 0.5, 2.0, 2.0)
     # The box sits in the middle of the frame, where it would with no scale.
     assert picture(shot["files"][0]).getchannel("A").getbbox() == (80, 40, 240, 120)
     assert len(scene.capture.probes) == 1
-    assert not list(Path(shot["files"][0]).parent.glob("*.probe.png"))
+    assert list(Path(shot["files"][0]).parent.glob("*.probe.png")) == []
     assert names(scene, "/obj") == ["boxgeo"]
     assert names(scene, "/out") == []
 
 
-def test_a_named_camera_gets_its_own_window_back(scene: Scene, home: Path) -> None:
+def test_a_worker_never_draws_a_calibration(scene: Scene, home: Path) -> None:
+    take(scene, home)
+    assert scene.capture.probes == []
+
+
+def test_the_scale_is_read_again_when_the_screen_ratio_changes(scene: Scene, home: Path) -> None:
+    gui_without_viewer(scene)
+    run = Run(scene, home, "gui")
+    capture.capture_image({}, run.context)
+    capture.capture_image({}, run.context)
+    assert len(scene.capture.probes) == 1
+    scene.ui.ratio = 2.0
+    capture.capture_image({}, run.context)
+    assert len(scene.capture.probes) == 2
+
+
+def test_a_sequence_first_still_reads_the_scale_under_a_plain_name(
+    scene: Scene, home: Path
+) -> None:
+    gui_without_viewer(scene)
+    scene.capture.backing = 2.0
+    said = take(scene, home, kind="gui", frames=[1, 2, 1], resolution=[320, 160])
+    [probe] = scene.capture.probes
+    assert "$F" not in probe["picture"]
+    [shot] = said["views"]
+    for item in shot["files"]:
+        assert picture(item).getchannel("A").getbbox() == (80, 40, 240, 120)
+    assert list(Path(shot["files"][0]).parent.glob("*.probe.png")) == []
+
+
+def test_a_named_camera_on_a_dense_screen_is_followed_with_a_wider_window(
+    scene: Scene, home: Path
+) -> None:
+    gui_without_viewer(scene)
     scene.capture.backing = 2.0
     shot_cam = scene.node("/obj").createNode("cam", "shotcam")
     shot_cam.parmTuple("win").set((0.1, 0.0))
-    take(scene, home, camera="/obj/shotcam")
+    before = camera_state(shot_cam)
+    take(scene, home, kind="gui", camera="/obj/shotcam")
     [seen] = scene.capture.seen
     assert seen["window"] == pytest.approx((0.6, 0.5, 2.0, 2.0))
-    assert tuple(parm.eval() for parm in shot_cam.parmTuple("win")) == (0.1, 0.0)
-    assert tuple(parm.eval() for parm in shot_cam.parmTuple("winsize")) == (1.0, 1.0)
+    assert camera_state(shot_cam) == before
 
 
 def test_a_scale_that_cannot_be_read_leaves_the_framing_unverified(
     scene: Scene, home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    gui_without_viewer(scene)
     monkeypatch.setattr(capture, "alpha_box", lambda path: None)
-    said = take(scene, home)
+    said = take(scene, home, kind="gui")
     [shot] = said["views"]
     assert shot["framing_unverified"] is True
     assert any("drawing scale" in item for item in said["warnings"])
+
+
+@pytest.mark.parametrize(
+    ("box", "scale"),
+    [
+        ((16, 16, 48, 48), 1.0),
+        ((32, 0, 64, 32), 2.0),
+        ((24, 0, 64, 40), 1.5),
+        # A scale half way between quarters goes up, not to the even one.
+        ((18, 10, 54, 46), 1.25),
+        # Edges that disagree are no reading at all.
+        ((16, 0, 48, 20), None),
+        ((0, 0, 64, 64), None),
+        (None, None),
+    ],
+)
+def test_the_scale_from_the_calibration_box(box: Any, scale: float | None) -> None:
+    assert capture.scale_from_box(box, 64) == scale
 
 
 def test_alpha_box_reads_what_a_render_node_writes(tmp_path: Path) -> None:
@@ -692,3 +766,125 @@ def test_alpha_box_reads_what_a_render_node_writes(tmp_path: Path) -> None:
     Image.new("RGB", (4, 4), (1, 2, 3)).save(tmp_path / "rgb.png")
     with pytest.raises(ValueError):
         capture.alpha_box(str(tmp_path / "rgb.png"))
+
+
+# Section: what a failed or stopped capture leaves
+
+
+def sidecar_of(path: str) -> dict[str, Any]:
+    [record] = Path(path).parent.glob("*_run.json")
+    import json
+
+    return json.loads(record.read_text(encoding="utf-8"))
+
+
+def test_the_run_record_lists_the_numbered_frames(scene: Scene, home: Path) -> None:
+    said = take(scene, home, frames=[1, 3, 1])
+    [shot] = said["views"]
+    record = sidecar_of(shot["files"][0])
+    assert record["paths"]["files"] == shot["files"]
+    with store_module.Store(home / store_module.STORE_FILE_NAME) as store:
+        assert store.get_run(shot["run_id"]).paths["files"] == shot["files"]
+
+
+def test_a_render_that_fails_part_way_leaves_no_frames(scene: Scene, home: Path) -> None:
+    scene.capture.fail_at_frame = 2.0
+    error = refused(scene, home, frames=[1, 3, 1])
+    assert error.code == "UI_UNAVAILABLE"
+    assert error.details["tried"][0]["reason"].startswith("OperationFailed")
+    folder = next((home.parent / ".agent" / "captures").iterdir())
+    assert list(folder.iterdir()) == []
+    assert names(scene, "/out") == []
+
+
+def test_a_stopped_sequence_keeps_and_lists_its_frames(scene: Scene, home: Path) -> None:
+    run = Run(scene, home, "hython")
+
+    def note(said: dict[str, Any]) -> None:
+        run.notes.append(said)
+        run.cancel.set()
+
+    context = tools.ToolContext(**{**run.context.__dict__, "progress": note})
+    said = capture.capture_image({"frames": [1, 4, 1]}, context)
+    [shot] = said["views"]
+    assert len(shot["files"]) == 1 and Path(shot["files"][0]).is_file()
+    assert any("before the stop are kept" in item for item in said["warnings"])
+    assert sidecar_of(shot["files"][0])["paths"]["files"] == shot["files"]
+
+
+# Section: the settings a viewport capture sets for itself
+
+
+def test_every_flipbook_setting_is_set_not_carried(scene: Scene, home: Path) -> None:
+    viewer_scene(scene)
+    module = scene.module()
+    module.flipbookObjectType = SimpleNamespace(Visible="Visible")
+    module.flipbookAntialias = SimpleNamespace(UseDefault="UseDefault")
+    context = tools.ToolContext(**{**Run(scene, home, "gui").context.__dict__, "hou": module})
+    said = capture.capture_image({"resolution": [64, 36]}, context)
+    [seen] = scene.capture.seen
+    settings = seen["settings"]
+    carried = {
+        name: value
+        for name, value in settings.items()
+        if value == FlipbookSettings.ARTIST[name] and name != "output"
+    }
+    assert carried == {}
+    assert settings["visibleObjects"] == "*"
+    assert settings["visibleTypes"] == "Visible"
+    assert settings["useMotionBlur"] is False
+    assert settings["backgroundImage"] == ""
+    assert not any("could not be set" in item for item in said["warnings"])
+
+
+def test_a_setting_this_build_does_not_name_is_reported(scene: Scene, home: Path) -> None:
+    viewer_scene(scene)
+    said = take(scene, home, kind="gui")
+    [note] = [item for item in said["warnings"] if "could not be set" in item]
+    assert "visibleTypes" in note and "antialias" in note
+
+
+def test_framing_while_looking_through_a_camera_leaves_the_camera_alone(
+    scene: Scene, home: Path
+) -> None:
+    viewer = viewer_scene(scene)
+    shot_cam = scene.node("/obj").createNode("cam", "shotcam")
+    viewer.viewport.setCamera(shot_cam)
+    before = view_state(viewer.viewport)
+    said = take(scene, home, kind="gui", frame_target="all")
+    [seen] = scene.capture.seen
+    assert seen["camera"] is None
+    assert viewer.viewport.framed == ["all"]
+    assert said["views"][0]["camera"]["left_camera"] is True
+    assert view_state(viewer.viewport) == before
+    assert viewer.viewport.camera() is shot_cam
+
+
+# Section: grabbing a pane that is not the current tab
+
+
+def test_a_pane_behind_another_is_brought_forward_then_put_back(
+    scene: Scene, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    editor = NetworkEditorTab(scene)
+    editor.window = Window(0, 0, 400, 300, 1.0)
+    editor.geometry = Rect(0, 0, 400, 300)
+    editor.window.painted.append((Rect(10, 10, 20, 20), (255, 0, 0, 255)))
+    other = Tab(scene, "Parm", "parms")
+    pane = desktop(scene, other, editor)
+    order: list[str] = []
+    monkeypatch.setattr(
+        capture,
+        "process_events",
+        lambda: order.append("paint" if editor.isCurrentTab() else "paint behind"),
+    )
+    grab = editor.window.grab
+
+    def grabbed() -> Any:
+        order.append("grab" if editor.isCurrentTab() else "grab behind")
+        return grab()
+
+    editor.window.grab = grabbed
+    take(scene, home, kind="gui", source="network")
+    assert order == ["paint", "grab"]
+    assert pane.currentTab() is other

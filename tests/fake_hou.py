@@ -919,6 +919,11 @@ class MainThread:
     # The pane tabs a desktop shows, for the captures that need a user
     # interface. A scene with no desktop has none.
     desktop: Desktop | None = None
+    # The main window's device pixel ratio, as the screen it is on has it.
+    ratio = 1.0
+
+    def mainQtWindow(self) -> Any:  # noqa: N802 - the name is Houdini's
+        return SimpleNamespace(devicePixelRatioF=lambda: self.ratio)
 
     def paneTabs(self) -> tuple[Any, ...]:  # noqa: N802 - the name is Houdini's
         return tuple(self.desktop.tabs) if self.desktop is not None else ()
@@ -1430,31 +1435,44 @@ class Viewport:
 
 
 class FlipbookSettings:
-    """Settings a flipbook takes, each a getter with no argument and a setter with one."""
+    """Settings a flipbook takes, each a getter with no argument and a setter with one.
 
-    FIELDS = (
-        "outputToMPlay",
-        "output",
-        "frameRange",
-        "frameIncrement",
-        "useResolution",
-        "resolution",
-        "beautyPassOnly",
-    )
+    The defaults are what an artist might have left in the flipbook dialog,
+    so a check can see that a capture sets each one rather than carrying it.
+    """
+
+    ARTIST = {
+        "outputToMPlay": True,
+        "output": "",
+        "frameRange": (100.0, 200.0),
+        "frameIncrement": 2.0,
+        "useResolution": False,
+        "resolution": (640, 480),
+        "beautyPassOnly": False,
+        "visibleObjects": "geo1",
+        "visibleTypes": "GeoOnly",
+        "useSheetSize": True,
+        "useMotionBlur": True,
+        "useDepthOfField": True,
+        "leaveFrameAtEnd": True,
+        "appendFramesToCurrent": True,
+        "backgroundImage": "plate.jpg",
+        "overrideGamma": True,
+        "overrideLUT": True,
+        "initializeSimulations": True,
+        "renderAllViewports": True,
+        "scopeChannelKeyframesOnly": True,
+        "audioFilename": "take.wav",
+        "outputZoom": 50,
+        "cropOutMaskOverlay": False,
+        "antialias": "HighQuality",
+        "setUseFrameTimeLimit": True,
+        "setUseFrameProgressLimit": True,
+    }
+    FIELDS = tuple(ARTIST)
 
     def __init__(self, values: dict[str, Any] | None = None) -> None:
-        self.values = dict(
-            values
-            or {
-                "outputToMPlay": True,
-                "output": "",
-                "frameRange": (1.0, 1.0),
-                "frameIncrement": 1.0,
-                "useResolution": False,
-                "resolution": (640, 480),
-                "beautyPassOnly": False,
-            }
-        )
+        self.values = dict(values or FlipbookSettings.ARTIST)
 
     def stash(self) -> FlipbookSettings:
         return FlipbookSettings(self.values)
@@ -1683,8 +1701,9 @@ class CaptureStandIn:
         self.seen: list[dict[str, Any]] = []
         # Set to make a render or a flipbook finish and write nothing.
         self.writes = True
-        # Set to make every picture empty.
+        # Set to make every picture empty, or one flat colour.
         self.blank = False
+        self.flat: tuple[int, int, int, int] | None = None
         # Set to make a flipbook raise the way a failed one does.
         self.flipbook_error: BaseException | None = None
         self.cop_size = (64, 32)
@@ -1694,6 +1713,8 @@ class CaptureStandIn:
         # How much larger than asked a render node draws, and the renders
         # that worked it out, kept apart from the ones a check looks at.
         self.backing = 1.0
+        # A frame at which a render raises after writing it, as a failed cook does.
+        self.fail_at_frame: float | None = None
         self.probes: list[dict[str, Any]] = []
 
     # Section: pictures
@@ -1710,8 +1731,8 @@ class CaptureStandIn:
         """
         from PIL import Image, ImageDraw
 
-        image = Image.new("RGBA", size, (0, 0, 0, 0))
-        if shown and not self.blank:
+        image = Image.new("RGBA", size, self.flat or (0, 0, 0, 0))
+        if shown and not self.blank and not self.flat:
             width, height = size
             window = (0.0, 0.0, 1.0, 1.0)
             if camera is not None and camera.parm("winx") is not None:
@@ -1802,10 +1823,14 @@ class CaptureStandIn:
                     "undo_enabled": self.scene.undos.disabled == 0,
                     "window": tuple(parm.eval() for parm in camera.parmTuple("win"))
                     + tuple(parm.eval() for parm in camera.parmTuple("winsize")),
+                    "follows": camera.inputs_now[0][0].path() if 0 in camera.inputs_now else None,
+                    "focal": camera.parm("focal").eval(),
                 }
             )
             if self.writes:
                 self.draw(picture, size, self.anything_shown(objects), camera)
+            if self.fail_at_frame is not None and frame >= self.fail_at_frame:
+                raise OperationFailed("the render stopped with an error")
             frame += step
 
     # Section: the viewport flipbook
