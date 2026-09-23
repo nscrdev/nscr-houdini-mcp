@@ -42,6 +42,7 @@ CODES: dict[str, str] = {
     "OUTCOME_UNKNOWN": "the work may have happened, and the bridge cannot say",
     "BODY_REFUSED": "the request body was refused before it was read",
     "CAPTURE_EMPTY": "the capture wrote no usable image",
+    "UI_UNAVAILABLE": "no way to make that picture works in this session",
     "FILE_NOT_FOUND": "no file at that path",
     "FILE_EXISTS": "a file is already at that path and is never written over",
     "UNSAVED_CHANGES": "the scene has changes that are not saved",
@@ -65,7 +66,6 @@ RESERVED = frozenset(
         "SESSION_DEAD",
         "OPERATION_MISMATCH",
         "OUTCOME_UNKNOWN",
-        "CAPTURE_EMPTY",
         "PATH_NOT_A_PARM",
     }
 )
