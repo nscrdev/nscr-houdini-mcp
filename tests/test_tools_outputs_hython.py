@@ -154,6 +154,9 @@ mcp.freeze_parm(rop.parm('picture'), path)
 result = {'during': rop.parm('picture').unexpandedString(), 'path': path}
 """
 
+DEFAULT_PICTURE = "$HIP/render/$HIPNAME.$OS.$F4.exr"
+READ_PICTURE = "result = hou.node('/out/beauty').parm('picture').unexpandedString()"
+
 
 def test_a_frozen_picture_is_given_back_and_the_saved_scene_holds_no_machine_path(
     place: dict[str, Any],
@@ -162,10 +165,7 @@ def test_a_frozen_picture_is_given_back_and_the_saved_scene_holds_no_machine_pat
     froze, after, saved = run(
         place,
         ("hou_python", {"code": FREEZE}),
-        (
-            "hou_python",
-            {"code": "result = hou.node('/out/beauty').parm('picture').unexpandedString()"},
-        ),
+        ("hou_python", {"code": READ_PICTURE}),
         ("hou_scene", {"action": "save"}),
     )
     body = ok(froze)
@@ -175,29 +175,82 @@ def test_a_frozen_picture_is_given_back_and_the_saved_scene_holds_no_machine_pat
     assert Path(frozen).is_absolute()
     [restored] = body["restored_parms"]
     assert restored["restored"] is True
-    template = ok(after)["result"]
-    assert template == restored["template"]
-    assert template.startswith("$HIP/renders/")
-    assert template.endswith("/beauty_v001.$F4.exr")
+    # Afterwards it holds what it held before, the line a person set.
+    assert ok(after)["result"] == DEFAULT_PICTURE
     ok(saved)
-    # The file on disk has the line with its variable and not the run's path.
     written = hip.read_bytes()
     assert frozen.encode("utf-8") not in written
-    assert template.encode("utf-8") in written
+    assert DEFAULT_PICTURE.encode("utf-8") in written
     opened, reread, linted = run(
         place,
         ("hou_scene", {"action": "open", "path": str(hip)}),
-        (
-            "hou_python",
-            {"code": "result = hou.node('/out/beauty').parm('picture').unexpandedString()"},
-        ),
+        ("hou_python", {"code": READ_PICTURE}),
         ("hou_outputs", {"action": "lint", "node": "/out"}),
     )
     assert "restored_parms" not in ok(opened)
-    assert ok(reread)["result"] == template
+    assert ok(reread)["result"] == DEFAULT_PICTURE
     problems = {row["problem"] for row in ok(linted)["rows"] if row["node"] == "/out/beauty"}
     assert "frozen_after_run" not in problems
     assert "absolute_path" not in problems
+
+
+def test_a_save_during_the_run_never_writes_the_run_path(place: dict[str, Any]) -> None:
+    hip = fresh_scene(
+        place, "saved_during_v001.hip", "hou.node('/out').createNode('karma', 'beauty')"
+    )
+    code = (
+        FREEZE
+        + "hou.hipFile.save()\n"
+        + "result['after_save'] = rop.parm('picture').unexpandedString()\n"
+    )
+    [froze] = run(place, ("hou_python", {"code": code}))
+    body = ok(froze)
+    frozen = body["result"]["path"]
+    # The run went on with its own path after the save.
+    assert body["result"]["after_save"] == frozen
+    written = hip.read_bytes()
+    assert frozen.encode("utf-8") not in written
+    assert DEFAULT_PICTURE.encode("utf-8") in written
+    assert body["restored_parms"][0]["restored"] is True
+
+
+def test_a_node_renamed_during_the_run_gets_its_value_back(place: dict[str, Any]) -> None:
+    fresh_scene(place, "renamed_v001.hip", "hou.node('/out').createNode('karma', 'beauty')")
+    code = FREEZE + "rop.setName('renamed')\n"
+    froze, after = run(
+        place,
+        ("hou_python", {"code": code}),
+        (
+            "hou_python",
+            {"code": "result = hou.node('/out/renamed').parm('picture').unexpandedString()"},
+        ),
+    )
+    [restored] = ok(froze)["restored_parms"]
+    assert restored["restored"] is True
+    assert restored["node"] == "/out/renamed"
+    assert ok(after)["result"] == DEFAULT_PICTURE
+
+
+def test_an_expression_link_comes_back_as_an_expression(place: dict[str, Any]) -> None:
+    build = (
+        "out = hou.node('/out')\n"
+        "out.createNode('karma', 'source')\n"
+        "rop = out.createNode('karma', 'beauty')\n"
+        "rop.parm('picture').setExpression('chs(\"../source/picture\")', hou.exprLanguage.Hscript)"
+    )
+    fresh_scene(place, "linked_v001.hip", build)
+    check = (
+        "p = hou.node('/out/beauty').parm('picture')\n"
+        "result = [p.expression(), str(p.expressionLanguage())]"
+    )
+    froze, after = run(place, ("hou_python", {"code": FREEZE}), ("hou_python", {"code": check}))
+    body = ok(froze)
+    assert body["result"]["during"] == body["result"]["path"]
+    assert body["restored_parms"][0]["owed"] == {
+        "expression": 'chs("../source/picture")',
+        "language": "hscript",
+    }
+    assert ok(after)["result"] == ['chs("../source/picture")', "exprLanguage.Hscript"]
 
 
 def test_lint_finds_the_one_picture_set_to_an_absolute_path(place: dict[str, Any]) -> None:
@@ -208,6 +261,8 @@ def test_lint_finds_the_one_picture_set_to_an_absolute_path(place: dict[str, Any
         "'$HIP/render/managed_v001.$F4.exr')\n"
         "out.createNode('karma', 'by_hand').parm('picture').set("
         f"'{folder}/render/by_hand_v001.$F4.exr')\n"
+        "out.createNode('alembic', 'abc')\n"
+        "hou.node('/stage').createNode('usdrender_rop', 'husk')\n"
         "hou.node('/obj').createNode('geo', 'geo1').createNode('filecache', 'sim')"
     )
     fresh_scene(place, "lint_v001.hip", build)
@@ -216,8 +271,20 @@ def test_lint_finds_the_one_picture_set_to_an_absolute_path(place: dict[str, Any
     absolute = [row for row in rows if row["problem"] == "absolute_path"]
     assert [(row["node"], row["parm"]) for row in absolute] == [("/out/by_hand", "picture")]
     assert absolute[0]["raw"] == f"{folder}/render/by_hand_v001.$F4.exr"
-    by_node = {row["node"]: row["parm"] for row in rows}
-    # The parameter names come from each node type: the cache writes `file`.
-    assert by_node["/obj/geo1/sim"] == "file"
+    parms = {(row["node"], row["parm"]) for row in rows}
+    # The parameter names come from each node type: the cache writes `file`,
+    # an Alembic node an unmarked `filename`.
+    assert ("/obj/geo1/sim", "file") in parms
+    assert ("/out/abc", "filename") in parms
+    # The deep output is off with its toggle, which a fresh node only says
+    # once asked to work out its parameters; a renderer's logs, a render it
+    # reads back and an empty unmarked image are not outputs.
+    assert {parm for node, parm in parms if node == "/out/managed"} == {"picture"}
     assert {row["problem"] for row in rows if row["node"] == "/out/managed"} == {"missing_on_disk"}
+    assert not {parm for node, parm in parms if node == "/stage/husk"} & {
+        "husk_stdout",
+        "husk_stderr",
+        "renderexisting",
+        "outputimage",
+    }
     assert ok(linted)["parms_checked"] >= 3
