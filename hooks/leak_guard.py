@@ -84,10 +84,16 @@ def terms_file(root: Path) -> Path:
     if path.is_file():
         return path
     try:
-        common = Path(git("rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+        found = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=root,
+        ).stdout.strip()
     except (subprocess.CalledProcessError, OSError):
         return path
-    return common.parent / TERMS_PATH
+    return Path(found).parent / TERMS_PATH
 
 
 def load_terms(root: Path) -> tuple[list[str], re.Pattern[str]] | None:
