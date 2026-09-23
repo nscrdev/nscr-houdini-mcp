@@ -564,25 +564,28 @@ def restore_left_over(call: Call, hip: Any = ASK) -> list[dict[str, Any]]:
 # Section: shared pieces
 
 # The output table's variables as each session has them, asked once per
-# session: they are the session's environment, which does not change while it
-# runs. Keyed by the state folder too, since a session id is only unique in one.
-_variables: dict[tuple[str, str], dict[str, str | None]] = {}
+# session and scene: opening a scene can bring a `$JOB` of its own. Keyed by
+# the state folder too, since a session id is only unique in one.
+_variables: dict[tuple[str, str], tuple[Any, dict[str, str | None]]] = {}
 _variables_lock = threading.Lock()
 
 
 def session_variables(call: Call) -> dict[str, str | None]:
-    """`$JOB` and `$HOUDINI_TEMP_DIR` as the session has them, asked once."""
+    """`$JOB` and `$HOUDINI_TEMP_DIR` as the session has them, asked again
+    once the session's scene epoch has moved."""
     key = (str(call.router.home), call.target().session_id)
+    epoch = call.trace.get("scene_epoch")
     with _variables_lock:
         kept = _variables.get(key)
-    if kept is not None:
-        return kept
+    if kept is not None and kept[0] == epoch:
+        return kept[1]
     data = dict(call.bridge("outputs.variables").get("data") or {})
+    epoch = call.trace.get("scene_epoch")
     found = {
         name: (str(data[name]) if data.get(name) else None) for name in ("JOB", "HOUDINI_TEMP_DIR")
     }
     with _variables_lock:
-        _variables[key] = found
+        _variables[key] = (epoch, found)
     return found
 
 

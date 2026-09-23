@@ -238,8 +238,8 @@ Alembic and USD render nodes have; hooks, a renderer's logs, a render it reads
 back and folders are not. One row per problem: `absolute_path`, `outside_hip`
 (outside the folders the output table manages for this scene),
 `unversioned`, `missing_on_disk` (for a sequence, at the current frame and at
-both ends of the frame range, and with `empty` for a parameter that names
-nothing), `frozen_after_run`, `expression` for a value only an evaluation
+both ends of the frame range, and with `empty` for a node's main output, or
+one a toggle of its own turns on, that names nothing), `frozen_after_run`, `expression` for a value only an evaluation
 could give and `unexpanded` for a variable it cannot fill in. Nothing is
 evaluated and nothing cooks: values are expanded from the table's variables
 and the node's and scene's own names. `list` and `lint` page with `limit` and

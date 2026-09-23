@@ -44,7 +44,8 @@ when it is a file parameter the type leaves unmarked, as Alembic and USD
 render nodes do; hooks run before and after a render, a renderer's own log
 files, a render it reads back and a folder are not. What it reports, per
 parameter, is any of `absolute_path`, `outside_hip`, `unversioned`,
-`missing_on_disk` (with `empty` when the parameter holds nothing) and
+`missing_on_disk` (with `empty` when a node's main output, or one a toggle
+turns on, holds nothing; a spare output left empty is only unused) and
 `frozen_after_run`, or `expression` for a value that only an evaluation could
 give, which the lint never runs, and `unexpanded` for a variable it cannot
 fill in. Nothing is cooked or evaluated: the value is expanded here from the
@@ -195,8 +196,15 @@ def _language_value(hou: Any, language: str | None) -> Any:
 
 
 def put_back(hou: Any, parm: Any, row: Any) -> None:
-    """Give a parameter what it held before it was frozen."""
+    """Give a parameter what it held before it was frozen.
+
+    An expression goes back over a cleared value: Houdini keeps the value an
+    expression was set over as the channel's own default and writes it into
+    the scene file, so setting it over the run's path would save that path.
+    """
     if row.original_expression is not None:
+        tool_module._quiet(parm.deleteAllKeyframes)
+        parm.set(row.original if row.original is not None else "")
         parm.setExpression(row.original_expression, _language_value(hou, row.original_language))
         return
     parm.set(row.original if row.original is not None else row.template)
@@ -266,6 +274,7 @@ def freeze(
             hint="set the parameter to one value or one expression first",
         )
     held_by = token or new_token()
+    _drop_stale(hou, open_store, session_id, node.path(), parm.name(), held_by)
     with open_store() as store:
         run = store.get_run(run_id)
         paths = run.paths if run is not None and isinstance(run.paths, Mapping) else {}
@@ -331,6 +340,35 @@ def freeze(
         "token": held_by,
         "owed": _owed(row),
     }
+
+
+def _drop_stale(
+    hou: Any,
+    open_store: Callable[[], Any],
+    session_id: str,
+    node_path: str,
+    parm_name: str,
+    token: str,
+) -> None:
+    """Let go of this session's own record for a parameter path that no longer
+    means the node it was made for.
+
+    A record kept because its node could not be found would otherwise hold
+    the path for the rest of the session, so a node made again under the same
+    name could never be frozen. It is stale when the node it names is gone
+    from this session, or when this session now holds another scene.
+    """
+    with open_store() as store:
+        row = store.get_frozen_parm(session_id, node_path, parm_name)
+        if row is None or row.token == token:
+            return
+        gone = (
+            row.node_sid is not None
+            and tool_module._quiet(lambda: hou.nodeBySessionId(int(row.node_sid))) is None
+        )
+        moved = row.hip_key != output_rules.scene_key(scene_path(hou))
+        if gone or moved:
+            store.thaw_parm(session_id, node_path, parm_name, token=row.token, state=row.state)
 
 
 def _owed(row: Any) -> dict[str, Any]:
@@ -558,6 +596,7 @@ def lint(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, Any]:
     frames = [int(round(frame)) for frame in tool_module._frames_to_try(hou)]
 
     kinds: dict[str, tuple[tuple[tuple[str, bool], ...], bool]] = {}
+    mains: dict[str, str | None] = {}
     rows: list[dict[str, Any]] = []
     last: list[str] | None = None
     more = False
@@ -580,6 +619,7 @@ def lint(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, Any]:
         if not path:
             continue
         outputs = _output_parms(node, kinds)
+        main = _main_output(node, kinds, mains)
         if not outputs:
             through = [path, PAST_EVERY_NAME]
             continue
@@ -594,7 +634,8 @@ def lint(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, Any]:
             if not marked and tool_module._quiet(parm.isHidden):
                 continue
             checked += 1
-            found = _check(parm, node, path, name, marked, roots, frozen, frames, scene)
+            wanted = name == main or _turned_on(node, name)
+            found = _check(parm, node, path, name, marked, roots, frozen, frames, scene, wanted)
             if not found:
                 continue
             if len(rows) >= limit:
@@ -733,6 +774,38 @@ def _output_parms(
     return picked
 
 
+def _main_output(
+    node: Any,
+    kinds: dict[str, tuple[tuple[tuple[str, bool], ...], bool]],
+    mains: dict[str, str | None],
+) -> str | None:
+    """The node's main output: the first parameter its type marks as written
+    to, in the type's own order, such as a render's picture."""
+    node_type = tool_module._quiet(node.type)
+    key = str(
+        tool_module._quiet(node_type.nameWithCategory) or tool_module._quiet(node_type.name) or ""
+    )
+    if key not in mains:
+        names = kinds.get(key, ((), False))[0]
+        mains[key] = next((name for name, marked in names if marked), None)
+    return mains[key]
+
+
+# Toggles a node type turns an extra output on with, by the output's name.
+TOGGLE_PREFIXES = ("use", "enable")
+
+
+def _turned_on(node: Any, name: str) -> bool:
+    for prefix in TOGGLE_PREFIXES:
+        toggle = tool_module._quiet(lambda prefix=prefix: node.parm(f"{prefix}{name}"))
+        if toggle is None:
+            continue
+        kind = tool_module._quiet(lambda toggle=toggle: toggle.parmTemplate().type().name())
+        if kind == "Toggle" and tool_module._quiet(toggle.eval):
+            return True
+    return False
+
+
 def _is_multiparm(template: Any) -> bool:
     if template is None or tool_module._quiet(lambda: template.type().name()) != "Folder":
         return False
@@ -816,8 +889,13 @@ def _check(
     frozen: Mapping[Any, Any],
     frames: list[int],
     scene: _SceneNames,
+    wanted: bool = True,
 ) -> list[dict[str, Any]]:
-    """The problems one output parameter has, one row each."""
+    """The problems one output parameter has, one row each.
+
+    `wanted` says an empty value is a problem: the node's main output, or
+    one a toggle of its own turns on. An empty spare output is just unused.
+    """
     raw = raw_value(parm)
     expression, keyed = tool_module._expression_of(parm)
     evaluated = (
@@ -834,7 +912,7 @@ def _check(
         return [_row(path, name, raw, None, "expression")]
     if not raw.strip():
         # A parameter the type writes to that names nothing writes nowhere.
-        if not marked:
+        if not marked or not wanted:
             return []
         return [{**_row(path, name, raw, None, "missing_on_disk"), "empty": True}]
     if not _names_a_place(raw):

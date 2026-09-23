@@ -176,6 +176,9 @@ class Parm:
         self.default = default
         self.value: Any = default
         self._expression: str | None = None
+        # The value an expression was set over, which Houdini keeps as the
+        # channel's own default and writes into the scene file with it.
+        self.channel_default: Any = None
         self._language = "hscript"
         self.locked = False
         # Whether a disable rule on the node turns this parameter off, and
@@ -219,6 +222,8 @@ class Parm:
             self._node.grow(self)
 
     def setExpression(self, text: str, language: str = "hscript") -> None:  # noqa: N802
+        if self._expression is None:
+            self.channel_default = self.value
         self._expression = text
         self._language = language
         self._node.dirty = True
@@ -278,8 +283,13 @@ class Parm:
         return self.hidden
 
     def deleteAllKeyframes(self) -> None:  # noqa: N802 - the name is Houdini's
+        # A string parameter whose expression goes is left empty, as it is in
+        # Houdini.
+        if self._expression is not None or self.keys:
+            self.value = ""
         self.keys = []
         self._expression = None
+        self.channel_default = None
 
     def isLocked(self) -> bool:  # noqa: N802 - the name is Houdini's
         return self.locked
@@ -1167,7 +1177,10 @@ class Scene:
         for node in self.everything():
             for parm in node.parms():
                 if parm.parmTemplate().type().name() == "String":
-                    held = parm._expression if parm._expression is not None else parm.value
+                    if parm._expression is not None:
+                        held = f"{parm._expression} {parm.channel_default}"
+                    else:
+                        held = parm.value
                     lines.append(f"\n{parm.path()} {held}")
         return lines
 

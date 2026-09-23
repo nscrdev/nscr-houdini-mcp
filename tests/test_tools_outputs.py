@@ -231,6 +231,11 @@ def test_job_and_temp_folders_are_the_sessions_own(
     ok(call(bench, action="resolve", kind="cache", name="sim"))
     asked = [sent for sent in through(bench).calls if sent["tool"] == "outputs.variables"]
     assert len(asked) == 1
+    # A scene loaded since may bring a folder of its own, so they are asked again.
+    through(bench).identity.bump("load")
+    ok(call(bench, action="resolve", kind="cache", name="sim"))
+    asked = [sent for sent in through(bench).calls if sent["tool"] == "outputs.variables"]
+    assert len(asked) == 2
 
 
 # Section: list
@@ -464,8 +469,17 @@ def test_an_empty_output_and_a_multiparms_instances_are_read(
     assert (empty.path(), "picture", "missing_on_disk") in rows
     [blank] = [row for row in body["rows"] if row["node"] == empty.path()]
     assert blank["empty"] is True
-    assert (multi.path(), "output1", "missing_on_disk") in rows
     assert (multi.path(), "output2", "absolute_path") in rows
+    # An empty extra output is unused, not missing: only a node's main output,
+    # or one a toggle of its own turns on, has to name a file.
+    assert not {problem for node, parm, problem in rows if parm == "output1"}
+    deep = karma(scene.node("/out"))
+    deep.parm("dcm").set(1)
+    deep.parm("dcmfilename").set("")
+    assert not {row for row in rows_of(ok(call(bench, action="lint"))) if row[0] == deep.path()} - {
+        (deep.path(), "picture", "unversioned"),
+        (deep.path(), "picture", "missing_on_disk"),
+    }
 
 
 class StopAfter:
@@ -555,6 +569,36 @@ def test_an_expression_link_is_given_back_as_an_expression(
     assert restored["restored"] is True
     assert restored["owed"] == {"expression": 'chs("../karma2/picture")', "language": "hscript"}
     assert picture(scene).expression() == 'chs("../karma2/picture")'
+
+
+def test_an_expression_given_back_never_leaves_the_run_path_in_a_saved_file(
+    bench: Bench, scene: Scene, project: Path
+) -> None:
+    karma(scene.node("/out"))
+    picture(scene).setExpression('chs("../karma2/picture")', "hscript")
+    scene.hipFile.writes_files = True
+    scene.hipFile.writes_values = True
+    hip = project / "shot_v001.hip"
+    body = ok(call(bench, "hou_python", code=FREEZE + "hou.hipFile.save()\n"))
+    frozen = body["result"]["path"]
+    assert frozen not in hip.read_text(encoding="utf-8")
+    ok(call(bench, "hou_python", code="hou.hipFile.save()"))
+    written = hip.read_text(encoding="utf-8")
+    assert frozen not in written
+    assert 'chs("../karma2/picture")' in written
+
+
+def test_a_node_made_again_under_the_same_name_can_be_frozen(
+    bench: Bench, scene: Scene, project: Path
+) -> None:
+    karma(scene.node("/out"))
+    gone = ok(call(bench, "hou_python", code=FREEZE + "node.destroy()\n"))
+    assert gone["restored_parms"][0]["kept"] is True
+    karma(scene.node("/out"), "karma1")
+    again = ok(call(bench, "hou_python", code=FREEZE))
+    assert again["restored_parms"][0]["restored"] is True
+    with store(bench) as opened:
+        assert opened.list_frozen_parms() == []
 
 
 def test_a_parm_with_several_keyframes_is_not_frozen(

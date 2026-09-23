@@ -238,19 +238,30 @@ def test_an_expression_link_comes_back_as_an_expression(place: dict[str, Any]) -
         "rop = out.createNode('karma', 'beauty')\n"
         "rop.parm('picture').setExpression('chs(\"../source/picture\")', hou.exprLanguage.Hscript)"
     )
-    fresh_scene(place, "linked_v001.hip", build)
+    hip = fresh_scene(place, "linked_v001.hip", build)
     check = (
         "p = hou.node('/out/beauty').parm('picture')\n"
         "result = [p.expression(), str(p.expressionLanguage())]"
     )
-    froze, after = run(place, ("hou_python", {"code": FREEZE}), ("hou_python", {"code": check}))
+    # A save while the run holds the path, and one after it is given back.
+    froze, after, saved = run(
+        place,
+        ("hou_python", {"code": FREEZE + "hou.hipFile.save()\n"}),
+        ("hou_python", {"code": check}),
+        ("hou_scene", {"action": "save"}),
+    )
     body = ok(froze)
-    assert body["result"]["during"] == body["result"]["path"]
+    frozen = body["result"]["path"]
+    assert body["result"]["during"] == frozen
     assert body["restored_parms"][0]["owed"] == {
         "expression": 'chs("../source/picture")',
         "language": "hscript",
     }
     assert ok(after)["result"] == ['chs("../source/picture")', "exprLanguage.Hscript"]
+    ok(saved)
+    # Houdini keeps the value an expression was set over and saves it with
+    # the channel, so the path must not be what it was set over.
+    assert frozen.encode("utf-8") not in hip.read_bytes()
 
 
 def test_lint_finds_the_one_picture_set_to_an_absolute_path(place: dict[str, Any]) -> None:
@@ -262,6 +273,7 @@ def test_lint_finds_the_one_picture_set_to_an_absolute_path(place: dict[str, Any
         "out.createNode('karma', 'by_hand').parm('picture').set("
         f"'{folder}/render/by_hand_v001.$F4.exr')\n"
         "out.createNode('alembic', 'abc')\n"
+        "out.createNode('comp', 'comp1')\n"
         "hou.node('/stage').createNode('usdrender_rop', 'husk')\n"
         "hou.node('/obj').createNode('geo', 'geo1').createNode('filecache', 'sim')"
     )
@@ -287,4 +299,6 @@ def test_lint_finds_the_one_picture_set_to_an_absolute_path(place: dict[str, Any
         "renderexisting",
         "outputimage",
     }
+    # A comp node's five spare outputs are empty and unused, not missing.
+    assert not {parm for node, parm in parms if node == "/out/comp1" and parm.startswith("copaux")}
     assert ok(linted)["parms_checked"] >= 3
