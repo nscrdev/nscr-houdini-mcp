@@ -37,15 +37,24 @@ REFERENCES = Path(__file__).resolve().parent / "fixtures" / "brief" / "reference
 REFERENCE_IMAGE = REFERENCES / "front_shaded.png"
 CANDIDATE_IMAGE = REFERENCES / "three_quarter_shaded.png"
 
-# Code the lost reply step runs. The sleep keeps it running after the first
+# Code the lost reply step runs. It counts its own runs in the namespace, so
+# the pass can tell it ran once. The sleep keeps it running after the first
 # send is given up on, so the second send meets work that is still going.
 BUILD_CODE = (
     "import time\n"
+    "try:\n"
+    "    seq_runs += 1\n"
+    "except NameError:\n"
+    "    seq_runs = 1\n"
     "time.sleep(3)\n"
     "made = [hou.node('/obj').createNode('geo', f'seq_{i}') for i in range(3)]\n"
-    "result = [node.path() for node in made]\n"
+    "result = {'paths': [node.path() for node in made], 'runs': seq_runs}\n"
 )
 NODE_NAMES = ("seq_0", "seq_1", "seq_2")
+NAMESPACE = "seq"
+
+# What a full compare result counts, whatever the images.
+METRIC_KEYS = ("mae", "rmse", "psnr_db", "diff_area_pct")
 
 # Longer than `inline_wait_s` in the pass's config, so `auto` hands back a job.
 SLOW_CODE = "import time\ntime.sleep(3)\nresult = {'slept': 3}\n"
@@ -263,8 +272,8 @@ async def run_sequence(connected: Any, *, record: Record | None = None) -> Recor
     # Nothing is live before the worker starts.
     await run.refused("ping, nothing live", "hou_ping", {}, "NO_SESSION")
 
-    listing = await run.ok("sessions list", "hou_sessions", {"action": "list"})
-    check(isinstance(listing.body.get("sessions"), list), "sessions list: no sessions list")
+    listing = await run.ok("sessions list, empty", "hou_sessions", {"action": "list"})
+    check(listing.body.get("sessions") == [], f"sessions list: {listing.body.get('sessions')}")
 
     started_step = await run.ok("sessions start", "hou_sessions", {"action": "start"})
     worker = started_step.body.get("session") or {}
@@ -273,6 +282,13 @@ async def run_sequence(connected: Any, *, record: Record | None = None) -> Recor
     alias = worker.get("alias")
     check(alias, "sessions start: no alias")
     on = {"session": alias}
+
+    listing = await run.ok("sessions list", "hou_sessions", {"action": "list"})
+    rows = {row.get("session_id"): row for row in listing.body.get("sessions") or []}
+    row = rows.get(worker.get("session_id")) or {}
+    check(row.get("alias") == alias, f"sessions list: no row for the worker in {list(rows)}")
+    check(row.get("kind") == "hython", f"sessions list: kind {row.get('kind')}")
+    check(row.get("state") == "live", f"sessions list: state {row.get('state')}")
 
     ping = await run.ok("ping", "hou_ping", on)
     check(ping.body.get("session_id") == worker.get("session_id"), "ping: another session")
@@ -285,20 +301,34 @@ async def run_sequence(connected: Any, *, record: Record | None = None) -> Recor
     # Three nodes, with the first reply lost and the call sent again under
     # the same operation id: one set of nodes, not two.
     operation_id = new_operation_id()
-    build = {"code": BUILD_CODE, "operation_id": operation_id, **on}
+    build = {"code": BUILD_CODE, "operation_id": operation_id, "namespace": NAMESPACE, **on}
     try:
         await asyncio.wait_for(connected.call_tool("hou_python", build), GIVE_UP_S)
         check(False, "python build: the first send answered before it was given up on")
     except TimeoutError:
         pass
+    sent_again_at = time.time()
     retried = await run.ok("python build, sent again", "hou_python", {**build, "wait_s": 30})
     check(retried.body["trace"].get("operation_id") == operation_id, "python build: another id")
-    if "result" not in retried.body:
-        check(retried.body.get("job_id"), "python build: neither a result nor a job")
-        await run.follow("python build, followed", retried.body["job_id"])
-        retried = await run.ok("python build, answered", "hou_python", build)
-    made = retried.body.get("result")
-    check(made == [f"/obj/{name}" for name in NODE_NAMES], f"python build: made {made}")
+    # The second send met the first one's work still running: it is handed the
+    # job, not a result, and that job started before the second send went.
+    check("result" not in retried.body, "python build: the second send ran the code itself")
+    check(retried.body.get("state") in ("queued", "running"), "python build: not still running")
+    check(retried.body.get("job_id") == f"job-{operation_id}", "python build: another job")
+    began = retried.body.get("started_at")
+    check(isinstance(began, (int, float)) and began < sent_again_at, "python build: started late")
+    await run.follow("python build, followed", retried.body["job_id"])
+    retried = await run.ok("python build, answered", "hou_python", build)
+    made = retried.body.get("result") or {}
+    paths = [f"/obj/{name}" for name in NODE_NAMES]
+    check(made.get("paths") == paths, f"python build: made {made}")
+    check(made.get("runs") == 1, f"python build: the code ran {made.get('runs')} times")
+    counted = await run.ok(
+        "python build, runs counted",
+        "hou_python",
+        {"code": "result = seq_runs", "namespace": NAMESPACE, **on},
+    )
+    check(counted.body.get("result") == 1, f"python build: ran {counted.body.get('result')} times")
 
     tree = await run.ok("inspect tree", "hou_inspect", {"mode": "tree", "path": "/obj", **on})
     paths = [row.get("path") for row in tree.body.get("rows") or tree.body.get("nodes") or []]
@@ -315,14 +345,21 @@ async def run_sequence(connected: Any, *, record: Record | None = None) -> Recor
     check("t" in read, f"inspect parms: read {read[:10]}")
 
     node_type = await run.ok(
-        "node type", "hou_node_type", {"type": "attribwrangle", "context": "sop", **on}
+        "node type",
+        "hou_node_type",
+        {"type": "attribwrangle", "context": "sop", "detail": "full", **on},
     )
-    check("attribwrangle" in json.dumps(node_type.body), "node type: not the wrangle")
+    parm_names = [row.get("name") for row in node_type.body.get("parms") or []]
+    check(parm_names, "node type: no parameters")
+    check("snippet" in parm_names, f"node type: no snippet in {parm_names[:10]}")
 
     page = await run.ok(
         "docs page", "hou_docs", {"mode": "page", "path": "nodes/sop/attribwrangle"}
     )
-    check("wrangle" in json.dumps(page.body).lower(), "docs page: not the wrangle page")
+    title = str(page.body.get("title") or "")
+    text = str(page.body.get("text") or "")
+    check("wrangle" in title.lower(), f"docs page: title {title!r}")
+    check(len(text) > 200 and "VEX" in text, "docs page: no text read")
 
     resolved = await run.ok(
         "outputs resolve",
@@ -354,6 +391,10 @@ async def run_sequence(connected: Any, *, record: Record | None = None) -> Recor
         },
     )
     check(compared.image, "compare: no image block")
+    metrics = compared.body.get("metrics") or {}
+    missing = [key for key in METRIC_KEYS if key not in metrics]
+    check(not missing, f"compare: metrics lack {missing}")
+    check(0.0 < float(metrics["mae"]["overall"]) < 1.0, f"compare: mae {metrics['mae']}")
 
     stopped = await run.ok("sessions stop", "hou_sessions", {"action": "stop", **on})
     check((stopped.body.get("stopped") or {}).get("ended") is True, "sessions stop: not ended")
