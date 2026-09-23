@@ -408,11 +408,48 @@ class HelpServer:
 
 
 def dead_url() -> str:
-    """An address on loopback where nothing listens."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-    return f"http://127.0.0.1:{port}/"
+    """The address of a help server that has gone: it listened, then closed.
+
+    Whether this system refuses a connection there at once or lets it hang,
+    the help server has gone either way, and must be read as that.
+    """
+    gone = HelpServer()
+    url = gone.url
+    gone.close()
+    return url
+
+
+class Silent:
+    """A help server that takes a connection and never answers, as a busy one does."""
+
+    def __init__(self) -> None:
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(8)
+        self.held: list[socket.socket] = []
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._take, daemon=True)
+        self.thread.start()
+
+    def _take(self) -> None:
+        self.listener.settimeout(0.05)
+        while not self.stop.is_set():
+            try:
+                taken, _ = self.listener.accept()
+            except OSError:
+                continue
+            self.held.append(taken)
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.listener.getsockname()[1]}/"
+
+    def close(self) -> None:
+        self.stop.set()
+        self.thread.join(2.0)
+        for taken in self.held:
+            taken.close()
+        self.listener.close()
 
 
 # Section: fixtures
@@ -984,7 +1021,8 @@ def test_help_server_pages_are_cached_too(remote: Bench, served: HelpServer) -> 
 def test_a_help_server_that_went_away_is_asked_for_again_once(remote: Bench, scene: Scene) -> None:
     scene.help_url = dead_url()
     error = failed(docs(remote, path="nodes/sop/attribwrangle"), "HELP_UNAVAILABLE")
-    assert "help server did not answer" in " ".join(error["details"]["notes"])
+    assert "did not take a connection" in " ".join(error["details"]["notes"])
+    assert "left alone" not in " ".join(error["details"]["notes"])
     assert asked_bridge(remote) == 2
 
 
@@ -1017,6 +1055,55 @@ def test_a_slow_help_server_is_given_up_on_and_left_alone(
     assert served.asked == ["/nodes/sop/attribwrangle"]
 
 
+def test_a_help_server_that_takes_the_connection_and_never_answers_is_left_alone(
+    remote: Bench, scene: Scene, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(helpdocs, "HELP_TIMEOUT_S", 0.3)
+    silent = Silent()
+    try:
+        scene.help_url = silent.url
+        started = time.monotonic()
+        error = failed(docs(remote, path="nodes/sop/attribwrangle"), "HELP_UNAVAILABLE")
+        assert time.monotonic() - started < 1.5
+        assert "left alone for 60 s" in " ".join(error["details"]["notes"])
+        # It is there, only busy: the address is not asked for again.
+        assert asked_bridge(remote) == 1
+        assert helpdocs.URLS.quiet_for("s-1") > 0
+    finally:
+        silent.close()
+
+
+def test_the_two_failures_are_told_apart(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(helpdocs, "HELP_TIMEOUT_S", 0.3)
+    with pytest.raises(helpdocs.HelpServerError) as gone:
+        helpdocs.fetch(dead_url(), "nodes/sop/attribwrangle")
+    assert gone.value.timed_out is False
+    silent = Silent()
+    try:
+        with pytest.raises(helpdocs.HelpServerError) as busy_one:
+            helpdocs.fetch(silent.url, "nodes/sop/attribwrangle")
+        assert busy_one.value.timed_out is True
+    finally:
+        silent.close()
+
+
+def test_a_connect_that_does_not_complete_is_a_help_server_that_went(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A system that lets a connection to a closed port hang rather than
+    # refuse it: the connect is what does not finish.
+    def hangs(self: Any) -> None:
+        time.sleep(1.0)
+
+    monkeypatch.setattr(helpdocs.http.client.HTTPConnection, "connect", hangs)
+    monkeypatch.setattr(helpdocs, "HELP_TIMEOUT_S", 0.3)
+    started = time.monotonic()
+    with pytest.raises(helpdocs.HelpServerError) as raised:
+        helpdocs.fetch("http://127.0.0.1:9/", "nodes/sop/attribwrangle")
+    assert raised.value.timed_out is False
+    assert time.monotonic() - started < 0.9
+
+
 def test_a_busy_session_is_not_waited_for(remote: Bench, scene: Scene) -> None:
     with busy(remote, scene):
         started = time.monotonic()
@@ -1036,7 +1123,7 @@ def test_a_failure_and_a_busy_refresh_are_both_named(remote: Bench, scene: Scene
     with busy(remote, scene):
         error = failed(docs(remote, path="nodes/sop/attribwrangle"), "HELP_UNAVAILABLE")
     [note] = error["details"]["notes"][-1:]
-    assert "the help server did not answer" in note
+    assert "the help server did not take a connection" in note
     assert "SESSION_BUSY" in note
 
 
