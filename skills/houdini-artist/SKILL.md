@@ -15,13 +15,13 @@ compatibility: "Works best with a Houdini 22 MCP server connection."
 - More colours: purple for caches, red for something broken or temporary, grey for parked work.
 - Names: lowercase with underscores, and only on nodes other nodes or people refer to.
 - Reads may roam: any file the scene or the person points at.
-- Writes stay under `$HIP`, in the managed output folders, never beside the source files.
+- Writes go where the server's output table puts them, under `$HIP` by default, never beside the source files.
 
 ## How to think
 
 **Say how it works before you build it.** Put the mechanism into plain words first: what drives what, what changes over time, and what a viewer will actually notice. Then decide what deserves to be a system. Ask whether the effect needs a simulation at all, since a lot of motion that reads as physical is cheaper, steadier and easier to direct when it is keyed or driven by a procedure. When the same construction shows up more than once, share it only if the copies should change together; things that merely look alike today often need to drift apart tomorrow, so do not merge them in anticipation. The exception is a throwaway test that answers one question, which needs nothing more than the question.
 
-**Build systems, not shots.** Prefer a small rig with a few meaningful controls that produces a family of results over one result tuned by hand. The second request is nearly always a variation of the first, and a rig answers it in minutes. The exception is a single frame that will not be revisited, or a deadline the reusable version would miss; when you take that shortcut, say so.
+**Make something that answers the next request too.** Prefer a small rig with a few meaningful controls that produces a family of results over one result tuned by hand. The second request is nearly always a variation of the first, and a rig answers it in minutes. The exception is a single frame that will not be revisited, or a deadline the reusable version would miss; when you take that shortcut, say so.
 
 **Plan the system, then build and inspect at its boundaries.** Before placing anything, sketch the stages and what crosses between them: which attributes, which groups, what scale and orientation. Build one stage, inspect it where it hands off to the next, then move on. Checking after every single node is slow, and checking only at the end hides where things went wrong. For a quick experiment the plan can be one sentence, but it should still exist.
 
@@ -36,11 +36,11 @@ compatibility: "Works best with a Houdini 22 MCP server connection."
 
 A scratch network that answers one question is the exception, as long as it is deleted or clearly parked afterwards.
 
-**Look before you claim.** Look at decision points, not only at the end. Make invisible data visible: colour by an attribute, show normals, point numbers or bounds, so that you are judging the data rather than your expectation of it. When there is a reference, judge the target feature in a view matched to it (camera, framing, and lighting where lighting matters) and report the differences you see rather than a verdict such as "matches". Anything that moves gets a flipbook early, because timing problems do not show in a still frame. Keep a documentation camera you can move freely and capture from it at each milestone, so there is a record of how the scene got where it is. Keep the person able to follow along: say what you are about to look at and what you saw. The exception is a purely structural change, such as a rename, where a read of the network is enough.
+**Look before you claim.** Look at decision points, not only at the end. Make invisible data visible: colour by an attribute, show normals, point numbers or bounds, so that you are judging the data rather than your expectation of it. When there is a reference, judge the target feature in a view matched to it (camera, framing, and lighting where lighting matters) and report the differences you see rather than a verdict such as "matches". Anything that moves gets a flipbook early, because timing problems do not show in a still frame. Keep a camera for the record, apart from any shot camera, move it wherever it shows the work best, and capture from it at each milestone, so there is a record of how the scene got where it is. Keep the person able to follow along: say what you are about to look at and what you saw. The exception is a purely structural change, such as a rename, where a read of the network is enough.
 
 **Isolate before you fix.** Change one variable per test, or you cannot tell which change mattered. Suspect upstream first, since most wrong looking results are fed wrong inputs. Cut the problem down to the smallest setup that still shows it. Read the error text in full before guessing at its cause. An expensive setting, such as many more substeps or full resolution, is a useful diagnostic: if raising it makes the problem vanish, you have learned what kind of problem it is, and the next job is to find the cheap fix. In a long graph, bisect: check the middle, then the half that is wrong. The exception is an obvious typo, which you can simply fix.
 
-**Cheap loop first.** Work with low counts and low resolution until the behaviour is right, and add detail only once it is. Cache at the boundary that has settled, so later changes do not recook what came before it. Strip attributes and groups that nothing downstream reads. Set the quality bar from what the result is for; a layout check does not need final quality. Timebox exploration. Use stored check results instead of rebuilding them. Wait on long jobs through the job tool rather than sleeping and asking again. Keep what comes back small by filtering and summarising inside Houdini. Report what is still unresolved instead of burying it. The exception is a final, or a look that depends on fine detail, which is judged at the quality it will ship at.
+**Cheap loop first.** Work with low counts and low resolution until the behaviour is right, and add detail only once it is. Cache at the boundary that has settled, so later changes do not recook what came before it. Strip attributes and groups that nothing downstream reads. Set the quality bar from what the result is for; a layout check does not need final quality. Timebox exploration. Wait on long jobs through the job tool rather than sleeping and asking again, and when a job has already finished, read its result from the job record instead of running it again. Keep what comes back small by filtering and summarising inside Houdini. Report what is still unresolved instead of burying it. The exception is a final, or a look that depends on fine detail, which is judged at the quality it will ship at.
 
 ## The revision budget
 
@@ -50,17 +50,21 @@ Work to the budget in the house conventions. Each attempt on one detail should t
 
 The closing message contains:
 
-- If a reference was supplied: the compare run folder, the numbers it produced, and the three largest remaining differences in plain words. A closing message with no compare path is not done.
+- The checks you ran and what they showed: cook errors or their absence, which views you looked at, and what you saw in them.
+- If a reference was supplied and `hou_compare` is available: the compare run folder, the numbers it produced, and the three largest remaining differences in plain words. A closing message with no compare path is not done.
+- If a reference was supplied and there is no compare tool: say that no compare run was possible, and list the differences you saw in the matched views, largest first.
 - The scene path and the version you saved.
 - What a person must know to pick it up: where the controls are, which `OUT_` nodes to read from, what is cached and where.
 - What is unresolved: missing types or plugins, open questions, and anything you skipped and why.
+- If nothing was built, say so plainly and give the plan instead.
 
 ## If a Houdini MCP server is connected
 
 - Which Houdini you are talking to, and spare workers for heavy work: `hou_ping`, `hou_sessions`.
 - Open, save in place, save the next increment, and see what failed to load: `hou_scene`.
 - Read the network, parameters and errors before changing them: `hou_inspect`.
-- Build and change things, filtering inside Houdini so only the answer comes back: `hou_python`.
-- Wait on long work instead of sleeping, or cancel it: `hou_jobs`.
+- Build and change things, filtering inside Houdini so only the answer comes back: `hou_python`. Inside it, `mcp.output_path` hands out a managed path for a render, cache or capture, `mcp.progress` reports how far a long loop has got, and `mcp.cancelled` says when to stop.
+- Wait on long work instead of sleeping, read a finished job's result, or cancel it: `hou_jobs`.
 - Arriving, use them once they appear: `hou_capture` for views and flipbooks, `hou_compare` for matched views against a reference, `hou_outputs` for managed output paths, `hou_docs` and `hou_node_type` to check a node or parameter instead of guessing.
-- If none of these tools are available, say so plainly and continue with planning only: the mechanism, the system, its boundaries, and the checks you would run.
+- With a different Houdini server, use its tools for the same jobs; nothing above depends on these names.
+- Only when there are no Houdini tools at all, say so plainly and continue with planning only: the mechanism, the system, its boundaries, and the checks you would run.
