@@ -250,9 +250,12 @@ def _as_array(value: Any, most: int) -> Any:
     except Exception:  # noqa: BLE001 - a shape we cannot read is no shape
         return _UNKNOWN
     head = value
-    if shape and isinstance(shape[0], int) and shape[0] > most:
+    sized = shape and all(isinstance(size, int) for size in shape)
+    if sized and any(size > most for size in shape):
+        # Every axis is cut, not only the first: a wide inner axis would
+        # otherwise be copied whole before the cap could see it.
         try:
-            head = value[: most + 1]
+            head = value[tuple(slice(0, most + 1) for _ in shape)]
         except Exception:  # noqa: BLE001 - one that will not slice is listed whole
             head = value
     try:

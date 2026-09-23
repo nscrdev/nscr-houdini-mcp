@@ -956,6 +956,37 @@ def test_a_long_array_is_cut_and_the_reply_says_so() -> None:
     assert converted.cut == ["data.points"]
 
 
+class Grid(Array):
+    """A two axis array that records how it was sliced."""
+
+    sliced: list[tuple[slice, ...]] = []
+
+    def __init__(self, rows: list[list[Any]]) -> None:
+        super().__init__(rows)
+        self.shape = (len(rows), len(rows[0]) if rows else 0)
+
+    def __getitem__(self, key: tuple[slice, ...]) -> Grid:
+        Grid.sliced.append(key)
+        rows, columns = key
+        return Grid([row[columns] for row in self._values[rows]])
+
+
+def test_a_wide_array_is_cut_on_every_axis_before_it_is_listed() -> None:
+    Grid.sliced.clear()
+    wide = Grid([list(range(100)) for _ in range(2)])
+    converted = encoding.convert({"grid": wide}, max_items=4)
+    assert Grid.sliced == [(slice(0, 5), slice(0, 5))]
+    assert converted.value["grid"] == [[0, 1, 2, 3], [0, 1, 2, 3]]
+    assert converted.lossy is True
+
+
+def test_a_real_wide_array_is_cut_on_every_axis() -> None:
+    numpy = pytest.importorskip("numpy")
+    converted = encoding.convert({"grid": numpy.zeros((2, 1000))}, max_items=4)
+    assert converted.value["grid"] == [[0.0] * 4, [0.0] * 4]
+    assert converted.lossy is True
+
+
 def test_a_real_array_is_read_the_same_way() -> None:
     numpy = pytest.importorskip("numpy")
     converted = encoding.convert({"points": numpy.arange(3)})
