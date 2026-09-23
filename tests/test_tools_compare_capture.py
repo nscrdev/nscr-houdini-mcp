@@ -509,11 +509,14 @@ def test_an_unreadable_reference_costs_no_capture(
     assert scene.capture.seen == []
 
 
-def test_a_mask_that_will_not_do_costs_no_capture(bench: Bench, scene: Scene) -> None:
+def test_a_mask_that_will_not_do_costs_no_capture(
+    bench: Bench, scene: Scene, tmp_path: Path
+) -> None:
     first = capture(bench, resolution=[64, 32])
     register(bench, first["path"])
     seen = len(scene.capture.seen)
-    error = refused(compare(bench, {"source": "viewport"}, mask="/no/such/mask.png"))
+    missing = tmp_path / "no" / "such" / "mask.png"
+    error = refused(compare(bench, {"source": "viewport"}, mask=str(missing)))
     assert error["code"] == "FILE_NOT_FOUND"
     assert error["details"]["argument"] == "mask"
     assert len(scene.capture.seen) == seen

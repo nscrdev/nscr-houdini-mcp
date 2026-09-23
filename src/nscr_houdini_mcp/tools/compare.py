@@ -640,14 +640,15 @@ def compare(call: Call) -> dict[str, Any]:
             "result": relative_to(folder / "result.json", scene.place),
         },
     )
-    # What the caller gets is the saved record with places it can open here.
+    # What the caller gets is the saved record with places it can open here,
+    # written with forward slashes like every other path the server hands out.
     returned = {
         **saved,
         "folder": str(folder),
         "files": absolute(folder, report["files"]),
         "sources": {
-            "candidate": {**saved["sources"]["candidate"], "path": str(candidate_path)},
-            "reference": {**saved["sources"]["reference"], "path": str(reference_path)},
+            "candidate": {**saved["sources"]["candidate"], "path": candidate_path.as_posix()},
+            "reference": {**saved["sources"]["reference"], "path": reference_path.as_posix()},
         },
     }
     how = arguments.get("return_image") or "thumb"
