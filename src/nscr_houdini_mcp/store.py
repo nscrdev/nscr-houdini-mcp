@@ -1398,6 +1398,45 @@ class Store:
                 raise UnknownRecord(f"no worker reservation {token}")
         return now
 
+    def hold_worker_for_job(self, session_id: str, job_id: str) -> bool:
+        """Put a job a session runs on its worker row, so the worker is not idle.
+
+        A worker a server already took for a job of its own keeps that job.
+        A session that is not a worker has no row, and nothing changes.
+        Returns whether the job was put on the row.
+        """
+        now = self._now()
+        states = ", ".join("?" * len(WORKER_ACTIVE_STATES))
+        with self._txn(write=True) as db:
+            written = db.execute(
+                f"UPDATE workers SET job_id = ?, leased_at = ? WHERE session_id = ?"
+                f" AND state IN ({states}) AND (job_id IS NULL OR job_id = ?)",
+                (job_id, now, session_id, *WORKER_ACTIVE_STATES, job_id),
+            )
+            return written.rowcount > 0
+
+    def renew_worker_of_session(self, session_id: str) -> bool:
+        """Renew the idle lease of the worker a session is, while it works."""
+        now = self._now()
+        states = ", ".join("?" * len(WORKER_ACTIVE_STATES))
+        with self._txn(write=True) as db:
+            written = db.execute(
+                f"UPDATE workers SET leased_at = ? WHERE session_id = ? AND state IN ({states})",
+                (now, session_id, *WORKER_ACTIVE_STATES),
+            )
+            return written.rowcount > 0
+
+    def free_worker_of_job(self, session_id: str, job_id: str) -> bool:
+        """Take a finished job off its worker row. The idle wait starts again now."""
+        now = self._now()
+        with self._txn(write=True) as db:
+            written = db.execute(
+                "UPDATE workers SET job_id = NULL, leased_at = ?"
+                " WHERE session_id = ? AND job_id = ?",
+                (now, session_id, job_id),
+            )
+            return written.rowcount > 0
+
     def get_worker(self, token: str) -> WorkerRecord | None:
         """One reservation by its owner token."""
         row = self._read_one("SELECT * FROM workers WHERE token = ?", (token,))

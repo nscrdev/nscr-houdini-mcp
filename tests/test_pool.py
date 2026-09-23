@@ -354,6 +354,65 @@ def test_a_worker_on_a_job_is_never_idle(home: Path, hython: Path) -> None:
         assert _watch_once(store, record.token, clock, threading.Event()) is None
 
 
+def test_a_worker_running_a_call_is_never_idle_however_long_it_runs(
+    home: Path, hython: Path
+) -> None:
+    clock = FakeClock()
+    running = [True]
+    with lease_store(home, clock) as store:
+        config = pool.PoolConfig(home=home, max_idle_s=60.0)
+        record = start(config, store, FakeLauncher(home), hython)
+        clock.tick(31 * 60.0)
+        stop = threading.Event()
+        stop.set()
+        busy = pool.watch_lease(
+            store,
+            record.token,
+            max_idle_s=60.0,
+            stop=stop,
+            interval_s=0.0,
+            clock=clock,
+            busy=lambda: running[0],
+        )
+        assert busy == "stopped"
+        assert store.get_worker(record.token).state == "running"
+        running[0] = False
+        assert _watch_once(store, record.token, clock, threading.Event()) == "idle"
+
+
+def test_a_job_on_the_worker_row_keeps_it_and_its_end_starts_the_idle_wait(
+    home: Path, hython: Path
+) -> None:
+    clock = FakeClock()
+    with lease_store(home, clock) as store:
+        config = pool.PoolConfig(home=home, max_idle_s=60.0)
+        record = start(config, store, FakeLauncher(home), hython)
+        assert store.hold_worker_for_job(record.session_id, "job-a") is True
+        clock.tick(31 * 60.0)
+        assert _watch_once(store, record.token, clock, threading.Event()) is None
+        assert store.renew_worker_of_session(record.session_id) is True
+        assert store.get_worker(record.token).leased_at == clock.now
+        clock.tick(30.0)
+        assert store.free_worker_of_job(record.session_id, "job-a") is True
+        assert store.get_worker(record.token).job_id is None
+        clock.tick(59.0)
+        assert _watch_once(store, record.token, clock, threading.Event()) is None
+        clock.tick(2.0)
+        assert _watch_once(store, record.token, clock, threading.Event()) == "idle"
+
+
+def test_a_job_a_server_took_the_worker_for_is_not_replaced(home: Path, hython: Path) -> None:
+    clock = FakeClock()
+    with lease_store(home, clock) as store:
+        config = pool.PoolConfig(home=home, max_idle_s=60.0)
+        record = start(config, store, FakeLauncher(home), hython)
+        pool.reserve(store, "w1", job_id="job-server")
+        assert store.hold_worker_for_job(record.session_id, "job-a") is False
+        assert store.free_worker_of_job(record.session_id, "job-a") is False
+        assert store.get_worker(record.token).job_id == "job-server"
+        assert store.hold_worker_for_job("no-such-session", "job-a") is False
+
+
 def test_touching_the_lease_keeps_a_worker_alive(home: Path, hython: Path) -> None:
     clock = FakeClock()
     with lease_store(home, clock) as store:

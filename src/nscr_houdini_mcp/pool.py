@@ -765,6 +765,7 @@ def watch_lease(
     clock: Callable[[], float] = time.time,
     trouble_s: float = LEASE_TROUBLE_S,
     log: Callable[[str], None] | None = None,
+    busy: Callable[[], bool] | None = None,
 ) -> str:
     """Watch one worker's own row until it should end, and say why.
 
@@ -775,7 +776,9 @@ def watch_lease(
     under it, `stopped` when the process is going down for its own reasons,
     and `unreadable` when the store has not been readable for a long time.
 
-    A worker holding a job is never idle, however long the job runs.
+    A worker holding a job is never idle, however long the job runs, and
+    neither is one whose `busy` says a call is running in it now: a call can
+    outlast the idle limit without any server routing to the worker.
 
     A store that another process has locked for a moment, or a read that
     failed once, is not a reason to stop watching: the pass is given up on,
@@ -788,7 +791,7 @@ def watch_lease(
     trouble_since: float | None = None
     while True:
         try:
-            reason = _lease_pass(store, token, max_idle_s=max_idle_s, clock=clock)
+            reason = _lease_pass(store, token, max_idle_s=max_idle_s, clock=clock, busy=busy)
         except store_module.StoreError as error:
             if trouble_since is None:
                 trouble_since = clock()
@@ -808,7 +811,12 @@ def watch_lease(
 
 
 def _lease_pass(
-    store: Store, token: str, *, max_idle_s: float, clock: Callable[[], float]
+    store: Store,
+    token: str,
+    *,
+    max_idle_s: float,
+    clock: Callable[[], float],
+    busy: Callable[[], bool] | None = None,
 ) -> str | None:
     """One look at the row. `None` means carry on watching."""
     record = store.get_worker(token)
@@ -822,6 +830,8 @@ def _lease_pass(
     # A clock that stepped backwards must not make a worker look fresh or
     # old, so the age is never negative.
     idle_for = max(0.0, clock() - record.leased_at)
+    if busy is not None and busy():
+        return None
     if record.job_id is None and max_idle_s > 0 and idle_for >= max_idle_s:
         store.set_worker_state(token, "stopping")
         return "idle"

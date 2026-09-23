@@ -13,7 +13,9 @@ runs, one small thread per job does three things:
   what `mcp.cancelled()` looks at, so a job cancelled from any server process
   sees it even when the direct request to this session never arrived.
 - Keeps the row's heartbeat fresh, so the job is not taken for one whose
-  session has gone quiet.
+  session has gone quiet, and renews the idle lease of the worker it runs
+  in. The job sits on the worker's row from accept to finish, so a worker
+  running a long job is never stopped for being idle.
 
 How it ends. Work that saw the cancel flag and stopped is `cancelled`. Work
 that finished without ever looking is `done`, with `cancel_requested` still
@@ -120,6 +122,8 @@ class JobKeeper:
                 replace=True,
             )
         )
+        if self._session_id:
+            self._write(lambda store: store.hold_worker_for_job(self._session_id, job_id))
         threading.Thread(
             target=self._watch, args=(running, job), name="nscr-mcp-job", daemon=True
         ).start()
@@ -156,6 +160,7 @@ class JobKeeper:
                     error=error,
                 )
             )
+        self._free(job)
         self._write(lambda store: job_rules.export(store, job.job_id, home=self._home))
 
     def asked_to_stop(self, running: Any) -> None:
@@ -175,6 +180,12 @@ class JobKeeper:
         with job.lock:
             job.closed = True
             self._write(lambda store: store.drop_job(job.job_id))
+        self._free(job)
+
+    def _free(self, job: _Job) -> None:
+        """Take the job off the worker row, which starts its idle wait again."""
+        if self._session_id:
+            self._write(lambda store: store.free_worker_of_job(self._session_id, job.job_id))
 
     # Section: while it runs
 
@@ -208,7 +219,12 @@ class JobKeeper:
                 store.touch_job(job.job_id)
                 return store.get_job(job.job_id)
 
+            def lease(store: store_module.Store) -> bool:
+                return store.renew_worker_of_session(self._session_id)
+
             record = self._write(beat)
+            if self._session_id:
+                self._write(lease)
         if record is not None and record.cancel_requested and not running.cancel.is_set():
             self._log(f"job {job.job_id} was asked to stop")
             running.cancel.set()

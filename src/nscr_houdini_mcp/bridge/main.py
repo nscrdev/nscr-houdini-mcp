@@ -175,7 +175,14 @@ def _watch_lease(bridge: Bridge, token: str, max_idle_s: float) -> None:
     try:
         with pool.open_store(bridge.home) as store:
             reason = pool.watch_lease(
-                store, token, max_idle_s=max_idle_s, stop=bridge.stopping, log=note
+                store,
+                token,
+                max_idle_s=max_idle_s,
+                stop=bridge.stopping,
+                log=note,
+                # A call running here is a use of the worker, however long
+                # it runs and whether or not anybody routes to it meanwhile.
+                busy=lambda: bridge.dispatcher.running is not None,
             )
     except Exception as error:  # noqa: BLE001 - reported, never fatal to the worker
         print(f"worker lease not watched: {error}", flush=True)

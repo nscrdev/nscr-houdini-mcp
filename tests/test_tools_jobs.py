@@ -566,3 +566,15 @@ def test_a_stop_asked_of_the_session_directly_is_put_on_the_row(bench: Bench) ->
     assert reply.payload["data"]["asked"] is True
     support.wait_until(lambda: row(bench, job_id).state == "cancelled", timeout_s=10.0)
     assert row(bench, job_id).cancel_requested is True
+
+
+def test_a_running_job_sits_on_its_worker_row_until_it_ends(bench: Bench, module: Any) -> None:
+    bench.worker("s-1", "wk-1")
+    handle = in_the_background(bench, "hou.gate.wait(10)")
+    with bench.store() as store:
+        assert store.get_worker("wk-1").job_id == handle["job_id"]
+    module.gate.set()
+    idle(bench)
+    support.wait_until(lambda: row(bench, handle["job_id"]).state == "done", timeout_s=5.0)
+    with bench.store() as store:
+        assert store.get_worker("wk-1").job_id is None
