@@ -63,7 +63,7 @@ Run the server on stdio:
 nscr-houdini-mcp
 ```
 
-Six tools so far. `hou_ping` says which session a call reaches and that it
+Seven tools so far. `hou_ping` says which session a call reaches and that it
 answers. `hou_sessions` lists every session with its state (`live`, `busy`,
 `unresponsive`, `crashed` or `gone`) and starts and stops workers under the
 pool's rules; it never closes a Houdini with a user interface. `hou_scene`
@@ -210,6 +210,61 @@ whether stopped or found gone, is `lost` with the progress and outputs it had
 written, and so is one its session has said nothing about for fifteen
 minutes. A job that ends leaves a readable copy of itself beside the scene,
 in `.agent/jobs/`. Jobs are kept for 7 days.
+
+`hou_compare` puts a candidate image beside a reference and says how far
+apart they are, as pictures and as numbers. It never says pass or fail: there
+is no match flag and no built in threshold. The candidate is a file in this
+build; a viewport capture, a node's own image and a render are named in the
+schema and answer `NOT_YET_AVAILABLE`, naming the capture tool to use when it
+arrives. The work runs in the server with NumPy and Pillow, in a fixed order,
+and the result records every step:
+
+1. Colour. A PNG, JPEG or TIFF is converted to sRGB through its embedded ICC
+   profile; with none, sRGB is assumed and the result says `assumed_srgb`. An
+   EXR or HDR file is read by the session, through a COP `file` node made and
+   removed for the purpose, and brought to display values with the session's
+   OpenColorIO display and view. The result names the configuration, display,
+   view, exposure, channel and what was done with alpha, and says
+   `transfer_mismatch_possible` when the two sides went through different
+   kinds of transform or their mean luminance is more than 25 percent apart.
+2. Alignment at native size: `align` (`fit` letterboxes to the reference's
+   aspect, `fill` crops to cover it, `stretch`, `none`), then `adjust` (`dx`,
+   `dy` and `scale` in shares of the frame), then `auto_shift`, a translation
+   found by phase correlation. A candidate with more pixels than the reference
+   keeps them: the grid grows instead, up to four times.
+3. Crops before any shrinking. Named regions and `region`, each
+   `[x0, y0, x1, y1]` in shares of the frame, are cut from the aligned native
+   images, and a detail crop's numbers are counted at that size.
+4. The overview: both sides resized to a long edge of 1024 for the whole
+   image numbers, the difference map and the sheet.
+
+The numbers are mean absolute error and RMSE per channel and overall, PSNR,
+the share of the counted area whose difference is over `tolerance` (0.05
+unless you say), and a rough box around the largest area of difference.
+`match_exposure` adds the same numbers after one gain evens out the mean
+luminance. In `likeness` mode, the default, they are labelled secondary,
+because lighting and framing move them; in `regression` mode they are
+primary. `mask` limits the counted area to the reference's registered mask or
+alpha, or to a mask file; the candidate's alpha never decides it. Numbers that
+cannot be counted are named in `missing` with the reason, and the aligned pair
+and the sheet are written all the same.
+
+Every compare writes `candidate.png` and `reference.png` (the aligned pair),
+`diff.png`, `overview.jpg` (candidate, reference and difference, labelled),
+`crops/<region>.png` and `result.json` to a `compare` folder, and returns
+the overview as an image for the person as well as the agent (`return_image`
+`thumb`, `full` or `none`).
+
+`set_reference` copies an image into `$HIP/.agent/reference/` and writes one
+record beside it, `<ref_id>.json`, that is never written again: the content
+hash, the colour profile or the assumption made, and optionally the camera it
+was framed for, named `regions` and a mask. Registering a name again makes a
+new record and id. `list_references` lists the names, and `hou_scene` `info`
+at `full` detail lists them too, so a fresh context finds the goal. Compares
+with the same reference id and hash, camera, crop, mask, colour records and
+settings form a series, logged under `reference/series/`; a result in a
+series with earlier runs carries the trend, and one that starts a new series
+says which of those changed.
 
 ### The Houdini side
 
@@ -412,6 +467,7 @@ hip       $HIP/<name>_v<ver>.hip
 capture   $HIP/.agent/captures/<date>/<time>_<name>_<run_id>.png
 compare   $HIP/.agent/compare/<date>_<name>/<ver>_<run_id>/
 job       $HIP/.agent/jobs/<job_id>.json
+reference $HIP/.agent/reference/<name>_<run_id>.png
 ```
 
 A `job` path is only ever written by a session or the server, for the record
