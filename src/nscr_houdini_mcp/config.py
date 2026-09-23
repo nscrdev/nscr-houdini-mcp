@@ -23,9 +23,8 @@ Pacing. `gui_min_pause_ms` and `gui_max_calls_per_s` limit how hard this
 server drives a Houdini with a user interface: the least time between one
 call ending and the next starting, and how many calls may start in any one
 second. Zero turns either off, and both at zero turn pacing off; a negative
-value is refused. `treat_workers_as_gui` paces workers the same
-way; it exists so the pacing can be tried against a headless Houdini, and is
-left out of the template on purpose.
+value is refused. Workers are never paced from here: only a test can ask
+for that, through the server's own constructor, so no config file can.
 
 The same file may hold `[outputs]` and `[conventions]` tables. Those belong to
 the output paths, which check them when they read them, so they are passed
@@ -107,7 +106,6 @@ KEYS = (
     "inline_wait_s",
     "gui_min_pause_ms",
     "gui_max_calls_per_s",
-    "treat_workers_as_gui",
     "transport",
 )
 
@@ -214,7 +212,6 @@ class Config:
     inline_wait_s: int = DEFAULT_INLINE_WAIT_S
     gui_min_pause_ms: int = pacing.DEFAULT_MIN_PAUSE_MS
     gui_max_calls_per_s: int = pacing.DEFAULT_MAX_CALLS_PER_S
-    treat_workers_as_gui: bool = False
     transport: str = TRANSPORTS[0]
     # Which keys the file set. The rest are defaults.
     from_file: frozenset[str] = frozenset()
@@ -243,7 +240,6 @@ class Config:
             "inline_wait_s": self.inline_wait_s,
             "gui_min_pause_ms": self.gui_min_pause_ms,
             "gui_max_calls_per_s": self.gui_max_calls_per_s,
-            "treat_workers_as_gui": self.treat_workers_as_gui,
             "transport": self.transport,
         }
         return {key: values[key] for key in KEYS}
@@ -418,12 +414,6 @@ def _calls_per_s(value: Any, key: str, path: Path) -> int:
     return _whole(value, key, path, 0, MAX_GUI_CALLS_PER_S)
 
 
-def _switch(value: Any, key: str, path: Path) -> bool:
-    if not isinstance(value, bool):
-        raise ConfigError(f"{key} must be true or false, got {_kind(value)}", path=path, key=key)
-    return value
-
-
 def _transport(value: Any, key: str, path: Path) -> str | None:
     text = _text(value, key, path)
     if text is not None and text not in TRANSPORTS:
@@ -453,7 +443,6 @@ _CHECKS = {
     "inline_wait_s": _inline_wait,
     "gui_min_pause_ms": _pause_ms,
     "gui_max_calls_per_s": _calls_per_s,
-    "treat_workers_as_gui": _switch,
     "transport": _transport,
 }
 

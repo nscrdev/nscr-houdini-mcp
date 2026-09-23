@@ -217,7 +217,175 @@ def test_callers_side_by_side_leave_the_session_the_whole_pause_between_calls() 
     assert min(gaps) >= pause - 0.002, gaps
 
 
+def test_the_queue_for_one_session_is_bounded() -> None:
+    paced = Pacer(min_pause_s=0.05, max_per_s=10, max_queued=3)
+    paced.admit("gui", budget_s=1.0)
+    outcomes: list[str] = []
+    kept = threading.Lock()
+
+    def waiter() -> None:
+        try:
+            paced.admit("gui", budget_s=5.0)
+            outcome = "admitted"
+            paced.done("gui")
+        except NoTurn as refused:
+            outcome = refused.reason
+        with kept:
+            outcomes.append(outcome)
+
+    threads = [threading.Thread(target=waiter) for _ in range(3)]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + 5.0
+    while len(paced._paces["gui"].queue) < 3 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    # Three wait; a fourth is refused at once, with when to come back.
+    with pytest.raises(NoTurn) as refused:
+        paced.admit("gui", budget_s=5.0)
+    assert refused.value.reason == "too many calls are queued"
+    assert refused.value.waited_s == 0.0
+    assert refused.value.retry_after_s >= 0.05
+    paced.done("gui")
+    for thread in threads:
+        thread.join(10)
+    assert outcomes == ["admitted"] * 3
+
+
+def test_a_call_whose_caller_went_away_leaves_the_queue() -> None:
+    paced = Pacer(min_pause_s=0.05, max_per_s=10)
+    paced.admit("gui", budget_s=1.0)
+    gone = threading.Event()
+    seen: list[BaseException] = []
+
+    def waiter() -> None:
+        try:
+            paced.admit("gui", budget_s=30.0, cancelled=gone.is_set)
+        except NoTurn as refused:
+            seen.append(refused)
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    time.sleep(0.1)
+    started = time.monotonic()
+    gone.set()
+    thread.join(5)
+    assert time.monotonic() - started < 0.5
+    assert [refused.reason for refused in seen] == ["the caller went away"]
+    assert len(paced._paces["gui"].queue) == 0
+
+
 # Section: which calls are paced, and what the bridge is told
+
+
+class CountingBridge:
+    """A stand in bridge that takes a little while per call and counts them."""
+
+    def __init__(self, *, takes_s: float = 0.02, hold: threading.Event | None = None) -> None:
+        self.takes_s = takes_s
+        self.hold = hold
+        self.tools: list[str] = []
+        self.lock = threading.Lock()
+
+    def __call__(self, session: client.Session, tool: str, **rest: Any) -> client.Answer:
+        with self.lock:
+            self.tools.append(tool)
+        if self.hold is not None:
+            self.hold.wait(10)
+        time.sleep(self.takes_s)
+        return client.Answer(200, {"ok": True, "data": {}}, {})
+
+
+def real_router(rows: list, send: Any) -> Router:
+    return Router(
+        home=Path("."),
+        open_store=lambda path: FakeStore(rows),
+        open_session=FakeFiles([row.session_id for row in rows]).open,
+        send=send,
+        renew_lease=lambda store, session_id: None,
+        pacer=Pacer(min_pause_s=0.05, max_per_s=10),
+    )
+
+
+def test_forty_callers_with_a_short_wait_are_mostly_busy_and_only_the_admitted_are_sent() -> None:
+    bridge = CountingBridge()
+    routed = real_router([record("s-1", "scene", kind="gui")], bridge)
+    target = routed.resolve(None)
+    answers: list[str] = []
+    kept = threading.Lock()
+    go = threading.Barrier(40)
+
+    def caller() -> None:
+        go.wait()
+        try:
+            routed.call(target, "bridge.ping", wait_s=0.1)
+            answer = "sent"
+        except CallError as error:
+            answer = error.code
+        with kept:
+            answers.append(answer)
+
+    threads = [threading.Thread(target=caller) for _ in range(40)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    assert len(answers) == 40
+    sent = answers.count("sent")
+    assert answers.count("SESSION_BUSY") == 40 - sent
+    assert sent <= 5
+    assert answers.count("SESSION_BUSY") >= 35
+    assert len(bridge.tools) == sent
+
+
+def test_a_queued_call_whose_caller_cancels_never_reaches_the_bridge() -> None:
+    release = threading.Event()
+    bridge = CountingBridge(hold=release)
+    routed = real_router([record("s-1", "scene", kind="gui")], bridge)
+    target = routed.resolve(None)
+    first = threading.Thread(target=lambda: routed.call(target, "bridge.ping", wait_s=5.0))
+    first.start()
+    while not bridge.tools:
+        time.sleep(0.005)
+    gone = threading.Event()
+    refused: list[CallError] = []
+
+    def queued() -> None:
+        try:
+            routed.call(target, "python.run", wait_s=30.0, operation_id="op-q", cancelled=gone)
+        except CallError as error:
+            refused.append(error)
+
+    second = threading.Thread(target=queued)
+    second.start()
+    time.sleep(0.1)
+    gone.set()
+    second.join(5)
+    release.set()
+    first.join(10)
+    assert [error.code for error in refused] == ["SESSION_BUSY"]
+    assert refused[0].details["reason"] == "the caller went away"
+    assert bridge.tools == ["bridge.ping"]
+
+
+def test_a_cancelled_call_tells_its_thread() -> None:
+    import anyio
+
+    from nscr_houdini_mcp.server import in_daemon_thread
+
+    gone = threading.Event()
+    finished = threading.Event()
+
+    def work() -> None:
+        gone.wait(5)
+        finished.set()
+
+    async def cancel_it() -> None:
+        with anyio.move_on_after(0.1):
+            await in_daemon_thread(work, cancelled=gone)
+
+    anyio.run(cancel_it)
+    assert gone.is_set()
+    assert finished.wait(5)
 
 
 def router(rows: list, clock: Clock, *, pace_workers: bool = False, send: Any = None) -> Router:
@@ -348,25 +516,29 @@ def test_the_pacing_keys_have_their_defaults() -> None:
     config = Config(path=Path("config.toml"))
     assert config.gui_min_pause_ms == 50
     assert config.gui_max_calls_per_s == 10
-    assert config.treat_workers_as_gui is False
     assert "gui_min_pause_ms = 50" in config_module.TEMPLATE
     assert "gui_max_calls_per_s = 10" in config_module.TEMPLATE
     assert "0 turns that rule off" in config_module.TEMPLATE
-    # For tests only, so a person never meets it in the template.
+
+
+def test_no_config_can_ask_for_workers_to_be_paced() -> None:
+    # Pacing workers is for tests, through the constructor, never a key.
+    assert not hasattr(Config(path=Path("config.toml")), "treat_workers_as_gui")
+    with pytest.raises(ConfigError) as refused:
+        parse_config({"treat_workers_as_gui": True}, path=Path("config.toml"))
+    assert refused.value.key == "treat_workers_as_gui"
     assert "treat_workers_as_gui" not in config_module.TEMPLATE
 
 
 def test_the_pacing_keys_are_read_and_checked() -> None:
-    raw = {"gui_min_pause_ms": 0, "gui_max_calls_per_s": 25, "treat_workers_as_gui": True}
+    raw = {"gui_min_pause_ms": 0, "gui_max_calls_per_s": 25}
     config = parse_config(raw, path=Path("config.toml"))
     assert (config.gui_min_pause_ms, config.gui_max_calls_per_s) == (0, 25)
-    assert config.treat_workers_as_gui is True
     for bad in (
         {"gui_min_pause_ms": -1},
         {"gui_max_calls_per_s": -1},
         {"gui_min_pause_ms": 1.5},
         {"gui_max_calls_per_s": 100_000},
-        {"treat_workers_as_gui": "yes"},
     ):
         with pytest.raises(ConfigError) as refused:
             parse_config(bad, path=Path("config.toml"))
@@ -379,7 +551,15 @@ def test_the_server_builds_its_router_with_the_configured_pace() -> None:
     assert routed.pacer.min_pause_s == pytest.approx(0.075)
     assert routed.pacer.max_per_s == 4
     assert routed.pace_workers is False
-    assert _router_for(Config(path=Path("c.toml"), treat_workers_as_gui=True)).pace_workers
+    assert _router_for(config, pace_workers=True).pace_workers
+
+
+def test_only_the_constructor_paces_workers() -> None:
+    config = Config(path=Path("config.toml"))
+    plain = build_server(TOOLS, config_loader=lambda: config)
+    paced = build_server(TOOLS, config_loader=lambda: config, pace_workers=True)
+    assert plain.runtime.settings()[1].pace_workers is False
+    assert paced.runtime.settings()[1].pace_workers is True
 
 
 # Section: through the server

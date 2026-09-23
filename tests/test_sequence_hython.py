@@ -49,9 +49,14 @@ def hython_available() -> bool:
     return True
 
 
+# A cold worker start and a whole pass take longer than the suite's own per
+# test limit on a slow runner (the client here waits up to 300 seconds a call),
+# so every test in this file carries its own deadline and gets to its own
+# cleanup rather than being cut off.
 pytestmark = [
     pytest.mark.houdini,
     pytest.mark.skipif(not hython_available(), reason="no hython on this machine"),
+    pytest.mark.timeout(900),
 ]
 
 PORT_RANGE = support.POOL_PORTS

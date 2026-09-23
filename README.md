@@ -507,8 +507,10 @@ in its trace, as `throttled_ms`, and when it was let through, as
 The pace is kept per server process and per session. Two agents sharing one
 server process share its one allowance; two server processes, one per
 client, each have their own, so together they get no more than twice it.
-Workers are headless and are not paced. A cancel is never paced either,
-since it runs beside the call it stops.
+At most 32 calls wait on one session's turn; one more is answered
+`SESSION_BUSY` at once, and a call whose client cancels leaves the queue
+without being sent. Workers are headless and are not paced. A cancel is never
+paced either, since it runs beside the call it stops.
 
 The bridge has a limit of its own, whoever sends: it remembers the signed
 requests of the last two minutes, 20,000 at most, and refuses one more with
@@ -657,8 +659,10 @@ its own: the current one stamps every result with the server's details in its
 metadata. Everything the pass writes stays in pytest's temporary folder.
 
 `tests/test_storm_cap_hython.py` has two server processes hammer one worker
-that is paced as if it had an interface, which the test only key
-`treat_workers_as_gui` allows, and prints the rates with and without the pace.
+that is paced as if it had an interface, which only a test can ask for, through
+the server's constructor, and prints the rates with and without the pace. Both
+files carry their own deadline of 900 seconds, longer than the suite's usual
+limit, for a slow Houdini to start in.
 
 ## Output folders
 

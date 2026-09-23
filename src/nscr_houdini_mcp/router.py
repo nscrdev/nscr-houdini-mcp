@@ -419,8 +419,12 @@ class Router:
         timeout_s: float | None = None,
         socket_s: float | None = None,
         skip_if_busy: bool = False,
+        cancelled: threading.Event | None = None,
     ) -> dict[str, Any]:
         """Send one bridge call and hand back the reply, or raise `CallError`.
+
+        `cancelled` is set when the caller has gone. A paced call still
+        waiting for its turn then leaves the queue and is never sent.
 
         A call that carries an `operation_id` is sent once more if its reply is
         lost, with the same id, which the client does on its own. `socket_s`
@@ -445,9 +449,21 @@ class Router:
         # the bridge is given what is left of it.
         budget = BRIDGE_WAIT_S if wait_s is None else wait_s
         try:
-            turn = self.pacer.admit(target.session_id, budget_s=budget, skip_if_busy=skip_if_busy)
+            turn = self.pacer.admit(
+                target.session_id,
+                budget_s=budget,
+                skip_if_busy=skip_if_busy,
+                cancelled=cancelled.is_set if cancelled is not None else None,
+            )
         except NoTurn as refused:
             raise paced_busy(target, refused) from None
+        if cancelled is not None and cancelled.is_set():
+            # Gone in the moment between the turn and the send: give it back.
+            self.pacer.done(target.session_id)
+            raise paced_busy(
+                target,
+                NoTurn(waited_s=turn.waited_s, retry_after_s=0.0, reason="the caller went away"),
+            )
         waited = throttled_ms(turn.waited_s)
         said: dict[str, Any] = {ADMITTED_KEY: round(turn.at, 3)}
         if waited:

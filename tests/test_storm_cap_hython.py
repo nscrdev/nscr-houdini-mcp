@@ -2,8 +2,9 @@
 
 Two server processes, each over stdio with a client of its own, send calls to
 one real worker as fast as their answers come back. The worker stands in for a
-session with a user interface: each server's config sets
-`treat_workers_as_gui`, which exists for this, so the pacing applies to it.
+session with a user interface: each server is started with `pace_workers`, a
+constructor argument only tests pass and no config can set, so the pacing
+applies to it.
 
 Paced, every call still succeeds within its `wait_s`, each client stays
 within its rate cap and its pause, counted from the admission times the server
@@ -52,7 +53,8 @@ pytestmark = [
 
 PORT_RANGE = support.POOL_PORTS
 
-SERVER_CODE = "from nscr_houdini_mcp.cli import main; raise SystemExit(main([]))"
+# The server as the entry point runs it, with the one test only argument.
+SERVER_CODE = "from nscr_houdini_mcp import server; server.run(pace_workers=True)"
 
 READ_TIMEOUT_S = 120.0
 
@@ -87,9 +89,7 @@ def settings(home: Path, name: str, *, pause_ms: int, per_s: int) -> Path:
     """A config for one run's servers, pacing the worker as if it had an interface."""
     path = home.parent / f"{name}.toml"
     path.write_text(
-        f"gui_min_pause_ms = {pause_ms}\n"
-        f"gui_max_calls_per_s = {per_s}\n"
-        "treat_workers_as_gui = true\n",
+        f"gui_min_pause_ms = {pause_ms}\ngui_max_calls_per_s = {per_s}\n",
         encoding="utf-8",
     )
     return path
@@ -197,6 +197,10 @@ def summary(runs: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+# A worker start and two runs of calls take longer than the suite's own
+# per test limit on a slow runner, so this test carries its own deadline and
+# gets to its own cleanup rather than being cut off.
+@pytest.mark.timeout(900)
 def test_two_clients_on_one_session_are_each_held_to_the_cap_and_never_refused(
     worker: tuple[Path, WorkerRecord],
 ) -> None:

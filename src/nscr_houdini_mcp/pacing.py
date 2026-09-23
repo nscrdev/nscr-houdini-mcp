@@ -21,6 +21,10 @@ the bridge. When the turn is plainly further off than that, or the call asked
 to be skipped when the session is busy, the call is refused at once with the
 time until the turn, rather than sent late to a caller that has given up.
 
+The queue is bounded: past `max_queued` calls waiting on one session, a new
+one is refused at once. A call whose caller has gone, by a cancel or its own
+deadline, leaves the queue before it can reach the bridge.
+
 The pace is kept per server process and per session: a second session is
 paced on its own. Several agents sharing one server process share its one
 allowance; two server processes each have their own. Workers are headless,
@@ -43,6 +47,12 @@ WINDOW_S = 1.0
 
 DEFAULT_MIN_PAUSE_MS = 50
 DEFAULT_MAX_CALLS_PER_S = 10
+
+# The most calls that may wait on one session's turn at once.
+DEFAULT_MAX_QUEUED = 32
+
+# How often a waiting call looks at whether its caller has gone.
+CANCEL_POLL_S = 0.05
 
 
 class NoTurn(Exception):
@@ -91,12 +101,14 @@ class Pacer:
         *,
         min_pause_s: float = DEFAULT_MIN_PAUSE_MS / 1000.0,
         max_per_s: int = DEFAULT_MAX_CALLS_PER_S,
+        max_queued: int = DEFAULT_MAX_QUEUED,
         clock: Callable[[], float] = time.monotonic,
         wall: Callable[[], float] = time.time,
         wait: Callable[[threading.Condition, float], object] | None = None,
     ) -> None:
         self.min_pause_s = max(0.0, float(min_pause_s))
         self.max_per_s = max(0, int(max_per_s))
+        self.max_queued = max(1, int(max_queued))
         self._clock = clock
         self._wall = wall
         self._wait = wait or (lambda condition, seconds: condition.wait(seconds))
@@ -110,18 +122,31 @@ class Pacer:
         with both off calls go straight through, several at once."""
         return self.min_pause_s > 0 or self.max_per_s > 0
 
-    def admit(self, key: str, *, budget_s: float, skip_if_busy: bool = False) -> Turn:
+    def admit(
+        self,
+        key: str,
+        *,
+        budget_s: float,
+        skip_if_busy: bool = False,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> Turn:
         """Wait for this call's turn, no longer than `budget_s`.
 
         Raises `NoTurn` at once when the turn is known to be further off than
-        the budget, or when anything at all stands in the way of a call that
-        asked to be skipped; and when the budget runs out behind a call that
-        is still out. Turns go in the order they were asked for.
+        the budget, when the queue is full, or when anything at all stands in
+        the way of a call that asked to be skipped; and when the budget runs
+        out, or `cancelled` says the caller has gone, while it waits. Turns go
+        in the order they were asked for.
         """
         if not self.active:
             return Turn(0.0, self._wall())
         with self._ready:
             pace = self._paces.setdefault(key, _Pace())
+            if len(pace.queue) >= self.max_queued:
+                now = self._clock()
+                raise self._refuse(
+                    pace, now, now, self._earliest(pace, now), "too many calls are queued"
+                )
             ticket = next(self._tickets)
             pace.queue.append(ticket)
             started = self._clock()
@@ -132,6 +157,8 @@ class Pacer:
                     now = self._clock()
                     first = pace.queue[0] == ticket
                     turn = self._earliest(pace, now)
+                    if cancelled is not None and cancelled():
+                        raise self._refuse(pace, started, now, turn, "the caller went away")
                     if first and not pace.out and turn <= now:
                         granted = True
                         break
@@ -142,6 +169,8 @@ class Pacer:
                     if now >= deadline:
                         raise self._refuse(pace, started, now, turn, "the wait ran out")
                     until = deadline if (pace.out or not first) else min(turn, deadline)
+                    if cancelled is not None:
+                        until = min(until, now + CANCEL_POLL_S)
                     self._wait(self._ready, max(0.0, until - now))
             finally:
                 if not granted:

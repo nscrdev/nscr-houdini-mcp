@@ -17,6 +17,7 @@ answer the client in the meantime.
 
 from __future__ import annotations
 
+import functools
 import logging
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -112,6 +113,7 @@ class Runtime:
         name: str,
         arguments: Mapping[str, Any] | None,
         progress: Callable[[float, float | None, str | None], None] | None = None,
+        cancelled: threading.Event | None = None,
     ) -> CallToolResult:
         """Run one tool call to a finished result. Never raises.
 
@@ -144,6 +146,7 @@ class Runtime:
                 transport=config.transport,
                 config=config,
                 progress=progress,
+                cancelled=cancelled,
             )
             data = spec.handler(call)
             summary = spec.summary(data) if spec.summary else None
@@ -172,7 +175,9 @@ class Runtime:
             )
 
 
-async def in_daemon_thread(work: Callable[..., Any], *args: Any) -> Any:
+async def in_daemon_thread(
+    work: Callable[..., Any], *args: Any, cancelled: threading.Event | None = None
+) -> Any:
     """Run blocking work on a thread of its own and wait for it, cancellably.
 
     A call can sit on a busy session for as long as its budgets allow. When the
@@ -200,13 +205,20 @@ async def in_daemon_thread(work: Callable[..., Any], *args: Any) -> Any:
                 pass
 
     threading.Thread(target=run, name="nscr-mcp-call", daemon=True).start()
-    await done.wait()
+    try:
+        await done.wait()
+    except BaseException:
+        # The client cancelled or went away. The thread is told, so a call it
+        # has not sent yet, such as one queued for a paced turn, never is.
+        if cancelled is not None:
+            cancelled.set()
+        raise
     if "error" in box:
         raise box["error"]
     return box["value"]
 
 
-def _router_for(config: Config) -> Router:
+def _router_for(config: Config, *, pace_workers: bool = False) -> Router:
     pacer = Pacer(
         min_pause_s=config.gui_min_pause_ms / 1000.0,
         max_per_s=config.gui_max_calls_per_s,
@@ -215,7 +227,7 @@ def _router_for(config: Config) -> Router:
         config.state_home,
         default_session=config.default_session,
         pacer=pacer,
-        pace_workers=config.treat_workers_as_gui,
+        pace_workers=pace_workers,
     )
 
 
@@ -240,7 +252,10 @@ class HoudiniServer(MCPServer):
     async def call_tool(
         self, name: str, arguments: dict[str, Any], context: Any = None
     ) -> CallToolResult:
-        return await in_daemon_thread(self.runtime.run, name, arguments, notifier(context))
+        cancelled = threading.Event()
+        return await in_daemon_thread(
+            self.runtime.run, name, arguments, notifier(context), cancelled, cancelled=cancelled
+        )
 
 
 def notifier(context: Any) -> Callable[[float, float | None, str | None], None] | None:
@@ -268,8 +283,15 @@ def build_server(
     *,
     config_loader: Callable[[], Config] = load_config,
     router_factory: Callable[[Config], Router] | None = None,
+    pace_workers: bool = False,
 ) -> HoudiniServer:
-    """Build the server object with its tools in their fixed order."""
+    """Build the server object with its tools in their fixed order.
+
+    `pace_workers` paces workers as if they had a user interface. It is for
+    tests, which have no interface to pace, and is never read from config.
+    """
+    if router_factory is None and pace_workers:
+        router_factory = functools.partial(_router_for, pace_workers=True)
     runtime = Runtime(tools, config_loader=config_loader, router_factory=router_factory)
     return HoudiniServer(
         runtime,
@@ -289,7 +311,10 @@ def reap_at_start(config_loader: Callable[[], Config] = load_config) -> int:
         return 0
 
 
-def run() -> None:
-    """Run the server on the configured transport. Only stdio exists today."""
+def run(*, pace_workers: bool = False) -> None:
+    """Run the server on the configured transport. Only stdio exists today.
+
+    `pace_workers` is for tests only, as in `build_server`.
+    """
     reap_at_start()
-    build_server().run(transport="stdio")
+    build_server(pace_workers=pace_workers).run(transport="stdio")

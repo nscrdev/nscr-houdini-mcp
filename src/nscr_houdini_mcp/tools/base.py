@@ -17,6 +17,7 @@ This module never imports `hou`.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -218,8 +219,11 @@ class Call:
         transport: str = "stdio",
         config: Config | None = None,
         progress: Callable[[float, float | None, str | None], None] | None = None,
+        cancelled: threading.Event | None = None,
     ) -> None:
         self.spec = spec
+        # Set when the client has gone, so work not yet sent is not sent.
+        self.cancelled = cancelled
         self.arguments = dict(arguments)
         self.router = router
         self.transport = transport
@@ -301,6 +305,7 @@ class Call:
                 wait_s=self.arguments.get("wait_s") if wait_s is None else wait_s,
                 timeout_s=self.arguments.get("timeout_s") if timeout_s is None else timeout_s,
                 skip_if_busy=skip_if_busy,
+                cancelled=self.cancelled,
             )
         except CallError as error:
             self._note(error.trace)
