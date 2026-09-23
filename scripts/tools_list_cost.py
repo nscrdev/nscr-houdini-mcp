@@ -9,9 +9,12 @@ How it counts
    fields dropped and no extra whitespace.
 3. Count tokens with a real tokenizer when one is importable: `tiktoken`, an
    optional dev dependency, with the `o200k_base` encoding unless `--encoding`
-   names another. Without it, or when the encoding cannot be loaded (its tables
-   are fetched once and then cached), tokens are estimated as
-   `ceil(len(json_text) / 4)`. The report says which of the two was used.
+   names another. The encoding's tables are read from tiktoken's own cache
+   first; only when they are not there are they fetched, once, with a ten
+   second limit on the network. Without the package, or when the tables are
+   neither cached nor fetched, tokens are estimated as
+   `ceil(len(json_text) / 4)`. The report says which of the two was used, and
+   why when it fell back.
 
 A tokenizer's count is exact for that encoding only; a client on another
 encoding pays a somewhat different number. The estimate is rougher still.
@@ -28,11 +31,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import json
 import math
+import socket
 import sys
+import urllib.request
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -42,6 +49,10 @@ CHARS_PER_TOKEN = 4
 
 # The encoding used when the tokenizer is there and no other is named.
 DEFAULT_ENCODING = "o200k_base"
+
+# The longest any one step of fetching an encoding's tables may take, so a
+# network that swallows requests costs seconds, not minutes.
+DOWNLOAD_TIMEOUT_S = 10.0
 
 # The goal for the whole `tools/list` payload.
 BUDGET_TOKENS = 4000
@@ -70,15 +81,73 @@ def make_counter(encoding: str = DEFAULT_ENCODING, *, estimate_only: bool = Fals
     except ImportError:
         estimate.note = "tiktoken is not installed"
         return estimate
-    try:
-        tokenizer = tiktoken.get_encoding(encoding)
-    except Exception as error:  # noqa: BLE001 - no table means fall back, whatever the reason
-        estimate.note = f"the {encoding} encoding could not be loaded ({type(error).__name__})"
+    tokenizer, note = load_encoding(tiktoken, encoding)
+    if tokenizer is None:
+        estimate.note = note
         return estimate
     return Counter(
         lambda text: len(tokenizer.encode(text, disallowed_special=())),
         f"tiktoken {encoding}",
     )
+
+
+class NotCached(Exception):
+    """The tables are not in tiktoken's cache, and reading them was held back."""
+
+
+def load_encoding(
+    tiktoken: Any, encoding: str, *, timeout_s: float = DOWNLOAD_TIMEOUT_S
+) -> tuple[Any, str | None]:
+    """The encoding and nothing, or nothing and why not.
+
+    The cache is tried first with every read of the tables held back, so a
+    cached encoding never touches the network. Only then are they fetched,
+    under a socket timeout that is put back afterwards.
+    """
+    try:
+        loader = importlib.import_module(f"{tiktoken.__name__}.load")
+    except Exception:  # noqa: BLE001 - a tokenizer laid out otherwise is only tried
+        loader = None
+    fetch = getattr(loader, "read_file", None)
+    if loader is not None and fetch is not None:
+
+        def cache_only(path: str) -> bytes:
+            raise NotCached(path)
+
+        loader.read_file = cache_only
+        try:
+            return tiktoken.get_encoding(encoding), None
+        except NotCached:
+            pass
+        except Exception as error:  # noqa: BLE001 - no table means fall back
+            return None, f"the {encoding} encoding could not be loaded ({type(error).__name__})"
+        finally:
+            loader.read_file = fetch
+    before = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(timeout_s)
+    if loader is not None and fetch is not None:
+        # tiktoken's own fetch waits on the network with no limit of its own,
+        # which the socket default does not reach, so a web address is read
+        # here instead, with the limit on every step. Anything else is its.
+        def bounded(path: str) -> bytes:
+            if not path.startswith(("http://", "https://")):
+                return fetch(path)
+            with urllib.request.urlopen(path, timeout=timeout_s) as answer:  # noqa: S310
+                return answer.read()
+
+        loader.read_file = bounded
+    try:
+        return tiktoken.get_encoding(encoding), None
+    except Exception as error:  # noqa: BLE001 - no table means fall back, whatever the reason
+        return None, (
+            f"tiktoken is installed, but the {encoding} tables are not in its cache and"
+            f" could not be fetched within {timeout_s:g} seconds a step"
+            f" ({type(error).__name__}); run once with a network to cache them"
+        )
+    finally:
+        socket.setdefaulttimeout(before)
+        if loader is not None and fetch is not None:
+            loader.read_file = fetch
 
 
 def tool_payloads() -> list[dict]:
@@ -124,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"payload bytes: {len(whole)}")
         print(f"tokens: {total}  (counted with {counter.method})")
         if counter.note:
-            print(f"no tokenizer: {counter.note}; install the dev extras for a real count")
+            print(f"estimated, not counted: {counter.note}")
         share = total * 100 / BUDGET_TOKENS
         state = "within" if total <= BUDGET_TOKENS else "OVER"
         print(f"budget: {BUDGET_TOKENS} tokens, {share:.0f} percent used, {state} budget")

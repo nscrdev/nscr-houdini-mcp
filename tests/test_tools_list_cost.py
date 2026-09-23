@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import socket
 import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -80,3 +82,68 @@ def test_over_a_given_budget_it_fails(capsys: pytest.CaptureFixture[str]) -> Non
     script = load()
     assert script.main(["--estimate", "--max-tokens", "1"]) == 1
     assert "over budget" in capsys.readouterr().err
+
+
+def laid_out_like_tiktoken(
+    monkeypatch: pytest.MonkeyPatch, cached: set[str], fetch: Any
+) -> tuple[Any, list[str]]:
+    """A package shaped the way the script reads tiktoken: `get_encoding`
+    reads its tables through `load.read_file` unless they are cached."""
+    package = types.ModuleType("stand_in_tokenizer")
+    loader = types.ModuleType("stand_in_tokenizer.load")
+    loader.read_file = fetch
+    fetched: list[str] = []
+
+    class Words:
+        def encode(self, text: str, **_: Any) -> list[str]:
+            return text.split()
+
+    def get_encoding(name: str) -> Any:
+        if name not in cached:
+            fetched.append(name)
+            loader.read_file(f"blob://{name}")
+        return Words()
+
+    package.get_encoding = get_encoding
+    package.load = loader
+    monkeypatch.setitem(sys.modules, "stand_in_tokenizer", package)
+    monkeypatch.setitem(sys.modules, "stand_in_tokenizer.load", loader)
+    return package, fetched
+
+
+def test_a_cached_encoding_never_reaches_for_the_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    script = load()
+
+    def never(path: str) -> bytes:
+        raise AssertionError(f"fetched {path}")
+
+    package, fetched = laid_out_like_tiktoken(monkeypatch, {"o200k_base"}, never)
+    tokenizer, note = script.load_encoding(package, "o200k_base")
+    assert note is None
+    assert len(tokenizer.encode("one two")) == 2
+    assert fetched == []
+    assert package.load.read_file is never
+
+
+def test_an_encoding_not_cached_is_fetched_with_a_limit_and_says_so_when_it_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = load()
+    limits: list[float | None] = []
+
+    def unreachable(path: str) -> bytes:
+        limits.append(socket.getdefaulttimeout())
+        raise OSError("no route")
+
+    package, fetched = laid_out_like_tiktoken(monkeypatch, set(), unreachable)
+    before = socket.getdefaulttimeout()
+    tokenizer, note = script.load_encoding(package, "o200k_base", timeout_s=3.0)
+    assert tokenizer is None
+    # Tried from the cache first, then fetched once, under the limit.
+    assert fetched == ["o200k_base", "o200k_base"]
+    assert limits == [3.0]
+    assert socket.getdefaulttimeout() == before
+    assert package.load.read_file is unreachable
+    assert note.startswith("tiktoken is installed, but the o200k_base tables are not in its cache")
+    assert "could not be fetched within 3 seconds" in note
+    assert "not installed" not in note

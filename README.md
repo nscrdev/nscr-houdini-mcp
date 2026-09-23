@@ -44,8 +44,10 @@ python scripts/tools_list_cost.py     # token cost of the tools/list payload
 `scripts/tools_list_cost.py` serialises the tool list the way a client receives
 it and counts its tokens, in total and per tool, against a budget of 4,000.
 With the dev extras installed it counts with `tiktoken` and the `o200k_base`
-encoding (`--encoding` names another); without them it falls back to bytes
-divided by four, rounded up, and says so. `tiktoken` is only ever a dev
+encoding (`--encoding` names another), read from tiktoken's cache, or fetched
+once with a ten second limit when it is not there. Without the package, or
+with the encoding neither cached nor fetched, it falls back to bytes divided
+by four, rounded up, and says which of the two happened. `tiktoken` is only ever a dev
 dependency. Either count is a budget signal to watch across commits, since a
 client on another encoding pays a somewhat different number. Pass
 `--max-tokens N` to make it fail over a budget.
