@@ -308,6 +308,9 @@ def test_the_jobs_of_a_killed_session_are_lost_with_what_they_wrote(bench: Bench
             operation_id="op-dead",
         )
         store.update_job("job-dead", outputs={"written": 5})
+        # Its caller was handed the job to follow, so it leaves a copy.
+        store.promote_job("job-dead")
+        store.create_job("job-quiet-dead", kind="python", session_id="s-dead", state="running")
     status = job(bench, "job-dead")
     assert status["state"] == "lost"
     assert status["progress"] == {"done": 5, "total": 10, "message": "half"}
@@ -318,6 +321,10 @@ def test_the_jobs_of_a_killed_session_are_lost_with_what_they_wrote(bench: Bench
     # No scene file, so the readable copy went to the scratch folder.
     assert Path(status["export_path"]).is_file()
     assert "/.agent/jobs/job-dead.json" in Path(status["export_path"]).as_posix()
+    # One whose caller had its answer, or none, leaves no copy.
+    quiet = job(bench, "job-quiet-dead")
+    assert quiet["state"] == "lost"
+    assert "export_path" not in quiet
 
 
 def test_a_session_stopped_on_purpose_loses_its_unfinished_jobs(bench: Bench) -> None:
@@ -415,33 +422,70 @@ def test_a_second_server_follows_a_job_by_id(bench: Bench, module: Any) -> None:
     assert body["outputs"]["result"] == "across"
 
 
-def test_a_finished_job_leaves_a_readable_copy_beside_the_scene(
-    bench: Bench, scene: Scene, tmp_path: Path
+def followed_to_the_end(bench: Bench, module: Any) -> dict[str, Any]:
+    """A job handed out to follow, let run to its end, with its copy written."""
+    handle = in_the_background(bench, "hou.gate.wait(10)\nresult = 3")
+    module.gate.set()
+    idle(bench)
+    support.wait_until(lambda: row(bench, handle["job_id"]).export_path, timeout_s=5.0)
+    return job(bench, handle["job_id"])
+
+
+def test_a_job_handed_out_to_follow_leaves_a_readable_copy_beside_the_scene(
+    bench: Bench, scene: Scene, module: Any, tmp_path: Path
 ) -> None:
     folder = tmp_path / "shots"
     folder.mkdir()
-    scene.hipFile.setName(str(folder / "shot_v002.hip"))
-    body = ok(python(bench, code="result = 3"))
-    copy = folder / ".agent" / "jobs" / f"{body['job_id']}.json"
-    assert copy.is_file()
+    hip = folder / "shot_v002.hip"
+    hip.write_bytes(b"scene")
+    scene.hipFile.setName(str(hip))
+    status = followed_to_the_end(bench, module)
+    copy = folder / ".agent" / "jobs" / f"{status['job_id']}.json"
+    assert Path(status["export_path"]) == copy
     written = json.loads(copy.read_text(encoding="utf-8"))
     assert written["state"] == "done"
-    assert written["job_id"] == body["job_id"]
-    assert written["scene"]["hip_path"] == str(folder / "shot_v002.hip")
+    assert written["job_id"] == status["job_id"]
+    assert written["scene"]["hip_path"] == str(hip)
     assert written["finished_utc"]
-    assert Path(job(bench, body["job_id"])["export_path"]) == copy
+    assert written["export_path"] == str(copy) or written["export_path"] == copy.as_posix()
+
+
+def test_an_answer_given_inline_leaves_no_copy(bench: Bench, scene: Scene, tmp_path: Path) -> None:
+    folder = tmp_path / "shots"
+    folder.mkdir()
+    hip = folder / "shot.hip"
+    hip.write_bytes(b"scene")
+    scene.hipFile.setName(str(hip))
+    body = ok(python(bench, code="result = 3"))
+    assert "export_path" not in job(bench, body["job_id"])
+    assert not (folder / ".agent").exists()
 
 
 def test_an_untitled_scene_puts_the_copy_in_the_scratch_folder(
-    bench: Bench, scene: Scene, monkeypatch: pytest.MonkeyPatch
+    bench: Bench, scene: Scene, module: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("HOUDINI_TEMP_DIR", raising=False)
     scene.hipFile.setName("untitled.hip")
-    body = ok(python(bench, code="result = 3"))
-    copy = Path(job(bench, body["job_id"])["export_path"])
+    copy = Path(followed_to_the_end(bench, module)["export_path"])
     assert copy.is_file()
     assert copy.is_relative_to(bench.home / "temp")
     assert copy.parent.as_posix().endswith("s-1/.agent/jobs")
+
+
+def test_a_pruned_job_takes_its_readable_copy_with_it(
+    bench: Bench, scene: Scene, module: Any, tmp_path: Path
+) -> None:
+    hip = tmp_path / "shot.hip"
+    hip.write_bytes(b"scene")
+    scene.hipFile.setName(str(hip))
+    status = followed_to_the_end(bench, module)
+    copy = Path(status["export_path"])
+    assert copy.is_file()
+    # A week and a minute later, the upkeep round takes the row and the copy.
+    with bench.store(clock=lambda: time.time() + job_rules.KEEP_S + 60.0) as store:
+        jobs_tool.sweep(store, bench.home)
+        assert store.get_job(status["job_id"]) is None
+    assert not copy.exists()
 
 
 # Section: the keeper on its own
@@ -688,6 +732,7 @@ def test_the_hou_jobs_tool_is_listed_last_and_small(bench: Bench) -> None:
         "state",
         "limit",
         "page",
+        "max_chars",
     }
     assert tool.input_schema["properties"]["wait_s"]["maximum"] == 50
     assert "7 days" in tool.description
@@ -885,3 +930,19 @@ def test_a_cancel_waits_on_the_session_no_longer_than_a_health_check(
     assert sent["http_timeout_s"] == jobs_tool.CANCEL_SOCKET_S == 2.0
     module.gate.set()
     idle(bench)
+
+
+def test_a_large_answer_spills_once_and_honours_max_chars(bench: Bench) -> None:
+    body = ok(python(bench, code="result = 'x' * 50000"))
+    first = job(bench, body["job_id"])
+    spilled = first["outputs"]["spill_path"]
+    assert Path(spilled).is_file()
+    assert row(bench, body["job_id"]).spill_path == spilled
+    again = job(bench, body["job_id"], max_chars=100)
+    assert again["outputs"]["spill_path"] == spilled
+    assert len(again["outputs"]["result"]) == 100
+    assert again["outputs"]["elided_chars"] > 49_000
+    files = list(Path(spilled).parent.glob("*.json"))
+    third = job(bench, body["job_id"])
+    assert third["outputs"]["spill_path"] == spilled
+    assert list(Path(spilled).parent.glob("*.json")) == files

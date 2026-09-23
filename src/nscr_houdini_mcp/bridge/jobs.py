@@ -21,8 +21,9 @@ How it ends. Work that saw the cancel flag and stopped is `cancelled`. Work
 that finished without ever looking is `done`, with `cancel_requested` still
 on the row. Work that raised, or a call that failed, is `failed` with the
 error. The ending and the call's receipt are written in one step, with the
-whole answer on the row. A finished job leaves a readable copy of its row
-beside the scene.
+whole answer on the row. A job its caller was handed to follow, rather than
+its answer, leaves a readable copy of its row beside the scene when it ends,
+written on a thread of its own so the main thread never waits on the disk.
 
 The row has to be there before the work may run: the write at accept is tried
 a few times over a busy store, and the call is refused when it cannot land,
@@ -242,8 +243,38 @@ class JobKeeper:
             except Exception as failure:  # noqa: BLE001 - reported; the caller falls back
                 self._log(f"could not write how job {job.job_id} ended: {failure}")
         self._free(job)
-        self._write(lambda store: job_rules.export(store, job.job_id, home=self._home))
+        if getattr(running, "promoted", False):
+            self._export_later(job.job_id)
         return landed
+
+    def promote(self, running: Any) -> None:
+        """Mark a job as one its caller was handed to follow.
+
+        Only such a job leaves a readable copy beside the scene. One that has
+        already ended by the time it is marked gets its copy now.
+        """
+        running.promoted = True
+        job_id = running.job_id
+        if not job_id:
+            return
+
+        def mark(store: store_module.Store) -> store_module.JobRecord | None:
+            store.promote_job(job_id)
+            return store.get_job(job_id)
+
+        record = self._write(mark)
+        if record is not None and record.state in store_module.JOB_FINAL_STATES:
+            if not record.export_path:
+                self._export_later(job_id)
+
+    def _export_later(self, job_id: str) -> None:
+        """Write the readable copy on a thread of its own, never the main thread."""
+        threading.Thread(
+            target=self._write,
+            args=(lambda store: job_rules.export(store, job_id, home=self._home),),
+            name="nscr-mcp-job-copy",
+            daemon=True,
+        ).start()
 
     def asked_to_stop(self, running: Any) -> None:
         """Put a stop asked of the session directly on the row as well."""

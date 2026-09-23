@@ -75,6 +75,7 @@ import re
 import secrets
 import sqlite3
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from nscr_houdini_mcp import config as config_module
@@ -197,11 +198,13 @@ def shape(
     budget: int,
     named: str | None,
     label: str | None = None,
+    spilled: str | None = None,
 ) -> dict[str, Any]:
     """One answer from the session, fitted to the caller's budget.
 
     The same for an answer that has just arrived and one read back from its
-    receipt when a job is looked at later.
+    job row later. `spilled` is where an earlier look already wrote what did
+    not fit, which is used again rather than written once more.
     """
     data = scrub(dict(reply.get("data") or {}))
 
@@ -218,7 +221,10 @@ def shape(
         elided += int(data["result_text_chars"]) - len(str(result))
     said: dict[str, Any] = {"result": shown, "stdout_tail": tail, "elided_chars": elided}
     if elided:
-        said.update(spill(call, result=result, stdout=stdout, dropped=dropped, error=error))
+        if spilled and Path(spilled).is_file():
+            said["spill_path"] = spilled
+        else:
+            said.update(spill(call, result=result, stdout=stdout, dropped=dropped, error=error))
     if error is not None:
         said["error"] = error
     said["duration_ms"] = data.get("duration_ms")

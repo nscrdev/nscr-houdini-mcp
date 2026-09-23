@@ -146,6 +146,8 @@ class Running:
     # note has come since the job row was last written.
     cancel_seen: bool = False
     stop_seen: bool = False
+    # Whether a caller was handed the job to follow instead of the answer.
+    promoted: bool = False
     noted: threading.Event = field(default_factory=threading.Event)
 
     def elapsed_s(self) -> float:
@@ -533,6 +535,8 @@ class Dispatcher:
         self, tool: Tool, running: Running, timeout_s: float, trace: Mapping[str, Any]
     ) -> Reply:
         """`TIMEOUT` with `still_running`: the work goes on, and here is its job."""
+        if running.job_id and self._jobs is not None and not running.promoted:
+            self._jobs.promote(running)
         return Reply(
             200,
             {

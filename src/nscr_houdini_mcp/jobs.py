@@ -10,12 +10,14 @@ coordination store.
   one holds the other, and a reply that never arrived can still be followed.
 - States: `queued` once the session has taken the work and before it runs,
   `running`, and one of `done`, `failed`, `cancelled` or `lost` at the end.
-  `lost` means the session running it is gone, or has said nothing for
-  longer than `SILENCE_S`; the progress and outputs it wrote are kept.
-- A finished job leaves a readable copy of its row beside the scene, under
-  the `job` kind of the output table: `$HIP/.agent/jobs/<job_id>.json`, or the
-  scratch folder for a scene that was never saved.
-- Rows are kept for `KEEP_S`, a week, then pruned.
+  `lost` means the session running it is known to have ended; the progress
+  and outputs it wrote are kept. Silence alone never makes a job lost.
+- A job a caller was handed to follow, rather than its answer, leaves a
+  readable copy of its row beside the scene when it ends, under the `job`
+  kind of the output table: `$HIP/.agent/jobs/<job_id>.json`, or the scratch
+  folder for a scene that was never saved. Where it went is on the row.
+- Rows are kept for `KEEP_S`, a week after they ended, then pruned, and
+  their readable copies with them.
 
 This module never imports `hou`.
 """
@@ -32,12 +34,6 @@ from nscr_houdini_mcp import store as store_module
 
 # How long a job row is kept after it last changed.
 KEEP_S = 7 * 24 * 60 * 60.0
-
-# How long a job may go without a word from its session before it counts as
-# lost. A session writes one every few seconds while the work runs; this is
-# long enough that a cook holding the interpreter for minutes is not taken
-# for a dead one.
-SILENCE_S = 15 * 60.0
 
 ID_PREFIX = "job-"
 
@@ -78,7 +74,7 @@ def export_plan(record: store_module.JobRecord, *, home: Path | str | None) -> o
 
 
 def export(store: store_module.Store, job_id: str, *, home: Path | str | None) -> str | None:
-    """Write a job's readable copy beside its scene. Returns the path.
+    """Write a job's readable copy beside its scene, and note on the row where.
 
     Nothing when there is no such job. A failure to work out the place or to
     write raises, and the caller decides whether that matters.
@@ -87,26 +83,32 @@ def export(store: store_module.Store, job_id: str, *, home: Path | str | None) -
     if record is None:
         return None
     plan = export_plan(record, home=home)
+    store.note_job_paths(job_id, export_path=plan.path)
     store_module.write_export(store.job_export(job_id), plan.path)
     return plan.path
 
 
-def export_path(record: store_module.JobRecord, *, home: Path | str | None) -> str | None:
-    """Where a job's readable copy is, when it has been written."""
-    hip = hip_of(record)
+def export_path(record: store_module.JobRecord) -> str | None:
+    """Where a job's readable copy is, as its row says, when the file is there.
+
+    The row is read rather than the place worked out again, because the
+    session and the server can pick different scratch folders for a scene
+    that has no file.
+    """
+    path = record.export_path
+    return path if path and Path(path).is_file() else None
+
+
+def remove_export(record: store_module.JobRecord) -> bool:
+    """Take away a pruned job's readable copy. Only a file named for the job."""
+    path = record.export_path
+    if not path or Path(path).name != f"{record.job_id}.json":
+        return False
     try:
-        plan = outputs.plan_path(
-            EXPORT_KIND,
-            run_id=record.job_id,
-            name=record.job_id,
-            hip_path=hip,
-            session_id=record.session_id,
-            conventions=outputs.load_conventions(home=home, hip_path=hip),
-            scratch_root=scratch_root(home),
-        )
-    except (outputs.OutputError, OSError):
-        return None
-    return plan.path if Path(plan.path).is_file() else None
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        return False
+    return True
 
 
 def progress_of(note: Any) -> dict[str, Any] | None:

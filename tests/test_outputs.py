@@ -694,6 +694,7 @@ def test_a_job_record_goes_beside_the_scene_and_is_never_handed_out(
 ) -> None:
     folder = tmp_path / "shots"
     folder.mkdir()
+    (folder / "shot.hip").write_bytes(b"scene")
     made = outputs.record_path(
         "job", "job-op-1", hip_path=str(folder / "shot.hip"), session_id="s1"
     )
@@ -706,11 +707,16 @@ def test_a_job_record_goes_beside_the_scene_and_is_never_handed_out(
         outputs.record_path("capture", "x", hip_path=None, session_id="s1")
 
 
-def test_a_job_record_of_a_scene_whose_folder_is_gone_is_refused(tmp_path: Path) -> None:
+def test_a_job_record_of_a_scene_file_that_is_gone_is_refused(tmp_path: Path) -> None:
     missing = tmp_path / "moved" / "shot.hip"
     with pytest.raises(outputs.ConventionError):
         outputs.record_path("job", "job-1", hip_path=str(missing), session_id="s1")
     assert not missing.parent.exists()
+    # A folder that is there is not enough: the scene file itself must be.
+    missing.parent.mkdir()
+    with pytest.raises(outputs.ConventionError):
+        outputs.record_path("job", "job-1", hip_path=str(missing), session_id="s1")
+    assert not (missing.parent / ".agent").exists()
 
 
 def test_a_job_record_of_an_untitled_scene_goes_to_the_scratch_folder(tmp_path: Path) -> None:

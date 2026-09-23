@@ -23,7 +23,8 @@ What `status` and `cancel` answer, for every kind of job: `job_id`, `state`,
 `outputs`, `error`, `started_at`, `ended_at`, `elapsed_s`, `scene_epoch` and
 `cancel_requested`, and `export_path` once the readable copy beside the scene
 has been written. For a Python job that has ended, `outputs` is the answer the
-call would have given, read back from its receipt, fitted to the usual budget.
+call would have given, read back from the job row and fitted to `max_chars`.
+What does not fit is spilled once per job, and later looks name that file.
 
 A job is `lost` only when its session is known to have ended: its process
 is gone, its row says it ended, or it was stopped. Silence alone never ends
@@ -381,7 +382,7 @@ def job_row(record: JobRecord, call: Call, *, full: bool) -> dict[str, Any]:
             row["outputs"] = answer
             row["error"] = answer.get("error", record.error)
     if record.state in FINAL:
-        path = job_rules.export_path(record, home=call.router.home)
+        path = job_rules.export_path(record)
         if path is not None:
             row["export_path"] = path
     return row
@@ -400,9 +401,18 @@ def python_answer(call: Call, record: JobRecord) -> dict[str, Any] | None:
     reply = {key: kept[key] for key in ("undo", "scene_epoch", "cut", "lossy") if key in kept}
     reply["data"] = answer
     spec = record.spec if isinstance(record.spec, dict) else {}
+    budget = int(call.arguments.get("max_chars") or python_tool.DEFAULT_MAX_CHARS)
     said = python_tool.shape(
-        call, reply, budget=python_tool.DEFAULT_MAX_CHARS, named=spec.get("namespace")
+        call, reply, budget=budget, named=spec.get("namespace"), spilled=record.spill_path
     )
+    written = said.get("spill_path")
+    if written and written != record.spill_path:
+        # The first look that spilled keeps its file; the next ones use it.
+        try:
+            with capped(call, BUSY_S) as store:
+                store.note_job_paths(record.job_id, spill_path=written)
+        except (store_module.StoreError, sqlite3.Error, CallError):
+            pass
     said["operation_id"] = record.operation_id
     return said
 
@@ -525,14 +535,16 @@ def sweep(store: store_module.Store, home: Any) -> None:
     for record in store.list_jobs(states=["lost"], limit=EXPORT_BATCH):
         reconcile(store, record)
     export_lost(store, home)
-    store.prune_final_jobs(job_rules.KEEP_S)
+    for record in store.prune_final_jobs(job_rules.KEEP_S):
+        job_rules.remove_export(record)
 
 
 def export_lost(store: store_module.Store, home: Any) -> None:
     """Write the readable copy of recently lost jobs that have none yet.
 
     A job that ends on its own writes its copy from the session. One that is
-    lost cannot, so whoever finds it lost writes it. Best effort.
+    lost cannot, so whoever finds it lost writes it, for a job its caller was
+    handed to follow. Best effort.
     """
     try:
         recent = store.list_jobs(states=["lost"], limit=EXPORT_BATCH)
@@ -542,7 +554,7 @@ def export_lost(store: store_module.Store, home: Any) -> None:
     for record in recent:
         if record.finished_at is not None and now - record.finished_at > EXPORT_LOOKBACK_S:
             continue
-        if job_rules.export_path(record, home=home) is not None:
+        if not record.promoted or job_rules.export_path(record) is not None:
             continue
         try:
             job_rules.export(store, record.job_id, home=home)
@@ -620,6 +632,7 @@ HOU_JOBS = ToolSpec(
             "state": {"type": "string", "enum": list(STATES)},
             "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT},
             "page": {"type": "string"},
+            "max_chars": {"type": "integer", "minimum": 1, "maximum": python_tool.MAX_MAX_CHARS},
         }
     ),
     output_schema=outputs({}),

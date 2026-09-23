@@ -197,7 +197,9 @@ job: its state (`queued`, `running`, `done`, `failed`, `cancelled` or
 it ran against and whether a cancel was asked for. With `wait_s` (up to 50)
 the call is held until the state or the progress changes, and says so with
 `changed`, so there is no need to poll with sleeps. For a Python job that has
-ended, `outputs` is the answer the call would have given. `cancel` writes the
+ended, `outputs` is the answer the call would have given, fitted to
+`max_chars`, and what does not fit is written to one spill file per job.
+`cancel` writes the
 request where the session reads it within two seconds and also asks the
 session directly, and says whether that direct request got there. In a
 session with a user interface a cancel is best effort: the code runs on
@@ -207,9 +209,13 @@ Houdini's main thread, and only code that looks at `mcp.cancelled()` stops.
 Jobs live in the coordination store, so any server can answer for any job,
 including one started after the call that began it. A job whose session ends,
 whether stopped or found gone, is `lost` with the progress and outputs it had
-written, and so is one its session has said nothing about for fifteen
-minutes. A job that ends leaves a readable copy of itself beside the scene,
-in `.agent/jobs/`. Jobs are kept for 7 days.
+written. Silence alone never ends a job, since a long cook can hold Houdini's
+interpreter and a machine can sleep; a job still going says how long its
+session has said nothing in `silent_s`. A job whose caller was handed the
+job to follow, rather than its answer, leaves a readable copy of itself
+beside the scene file when it ends, in `.agent/jobs/`, and nothing is made
+beside a scene file that is not there. Jobs are kept for 7 days after they
+end, and their copies go with them.
 
 ### The Houdini side
 

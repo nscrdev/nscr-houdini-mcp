@@ -854,8 +854,8 @@ def record_path(
     Nothing is versioned and no run is recorded: the name is the record's own
     id, so writing it again writes the same file. A scene with no file goes
     to the scratch folder, the way every output of an unsaved scene does. A
-    scene whose own root is not there, because the file was moved or its disk
-    is gone, gets no record rather than a folder made for it.
+    scene file that is not there, because it was moved or its disk is gone,
+    gets no record rather than a folder made beside where it was.
     """
     if kind not in RECORD_KINDS:
         raise UnknownKind(f"{kind} is not a record kind")
@@ -868,8 +868,8 @@ def record_path(
         conventions=conventions,
         scratch_root=scratch_root,
     )
-    if hip_path is not None and not Path(plan.root).is_dir():
-        raise ConventionError(f"the output root {plan.root} is not there")
+    if hip_path is not None and not Path(hip_path).is_file():
+        raise ConventionError("the scene file is not there, so nothing is made beside it")
     _check_real_place(plan)
     Path(plan.directory).mkdir(parents=True, exist_ok=True)
     return plan
