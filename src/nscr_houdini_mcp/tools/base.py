@@ -266,6 +266,8 @@ class Call:
         arguments: Mapping[str, Any] | None = None,
         *,
         mutating: bool = False,
+        wait_s: float | None = None,
+        timeout_s: float | None = None,
     ) -> dict[str, Any]:
         """Send one bridge call and hand back the whole reply.
 
@@ -274,6 +276,9 @@ class Call:
         first, so sending the same id again replays every step from its
         receipt rather than doing any of them twice. The trace and any error
         name the id the caller holds, never a derived one.
+
+        `wait_s` and `timeout_s` are for a tool that sets its own budgets for
+        a call it makes on the side; otherwise the caller's are passed on.
         """
         target = self.target()
         operation_id = self._next_operation_id() if mutating else None
@@ -284,8 +289,8 @@ class Call:
                 arguments,
                 operation_id=operation_id,
                 scene_epoch=self._epoch,
-                wait_s=self.arguments.get("wait_s"),
-                timeout_s=self.arguments.get("timeout_s"),
+                wait_s=self.arguments.get("wait_s") if wait_s is None else wait_s,
+                timeout_s=self.arguments.get("timeout_s") if timeout_s is None else timeout_s,
             )
         except CallError as error:
             self._note(error.trace)

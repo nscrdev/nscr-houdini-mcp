@@ -13,6 +13,9 @@ surface a client sees is a separate, smaller set built on top of these.
   the build, the license, the renderers that are really installed and the ways
   this session can make a picture. The pool records the answer beside the
   worker, so another process can pick a worker without asking it anything.
+- `help.server` says where this session serves its help pages, from
+  `hou.helpServerUrl()`, which starts the help server when it is not running
+  yet. The server process then reads pages from it directly.
 - `node.create` mutates, so it runs on the main thread in a graphical session
   and inside one undo group in every session.
 - `node.inspect` reads nodes, networks and parameters a page at a time. It
@@ -238,6 +241,21 @@ def capabilities(arguments: Mapping[str, Any], context: ToolContext) -> dict[str
         "cancellation": True,
         "max_threads": _quiet(lambda: hou.expandString("$HOUDINI_MAXTHREADS")) or None,
         "platform": sys.platform,
+    }
+
+
+def help_server(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, Any]:
+    """Where this session serves its help, and which install the pages are from.
+
+    Nothing when this build or session will not say; the caller reads the
+    install's own help folder instead.
+    """
+    hou = _houdini(context)
+    url = _quiet(hou.helpServerUrl) if hasattr(hou, "helpServerUrl") else None
+    return {
+        "url": url if isinstance(url, str) and url else None,
+        "houdini_version": _quiet(hou.applicationVersionString),
+        "hfs": _quiet(lambda: hou.expandString("$HFS")) or None,
     }
 
 

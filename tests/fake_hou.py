@@ -946,6 +946,10 @@ class Scene:
         self.empty()
         self.undos.labels.clear()
         self.hipFile = HipFile(self, "/Users/somebody/scenes/example.hip")
+        # Where `helpServerUrl` says the help is served; each answer is
+        # counted, as the real one starts a server the first time it is asked.
+        self.help_url: str | None = None
+        self.help_asked = 0
 
     def empty(self) -> None:
         """Throw the scene away and put the empty networks back."""
@@ -1019,6 +1023,12 @@ class Scene:
     def frame(self) -> float:
         return 72.0 if threading.current_thread().name == "fake-main" else 1.0
 
+    def help_server_url(self) -> str:
+        self.help_asked += 1
+        if self.help_url is None:
+            raise OperationFailed("no help server")
+        return self.help_url
+
     def module(self) -> Any:
         """The scene as something that answers like the `hou` module."""
         return SimpleNamespace(
@@ -1040,6 +1050,7 @@ class Scene:
             hipFileEventType=HipFileEventType,
             playbar=SimpleNamespace(frameRange=lambda: (1.0, 240.0)),
             applicationVersionString=lambda: "22.0.368",
+            helpServerUrl=self.help_server_url,
             # The frame a thread that is not the main thread reads is not the
             # frame the session is on, which is why ambient state is only ever
             # read on the main thread.
