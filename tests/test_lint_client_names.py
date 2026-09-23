@@ -51,9 +51,47 @@ def test_an_import_from_integrations_in_src_is_refused(lint: Any, repo: Path) ->
     assert problems == [f"{Path('src/pkg/mod.py')}:1: refers to integrations/"]
 
 
-def test_a_package_relative_import_is_refused(lint: Any, repo: Path) -> None:
-    path = write(repo, "src/pkg/mod.py", "import pkg.integrations\nfrom .integrations import x\n")
-    assert len(lint.check_integrations([path], repo)) == 2
+def test_a_relative_or_plain_import_is_refused(lint: Any, repo: Path) -> None:
+    text = (
+        "import integrations\nfrom .integrations import x\n    from ..integrations.one import y\n"
+    )
+    path = write(repo, "src/pkg/mod.py", text)
+    assert len(lint.check_integrations([path], repo)) == 3
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        '"integrations/one/notes.md"',
+        "open('integrations/one/notes.md')",
+        "integrations/one/notes.md",
+        "see ../integrations/one",
+        "see ./integrations/one",
+        "see ..\\integrations\\one",
+        "<integrations/one/notes.md>",
+    ],
+)
+def test_a_path_into_integrations_is_refused(lint: Any, repo: Path, line: str) -> None:
+    path = write(repo, "src/pkg/mod.py", line + "\n")
+    assert len(lint.check_integrations([path], repo)) == 1
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "self.integrations.append(item)",
+        "from myapp import integrations",
+        "import pkg.integrations",
+        "from pkg.integrations import x",
+        "no integrations/ folder is read here",
+        "the `integrations/` folder is not shipped",
+        "docs/integrations/overview.md belongs to another project",
+        "integrations = []",
+    ],
+)
+def test_ordinary_code_and_prose_pass(lint: Any, repo: Path, line: str) -> None:
+    path = write(repo, "src/pkg/mod.py", line + "\n")
+    assert lint.check_integrations([path], repo) == []
 
 
 def test_a_link_in_a_skill_is_refused(lint: Any, repo: Path) -> None:

@@ -13,6 +13,17 @@ nothing under `skills/` or `src/` may import from it, link to it, or carry a
 line copied out of it. Whatever lives there is written for one client, and the
 skills and the server must stay readable without it.
 
+An import is a statement whose first module name is `integrations`, relative
+or not. A link is a path that starts with `integrations/`, or has it right
+after `../`, `./`, a quote or an opening bracket. Code and prose that only use
+the word, such as `self.integrations` or "no integrations/ folder is read
+here", pass.
+
+The copied line rule cannot tell which way a copy went, so it binds both
+ways: the shipped file is the original, and `integrations/` may not repeat a
+long line of it either. Text there that needs to say the same thing says it in
+its own words.
+
 Usage:
     scripts/lint_client_names.py             # every tracked text file, and all of skills/
     scripts/lint_client_names.py FILE ...    # only these files
@@ -76,10 +87,16 @@ SHIPPED_DIRS = ("skills", "src")
 # The folder whose text is for one client only.
 INTEGRATIONS_DIR = "integrations"
 
-# An import of the folder as a module, or a path into it, in any file format.
-INTEGRATIONS_REFERENCE = re.compile(
-    r"(?:^|[^\w])" + INTEGRATIONS_DIR + r"(?:[/\\]|\.\w)"
-    r"|\b(?:from|import)\s+[\w.]*\b" + INTEGRATIONS_DIR + r"\b",
+# An import whose first module name is the folder, relative or not.
+INTEGRATIONS_IMPORT = re.compile(
+    r"^\s*(?:from\s+\.*" + INTEGRATIONS_DIR + r"|import\s+" + INTEGRATIONS_DIR + r")\b"
+)
+
+# A path into the folder: at the start of a line, or right after `../`, `./`,
+# a quote or an opening bracket. Paths are matched without regard to case,
+# since two of the three systems this runs on ignore it.
+INTEGRATIONS_PATH = re.compile(
+    r"(?:^|\.\.?[/\\]|[\"'(\[<])" + INTEGRATIONS_DIR + r"[/\\]",
     re.IGNORECASE,
 )
 
@@ -193,7 +210,7 @@ def check_integrations(paths: list[Path], root: Path) -> list[str]:
         if text is None:
             continue
         for number, line in enumerate(text.splitlines(), start=1):
-            if INTEGRATIONS_REFERENCE.search(line):
+            if INTEGRATIONS_IMPORT.search(line) or INTEGRATIONS_PATH.search(line):
                 problems.append(f"{rel}:{number}: refers to {INTEGRATIONS_DIR}/")
             elif source_lines and " ".join(line.split()) in source_lines:
                 problems.append(f"{rel}:{number}: copies a line from {INTEGRATIONS_DIR}/")
