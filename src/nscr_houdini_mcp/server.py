@@ -148,9 +148,11 @@ class Runtime:
             summary = spec.summary(data) if spec.summary else None
             spill = Spill(config.spill_folder, config.spill_over_bytes)
             failed = bool(spec.failed(data)) if spec.failed else False
-            return ok_result(
+            result = ok_result(
                 data, call.trace, spill=spill, tool=name, summary=summary, is_error=failed
             )
+            result.content.extend(call.attachments)
+            return result
         except CallError as error:
             return error_result(error, call.trace if call else None)
         except Exception as error:  # noqa: BLE001 - a crash becomes a coded answer

@@ -230,6 +230,8 @@ class Call:
         self._epoch: int | None = self.arguments.get("scene_epoch")
         self._operation_id: str | None = self.arguments.get("operation_id")
         self._changes = 0
+        # Content blocks that go out beside the text block, such as an image.
+        self.attachments: list[Any] = []
 
     def target(self) -> Target:
         """The session this call goes to, settled once."""
