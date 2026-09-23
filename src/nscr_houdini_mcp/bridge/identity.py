@@ -44,6 +44,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from nscr_houdini_mcp.bridge import dirty as dirty_module
 from nscr_houdini_mcp.bridge import host
 
 # Alias patterns. A worker is addressed by number, a session with a scene by
@@ -134,6 +135,9 @@ class Identity:
         # Read by the scene callback on the main thread. Cleared by `unwatch`
         # from whichever thread is stopping the bridge, which calls no `hou`.
         self._watching = False
+        # Whether the scene has changes that are not on disk, as far as this
+        # session can see. The scene events below move it, and so do the calls.
+        self.dirty = dirty_module.DirtyMarker()
 
     # Section: handles
 
@@ -308,6 +312,9 @@ class Identity:
         except AttributeError:
             self._log("this build reports no hip file events, so the scene epoch never moves")
             return None
+        # The events that only move the unsaved mark, where the build has them.
+        after_save = getattr(events, "AfterSave", None)
+        after_merge = getattr(events, "AfterMerge", None)
 
         def on_event(event_type: Any = None, *_rest: Any) -> None:
             if not self._watching:
@@ -323,6 +330,8 @@ class Identity:
                     # The old scene is gone from here, load or no load.
                     self.bump(CLEARED)
                     self._counted_the_clear = self._mid_load()
+                    if not self._counted_the_clear:
+                        self.dirty.event(dirty_module.CLEARED)
                 elif event_type == after_load:
                     counted = self._counted_the_clear and self._mid_load()
                     self._load_began = None
@@ -331,6 +340,11 @@ class Identity:
                         self.settled(LOADED)
                     else:
                         self.bump(LOADED)
+                    self.dirty.event(dirty_module.LOADED)
+                elif after_save is not None and event_type == after_save:
+                    self.dirty.event(dirty_module.SAVED)
+                elif after_merge is not None and event_type == after_merge:
+                    self.dirty.event(dirty_module.MERGED)
             except Exception as error:  # noqa: BLE001 - never raise into Houdini's event loop
                 self._log(f"scene event: {type(error).__name__}: {error}")
 
