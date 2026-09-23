@@ -25,7 +25,7 @@ PARTS = [
     "How to think",
     "The revision budget",
     "Before you say done",
-    "If a Houdini MCP server is connected",
+    "With the nscr-houdini-mcp server connected",
 ]
 
 # Tools the skill may name before they are in the registry.
@@ -78,7 +78,7 @@ def test_the_frontmatter_names_the_skill_and_what_it_needs() -> None:
     fields, _ = frontmatter(skill_text())
     assert set(fields) == {"name", "description", "compatibility"}
     assert fields["name"] == "houdini-artist"
-    assert fields["compatibility"] == "Works best with a Houdini 22 MCP server connection."
+    assert fields["compatibility"] == "Written for the nscr-houdini-mcp server and Houdini 22."
     assert len(fields["description"]) > 100
 
 
@@ -93,7 +93,7 @@ def test_the_short_parts_stay_short() -> None:
     _, body = frontmatter(skill_text())
     parts = sections(body)
     assert len(parts["House conventions (edit these)"]) <= 12
-    assert len(parts["If a Houdini MCP server is connected"]) <= 8
+    assert len(parts["With the nscr-houdini-mcp server connected"]) <= 8
 
 
 def test_the_conventions_match_the_server_defaults() -> None:

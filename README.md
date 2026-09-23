@@ -543,7 +543,8 @@ and the node's and scene's own names. `list` and `lint` page with `limit` and
 `next_page`, the way reads do.
 
 `hou_capture` saves a picture of what a session shows: the `viewport`, one
-`node` on its own, the `network` editor, a `cop` output or a `pane` by name.
+`node` on its own, the `network` editor, a `cop` output or a `pane` by name
+(with no name, the Scene Viewer as it is on screen, grid and all).
 Every file goes under the `capture` kind of the output table below, and the
 answer carries the path, the width and height, the frame, the camera, the
 `route` that made it and `image_stats`: the mean, least and most of each
@@ -1043,8 +1044,8 @@ A skill is a plain `SKILL.md` file that tells an agent how to work: what to
 plan before building, what to look at before calling something finished, and
 when to stop and report. The first one, `houdini-artist`, covers modelling,
 lookdev, cleaning up a network, matching a reference, finding out why a scene
-is slow and getting a scene ready to hand on. It works best with this server
-connected, and still helps with planning when it is not.
+is slow and getting a scene ready to hand on. It is written for this server,
+and still helps with planning when no Houdini is connected.
 
 The skills ship with the package:
 

@@ -1,7 +1,7 @@
 ---
 name: houdini-artist
 description: "Work in Houdini the way a careful artist does. Use when someone asks to model something, set up lookdev, clean up this network, match this reference, make this procedural or reusable, find out why this is slow or broken, or get a scene ready to hand to someone else. Plans the system before building, looks at the result before claiming it, keeps a way back, and stops to report after a few tries on one detail."
-compatibility: "Works best with a Houdini 22 MCP server connection."
+compatibility: "Written for the nscr-houdini-mcp server and Houdini 22."
 ---
 
 ## House conventions (edit these)
@@ -58,7 +58,7 @@ The closing message contains:
 - What is unresolved: missing types or plugins, open questions, and anything you skipped and why.
 - If nothing was built, say so plainly and give the plan instead.
 
-## If a Houdini MCP server is connected
+## With the nscr-houdini-mcp server connected
 
 - Which Houdini you are talking to, and spare workers for heavy work: `hou_ping`, `hou_sessions`.
 - Open, save in place, save the next increment, and see what failed to load: `hou_scene`.
@@ -66,5 +66,5 @@ The closing message contains:
 - Build and change things, filtering inside Houdini so only the answer comes back: `hou_python`. Inside it, `mcp.output_path` hands out a managed path for a render, cache or capture, `mcp.progress` reports how far a long loop has got, and `mcp.cancelled` says when to stop.
 - Wait on long work instead of sleeping, read a finished job's result, or cancel it: `hou_jobs`.
 - Managed output paths, and a lint of where a scene writes: `hou_outputs`. A candidate image beside the reference, with the differences as pictures and numbers: `hou_compare`.
-- See what a session shows, from one view, four views, a turntable or a flipbook, as saved pictures you then look at: `hou_capture`.
-- With a different Houdini server, use its tools for the same jobs; nothing above depends on these names. With no Houdini tools at all, say so plainly and continue with planning only: the mechanism, the system, its boundaries, and the checks you would run.
+- See what a session shows, from one view, four views, a turntable or a flipbook, as saved pictures you then look at: `hou_capture`. To see the viewport exactly as the person sees it, grid and handles included, use `source: "pane"` with no path; `viewport` draws the geometry alone.
+- With no Houdini tools connected, say so plainly and continue with planning only: the mechanism, the system, its boundaries, and the checks you would run.
