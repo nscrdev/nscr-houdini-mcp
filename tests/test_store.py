@@ -274,7 +274,7 @@ def test_a_file_from_before_sessions_kept_how_they_ended_reads_right(tmp_path) -
     raw.close()
 
     with Store(path) as after:
-        assert after.schema_version() == 7
+        assert after.schema_version() == store_module.SCHEMA_VERSION
         assert after.get_session("s-old").ended_as is None
         assert after.get_session("s-dead").ended_as is None
         assert after.reclaim_sessions() == ["s-dead"]
@@ -850,6 +850,106 @@ def test_unknown_jobs_and_states_are_refused(store: Store) -> None:
         store.update_job("j3", state="mystery")
 
 
+def test_a_job_keeps_its_operation_what_it_runs_and_when_it_began(store: Store) -> None:
+    queued = store.create_job(
+        "j1", kind="python", operation_id="op-1", spec={"namespace": "shared"}
+    )
+    assert (queued.operation_id, queued.spec, queued.started_at) == (
+        "op-1",
+        {"namespace": "shared"},
+        None,
+    )
+    running = store.update_job("j1", state="running", scene={"hip_path": "/p/a.hip"})
+    assert running.started_at is not None
+    assert running.scene == {"hip_path": "/p/a.hip"}
+    again = store.update_job("j1", state="running")
+    assert again.started_at == running.started_at
+
+
+def test_a_job_id_taken_again_replaces_the_row_only_when_asked(store: Store) -> None:
+    store.create_job("j1", kind="python", state="done")
+    with pytest.raises(DuplicateRecord):
+        store.create_job("j1", kind="python")
+    fresh = store.create_job("j1", kind="python", state="queued", replace=True)
+    assert fresh.state == "queued"
+    assert fresh.finished_at is None
+
+
+def test_unfinished_jobs_are_lost_with_their_session(store: Store) -> None:
+    store.register_session("s1", kind="hython", pid=LIVE_PID, alias="w1")
+    store.register_session("s2", kind="hython", pid=DEAD_PID, alias="w2")
+    store.create_job("a", kind="python", session_id="s1", state="running")
+    store.create_job("b", kind="python", session_id="s2", state="running")
+    store.update_job("b", progress={"done": 3}, outputs={"kept": True})
+    store.create_job("c", kind="python", session_id="s2", state="queued")
+    store.create_job("d", kind="python", session_id="s2", state="done")
+    assert store.reclaim_sessions() == ["s2"]
+    lost = store.get_job("b")
+    assert (lost.state, lost.progress, lost.outputs) == ("lost", {"done": 3}, {"kept": True})
+    assert lost.error == store_module.SESSION_ENDED_ERROR
+    assert lost.finished_at is not None
+    assert store.get_job("c").state == "lost"
+    assert store.get_job("d").state == "done"
+    assert store.get_job("a").state == "running"
+    store.end_session("s1")
+    assert store.get_job("a").state == "lost"
+
+
+def test_losing_jobs_leaves_the_ones_that_finished(store: Store) -> None:
+    store.create_job("a", kind="python", state="running")
+    store.create_job("b", kind="python", state="running")
+    store.update_job("b", state="done")
+    marked = store.lose_jobs(["a", "b", "missing"], error={"code": "X"})
+    assert [record.job_id for record in marked] == ["a"]
+    assert store.get_job("a").error == {"code": "X"}
+    assert store.get_job("b").state == "done"
+    assert store.lose_jobs([]) == []
+
+
+def test_a_job_that_never_ran_can_be_taken_off(store: Store) -> None:
+    store.create_job("j1", kind="python")
+    assert store.drop_job("j1") is True
+    assert store.drop_job("j1") is False
+    assert store.get_job("j1") is None
+
+
+def test_jobs_page_from_the_last_row_a_caller_has(timed_store, clock) -> None:
+    for name in ("a", "b", "c", "d"):
+        timed_store.create_job(name, kind="python", session_id="s1" if name < "c" else "s2")
+        if name != "b":
+            clock.step(1.0)
+    first = timed_store.list_jobs(limit=2)
+    assert [job.job_id for job in first] == ["d", "c"]
+    after = (first[-1].created_at, first[-1].seq)
+    assert [job.job_id for job in timed_store.list_jobs(limit=2, before=after)] == ["b", "a"]
+    # Two rows made at the same moment still come one after the other.
+    tied = timed_store.list_jobs(limit=1, before=after)
+    rest = timed_store.list_jobs(before=(tied[0].created_at, tied[0].seq))
+    assert [job.job_id for job in rest] == ["a"]
+    assert [j.job_id for j in timed_store.list_jobs(session_ids=["s2"])] == ["d", "c"]
+    assert timed_store.list_jobs(session_ids=[]) == []
+
+
+def test_a_file_from_before_jobs_named_their_operation_reads_right(tmp_path) -> None:
+    """A schema 7 file with a job in it, opened by a build at schema 8."""
+    path = tmp_path / "coord.sqlite"
+    raw = sqlite3.connect(str(path))
+    for statements in store_module.MIGRATIONS[:7]:
+        for statement in statements:
+            raw.execute(statement)
+    raw.execute("PRAGMA user_version=7")
+    raw.execute(
+        "INSERT INTO jobs (job_id, session_id, kind, state, weight, created_at, updated_at)"
+        " VALUES ('old', NULL, 'render', 'done', 'light', 1.0, 1.0)"
+    )
+    raw.commit()
+    raw.close()
+    with Store(path) as after:
+        assert after.schema_version() == store_module.SCHEMA_VERSION
+        old = after.get_job("old")
+        assert (old.operation_id, old.spec, old.started_at) == (None, None, None)
+
+
 def test_old_jobs_are_pruned(store: Store) -> None:
     store.create_job("j1", kind="render")
     assert store.prune_jobs(max_age_s=-1) == 1
@@ -932,6 +1032,8 @@ def test_a_job_exports_with_readable_times(store: Store, tmp_path: Path) -> None
     assert export["state"] == "done"
     assert export["scene"] == {"hash": "abc"}
     assert export["finished_utc"] is not None
+    assert "started_utc" in export
+    assert "seq" not in export
     write_export(export, tmp_path / ".agent" / "jobs" / "j1" / "job.json")
     assert (tmp_path / ".agent" / "jobs" / "j1" / "job.json").is_file()
 

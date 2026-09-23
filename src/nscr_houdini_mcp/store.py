@@ -45,7 +45,7 @@ APP_DIR_NAME = "nscr-houdini-mcp"
 HOME_ENV_VAR = "NSCR_MCP_HOME"
 STORE_FILE_NAME = "coord.sqlite"
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SESSION_KINDS = frozenset({"gui", "hython"})
 SESSION_STATES = frozenset({"live", "busy", "unresponsive", "crashed", "gone"})
@@ -74,6 +74,9 @@ OPERATION_STATES = frozenset({"running", "done", "failed", OPERATION_ABANDONED})
 JOB_STATES = frozenset({"queued", "running", "done", "failed", "cancelled", "lost"})
 JOB_FINAL_STATES = frozenset({"done", "failed", "cancelled", "lost"})
 JOB_LIVE_STATES = ("queued", "running")
+
+# What a job that was still going says once its session is known to have ended.
+SESSION_ENDED_ERROR = {"code": "SESSION_ENDED", "message": "the session running this job ended"}
 
 MAX_ALIAS_INDEX = 4096
 
@@ -582,9 +585,16 @@ class JobRecord:
     created_at: float
     updated_at: float
     finished_at: float | None
+    # The operation the job runs under, what it runs, and when it began to.
+    operation_id: str | None = None
+    spec: Any = None
+    started_at: float | None = None
+    # Where the row sits in the table, for a list that goes on from a row.
+    seq: int | None = None
 
     @classmethod
     def _from_row(cls, row: sqlite3.Row) -> JobRecord:
+        keys = row.keys()
         return cls(
             job_id=row["job_id"],
             session_id=row["session_id"],
@@ -601,6 +611,10 @@ class JobRecord:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             finished_at=row["finished_at"],
+            operation_id=row["operation_id"],
+            spec=_load(row["spec"]),
+            started_at=row["started_at"],
+            seq=row["seq"] if "seq" in keys else None,
         )
 
 
@@ -771,7 +785,26 @@ _SCHEMA_6 = (
 # cleared by the next reader, so it is kept at the one moment it is known.
 _SCHEMA_7 = ("ALTER TABLE sessions ADD COLUMN ended_as TEXT",)
 
-MIGRATIONS = (_SCHEMA_1, _SCHEMA_2, _SCHEMA_3, _SCHEMA_4, _SCHEMA_5, _SCHEMA_6, _SCHEMA_7)
+# What a job runs and under which operation, so a job can be followed from
+# the call that started it, and when it began running as opposed to when it
+# was accepted.
+_SCHEMA_8 = (
+    "ALTER TABLE jobs ADD COLUMN operation_id TEXT",
+    "ALTER TABLE jobs ADD COLUMN spec TEXT",
+    "ALTER TABLE jobs ADD COLUMN started_at REAL",
+    "CREATE INDEX jobs_by_session ON jobs(session_id, state)",
+)
+
+MIGRATIONS = (
+    _SCHEMA_1,
+    _SCHEMA_2,
+    _SCHEMA_3,
+    _SCHEMA_4,
+    _SCHEMA_5,
+    _SCHEMA_6,
+    _SCHEMA_7,
+    _SCHEMA_8,
+)
 
 
 class Store:
@@ -1094,6 +1127,7 @@ class Store:
                 " WHERE session_id = ?",
                 (SESSION_GONE, SESSION_CRASHED, now, row["session_id"]),
             )
+            self._lose_session_jobs(db, row["session_id"], now)
             reclaimed.append(row["session_id"])
         return reclaimed
 
@@ -1122,14 +1156,16 @@ class Store:
         """
         if how not in SESSION_ENDINGS:
             raise ValueError(f"unknown way to end: {how}")
+        now = self._now()
         with self._txn(write=True) as db:
             written = db.execute(
                 "UPDATE sessions SET state = ?, ended_as = ?, heartbeat_at = ?"
                 " WHERE session_id = ?",
-                (SESSION_GONE, how, self._now(), session_id),
+                (SESSION_GONE, how, now, session_id),
             )
             if written.rowcount == 0:
                 raise UnknownRecord(f"no session {session_id}")
+            self._lose_session_jobs(db, session_id, now)
 
     # -- workers ----------------------------------------------------------
 
@@ -1545,17 +1581,26 @@ class Store:
         scene: Any = None,
         progress: Any = None,
         worker_pid: int | None = None,
+        operation_id: str | None = None,
+        spec: Any = None,
+        replace: bool = False,
     ) -> JobRecord:
-        """Record an accepted job, including the scene identity it consumes."""
+        """Record an accepted job, including the scene identity it consumes.
+
+        `replace` writes over a row with the same id, for a job id that is
+        taken again once everything the earlier one answered for has gone.
+        """
         if state not in JOB_STATES:
             raise ValueError(f"unknown job state: {state}")
         now = self._now()
+        started = now if state == "running" else None
+        verb = "INSERT OR REPLACE" if replace else "INSERT"
         with self._txn(write=True) as db:
             db.execute(
-                "INSERT INTO jobs (job_id, session_id, kind, state, weight, progress, outputs,"
+                f"{verb} INTO jobs (job_id, session_id, kind, state, weight, progress, outputs,"
                 " error, scene, cancel_requested, worker_pid, heartbeat_at, created_at,"
-                " updated_at, finished_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0, ?, ?, ?, ?, NULL)",
+                " updated_at, finished_at, operation_id, spec, started_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0, ?, ?, ?, ?, NULL, ?, ?, ?)",
                 (
                     job_id,
                     session_id,
@@ -1568,6 +1613,9 @@ class Store:
                     now,
                     now,
                     now,
+                    operation_id,
+                    _dump(spec),
+                    started,
                 ),
             )
             return JobRecord._from_row(
@@ -1583,8 +1631,12 @@ class Store:
         outputs: Any = None,
         error: Any = None,
         worker_pid: int | None = None,
+        scene: Any = None,
     ) -> JobRecord:
-        """Write progress, outputs so far or a final state."""
+        """Write progress, outputs so far or a final state.
+
+        A job moving to `running` is stamped with when it began, once.
+        """
         if state is not None and state not in JOB_STATES:
             raise ValueError(f"unknown job state: {state}")
         now = self._now()
@@ -1594,18 +1646,24 @@ class Store:
                 raise UnknownRecord(f"no job {job_id}")
             new_state = state or row["state"]
             finished = now if new_state in JOB_FINAL_STATES else row["finished_at"]
+            started = row["started_at"]
+            if started is None and new_state == "running":
+                started = now
             db.execute(
                 "UPDATE jobs SET state = ?, progress = ?, outputs = ?, error = ?, worker_pid = ?,"
-                " heartbeat_at = ?, updated_at = ?, finished_at = ? WHERE job_id = ?",
+                " scene = ?, heartbeat_at = ?, updated_at = ?, finished_at = ?, started_at = ?"
+                " WHERE job_id = ?",
                 (
                     new_state,
                     _dump(progress) if progress is not None else row["progress"],
                     _dump(outputs) if outputs is not None else row["outputs"],
                     _dump(error) if error is not None else row["error"],
                     row["worker_pid"] if worker_pid is None else worker_pid,
+                    _dump(scene) if scene is not None else row["scene"],
                     now,
                     now,
                     finished,
+                    started,
                     job_id,
                 ),
             )
@@ -1660,6 +1718,55 @@ class Store:
                 stale.append(record)
         return stale
 
+    def lose_jobs(self, job_ids: Sequence[str], *, error: Any = None) -> list[JobRecord]:
+        """Mark jobs `lost` that have not finished, keeping what they wrote so far.
+
+        A job that finished in the meantime keeps its own ending. Returns the
+        rows that were marked.
+        """
+        if not job_ids:
+            return []
+        now = self._now()
+        marks = ", ".join("?" * len(job_ids))
+        states = ", ".join("?" * len(JOB_LIVE_STATES))
+        with self._txn(write=True) as db:
+            rows = db.execute(
+                f"SELECT job_id FROM jobs WHERE job_id IN ({marks}) AND state IN ({states})",
+                (*job_ids, *JOB_LIVE_STATES),
+            ).fetchall()
+            lost = [row["job_id"] for row in rows]
+            for job_id in lost:
+                self._lose_job(db, job_id, now, error)
+            return [
+                JobRecord._from_row(
+                    db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+                )
+                for job_id in lost
+            ]
+
+    def _lose_session_jobs(self, db: sqlite3.Connection, session_id: str, now: float) -> None:
+        """Every unfinished job of a session that has ended is lost with it."""
+        states = ", ".join("?" * len(JOB_LIVE_STATES))
+        rows = db.execute(
+            f"SELECT job_id FROM jobs WHERE session_id = ? AND state IN ({states})",
+            (session_id, *JOB_LIVE_STATES),
+        ).fetchall()
+        for row in rows:
+            self._lose_job(db, row["job_id"], now, SESSION_ENDED_ERROR)
+
+    @staticmethod
+    def _lose_job(db: sqlite3.Connection, job_id: str, now: float, error: Any) -> None:
+        db.execute(
+            "UPDATE jobs SET state = 'lost', error = COALESCE(?, error), updated_at = ?,"
+            " finished_at = ? WHERE job_id = ?",
+            (_dump(error), now, now, job_id),
+        )
+
+    def drop_job(self, job_id: str) -> bool:
+        """Take a job row off, for work that was accepted and never ran."""
+        with self._txn(write=True) as db:
+            return db.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,)).rowcount > 0
+
     def get_job(self, job_id: str) -> JobRecord | None:
         """One job by id."""
         row = self._read_one("SELECT * FROM jobs WHERE job_id = ?", (job_id,))
@@ -1669,19 +1776,31 @@ class Store:
         self,
         *,
         session_id: str | None = None,
+        session_ids: Sequence[str] | None = None,
         states: Sequence[str] | None = None,
         limit: int = 50,
+        before: tuple[float, int] | None = None,
     ) -> list[JobRecord]:
-        """Recent jobs, newest first."""
-        sql = "SELECT * FROM jobs"
+        """Recent jobs, newest first.
+
+        `before` is the `created_at` and `seq` of the last row a caller has,
+        and the list goes on from the row after it.
+        """
+        sql = "SELECT rowid AS seq, * FROM jobs"
         clauses: list[str] = []
         args: list[Any] = []
         if session_id is not None:
             clauses.append("session_id = ?")
             args.append(session_id)
+        if session_ids is not None:
+            clauses.append(f"session_id IN ({', '.join('?' * len(session_ids)) or 'NULL'})")
+            args.extend(session_ids)
         if states:
             clauses.append(f"state IN ({', '.join('?' * len(states))})")
             args.extend(states)
+        if before is not None:
+            clauses.append("(created_at < ? OR (created_at = ? AND rowid < ?))")
+            args.extend([before[0], before[0], before[1]])
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
@@ -1877,10 +1996,18 @@ class Store:
         record = self.get_job(job_id)
         if record is None:
             raise UnknownRecord(f"no job {job_id}")
-        return _export_dict(
+        exported = _export_dict(
             record,
-            {"created_at": "created", "updated_at": "updated", "finished_at": "finished"},
+            {
+                "created_at": "created",
+                "started_at": "started",
+                "updated_at": "updated",
+                "finished_at": "finished",
+            },
         )
+        # Where the row sat in the table says nothing to a reader of the file.
+        exported.pop("seq", None)
+        return exported
 
 
 def write_export(record: Mapping[str, Any], path: Path | str) -> Path:
