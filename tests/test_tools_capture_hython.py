@@ -170,6 +170,66 @@ def framed(path: str) -> None:
     assert left > 0 and top > 0 and right < width and bottom < height
 
 
+def test_a_fresh_worker_s_first_capture_is_a_framed_sequence(place: dict[str, Any]) -> None:
+    """Run first: a worker that has captured nothing yet, asked for frames."""
+    [platform, sequence] = run(
+        place,
+        ("hou_python", {"code": "import os\nresult = os.environ.get('QT_QPA_PLATFORM')"}),
+        ("hou_capture", {"frames": [1, 2, 1], "resolution": [320, 180], "return_image": "none"}),
+    )
+    assert ok(platform)["result"] == "offscreen"
+    body = ok(sequence)
+    assert len(body["paths"]) == 2
+    for item in body["paths"]:
+        assert is_png(item)
+        framed(item)
+    captures = place["scenes"] / ".agent" / "captures"
+    assert list(captures.rglob("*.probe.png")) == []
+
+
+# A camera an artist animated and locked a parameter on, looking at the box.
+SHOT_CAMERA = """
+cam = hou.node('/obj').createNode('cam', 'shotcam')
+cam.parmTuple('t').set((0, 0, 6))
+for frame in (1, 10):
+    cam.parm('ty').setKeyframe(hou.Keyframe(0.0, hou.frameToTime(frame)))
+cam.parm('winx').lock(True)
+result = cam.path()
+"""
+
+CAMERA_STATE = """
+cam = hou.node('/obj/shotcam')
+result = {
+    'keys': {parm.name(): len(parm.keyframes()) for parm in cam.parms() if parm.keyframes()},
+    'locked': sorted(parm.name() for parm in cam.parms() if parm.isLocked()),
+    'values': {parm.name(): parm.eval() for parm in cam.parms()
+               if isinstance(parm.eval(), float)},
+    'outputs': [node.path() for node in cam.outputs()],
+    'obj': sorted(node.name() for node in hou.node('/obj').children()),
+}
+"""
+
+
+def test_a_named_camera_is_looked_through_and_left_as_it_was(place: dict[str, Any]) -> None:
+    [made] = run(place, ("hou_python", {"code": SHOT_CAMERA}))
+    camera = ok(made)["result"]
+    try:
+        [before] = run(place, ("hou_python", {"code": CAMERA_STATE}))
+        [result] = run(
+            place,
+            ("hou_capture", {"camera": camera, "resolution": [320, 180], "return_image": "none"}),
+        )
+        [after] = run(place, ("hou_python", {"code": CAMERA_STATE}))
+    finally:
+        run(place, ("hou_python", {"code": f"hou.node({camera!r}).destroy()"}))
+    body = ok(result)
+    assert body["camera"] == {"kind": "node", "path": camera}
+    framed(body["path"])
+    assert ok(after)["result"] == ok(before)["result"]
+    assert ok(before)["result"]["keys"]["ty"] == 2
+    assert ok(before)["result"]["locked"] == ["winx"]
+
+
 def test_a_fitted_persp_capture_of_a_box(place: dict[str, Any]) -> None:
     before = look(place)
     [result] = run(place, ("hou_capture", {"camera": "persp", "resolution": [640, 360]}))
