@@ -510,8 +510,14 @@ def named(
             return record
     under = sorted((r for r in records if r.alias == handle), key=lambda r: r.started_at)
     open_ones = [r for r in under if r.state != store_module.SESSION_GONE]
-    if open_ones or under:
-        return (open_ones or under)[-1]
+    if open_ones:
+        return open_ones[-1]
+    # The name a running session had before it took its scene's still finds it.
+    renamed = [
+        r for r in records if r.previous_alias == handle and r.state != store_module.SESSION_GONE
+    ]
+    if renamed or under:
+        return (renamed or under)[-1]
     # Nobody by that name: the rules say so, with the nearest names.
     return choose(records, handle)
 

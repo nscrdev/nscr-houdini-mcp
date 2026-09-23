@@ -1376,6 +1376,24 @@ def test_a_gui_session_started_before_its_scene_takes_the_scene_name(tmp_path: P
         scene.ui.stop()
 
 
+def test_a_gui_session_renamed_by_its_first_save_records_the_file_too(tmp_path: Path) -> None:
+    bridge, _, scene = _untitled_gui_bridge(tmp_path)
+    bridge.start()
+    try:
+        scene.hipFile.save("/scenes/layout_v001.hip")
+
+        assert bridge.alias == "layout_v001-1"
+        with store_module.Store(bridge.store_path) as store:
+            row = store.get_session(bridge.session_id)
+        assert (row.alias, row.previous_alias) == ("layout_v001-1", "untitled-1")
+        assert row.hip_path == "/scenes/layout_v001.hip"
+        entry = registry.read_entry(registry.entry_path(tmp_path, bridge.session_id))
+        assert entry["hip_path"] == "/scenes/layout_v001.hip"
+    finally:
+        bridge.stop()
+        scene.ui.stop()
+
+
 def test_a_gui_session_a_call_reached_first_keeps_its_name(tmp_path: Path) -> None:
     bridge, backend, scene = _untitled_gui_bridge(tmp_path)
     bridge.start()

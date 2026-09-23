@@ -460,12 +460,12 @@ class MainThreadRunner:
         is spent in full whenever the main thread is busy.
 
         `last` is posted to the main thread once more on the way out, for
-        what has to happen there after the session is closed.
+        what has to happen there after the session is closed. The poster is
+        kept, so `state` says whether it is still alive until it has ended.
         """
         self._closed.set()
         self._queue.cancel_all()
         self._kicks.put(None if last is None else _Last(last))
-        self._poster = None
 
     @property
     def pending(self) -> int:

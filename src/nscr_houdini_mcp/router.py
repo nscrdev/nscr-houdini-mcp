@@ -10,7 +10,11 @@ the last call. The rules, in order:
    is ever sent on to that successor, because work written for one process
    must not land in another. A session whose own port stopped answering is
    refused with `SESSION_UNRESPONSIVE`. A name nobody knows is
-   `SESSION_UNKNOWN`, with the nearest aliases.
+   `SESSION_UNKNOWN`, with the nearest aliases. The name a live session had
+   before it took its scene's still reaches it, since the store holds that
+   name for it, and the reply carries an `ALIAS_RENAMED` warning naming the
+   one it answers to now. It is the same process, so the work lands where the
+   caller meant it to.
 2. No `session` and exactly one live session: that one.
 3. No `session` and several live: the config's `default_session` when it
    names one of them, otherwise `SESSION_AMBIGUOUS` with the candidates.
@@ -96,6 +100,8 @@ class Target:
     record: SessionRecord
     session: client.Session
     houdini_version: str | None = None
+    # What the reply should say about how the session was found.
+    warnings: tuple[dict[str, Any], ...] = ()
 
     def __repr__(self) -> str:
         # The client holds the token, so it is never printed.
@@ -106,11 +112,14 @@ class Target:
         return self.record.session_id
 
     def trace(self) -> dict[str, Any]:
-        return {
+        trace: dict[str, Any] = {
             "session_id": self.record.session_id,
             "alias": self.record.alias,
             "scene_epoch": self.record.scene_epoch,
         }
+        if self.warnings:
+            trace["warnings"] = [dict(warning) for warning in self.warnings]
+        return trace
 
 
 # Section: the rules, on plain rows
@@ -175,6 +184,15 @@ def _named(
     current = [record for record in by_alias if record.state not in DEAD_STATES]
     if current:
         return _usable(current[0], live)
+    # A session that took its scene's name still answers to the one it had,
+    # which the store holds for it while it runs.
+    renamed = [
+        record
+        for record in records
+        if record.previous_alias == handle and record.state not in DEAD_STATES
+    ]
+    if renamed:
+        return _usable(renamed[0], live)
     if by_alias:
         return _usable(by_alias[0], live)
     names = sorted(
@@ -227,6 +245,24 @@ def dead(session_id: str, alias: str | None, live: Iterable[SessionRecord]) -> C
         hint = None
         message = f"session {session_id} has ended"
     return CallError("SESSION_DEAD", message, hint=hint, details=details)
+
+
+def renamed(record: SessionRecord, handle: str | None) -> tuple[dict[str, Any], ...]:
+    """`ALIAS_RENAMED`, when the call named a session by the name it had before."""
+    handle = (handle or "").strip()
+    if not handle or handle in (record.session_id, record.alias):
+        return ()
+    if record.previous_alias != handle:
+        return ()
+    return (
+        {
+            "code": "ALIAS_RENAMED",
+            "message": f"{handle} took its scene's name and answers to {record.alias} now",
+            "alias": record.alias,
+            "previous_alias": handle,
+            "hint": f"address this session as {record.alias} or by its id from here on",
+        },
+    )
 
 
 def _match(records: Iterable[SessionRecord], handle: str) -> SessionRecord | None:
@@ -293,7 +329,12 @@ class Router:
         session, facts = self._client(record, records)
         if record.kind == "hython":
             self._renew(record.session_id)
-        return Target(record, session, houdini_version=facts.get("houdini_version"))
+        return Target(
+            record,
+            session,
+            houdini_version=facts.get("houdini_version"),
+            warnings=renamed(record, handle),
+        )
 
     def reach(self, record: SessionRecord) -> Target:
         """A target for a row already read, for a look that is not a use.

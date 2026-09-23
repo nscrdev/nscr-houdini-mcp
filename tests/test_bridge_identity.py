@@ -335,6 +335,77 @@ def test_a_worker_never_takes_a_provisional_name(scene: Scene) -> None:
     assert session.alias == "w1"
 
 
+class SlowNamer(Namer):
+    """A store write that takes as long as the test says."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(self, hip_path: str) -> str:
+        self.entered.set()
+        assert self.release.wait(20.0)
+        return super().__call__(hip_path)
+
+
+def _load_in_background(scene: Scene, path: str) -> threading.Thread:
+    loading = threading.Thread(target=scene.hipFile.load, args=(path,), daemon=True)
+    loading.start()
+    return loading
+
+
+def test_a_reply_made_during_the_rename_carries_the_new_name(scene: Scene) -> None:
+    """Never the old name with a warning telling the caller the name is stale."""
+    namer = SlowNamer()
+    session = untitled(scene, namer)
+    loading = _load_in_background(scene, "/scenes/gui_v001.hip")
+    assert namer.entered.wait(20.0)
+
+    # Mid rename there is no drift to report: the name is on its way.
+    assert session.drift() is None
+    replies: list[dict[str, Any]] = []
+    replying = threading.Thread(target=lambda: replies.append(session.trace()), daemon=True)
+    replying.start()
+    time.sleep(0.2)
+    assert replies == []
+    namer.release.set()
+    replying.join(20.0)
+    loading.join(20.0)
+
+    [trace] = replies
+    assert trace["alias"] == "gui_v001-1"
+    assert "warnings" not in trace
+
+
+def test_a_rename_that_takes_too_long_holds_a_reply_back_only_so_long(
+    scene: Scene, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(identity_module, "RENAME_WAIT_S", 0.2)
+    namer = SlowNamer()
+    session = untitled(scene, namer)
+    loading = _load_in_background(scene, "/scenes/gui_v001.hip")
+    assert namer.entered.wait(20.0)
+    try:
+        began = time.monotonic()
+        trace = session.trace()
+        assert time.monotonic() - began < 5.0
+        # The old name, and nothing that tells the caller to rename anything.
+        assert trace["alias"] == "untitled-1"
+        assert "warnings" not in trace
+    finally:
+        namer.release.set()
+        loading.join(20.0)
+    assert session.trace()["alias"] == "gui_v001-1"
+
+
+def test_the_drift_warning_never_asks_the_caller_to_rename(scene: Scene) -> None:
+    session = identity(scene, tracks_hip=True)
+    session.watch()
+    scene.hipFile.load("/scenes/shot_020.hip")
+    assert "rename" not in session.drift()["hint"]
+
+
 def test_a_rename_the_store_refuses_leaves_the_old_name_and_says_why(scene: Scene) -> None:
     said: list[str] = []
     session = untitled(scene, Namer(fails=True), log=said.append)

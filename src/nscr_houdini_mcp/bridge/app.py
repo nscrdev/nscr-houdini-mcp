@@ -362,9 +362,11 @@ class Bridge:
         """
         with self._open_store() as store:
             record = store.rename_session(
-                self.session_id, alias_template=alias_template(self.kind, hip_path)
+                self.session_id,
+                alias_template=alias_template(self.kind, hip_path),
+                hip_path=hip_path,
             )
-        self._write_entry(alias=record.alias)
+        self._write_entry(alias=record.alias, hip_path=hip_path)
         self._log(f"named after the scene now: {record.alias}", problem=False)
         return record.alias
 

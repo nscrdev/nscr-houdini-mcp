@@ -670,3 +670,15 @@ def test_worker_busy_says_how_to_stop_it_anyway(
         store.lease_worker("wk-1", job_id="job-8")
     _, [result] = talk(bench.serve(), ("hou_sessions", {"action": "stop", "session": "w1"}))
     assert "pass force true" in text_of(result)
+
+
+def test_the_name_a_running_session_had_before_its_rename_still_finds_it(
+    tmp_path: Path,
+) -> None:
+    with Store(tmp_path / "coord.sqlite") as store:
+        store.register_session("s-1", kind="gui", pid=os.getpid(), alias_template="untitled-{n}")
+        store.rename_session("s-1", alias_template="shot_010-{n}")
+        store.register_session("s-2", kind="gui", pid=os.getpid(), alias_template="untitled-{n}")
+        records = store.list_sessions(include_gone=True)
+    assert sessions_tool.named(records, "untitled-1").session_id == "s-1"
+    assert sessions_tool.named(records, "untitled-2").session_id == "s-2"

@@ -22,6 +22,7 @@ import pytest
 from mcp.client.client import Client
 from mcp.shared.inbound import find_invalid_x_mcp_header
 
+from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge import client as bridge_client
 from nscr_houdini_mcp.config import Config, ConfigError
 from nscr_houdini_mcp.results import CallError
@@ -250,6 +251,40 @@ def test_the_config_default_settles_which_session_answers() -> None:
     _, [result] = talk(serve(stage, config=config), ("hou_ping", {}))
     assert not result.is_error
     assert stage.sent.calls[0]["session"] == "s-2"
+
+
+def test_a_caller_holding_a_freed_up_name_never_reaches_a_second_houdini(
+    tmp_path: Path,
+) -> None:
+    """A name read before a rename goes on reaching the session that had it.
+
+    The caller reads `untitled-1`, the scene loads and the session becomes
+    `shot_010-1`, and a second, empty Houdini starts. The second one is not
+    handed `untitled-1`, and a call by that name reaches the first, with a
+    warning that names what it answers to now.
+    """
+    with store_module.Store(tmp_path / "coord.sqlite") as store:
+        first = store.register_session(
+            "s-1", kind="gui", pid=os.getpid(), alias_template="untitled-{n}"
+        )
+        assert first.alias == "untitled-1"
+        store.rename_session("s-1", alias_template="shot_010-{n}", hip_path="/s/shot_010.hip")
+        second = store.register_session(
+            "s-2", kind="gui", pid=os.getpid(), alias_template="untitled-{n}"
+        )
+        assert second.alias == "untitled-2"
+        rows = store.list_sessions(include_gone=True)
+    reply = {**pong(), "alias": "shot_010-1"}
+    stage = Stage(rows, replies=(reply,))
+
+    _, [result] = talk(serve(stage), ("hou_ping", {"session": "untitled-1"}))
+
+    assert not result.is_error, text_of(result)
+    assert stage.sent.calls[0]["session"] == "s-1"
+    trace = result.structured_content["trace"]
+    assert trace["alias"] == "shot_010-1"
+    assert [warning["code"] for warning in trace["warnings"]] == ["ALIAS_RENAMED"]
+    assert "shot_010-1" in trace["warnings"][0]["message"]
 
 
 def test_a_dead_session_names_its_successor() -> None:

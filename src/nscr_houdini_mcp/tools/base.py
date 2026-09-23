@@ -357,9 +357,11 @@ class Call:
         for key in ("session_id", "alias", "scene_epoch"):
             if said.get(key) is not None:
                 self.trace[key] = said[key]
+        # The session's own warnings join the ones this end found on the way.
         warnings = said.get("warnings")
         if warnings:
-            self.trace["warnings"] = warnings
+            held = list(self.trace.get("warnings") or [])
+            self.trace["warnings"] = held + [w for w in warnings if w not in held]
         # Pacing waits add up over the bridge calls one tool call makes, and
         # the moment pacing let the last of them through is kept.
         waited = said.get("throttled_ms")
