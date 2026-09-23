@@ -480,3 +480,85 @@ def test_a_flat_capture_is_a_picture_with_a_note(bench: Bench, scene: Scene) -> 
     assert body["image_stats"]["flat"] is True
     assert body["image_stats"]["non_empty"] is True
     assert any("flat colour" in item for item in body["warnings"])
+
+
+# Section: finishing a capture once
+
+
+def finishing_call(bench: Bench) -> Any:
+    from nscr_houdini_mcp.tools.base import Call
+
+    return Call(capture_tool.HOU_CAPTURE, {}, bench.router(bench.config), config=bench.config)
+
+
+def test_a_capture_is_finished_once_however_many_ask(
+    bench: Bench, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "shot.png"
+    Image.new("RGBA", (40, 20), (5, 5, 5, 255)).save(path)
+    data = {
+        "source": "viewport",
+        "views": [{"view": "single", "files": [str(path)], "frames": [1.0], "run_id": "run-a"}],
+        "region": [0.0, 0.0, 0.5, 0.5],
+    }
+    finished: list[int] = []
+    real = capture_tool.finish
+    gate = threading.Event()
+
+    def slow(given: Any, **rest: Any) -> dict[str, Any]:
+        finished.append(1)
+        gate.wait(2.0)
+        return real(given, **rest)
+
+    monkeypatch.setattr(capture_tool, "finish", slow)
+    answers: list[dict[str, Any]] = []
+
+    def ask() -> None:
+        answers.append(capture_tool.finalised(finishing_call(bench), "op-once", data))
+
+    threads = [threading.Thread(target=ask) for _ in range(3)]
+    for thread in threads:
+        thread.start()
+    gate.set()
+    for thread in threads:
+        thread.join(10.0)
+    assert len(finished) == 1
+    assert len(answers) == 3
+    assert all(answer == answers[0] for answer in answers)
+    assert (answers[0]["width"], answers[0]["height"]) == (20, 10)
+    assert list(tmp_path.glob("*.partial")) == [] and list(tmp_path.glob("*.part")) == []
+
+
+def test_temporary_names_are_this_writer_s_own(tmp_path: Path) -> None:
+    from nscr_houdini_mcp import outputs
+
+    target = str(tmp_path / "a.png")
+    first, second = outputs.temporary_beside(target), outputs.temporary_beside(target)
+    assert first != second
+    assert Path(first).parent == Path(second).parent == tmp_path
+    assert Path(first).is_file() and Path(second).is_file()
+
+
+def test_no_thumbnail_is_sent_when_none_fits(
+    bench: Bench, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "noise.png"
+    Image.frombytes("RGB", (256, 256), os.urandom(256 * 256 * 3)).save(path)
+    assert capture_tool.thumbnail(str(path), max_bytes=10) is None
+    monkeypatch.setattr(capture_tool, "THUMB_MAX_BYTES", 10)
+    result = shoot(bench)
+    body = ok(result)
+    assert images(result) == []
+    assert "thumb" not in body
+    assert any("no thumbnail" in item for item in body["warnings"])
+
+
+def test_a_capture_stopped_before_any_frame_is_an_answer_not_an_error() -> None:
+    said = capture_tool.finish(
+        {
+            "source": "viewport",
+            "views": [{"view": "single", "files": [], "frames": [], "stopped_early": True}],
+            "stopped_early": True,
+        }
+    )
+    assert said["path"] is None and said["stopped_early"] is True

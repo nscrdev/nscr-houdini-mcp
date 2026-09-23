@@ -423,7 +423,7 @@ def job_row(record: JobRecord, call: Call, *, full: bool) -> dict[str, Any]:
             row["error"] = answer.get("error", record.error)
     if full and record.kind == "capture" and record.state in FINAL:
         # The paths and the image numbers, as the call would have given them.
-        answer = capture_tool.job_answer(record.outputs)
+        answer = capture_tool.job_answer(call, record)
         if answer is not None:
             row["outputs"] = {**answer, "operation_id": record.operation_id}
     if record.state in FINAL:

@@ -45,6 +45,8 @@ import io
 import math
 import os
 import re
+import sqlite3
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -55,10 +57,19 @@ from PIL.PngImagePlugin import PngInfo
 
 from nscr_houdini_mcp import config as config_module
 from nscr_houdini_mcp import jobs as job_rules
+from nscr_houdini_mcp import outputs as outputs_module
+from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge.dispatch import DEFAULT_TIMEOUT_S
 from nscr_houdini_mcp.results import CallError
 from nscr_houdini_mcp.tools import python as python_tool
-from nscr_houdini_mcp.tools.base import OPERATION_ID_MAX, Call, ToolSpec, inputs, outputs
+from nscr_houdini_mcp.tools.base import (
+    OPERATION_ID_MAX,
+    OPERATION_ID_SEPARATOR,
+    Call,
+    ToolSpec,
+    inputs,
+    outputs,
+)
 
 SOURCES = ("viewport", "node", "network", "cop", "pane")
 DISPLAYS = ("shaded", "wire", "shaded_wire", "matcap")
@@ -121,7 +132,9 @@ def capture(call: Call) -> dict[str, Any]:
         if error.code in python_tool.FOLLOWABLE:
             error.details["job_id"] = job_id
         raise
-    said = finish(dict(reply.get("data") or {}), strict=True)
+    said = finalised(call, call.operation_id(), dict(reply.get("data") or {}))
+    if said.get("empty") and not said.get("stopped_early"):
+        raise empty_error(said)
     said["job_id"] = job_id
     said["state"] = "done"
     attach(call, said, wanted)
@@ -219,12 +232,25 @@ def bad(argument: str, message: str) -> CallError:
 # Section: what was written
 
 
-def finish(data: Mapping[str, Any], *, strict: bool) -> dict[str, Any]:
+def finish(data: Mapping[str, Any], *, strict: bool = False) -> dict[str, Any]:
     """The session's answer with the images read: crops, numbers and a sheet.
 
-    `strict` makes a capture with nothing in it an error. A finished job read
-    back later is not strict: it reports `empty` instead.
+    It changes files, so it runs once per operation, through `finalised`.
+    What it reports as `empty` the call turns into `CAPTURE_EMPTY`; a
+    finished job read back later reports it as it is. `strict` raises here,
+    for a caller that finishes without the claim.
     """
+    views = list(data.get("views") or ())
+    if views and data.get("stopped_early") and not any(view.get("files") for view in views):
+        # Stopped before any frame: nothing to read, and nothing wrong.
+        return {
+            "source": data.get("source"),
+            "path": None,
+            "paths": [],
+            "frames": [],
+            "stopped_early": True,
+            "warnings": list(data.get("warnings") or []),
+        }
     region = data.get("region")
     sequence = bool(data.get("sequence"))
     rendered = data.get("source") in RENDERED
@@ -266,20 +292,7 @@ def finish(data: Mapping[str, Any], *, strict: bool) -> dict[str, Any]:
     if not shaped:
         raise CallError("CAPTURE_EMPTY", "the session answered with no image")
     if strict and all_empty:
-        raise CallError(
-            "CAPTURE_EMPTY",
-            "the capture wrote only empty images",
-            details={
-                "views": [
-                    {
-                        "view": item["view"],
-                        "route": item["route"],
-                        "image_stats": item["image_stats"],
-                    }
-                    for item in shaped
-                ]
-            },
-        )
+        raise empty_error({"views": shaped})
     first = shaped[0]
     said: dict[str, Any] = {"source": data.get("source")}
     sheet = data.get("sheet")
@@ -320,9 +333,102 @@ def finish(data: Mapping[str, Any], *, strict: bool) -> dict[str, Any]:
             said[key] = True
     if data.get("warnings") or notes:
         said["warnings"] = list(data.get("warnings") or []) + notes
-    if not strict and all_empty:
+    if all_empty:
         said["empty"] = True
     return said
+
+
+def empty_error(said: Mapping[str, Any]) -> CallError:
+    """`CAPTURE_EMPTY`, with the numbers of each view that came back empty."""
+    views = said.get("views") or [
+        {"view": "single", "route": said.get("route"), "image_stats": said.get("image_stats")}
+    ]
+    return CallError(
+        "CAPTURE_EMPTY",
+        "the capture wrote only empty images",
+        details={
+            "views": [
+                {
+                    "view": item.get("view"),
+                    "route": item.get("route"),
+                    "image_stats": item.get("image_stats"),
+                }
+                for item in views
+            ]
+        },
+    )
+
+
+# How long a second caller waits for the first to finish the same capture.
+FINISH_WAIT_S = 30.0
+FINISH_POLL_S = 0.1
+
+
+def finalised(call: Call, operation_id: str | None, data: Mapping[str, Any]) -> dict[str, Any]:
+    """The capture's answer with its files finished, made once per operation.
+
+    Cropping and stitching write files, and a retry after a lost reply and a
+    job status read can both arrive for the same capture. The first takes a
+    claim in the store under the operation id and keeps the finished answer
+    there; the others wait for it and read it, so no file is finished twice.
+    Without a store to claim in, the files are finished here: each is cut
+    once, whatever else reads it.
+    """
+    if not operation_id:
+        return finish(data)
+    key = f"{operation_id}{OPERATION_ID_SEPARATOR}finish"
+    runs = [view.get("run_id") for view in data.get("views") or ()]
+    sheet = data.get("sheet") if isinstance(data.get("sheet"), Mapping) else {}
+    digest = store_module.digest_arguments({"runs": runs, "sheet": sheet.get("run_id")})
+    try:
+        with call.router.store(create=True) as store:
+            claim = store.begin_operation(key, digest)
+    except (store_module.StoreError, sqlite3.Error, store_module.OperationMismatch, CallError):
+        return finish(data)
+    if not claim.claimed:
+        if not claim.outcome_unknown:
+            outcome = claim.record.outcome if isinstance(claim.record.outcome, Mapping) else {}
+            return dict(outcome.get("said") or {})
+        return waited(call, key)
+    try:
+        said = finish(data)
+    except BaseException:
+        settle(call, lambda store: store.drop_operation(key))
+        raise
+    settle(call, lambda store: store.finish_operation(key, outcome={"said": said}))
+    return said
+
+
+def waited(call: Call, key: str) -> dict[str, Any]:
+    """The answer another call is finishing, once it has."""
+    deadline = time.monotonic() + FINISH_WAIT_S
+    while time.monotonic() < deadline:
+        try:
+            with call.router.store() as store:
+                record = None if store is None else store.get_operation(key)
+        except (store_module.StoreError, sqlite3.Error, CallError):
+            record = None
+        if record is None:
+            break
+        if record.state != "running":
+            outcome = record.outcome if isinstance(record.outcome, Mapping) else {}
+            return dict(outcome.get("said") or {})
+        time.sleep(FINISH_POLL_S)
+    raise CallError(
+        "OUTCOME_UNKNOWN",
+        "another call is still finishing this capture",
+        hint="ask again shortly with the same operation_id",
+    )
+
+
+def settle(call: Call, action: Any) -> None:
+    """One write of the finishing claim. A store that will not take it costs the claim only."""
+    try:
+        with call.router.store() as store:
+            if store is not None:
+                action(store)
+    except (store_module.StoreError, sqlite3.Error, CallError):
+        pass
 
 
 def look(path: str, *, rendered: bool = True) -> tuple[dict[str, Any], tuple[int, int] | None]:
@@ -447,9 +553,14 @@ def stitch(path: str, parts: Sequence[str]) -> None:
 
 
 def save(image: Image.Image, path: str, note: PngInfo | None = None) -> None:
-    partial = f"{path}.part"
-    image.save(partial, format="PNG", pnginfo=note)
-    os.replace(partial, path)
+    """Write an image whole, through a file of this writer's own beside it."""
+    partial = outputs_module.temporary_beside(path)
+    try:
+        image.save(partial, format="PNG", pnginfo=note)
+        os.replace(partial, path)
+    except BaseException:
+        Path(partial).unlink(missing_ok=True)
+        raise
 
 
 # Section: the picture sent back
@@ -460,25 +571,31 @@ def attach(call: Call, said: dict[str, Any], wanted: str) -> None:
     if wanted == "none" or not said.get("path"):
         return
     path = str(said.get("paths", [None])[0] if said.get("paths") else said["path"])
+    notes = said.setdefault("warnings", [])
     try:
-        if wanted == "full":
-            data = Path(path).read_bytes()
-            if len(data) <= FULL_MAX_BYTES:
-                mime = "image/png"
-                width, height = said.get("width"), said.get("height")
-                kind = "full"
-            else:
-                said.setdefault("warnings", []).append(
+        made: tuple[bytes, str, tuple[Any, Any]] | None
+        kind = "thumb"
+        if wanted == "full" and Path(path).stat().st_size <= FULL_MAX_BYTES:
+            made = (Path(path).read_bytes(), "image/png", (said.get("width"), said.get("height")))
+            kind = "full"
+        else:
+            if wanted == "full":
+                notes.append(
                     f"the full image is over {FULL_MAX_BYTES} bytes, so a thumbnail came back"
                 )
-                data, mime, (width, height) = thumbnail(path)
-                kind = "thumb"
-        else:
-            data, mime, (width, height) = thumbnail(path)
-            kind = "thumb"
+            made = thumbnail(path)
     except (OSError, UnidentifiedImageError):
-        said.setdefault("warnings", []).append("the image could not be read for a thumbnail")
+        notes.append("the image could not be read for a thumbnail")
         return
+    finally:
+        if not notes:
+            said.pop("warnings", None)
+    if made is None:
+        said.setdefault("warnings", []).append(
+            f"no thumbnail of this image fits in {THUMB_MAX_BYTES} bytes, so none came back"
+        )
+        return
+    data, mime, (width, height) = made
     call.attachments.append(
         ImageContent(type="image", data=base64.b64encode(data).decode("ascii"), mime_type=mime)
     )
@@ -492,9 +609,14 @@ def attach(call: Call, said: dict[str, Any], wanted: str) -> None:
 
 
 def thumbnail(
-    path: str, *, edge: int = THUMB_EDGE, max_bytes: int = THUMB_MAX_BYTES
-) -> tuple[bytes, str, tuple[int, int]]:
-    """A small copy of an image: at most `edge` on its long side and `max_bytes` whole."""
+    path: str, *, edge: int = THUMB_EDGE, max_bytes: int | None = None
+) -> tuple[bytes, str, tuple[int, int]] | None:
+    """A small copy of an image: at most `edge` on its long side and `max_bytes` whole.
+
+    Nothing when no encoding of it fits in `max_bytes`, which is
+    `THUMB_MAX_BYTES` unless given.
+    """
+    max_bytes = THUMB_MAX_BYTES if max_bytes is None else max_bytes
     with Image.open(path) as opened:
         image = opened.copy()
     if image.mode.startswith("I") or image.mode == "F":
@@ -516,7 +638,8 @@ def thumbnail(
             if len(data) <= max_bytes:
                 return data, "image/jpeg", flat.size
         if max(flat.size) <= 16:
-            return data, "image/jpeg", flat.size
+            # Nothing small enough fits: better no thumbnail than one over the bound.
+            return None
         flat = flat.resize((max(1, flat.size[0] // 2), max(1, flat.size[1] // 2)))
 
 
@@ -544,14 +667,18 @@ def handle(call: Call, job_id: str) -> dict[str, Any]:
     }
 
 
-def job_answer(outputs_: Any) -> dict[str, Any] | None:
-    """A finished capture job's answer, read the way the call would have read it."""
-    kept = outputs_ if isinstance(outputs_, Mapping) else {}
+def job_answer(call: Call, record: Any) -> dict[str, Any] | None:
+    """A finished capture job's answer, read the way the call would have read it.
+
+    Finished under the same claim as the call's own answer, so a job read and
+    a retry arriving together finish the files once.
+    """
+    kept = record.outputs if isinstance(record.outputs, Mapping) else {}
     answer = kept.get("answer")
     if not isinstance(answer, Mapping):
         return None
     try:
-        return finish(answer, strict=False)
+        return finalised(call, record.operation_id, answer)
     except CallError as error:
         return {"error": error.as_dict()}
 
