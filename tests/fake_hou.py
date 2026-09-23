@@ -102,6 +102,11 @@ class TemplateType:
         return self._name
 
 
+class HoudiniCrashed(BaseException):  # noqa: N818 - it stands for a crash, not an error
+    """A call that brings a real Houdini down. It is not an `Exception`, so no
+    quiet read can swallow it and a check that makes one fails loudly."""
+
+
 class ParmTemplate:
     """What a parameter is: its kind, label, default, tags and menu.
 
@@ -128,6 +133,7 @@ class ParmTemplate:
         children: tuple[ParmTemplate, ...] = (),
         expression: tuple[str, ...] | str | None = None,
         ramp: str = "",
+        menu_type: str = "Normal",
     ) -> None:
         self._kind = TemplateType(kind)
         self._label = label
@@ -144,6 +150,7 @@ class ParmTemplate:
         self.children = list(children)
         self._expression = expression
         self._ramp = ramp
+        self._menu_type = menu_type
 
     def type(self) -> TemplateType:
         return self._kind
@@ -175,10 +182,12 @@ class ParmTemplate:
         return self.default
 
     def defaultValueAsString(self) -> str:  # noqa: N802 - the name is Houdini's
-        if self._kind.name() != "Menu":
-            raise AttributeError("only a menu has a default token")
-        index = self.default if isinstance(self.default, int) else self.default[0]
-        return self._menu[index]
+        # On a menu whose items toggle, Houdini 22 reads the mask of items
+        # that are on as an index and the process dies. Nothing may call it.
+        raise HoudiniCrashed("defaultValueAsString on a menu template")
+
+    def menuType(self) -> str:  # noqa: N802 - the name is Houdini's
+        return f"menuType.{self._menu_type}"
 
     def defaultExpression(self) -> Any:  # noqa: N802 - the name is Houdini's
         if self._expression is None:
@@ -927,6 +936,15 @@ def _wrangle_templates() -> list[ParmTemplate]:
             ParmTemplate("Separator", "", name="sepparm"),
             ParmTemplate(
                 "Toggle", "Enforce Prototypes", False, name="vex_strict", expression="off"
+            ),
+            ParmTemplate(
+                "Menu",
+                "Channels",
+                511,
+                name="channels",
+                menu=("tx", "ty", "tz", "rx", "ry", "rz"),
+                menu_type="StringToggle",
+                hidden=True,
             ),
         ),
     )

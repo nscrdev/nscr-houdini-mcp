@@ -267,7 +267,7 @@ def test_a_full_read_adds_hidden_parameters_menus_ranges_folders_and_help(bench:
     assert rows["bindings"]["folder"] == ["Bindings"]
     assert "folder" not in rows["remap"]
     assert rows["descriptiveparm"]["hidden"] is True
-    assert body["total"] == 10
+    assert body["total"] == 11
     assert body["help_summary"] == "Runs a VEX snippet to modify attribute values."
     assert body["help_path"] == "/nodes/sop/attribwrangle"
 
@@ -282,7 +282,7 @@ def test_include_brings_help_or_hidden_parameters_into_a_lower_level(bench: Benc
     assert by_name(standard["parms"])["descriptiveparm"]["hidden"] is True
     assert "menu" not in by_name(standard["parms"])["class"]
     counted = ok(lookup(bench, context="sop", type="attribwrangle", include=["hidden"]))
-    assert counted["parm_count"] == 10
+    assert counted["parm_count"] == 11
 
 
 def test_a_parm_filter_glob_keeps_matching_names_and_multiparm_instances(bench: Bench) -> None:
@@ -313,7 +313,7 @@ def test_the_parameters_page_and_the_pages_make_the_whole_table(bench: Bench) ->
         if page:
             arguments["page"] = page
         body = ok(lookup(bench, **arguments))
-        assert body["total"] == 10
+        assert body["total"] == 11
         assert "changed" not in body
         seen.extend(body["parms"])
         page = body.get("next_page")
@@ -329,11 +329,16 @@ def test_a_page_after_the_type_changed_still_comes_back_and_says_so(
 ) -> None:
     arguments = {"context": "sop", "type": "attribwrangle", "detail": "standard", "limit": 4}
     first = ok(lookup(bench, **arguments))
+    # A default changes and no name does, as when an asset is loaded again.
     wrangle = scene.library["Sop"].types["attribwrangle"]
-    wrangle.templates.append(ParmTemplate("Float", "Added", (1.0,), name="added"))
+    run_over = wrangle.templates[0].children[1]
+    assert run_over.name() == "class"
+    run_over.default = 3
     second = ok(lookup(bench, **arguments, page=first["next_page"]))
     assert second["changed"] is True
     assert second["parms"][0]["name"] == "vex_strict"
+    third = ok(lookup(bench, **arguments))
+    assert by_name(third["parms"])["class"]["default"] == "vertex"
 
 
 def raw_token(body: Any) -> str:
@@ -655,7 +660,7 @@ def test_a_large_table_is_summed_up_in_the_text_and_spilled_past_the_cap(
         wrangle.templates.append(ParmTemplate("Float", f"Extra {index}", (0.0,), name=f"x{index}"))
     result = lookup(bench, context="sop", type="attribwrangle", detail="full")
     first = text_of(result).splitlines()[0]
-    assert first == "hou_node_type Sop/attribwrangle: 4 inputs at most, 70 of 70 parameters"
+    assert first == "hou_node_type Sop/attribwrangle: 4 inputs at most, 71 of 71 parameters"
     bench.config = replace(bench.config, spill_over_bytes=1024)
     body = ok(lookup(bench, context="sop", type="attribwrangle", detail="full"))
     assert set(body) == {"spilled", "trace"}
@@ -834,3 +839,171 @@ def test_a_search_reads_the_help_index_once_and_a_card_reuses_the_open_archive(
         assert body["inputs"][0]["label"] == "Geometry to Copy"
     # Opened once, when the index was made, and read from since.
     assert len(opened) == 1
+
+
+# Section: bounds, stale definitions and help that cannot be read
+
+
+def test_a_query_over_the_bounds_is_refused_before_anything_is_sent(bench: Bench) -> None:
+    long = error(lookup(bench, query="w" * 201))
+    assert long["code"] == "BAD_ARGUMENTS" and long["details"]["argument"] == "query"
+    many = error(lookup(bench, query=" ".join(f"word{index}" for index in range(17))))
+    assert many["code"] == "BAD_ARGUMENTS" and many["details"]["argument"] == "query"
+    assert bench.sent.calls == []
+    # The same word many times is one word.
+    assert names(ok(lookup(bench, context="sop", query=" ".join(["wrangle"] * 20))))
+
+
+def test_the_bridge_holds_the_same_bounds(scene: Scene) -> None:
+    from nscr_houdini_mcp.bridge.errors import BridgeError
+    from nscr_houdini_mcp.bridge.tools import ToolContext
+
+    context = ToolContext(hou=scene.module())
+    for query in ("w" * 201, " ".join(f"word{index}" for index in range(17))):
+        with pytest.raises(BridgeError) as raised:
+            node_types.node_type({"query": query}, context)
+        assert raised.value.code == "BAD_ARGUMENTS"
+
+
+def test_a_search_asked_to_stop_hands_back_what_it_has(scene: Scene) -> None:
+    import threading
+
+    from nscr_houdini_mcp.bridge.tools import ToolContext
+
+    for index in range(600):
+        kind = NodeType(f"filler{index:03d}", "Sop")
+        scene.library["Sop"].types[kind.name()] = kind
+    cancel = threading.Event()
+    cancel.set()
+    context = ToolContext(hou=scene.module(), cancel=cancel)
+    result = node_types.node_type({"query": "filler", "limit": 5}, context)
+    assert result["stopped"] is True
+    assert "more" not in result and "next_offset" not in result
+    assert 0 < result["total"] < 600
+    whole = node_types.node_type({"query": "filler", "limit": 5}, ToolContext(hou=scene.module()))
+    assert whole["total"] == 600 and "stopped" not in whole
+
+
+def test_a_page_after_the_asset_library_changed_says_so(
+    bench: Bench, scene: Scene, tmp_path: Path
+) -> None:
+    import os
+
+    library = tmp_path / "tool.hda"
+    library.write_bytes(b"an asset library")
+    tool = scene.library["Sop"].types["com.example::tool::1.0"]
+    tool._library = str(library)
+    tool.templates.extend(
+        ParmTemplate("Float", f"Extra {index}", (0.0,), name=f"x{index}") for index in range(3)
+    )
+    arguments = {"context": "sop", "type": "com.example::tool::1.0", "detail": "standard"}
+    first = ok(lookup(bench, **arguments, limit=2))
+    stamp = library.stat().st_mtime_ns + 5_000_000_000
+    os.utime(library, ns=(stamp, stamp))
+    second = ok(lookup(bench, **arguments, limit=2, page=first["next_page"]))
+    assert second["changed"] is True
+
+
+def test_a_definition_that_went_stale_is_read_again_once(bench: Bench, scene: Scene) -> None:
+    from fake_hou import ObjectWasDeleted
+
+    wrangle = scene.library["Sop"].types["attribwrangle"]
+    real = wrangle.parmTemplateGroup
+    failures = [ObjectWasDeleted("the definition was reloaded")]
+
+    def once() -> Any:
+        if failures:
+            raise failures.pop()
+        return real()
+
+    wrangle.parmTemplateGroup = once  # type: ignore[method-assign]
+    body = ok(lookup(bench, context="sop", type="attribwrangle", detail="standard"))
+    assert body["total"] == 9
+
+
+def test_a_definition_that_stays_broken_is_a_coded_error_not_an_empty_card(
+    bench: Bench, scene: Scene
+) -> None:
+    from fake_hou import ObjectWasDeleted
+
+    wrangle = scene.library["Sop"].types["attribwrangle"]
+
+    def broken() -> Any:
+        raise ObjectWasDeleted("the definition is gone")
+
+    wrangle.parmTemplateGroup = broken  # type: ignore[method-assign]
+    refused = error(lookup(bench, context="sop", type="attribwrangle", detail="standard"))
+    assert refused["code"] == "NODE_NOT_FOUND"
+    assert refused["details"]["exception"] == "ObjectWasDeleted"
+
+
+def test_a_category_that_cannot_list_its_types_is_not_a_missing_type(
+    bench: Bench, scene: Scene
+) -> None:
+    from fake_hou import OperationFailed
+
+    def broken() -> Any:
+        raise OperationFailed("the category could not be read")
+
+    scene.library["Sop"].nodeTypes = broken  # type: ignore[method-assign]
+    refused = error(lookup(bench, context="sop", type="attribwrangle"))
+    assert refused["code"] == "TOOL_FAILED"
+    assert refused["details"]["exception"] == "OperationFailed"
+
+
+def test_help_that_cannot_be_read_says_so_and_is_tried_again_later(
+    bench: Bench, hfs: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = hfs / "houdini" / "help" / "nodes.zip"
+    archive.write_bytes(b"not an archive")
+    card = ok(lookup(bench, context="sop", type="xform", detail="full"))
+    assert card["help_available"] is False
+    assert card["help_summary"] is None
+    searched = ok(lookup(bench, context="sop", query="wrangle"))
+    assert searched["help_available"] is False
+    # A package's pages are still read.
+    labs = ok(lookup(bench, context="sop", type="labs::thing::1.0", include=["help"]))
+    assert labs["help_summary"] == "Makes a thing from its input."
+    made: list[Any] = []
+    real = node_types._open_archive
+
+    def counted(path: Any) -> Any:
+        made.append(path)
+        return real(path)
+
+    monkeypatch.setattr(node_types, "_open_archive", counted)
+    ok(lookup(bench, context="sop", query="wrangle"))
+    assert made == []
+    monkeypatch.setattr(node_types, "HELP_RETRY_S", 0.0)
+    ok(lookup(bench, context="sop", query="wrangle"))
+    assert len(made) == 1
+
+
+def test_a_menu_whose_items_toggle_keeps_its_mask_and_no_token_is_asked_for(
+    bench: Bench,
+) -> None:
+    # The stand in's `defaultValueAsString` crashes the way Houdini does, so
+    # reading every menu at full proves it is never asked.
+    body = ok(lookup(bench, context="sop", type="attribwrangle", detail="full"))
+    rows = by_name(body["parms"])
+    assert rows["channels"]["default"] == 511
+    assert rows["channels"]["menu_toggles"] is True
+    assert [item["token"] for item in rows["channels"]["menu"]][:2] == ["tx", "ty"]
+    assert rows["class"]["default"] == "point" and "menu_toggles" not in rows["class"]
+
+
+def test_help_that_is_there_is_not_marked(bench: Bench) -> None:
+    card = ok(lookup(bench, context="sop", type="xform", detail="full"))
+    assert "help_available" not in card
+    summary = ok(lookup(bench, context="sop", type="xform"))
+    assert "help_available" not in summary
+
+
+def test_a_missing_help_archive_is_not_available(
+    bench: Bench, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    empty = tmp_path / "no-help"
+    empty.mkdir()
+    monkeypatch.setenv("HFS", str(empty))
+    card = ok(lookup(bench, context="sop", type="xform", include=["help"]))
+    assert card["help_available"] is False

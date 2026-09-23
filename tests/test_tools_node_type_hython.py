@@ -204,3 +204,34 @@ def test_a_namespaced_type_where_the_build_ships_one(place: dict[str, Any]) -> N
     assert body["type"] == name
     assert body["namespace"] == name.split("::")[0]
     assert body["parms"]
+
+
+def test_a_menu_whose_items_toggle_is_read_without_asking_for_its_token(
+    place: dict[str, Any],
+) -> None:
+    # Asking this build for the default token of such a menu ends the process.
+    [result] = run(
+        place,
+        ("hou_node_type", {"context": "obj", "type": "blend", "detail": "full", "limit": 2000}),
+    )
+    rows = {row["name"]: row for row in ok(result)["parms"]}
+    toggles = [row for row in rows.values() if row.get("menu_toggles")]
+    assert toggles
+    assert all(isinstance(row["default"], int) for row in toggles)
+    [alive] = run(place, ("hou_ping", {}))
+    assert ok(alive)["call"]["ok"] is True
+
+
+def test_a_ragdoll_solver_has_its_bare_label(place: dict[str, Any]) -> None:
+    [result] = run(
+        place,
+        (
+            "hou_node_type",
+            {"context": "sop", "type": "kinefx::ragdollsolver", "detail": "standard"},
+        ),
+    )
+    if result.is_error and result.structured_content["error"]["code"] == "TYPE_NOT_FOUND":
+        pytest.skip("this build has no ragdoll solver")
+    body = ok(result)
+    assert body["inputs"][0]["label"] == "Skeleton"
+    assert body["labels_from"] == "dialog_script"

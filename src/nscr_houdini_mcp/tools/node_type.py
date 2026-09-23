@@ -12,7 +12,8 @@ assets and this build's own versions are the ones described.
 - `query` searches the types by keyword over name, label and help line,
   closest first: the exact name, then a name that starts with it, then one
   that holds it, then the label, then the help. Hidden types are left out
-  unless `include` has `hidden`.
+  unless `include` has `hidden`. A query is at most 200 characters and 16
+  different words.
 
 `summary` is who the type is, its input and output counts and how many
 parameters it has. `standard` adds the inputs, the outputs and the visible
@@ -40,7 +41,11 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-from nscr_houdini_mcp.bridge.node_types import TYPE_INCLUDES
+from nscr_houdini_mcp.bridge.node_types import (
+    MAX_QUERY_CHARS,
+    MAX_QUERY_WORDS,
+    TYPE_INCLUDES,
+)
 from nscr_houdini_mcp.bridge.tools import DEFAULT_LIMIT, MAX_LIMIT
 from nscr_houdini_mcp.results import CallError
 from nscr_houdini_mcp.tools.base import DETAIL, SESSION, WAIT_S, Call, ToolSpec, inputs, outputs
@@ -86,6 +91,12 @@ def node_type(call: Call) -> Mapping[str, Any]:
             "BAD_ARGUMENTS",
             "a type has only defaults; parm_filter takes all or a glob",
             details={"argument": "parm_filter"},
+        )
+    if query is not None and len(set(str(query).lower().split())) > MAX_QUERY_WORDS:
+        raise CallError(
+            "BAD_ARGUMENTS",
+            f"query is at most {MAX_QUERY_WORDS} different words",
+            details={"argument": "query"},
         )
     within("limit", arguments.get("limit"), MAX_LIMIT)
     mode = "type" if named is not None else "query"
@@ -227,7 +238,7 @@ HOU_NODE_TYPE = ToolSpec(
             "session": SESSION,
             "context": {"type": "string"},
             "type": {"type": "string"},
-            "query": {"type": "string"},
+            "query": {"type": "string", "maxLength": MAX_QUERY_CHARS},
             "parm_filter": {"type": "string"},
             "include": {"type": "array", "items": {"enum": list(TYPE_INCLUDES)}},
             "detail": DETAIL,

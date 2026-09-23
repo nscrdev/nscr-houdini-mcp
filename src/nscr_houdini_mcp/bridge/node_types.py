@@ -41,6 +41,7 @@ import json
 import os
 import re
 import threading
+import time
 import zipfile
 from collections.abc import Callable, Mapping
 from fnmatch import fnmatchcase
@@ -144,6 +145,16 @@ _LINK = re.compile(r"\[([^\]|]*)(?:\|[^\]]*)?\]")
 _SECTION = re.compile(r"^@(\w+)\s*$", re.MULTILINE)
 _HEADING = re.compile(r"^(\S[^\n]*?):\s*$", re.MULTILINE)
 
+# The longest search, in characters and in words, and how many types a
+# search looks at between two looks at whether it has been asked to stop.
+MAX_QUERY_CHARS = 200
+MAX_QUERY_WORDS = 16
+STOP_EVERY = 256
+
+# How long a help index that could not be read is kept before it is tried
+# again, so a Houdini whose help was missing or broken is not asked every call.
+HELP_RETRY_S = 60.0
+
 # Headings in a help page's inputs that are not inputs: a note to the reader.
 NOTE_WORDS = frozenset({"NOTE", "NOTES", "TIP", "TIPS", "WARNING", "IMPORTANT", "CAUTION"})
 
@@ -169,7 +180,9 @@ def node_type(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, A
     chosen = _category(categories, arguments.get("context"))
     page = (offset, limit)
     if arguments.get("query") is not None:
-        return _search(hou, categories, chosen, str(arguments["query"]), set(included), page)
+        return _search(
+            hou, categories, chosen, str(arguments["query"]), set(included), page, context
+        )
     if arguments.get("type") is None:
         raise BridgeError("BAD_ARGUMENTS", "node.type needs type or query")
     reader = _TypeReader(level, set(included), arguments.get("parm_filter"))
@@ -180,7 +193,8 @@ def node_type(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, A
 
 
 def _categories(hou: Any) -> dict[str, Any]:
-    found = _quiet(hou.nodeTypeCategories) or {}
+    """Every category. A failure to list them is the call's failure, not an empty list."""
+    found = hou.nodeTypeCategories() or {}
     return {str(name): category for name, category in dict(found).items()}
 
 
@@ -206,7 +220,8 @@ def _category(categories: Mapping[str, Any], given: Any) -> Any:
 
 
 def _types_of(category: Any) -> dict[str, Any]:
-    return {str(name): kind for name, kind in dict(_quiet(category.nodeTypes) or {}).items()}
+    """A category's types. A failure to list them is not a type that is missing."""
+    return {str(name): kind for name, kind in dict(category.nodeTypes() or {}).items()}
 
 
 def _category_name(category: Any) -> str:
@@ -393,14 +408,23 @@ class _TypeReader:
         asked: str,
         page: tuple[int, int],
     ) -> dict[str, Any]:
-        node_type, category, looked_up = _find(hou, categories, chosen, asked)
-        name = str(_ask(node_type, "name") or "")
-        least = int(_ask(node_type, "minNumInputs") or 0)
-        most = int(_ask(node_type, "maxNumInputs") or 0)
-        outputs = int(_ask(node_type, "maxNumOutputs") or 0)
+        try:
+            node_type, category, looked_up = _find(hou, categories, chosen, asked)
+            name, least, most, outputs, label, rows = self.read(node_type)
+        except BridgeError:
+            raise
+        except Exception:  # noqa: BLE001 - one more try, then the error is the answer
+            # A definition loaded again while it was read leaves the type
+            # object behind it stale. It is looked up once more, and what
+            # that raises goes to the caller as a coded error.
+            categories = _categories(hou)
+            if chosen is not None:
+                chosen = categories.get(_category_name(chosen), chosen)
+            node_type, category, looked_up = _find(hou, categories, chosen, asked)
+            name, least, most, outputs, label, rows = self.read(node_type)
         result: dict[str, Any] = {
             "type": name,
-            "label": str(_ask(node_type, "description") or ""),
+            "label": label,
             "category": _category_name(category),
             "min_inputs": least,
             "max_inputs": most,
@@ -408,7 +432,6 @@ class _TypeReader:
         }
         if looked_up != name:
             result["resolved_from"] = looked_up
-        rows = self.rows(_entries(node_type), (), hidden=False, multi=False)
         if not self.standard:
             result["parm_count"] = len(rows)
         kept: list[Any] = []
@@ -446,8 +469,20 @@ class _TypeReader:
             page_help = help_page()
             result["help_summary"] = page_help["summary"] if page_help else None
             result["help_path"] = page_help["path"] if page_help else None
-        result["mark"] = _mark([row["name"] for row in rows])
+        if kept and not _HELP.available:
+            result["help_available"] = False
+        result["mark"] = _mark(rows, identity=_definition_identity(node_type))
         return result
+
+    def read(self, node_type: Any) -> tuple[str, int, int, int, str, list[dict[str, Any]]]:
+        """What a card cannot do without, read strictly: a failure here is not an empty card."""
+        name = str(node_type.name())
+        least = int(node_type.minNumInputs() or 0)
+        most = int(node_type.maxNumInputs() or 0)
+        outputs = int(node_type.maxNumOutputs() or 0)
+        label = str(node_type.description() or "")
+        rows = self.rows(_entries(node_type), (), hidden=False, multi=False)
+        return name, least, most, outputs, label, rows
 
     def rows(
         self, templates: Any, folders: tuple[str, ...], *, hidden: bool, multi: bool
@@ -468,7 +503,7 @@ class _TypeReader:
                 label = str(_ask(template, "label") or _ask(template, "name") or "")
                 found.extend(
                     self.rows(
-                        _ask(template, "parmTemplates"),
+                        template.parmTemplates(),
                         (*folders, label),
                         hidden=concealed,
                         multi=multi,
@@ -479,7 +514,7 @@ class _TypeReader:
                 continue
             row = self.row(template, kind, folders, hidden=concealed, multi=multi)
             if kind == "Folder":
-                inner = self.rows(_ask(template, "parmTemplates"), (), hidden=concealed, multi=True)
+                inner = self.rows(template.parmTemplates(), (), hidden=concealed, multi=True)
                 matched = multi or self.keeps(row["name"])
                 if not matched:
                     inner = [item for item in inner if self.keeps(item["name"])]
@@ -504,6 +539,8 @@ class _TypeReader:
         }
         size = _ask(template, "numComponents")
         row["size"] = int(size) if isinstance(size, int) else 1
+        if kind == "Menu" and _toggles(template):
+            row["menu_toggles"] = True
         if kind == "Ramp":
             points = _ask(template, "defaultValue")
             if isinstance(points, int):
@@ -541,18 +578,14 @@ class _TypeReader:
 
 
 def _entries(node_type: Any) -> list[Any]:
-    group = _ask(node_type, "parmTemplateGroup")
-    if group is None:
-        return list(_ask(node_type, "parmTemplates") or ())
-    entries = _ask(group, "entries")
-    if entries is None:
-        entries = _ask(group, "parmTemplates")
-    return list(entries or ())
+    """A type's top level templates. Houdini raising here is the call's failure."""
+    group = node_type.parmTemplateGroup()
+    reader = getattr(group, "entries", None) or group.parmTemplates
+    return list(reader() or ())
 
 
 def _kind(template: Any) -> str:
-    kind = _quiet(lambda: template.type().name())
-    return str(kind) if kind else ""
+    return str(template.type().name() or "")
 
 
 def _is_multiparm(template: Any) -> bool:
@@ -567,15 +600,27 @@ def _single(values: Any) -> Any:
 
 
 def _default(template: Any, kind: str) -> Any:
-    """The default as the pane shows it. A menu's is the token it selects."""
-    if kind == "Menu":
-        token = _ask(template, "defaultValueAsString")
-        if token is not None:
-            return str(token)
+    """The default as the pane shows it. A menu's is the token it selects.
+
+    The token is looked up here from the index and the menu's items, never
+    asked of the template: `defaultValueAsString` takes a menu whose items
+    toggle on and off for a plain one, reads its default, which is a mask of
+    the items that are on, as an index, and brings the whole of Houdini down.
+    Such a menu's default stays the mask.
+    """
     value = _ask(template, "defaultValue")
     if value is None:
         return None
+    if kind == "Menu" and not _toggles(template) and isinstance(value, int):
+        items = list(_ask(template, "menuItems") or ())
+        if 0 <= value < len(items):
+            return str(items[value])
     return _single(value)
+
+
+def _toggles(template: Any) -> bool:
+    """Whether a menu's items are turned on and off each, rather than one chosen."""
+    return "toggle" in str(_ask(template, "menuType") or "").lower()
 
 
 def _default_expression(template: Any) -> Any:
@@ -707,9 +752,31 @@ def _inputs(least: int, most: int, labels: Mapping[int, str]) -> tuple[list[dict
     return listed, count < most
 
 
-def _mark(names: list[str]) -> str:
-    text = json.dumps(names, separators=(",", ":"))
+def _mark(rows: list[Any], *, identity: Any = None) -> str:
+    """A fingerprint of every row a lookup pages through, and where they came from.
+
+    Any change to a row, a default or a menu as much as a name, changes it,
+    and so does a definition loaded again from its library.
+    """
+    text = json.dumps(
+        {"rows": rows, "from": identity}, sort_keys=True, separators=(",", ":"), default=str
+    )
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _definition_identity(node_type: Any) -> list[Any] | None:
+    """The library an asset was loaded from and when that file last changed."""
+    definition = _ask(node_type, "definition")
+    if definition is None:
+        return None
+    path = _ask(definition, "libraryFilePath")
+    changed = None
+    if path:
+        try:
+            changed = os.stat(str(path)).st_mtime_ns
+        except (OSError, ValueError):
+            changed = None
+    return [None if path is None else str(path), changed]
 
 
 # Section: searching
@@ -722,11 +789,31 @@ def _search(
     query: str,
     included: set[str],
     page: tuple[int, int],
+    context: ToolContext,
 ) -> dict[str, Any]:
-    wanted = " ".join(query.lower().split())
-    if not wanted:
+    """Every type that matches, closest first, a page at a time.
+
+    A search that is asked to stop, because its caller gave up or the
+    session is going down, hands back what it had ranked so far and says
+    `stopped`, with no next page, since the order of a partial search is not
+    the order of the whole one.
+    """
+    if len(query) > MAX_QUERY_CHARS:
+        raise BridgeError(
+            "BAD_ARGUMENTS",
+            f"query is at most {MAX_QUERY_CHARS} characters",
+            {"argument": "query", "given": len(query)},
+        )
+    words = list(dict.fromkeys(query.lower().split()))
+    if not words:
         raise BridgeError("BAD_ARGUMENTS", "query needs a word to look for", {"argument": "query"})
-    words = wanted.split()
+    if len(words) > MAX_QUERY_WORDS:
+        raise BridgeError(
+            "BAD_ARGUMENTS",
+            f"query is at most {MAX_QUERY_WORDS} words",
+            {"argument": "query", "given": len(words)},
+        )
+    wanted = " ".join(words)
     if chosen is not None:
         looked = [chosen]
     else:
@@ -738,9 +825,17 @@ def _search(
         ]
     pages = _HELP.pages(hou)
     ranked: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    stopped = False
+    seen = 0
     for order, category in enumerate(looked):
+        if stopped:
+            break
         place = _category_name(category)
         for name, node_type in _types_of(category).items():
+            seen += 1
+            if seen % STOP_EVERY == 0 and context.should_stop():
+                stopped = True
+                break
             hidden = bool(_ask(node_type, "hidden"))
             if hidden and "hidden" not in included:
                 continue
@@ -779,8 +874,11 @@ def _search(
                 name,
             )
             ranked.append((key, row))
+    if not stopped and context.should_stop():
+        stopped = True
     ranked.sort(key=lambda pair: pair[0])
     rows = [row for _, row in ranked]
+    mark = _mark(rows)
     offset, limit = page
     chosen_rows = rows[offset : offset + limit]
     for row in chosen_rows:
@@ -798,11 +896,15 @@ def _search(
         "query": query,
         "rows": chosen_rows,
         "total": len(rows),
-        "mark": _mark([f"{row['category']}/{row['type']}" for row in rows]),
+        "mark": mark,
     }
     if chosen is not None:
         result["category"] = _category_name(chosen)
-    if offset + len(chosen_rows) < len(rows):
+    if not _HELP.available:
+        result["help_available"] = False
+    if stopped:
+        result["stopped"] = True
+    elif offset + len(chosen_rows) < len(rows):
         result["more"] = True
         result["next_offset"] = offset + len(chosen_rows)
     return result
@@ -859,23 +961,39 @@ class _HelpIndex:
         self._source: tuple[Any, ...] | None = None
         self._pages: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         self._archive: zipfile.ZipFile | None = None
+        # Whether the shipped help could be read, and when it was last tried.
+        self.available = True
+        self._tried = 0.0
 
     def pages(self, hou: Any) -> dict[tuple[str, str, str, str], dict[str, Any]]:
-        """The index, made again first when anything it was made from has changed."""
+        """The index, made again first when anything it was made from has changed.
+
+        When the shipped help is missing or cannot be read, that is kept apart
+        from an index that is merely empty: `available` says so, and it is
+        tried again once `HELP_RETRY_S` has gone by, whether or not anything
+        seems to have changed.
+        """
         archive = _help_archive(hou)
         folders = _help_folders(hou)
-        source = (_stamp(archive), tuple(_folder_stamp(folder) for folder in folders))
+        source = (archive, _stamp(archive), tuple(_folder_stamp(folder) for folder in folders))
+        now = time.monotonic()
         with self._lock:
-            if self._source != source:
+            stale = not self.available and now - self._tried >= HELP_RETRY_S
+            if self._source != source or stale:
                 self._close()
                 opened = _open_archive(archive)
-                pages = _read_archive(opened) if opened is not None else {}
+                shipped = _read_archive(opened) if opened is not None else None
+                pages = dict(shipped or {})
                 for folder in folders:
                     for key, page in _read_folder(folder).items():
                         pages.setdefault(key, page)
-                self._archive = opened
+                if shipped is None and opened is not None:
+                    opened.close()
+                self._archive = opened if shipped is not None else None
                 self._pages = pages
                 self._source = source
+                self.available = shipped is not None
+                self._tried = now
             return self._pages
 
     def page_for(
@@ -1007,7 +1125,10 @@ def _page_key(folder: str, parsed: dict[str, Any]) -> tuple[str, str, str, str] 
     return (folder, namespace, internal, version)
 
 
-def _read_archive(archive: zipfile.ZipFile) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+def _read_archive(
+    archive: zipfile.ZipFile,
+) -> dict[tuple[str, str, str, str], dict[str, Any]] | None:
+    """The pages in the shipped archive, or nothing when it cannot be read."""
     pages: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     try:
         for member in archive.namelist():
@@ -1023,8 +1144,8 @@ def _read_archive(archive: zipfile.ZipFile) -> dict[tuple[str, str, str, str], d
             parsed["path"] = f"/nodes/{member[: -len('.txt')]}"
             parsed["member"] = member
             pages.setdefault(key, parsed)
-    except (OSError, zipfile.BadZipFile):
-        return {}
+    except (OSError, EOFError, zipfile.BadZipFile):
+        return None
     return pages
 
 
