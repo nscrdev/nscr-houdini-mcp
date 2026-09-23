@@ -682,3 +682,28 @@ def test_the_name_a_running_session_had_before_its_rename_still_finds_it(
         records = store.list_sessions(include_gone=True)
     assert sessions_tool.named(records, "untitled-1").session_id == "s-1"
     assert sessions_tool.named(records, "untitled-2").session_id == "s-2"
+
+
+def _renamed_gui(bench: Bench) -> None:
+    bench.session("s-2", "untitled-1", kind="gui")
+    with bench.store() as store:
+        store.rename_session("s-2", alias_template="shot_010-{n}")
+
+
+def test_info_by_the_name_a_session_had_says_what_it_answers_to_now(bench: Bench) -> None:
+    _renamed_gui(bench)
+    _, [result] = talk(bench.serve(), ("hou_sessions", {"action": "info", "session": "untitled-1"}))
+    assert not result.is_error, text_of(result)
+    trace = result.structured_content["trace"]
+    assert trace["session_id"] == "s-2"
+    assert trace["alias"] == "shot_010-1"
+    [warning] = trace["warnings"]
+    assert (warning["code"], warning["alias"]) == ("ALIAS_RENAMED", "shot_010-1")
+
+
+def test_stop_by_the_name_a_session_had_says_what_it_answers_to_now(bench: Bench) -> None:
+    _renamed_gui(bench)
+    _, [result] = talk(bench.serve(), ("hou_sessions", {"action": "stop", "session": "untitled-1"}))
+    assert result.structured_content["error"]["code"] == "NOT_A_WORKER"
+    [warning] = result.structured_content["trace"]["warnings"]
+    assert (warning["code"], warning["alias"]) == ("ALIAS_RENAMED", "shot_010-1")

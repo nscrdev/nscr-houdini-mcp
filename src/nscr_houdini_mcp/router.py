@@ -178,23 +178,9 @@ def _named(
     by_id = next((record for record in records if record.session_id == handle), None)
     if by_id is not None:
         return _usable(by_id, live)
-    # The newest session under an alias is the one that name means now.
-    by_alias = [record for record in records if record.alias == handle]
-    by_alias.sort(key=lambda record: record.started_at, reverse=True)
-    current = [record for record in by_alias if record.state not in DEAD_STATES]
-    if current:
-        return _usable(current[0], live)
-    # A session that took its scene's name still answers to the one it had,
-    # which the store holds for it while it runs.
-    renamed = [
-        record
-        for record in records
-        if record.previous_alias == handle and record.state not in DEAD_STATES
-    ]
-    if renamed:
-        return _usable(renamed[0], live)
-    if by_alias:
-        return _usable(by_alias[0], live)
+    found = holder(records, handle)
+    if found is not None:
+        return _usable(found, live)
     names = sorted(
         {r.alias for r in records if r.state not in DEAD_STATES} | {r.session_id for r in live}
     )
@@ -207,6 +193,27 @@ def _named(
             "live": [row(record) for record in live],
         },
     )
+
+
+def holder(
+    records: Sequence[SessionRecord], handle: str, *, ended: Sequence[str] = DEAD_STATES
+) -> SessionRecord | None:
+    """The session a name means, by its alias now or the one it had before.
+
+    One that has not ended and answers to the name now comes first, then one
+    that has not ended and had it before a rename, which the store holds for
+    it while it runs. Among sessions that have ended, the newest to hold the
+    name either way, so a refusal names the session the caller last knew by it.
+    """
+    now_or_before = [r for r in records if handle in (r.alias, r.previous_alias)]
+    now_or_before.sort(key=lambda record: record.started_at, reverse=True)
+    for wanted in (handle, None):
+        for record in now_or_before:
+            if record.state in ended:
+                continue
+            if wanted is None or record.alias == wanted:
+                return record
+    return now_or_before[0] if now_or_before else None
 
 
 def _usable(record: SessionRecord, live: Sequence[SessionRecord]) -> SessionRecord:

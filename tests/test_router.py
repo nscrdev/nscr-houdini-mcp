@@ -236,6 +236,36 @@ def test_a_session_that_holds_a_name_now_wins_over_one_that_held_it_before() -> 
     assert choose(rows, "untitled-1").session_id == "s-2"
 
 
+def test_the_old_name_of_a_renamed_session_that_ended_names_that_session() -> None:
+    """Not unknown, and not an older session that once held the same name."""
+    rows = [
+        record("s-0", "untitled-1", state="gone", kind="gui", started_at=1.0),
+        record(
+            "s-1",
+            "shot_010-1",
+            state="gone",
+            kind="gui",
+            started_at=2.0,
+            previous_alias="untitled-1",
+        ),
+    ]
+    for known in (rows, rows[1:]):
+        with pytest.raises(CallError) as caught:
+            choose(known, "untitled-1")
+        assert caught.value.code == "SESSION_DEAD"
+        assert caught.value.details["session_id"] == "s-1"
+
+
+def test_a_later_holder_of_an_old_name_is_the_one_it_means() -> None:
+    rows = [
+        record("s-1", "shot_010-1", state="gone", started_at=2.0, previous_alias="untitled-1"),
+        record("s-3", "untitled-1", state="gone", started_at=3.0),
+    ]
+    with pytest.raises(CallError) as caught:
+        choose(rows, "untitled-1")
+    assert caught.value.details["session_id"] == "s-3"
+
+
 def test_an_unresponsive_session_is_refused_with_the_others_listed() -> None:
     rows = [record("s-1", "w1", state="unresponsive"), record("s-2", "w2")]
     with pytest.raises(CallError) as caught:

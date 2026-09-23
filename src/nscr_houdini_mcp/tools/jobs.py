@@ -285,13 +285,18 @@ def list_jobs(call: Call) -> dict[str, Any]:
 
 
 def sessions_named(store: store_module.Store, handle: str) -> list[str]:
-    """Every session a list filter means: one id, or every session under an alias."""
+    """Every session a list filter means: one id, or every session under an alias.
+
+    A session that took its scene's name is under the name it had before too.
+    """
     handle = handle.strip()
     records = stored(lambda: store.list_sessions(include_gone=True))
     by_id = [record.session_id for record in records if record.session_id == handle]
     if by_id:
         return by_id
-    return [record.session_id for record in records if record.alias == handle]
+    return [
+        record.session_id for record in records if handle in (record.alias, record.previous_alias)
+    ]
 
 
 def list_row(record: JobRecord, now: float) -> dict[str, Any]:

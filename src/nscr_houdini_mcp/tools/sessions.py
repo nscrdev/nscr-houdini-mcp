@@ -43,7 +43,15 @@ from nscr_houdini_mcp.bridge import marshal
 from nscr_houdini_mcp.bridge.app import LOG_DIR_NAME
 from nscr_houdini_mcp.config import Config, ConfigError, resolve_hython
 from nscr_houdini_mcp.results import CallError
-from nscr_houdini_mcp.router import LIVE_STATES, Router, Target, choose, dead
+from nscr_houdini_mcp.router import (
+    LIVE_STATES,
+    Router,
+    Target,
+    choose,
+    dead,
+    holder,
+    renamed,
+)
 from nscr_houdini_mcp.store import SessionRecord, WorkerRecord
 from nscr_houdini_mcp.tools.base import (
     DETAIL,
@@ -110,7 +118,8 @@ def session_info(call: Call) -> dict[str, Any]:
     """
     router = call.router
     records, workers, _active = read_rows(router)
-    record = named(records, call.arguments.get("session"), router.default_session)
+    handle = call.arguments.get("session")
+    record = named(records, handle, router.default_session)
     call.trace.update(
         {
             "session_id": record.session_id,
@@ -118,6 +127,7 @@ def session_info(call: Call) -> dict[str, Any]:
             "scene_epoch": record.scene_epoch,
         }
     )
+    warn_if_renamed(call, record, handle)
     if record.state == store_module.SESSION_GONE:
         target, health, state = None, None, ended_state(record)
     else:
@@ -448,6 +458,7 @@ def stop_worker(call: Call) -> dict[str, Any]:
 def stop_one(call: Call, store: Any, handle: str, progress: dict[str, bool]) -> dict[str, Any]:
     router = call.router
     record = named(router.records(include_gone=True), handle)
+    warn_if_renamed(call, record, handle)
     if record.state == store_module.SESSION_GONE:
         raise dead(record.session_id, record.alias, [])
     if record.kind != "hython":
@@ -499,8 +510,9 @@ def named(
 ) -> SessionRecord:
     """The session a caller means, in whatever state it is.
 
-    By id first, then the newest under an alias, preferring one that has not
-    ended. With no name, the usual rules for a call that names none.
+    By id first, then by name the way the router reads one, preferring a
+    session that has not ended. With no name, the usual rules for a call that
+    names none.
     """
     if not handle:
         return choose(records, None, default=default)
@@ -508,18 +520,19 @@ def named(
     for record in records:
         if record.session_id == handle:
             return record
-    under = sorted((r for r in records if r.alias == handle), key=lambda r: r.started_at)
-    open_ones = [r for r in under if r.state != store_module.SESSION_GONE]
-    if open_ones:
-        return open_ones[-1]
-    # The name a running session had before it took its scene's still finds it.
-    renamed = [
-        r for r in records if r.previous_alias == handle and r.state != store_module.SESSION_GONE
-    ]
-    if renamed or under:
-        return (renamed or under)[-1]
+    found = holder(records, handle, ended=(store_module.SESSION_GONE,))
+    if found is not None:
+        return found
     # Nobody by that name: the rules say so, with the nearest names.
     return choose(records, handle)
+
+
+def warn_if_renamed(call: Call, record: SessionRecord, handle: str | None) -> None:
+    """Say so when the caller named a session by the name it had before."""
+    warnings = renamed(record, handle)
+    if warnings:
+        held = list(call.trace.get("warnings") or [])
+        call.trace["warnings"] = held + [dict(warning) for warning in warnings]
 
 
 def refuse_if_in_use(router: Router, record: SessionRecord, worker: WorkerRecord) -> None:
