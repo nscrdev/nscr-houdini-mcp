@@ -98,6 +98,16 @@ QT_PLATFORM_ENV_VAR = "QT_QPA_PLATFORM"
 QT_PLATFORM = "offscreen"
 
 
+def _mark_session(bridge: Bridge) -> None:
+    """Record this bridge on `hou.session` under the name the startup module checks."""
+    try:
+        import hou
+
+        hou.session.nscr_mcp_bridge = bridge
+    except Exception:  # noqa: BLE001 - a bridge that runs is worth more than the mark
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     os.environ.setdefault(QT_PLATFORM_ENV_VAR, QT_PLATFORM)
     args = build_parser().parse_args(argv)
@@ -115,6 +125,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     bridge = Bridge(config)
     record = bridge.start()
+    # Hang it where the startup module looks, so an autostart that runs later in
+    # this process, from a package of any version, keeps this one.
+    _mark_session(bridge)
     # The token is not printed here and never is. Whoever may read the session
     # file may read the token.
     print(f"bridge {record.alias} {record.session_id} on port {bridge.port}", flush=True)

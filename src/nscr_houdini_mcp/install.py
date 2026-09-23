@@ -73,6 +73,9 @@ HFS_ENV_VAR = "HFS"
 PAYLOAD_ENV_VAR = "NSCR_MCP_PAYLOAD"
 SOURCE_ENV_VAR = "NSCR_MCP_SRC"
 AUTOSTART_ENV_VAR = "NSCR_MCP_AUTOSTART"
+# A hython this tool starts with its own bridge sets this, so a package
+# installed with autostart does not open a second bridge in it.
+NO_AUTOSTART_ENV_VAR = "NSCR_MCP_NO_AUTOSTART"
 
 # What Houdini itself puts in place of the version in a pref dir setting.
 VERSION_TOKEN = "__HVER__"
@@ -685,6 +688,8 @@ def ask_houdini(version: str = DEFAULT_HOUDINI_VERSION) -> tuple[HoudiniAnswer |
             errors="replace",
             timeout=ASK_TIMEOUT_S,
             check=False,
+            # Only a question: a package installed with autostart opens no bridge here.
+            env={**os.environ, NO_AUTOSTART_ENV_VAR: "1"},
         )
     except subprocess.TimeoutExpired:
         return None, f"{hython} did not answer within {ASK_TIMEOUT_S:.0f} seconds"

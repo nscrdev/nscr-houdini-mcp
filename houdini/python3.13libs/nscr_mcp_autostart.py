@@ -18,6 +18,10 @@ import sys
 import traceback
 
 AUTOSTART_VAR = "NSCR_MCP_AUTOSTART"
+# Set by this tool when it starts a hython with a bridge of its own. A package
+# installed with autostart sets the variable above in every Houdini it loads
+# into, workers included, so the worker says it here instead.
+KEEP_OUT_VAR = "NSCR_MCP_NO_AUTOSTART"
 PORT_VAR = "NSCR_MCP_PORT"
 MAX_PORT_VAR = "NSCR_MCP_MAX_PORT"
 HOME_VAR = "NSCR_MCP_HOME"
@@ -34,6 +38,8 @@ HIGHEST_PORT = 65535
 
 def wanted():
     """Whether this session was asked to open a port at startup."""
+    if os.environ.get(KEEP_OUT_VAR, "0").strip().lower() in TRUE_WORDS:
+        return False
     return os.environ.get(AUTOSTART_VAR, "0").strip().lower() in TRUE_WORDS
 
 

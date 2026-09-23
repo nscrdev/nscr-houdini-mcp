@@ -251,6 +251,8 @@ class HythonBridge:
             source_root if not existing else os.pathsep.join([source_root, existing])
         )
         environment[HOME_ENV_VAR] = str(self.home)
+        # This hython starts its own bridge; one from an autostart package would be a second.
+        environment[install_module.NO_AUTOSTART_ENV_VAR] = "1"
         # A worker started from here exists to be driven and tested, so it
         # carries the self check tool. Nothing else turns it on.
         environment[app.SELFCHECK_ENV_VAR] = "1"

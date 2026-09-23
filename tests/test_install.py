@@ -708,6 +708,19 @@ def test_a_port_range_that_makes_no_sense_is_refused(
     assert capsys.readouterr().err.count("\n") == 3
 
 
+def test_a_hython_this_tool_started_keeps_an_autostart_package_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A package installed with autostart sets the variable in every Houdini it
+    # loads into; a worker opens its own bridge and must not get a second.
+    module = autostart_module()
+    monkeypatch.setenv(module.AUTOSTART_VAR, "1")
+    assert module.wanted() is True
+    monkeypatch.setenv(module.KEEP_OUT_VAR, "1")
+    assert module.wanted() is False
+    assert module.KEEP_OUT_VAR == install_module.NO_AUTOSTART_ENV_VAR
+
+
 def test_a_start_that_fails_says_so_and_writes_the_story_down(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -296,6 +296,8 @@ def worker_env(
         source_root if not existing else os.pathsep.join([source_root, existing])
     )
     environment[store_module.HOME_ENV_VAR] = str(config.home)
+    # The worker starts its own bridge; one from an autostart package would be a second.
+    environment[install_module.NO_AUTOSTART_ENV_VAR] = "1"
     threads = thread_cap(config, weight)
     if threads is None:
         # Houdini's own default, whatever this shell was carrying.

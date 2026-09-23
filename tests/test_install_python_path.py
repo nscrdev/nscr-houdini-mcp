@@ -688,6 +688,7 @@ def test_a_launched_hython_is_never_given_the_whole_environment(
     stand_in = home / "hython"
     stand_in.write_text("")
     given = HythonBridge(home=home, env={}, hython=stand_in)._child_env()
+    assert given[install_module.NO_AUTOSTART_ENV_VAR] == "1"
     assert given["PYTHONPATH"] == str(
         install_module.copy_for_source(
             from_site / install_module.PACKAGE_NAME, home, stamp_of(from_site)

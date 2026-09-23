@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+from nscr_houdini_mcp import install as install_module
 from nscr_houdini_mcp import pool
 from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge import client, registry
@@ -886,3 +887,8 @@ def test_a_worker_nothing_was_read_about_still_lists(store: Store) -> None:
     row = pool.list_workers(store)[0]
     assert row["capabilities"] == "-"
     assert row["pid"] == "-"
+
+
+def test_a_worker_keeps_an_autostart_package_out(config: pool.PoolConfig) -> None:
+    given = pool.worker_env(config, base={"NSCR_MCP_AUTOSTART": "1"})
+    assert given[install_module.NO_AUTOSTART_ENV_VAR] == "1"
