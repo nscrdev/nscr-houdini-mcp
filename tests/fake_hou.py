@@ -10,6 +10,7 @@ a real headless session before it was written here.
 
 from __future__ import annotations
 
+import os
 import queue
 import re
 import threading
@@ -101,18 +102,38 @@ class TemplateType:
         return self._name
 
 
+class HoudiniCrashed(BaseException):  # noqa: N818 - it stands for a crash, not an error
+    """A call that brings a real Houdini down. It is not an `Exception`, so no
+    quiet read can swallow it and a check that makes one fails loudly."""
+
+
 class ParmTemplate:
-    """What a parameter is: its kind, label, default, tags and menu."""
+    """What a parameter is: its kind, label, default, tags and menu.
+
+    The keywords after `menu` are for a type's own template group, read with
+    no node at all: a name, how many components, a menu a script fills in, a
+    range, whether it is hidden, and the templates inside a folder.
+    """
 
     def __init__(
         self,
         kind: str,
         label: str = "",
-        default: tuple[Any, ...] = (0.0,),
+        default: Any = (0.0,),
         *,
         tags: dict[str, str] | None = None,
         folder: str = "",
         menu: tuple[str, ...] = (),
+        name: str = "",
+        size: int = 1,
+        labels: tuple[str, ...] = (),
+        script: str = "",
+        span: tuple[float, float, bool, bool] | None = None,
+        hidden: bool = False,
+        children: tuple[ParmTemplate, ...] = (),
+        expression: tuple[str, ...] | str | None = None,
+        ramp: str = "",
+        menu_type: str = "Normal",
     ) -> None:
         self._kind = TemplateType(kind)
         self._label = label
@@ -120,9 +141,22 @@ class ParmTemplate:
         self._tags = dict(tags or {})
         self._folder = folder
         self._menu = menu
+        self._name = name
+        self._size = size
+        self._labels = labels
+        self._script = script
+        self._span = span
+        self._hidden = hidden
+        self.children = list(children)
+        self._expression = expression
+        self._ramp = ramp
+        self._menu_type = menu_type
 
     def type(self) -> TemplateType:
         return self._kind
+
+    def name(self) -> str:
+        return self._name
 
     def label(self) -> str:
         return self._label
@@ -136,8 +170,72 @@ class ParmTemplate:
     def menuItems(self) -> tuple[str, ...]:  # noqa: N802 - the name is Houdini's
         return self._menu
 
-    def defaultValue(self) -> tuple[Any, ...]:  # noqa: N802 - the name is Houdini's
+    def menuLabels(self) -> tuple[str, ...]:  # noqa: N802 - the name is Houdini's
+        return self._labels or self._menu
+
+    def itemGeneratorScript(self) -> str:  # noqa: N802 - the name is Houdini's
+        return self._script
+
+    def defaultValue(self) -> Any:  # noqa: N802 - the name is Houdini's
+        if self._kind.name() in ("Separator", "Label", "Button"):
+            raise AttributeError("this kind of template has no default")
         return self.default
+
+    def defaultValueAsString(self) -> str:  # noqa: N802 - the name is Houdini's
+        # On a menu whose items toggle, Houdini 22 reads the mask of items
+        # that are on as an index and the process dies. Nothing may call it.
+        raise HoudiniCrashed("defaultValueAsString on a menu template")
+
+    def menuType(self) -> str:  # noqa: N802 - the name is Houdini's
+        return f"menuType.{self._menu_type}"
+
+    def defaultExpression(self) -> Any:  # noqa: N802 - the name is Houdini's
+        if self._expression is None:
+            raise AttributeError("this kind of template has no default expression")
+        return self._expression
+
+    def numComponents(self) -> int:  # noqa: N802 - the name is Houdini's
+        return self._size
+
+    def minValue(self) -> float:  # noqa: N802 - the name is Houdini's
+        return self._range()[0]
+
+    def maxValue(self) -> float:  # noqa: N802 - the name is Houdini's
+        return self._range()[1]
+
+    def minIsStrict(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return self._range()[2]
+
+    def maxIsStrict(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return self._range()[3]
+
+    def _range(self) -> tuple[float, float, bool, bool]:
+        if self._span is None:
+            raise AttributeError("only a number has a range")
+        return self._span
+
+    def isHidden(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return self._hidden
+
+    def parmTemplates(self) -> tuple[ParmTemplate, ...]:  # noqa: N802 - the name is Houdini's
+        if self._kind.name() != "Folder":
+            raise AttributeError("only a folder holds templates")
+        return tuple(self.children)
+
+    def parmType(self) -> str:  # noqa: N802 - the name is Houdini's
+        if self._kind.name() != "Ramp":
+            raise AttributeError("only a ramp has a ramp type")
+        return f"rampParmType.{self._ramp}"
+
+
+class ParmTemplateGroup:
+    """A type's parameter templates, top level first, as the pane lays them out."""
+
+    def __init__(self, entries: list[ParmTemplate]) -> None:
+        self._entries = entries
+
+    def entries(self) -> tuple[ParmTemplate, ...]:
+        return tuple(self._entries)
 
 
 # What an expression may call in this stand in, and what reading a node from
@@ -349,20 +447,58 @@ DESCRIPTIONS = {"xform": "Transform", "attribwrangle": "Attribute Wrangle"}
 
 
 class NodeType:
-    def __init__(self, name: str, category: str = "Sop") -> None:
+    """A node type: what a node of it is called and, for a type in the
+    library, everything a type says about itself without a node."""
+
+    def __init__(
+        self,
+        name: str,
+        category: str = "Sop",
+        *,
+        label: str | None = None,
+        inputs: tuple[int, int] = (1, 1),
+        outputs: int = 1,
+        unordered: bool = False,
+        templates: list[ParmTemplate] | None = None,
+        dialog: str = "",
+        help_text: str = "",
+        library: str | None = None,
+        hidden: bool = False,
+        deprecated: dict[str, Any] | None = None,
+        order: tuple[str, ...] = (),
+    ) -> None:
         self._name = name
         self._category = category
+        self._label = label
+        self._inputs = inputs
+        self._outputs = outputs
+        self._unordered = unordered
+        self.templates = list(templates or [])
+        self._dialog = dialog
+        self.help_text = help_text
+        self._library = library
+        self._hidden = hidden
+        self._deprecated = deprecated
+        self._order = order or (name,)
+        # How many times the template group was asked for.
+        self.read = 0
 
     def name(self) -> str:
         return self._name
 
     def nameComponents(self) -> tuple[str, str, str, str]:  # noqa: N802 - the name is Houdini's
-        return ("", "", self._name, "")
+        # A version is the last part when it is a number; the base name is the
+        # part before it, and everything in front is the namespace.
+        parts = self._name.split("::")
+        version = parts.pop() if len(parts) > 1 and parts[-1].replace(".", "").isdigit() else ""
+        return ("", "::".join(parts[:-1]), parts[-1], version)
 
     def nameWithCategory(self) -> str:  # noqa: N802 - the name is Houdini's
         return f"{self._category}/{self._name}"
 
     def description(self) -> str:
+        if self._label is not None:
+            return self._label
         return DESCRIPTIONS.get(self._name, self._name.title())
 
     def category(self) -> Any:
@@ -370,6 +506,67 @@ class NodeType:
 
     def defaultColor(self) -> Color:  # noqa: N802 - the name is Houdini's
         return Color(0.8, 0.8, 0.8)
+
+    def minNumInputs(self) -> int:  # noqa: N802 - the name is Houdini's
+        return self._inputs[0]
+
+    def maxNumInputs(self) -> int:  # noqa: N802 - the name is Houdini's
+        return self._inputs[1]
+
+    def maxNumOutputs(self) -> int:  # noqa: N802 - the name is Houdini's
+        return self._outputs
+
+    def hasUnorderedInputs(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return self._unordered
+
+    def parmTemplateGroup(self) -> ParmTemplateGroup:  # noqa: N802 - the name is Houdini's
+        self.read += 1
+        return ParmTemplateGroup(self.templates)
+
+    def hasSectionData(self, name: str) -> bool:  # noqa: N802 - the name is Houdini's
+        return name == "DialogScript" and bool(self._dialog)
+
+    def sectionData(self, name: str) -> str:  # noqa: N802 - the name is Houdini's
+        if not self.hasSectionData(name):
+            raise OperationFailed("no such section")
+        return self._dialog
+
+    def embeddedHelp(self) -> str:  # noqa: N802 - the name is Houdini's
+        return self.help_text
+
+    def defaultHelpUrl(self) -> str:  # noqa: N802 - the name is Houdini's
+        return f"operator:{self._category}/{self._name}"
+
+    def definition(self) -> Any:
+        if self._library is None:
+            return None
+        return SimpleNamespace(libraryFilePath=lambda: self._library)
+
+    def hidden(self) -> bool:
+        return self._hidden
+
+    def deprecated(self) -> bool:
+        return self._deprecated is not None
+
+    def deprecationInfo(self) -> dict[str, Any]:  # noqa: N802 - the name is Houdini's
+        return dict(self._deprecated or {})
+
+    def namespaceOrder(self) -> tuple[str, ...]:  # noqa: N802 - the name is Houdini's
+        return self._order
+
+
+class NodeTypeCategory:
+    """One context's types, by name."""
+
+    def __init__(self, name: str, types: list[NodeType]) -> None:
+        self._name = name
+        self.types = {kind.name(): kind for kind in types}
+
+    def name(self) -> str:
+        return self._name
+
+    def nodeTypes(self) -> dict[str, NodeType]:  # noqa: N802 - the name is Houdini's
+        return dict(self.types)
 
 
 class Color:
@@ -657,11 +854,262 @@ def _category(parent: Node | None) -> str:
     return {"/obj": "Object", "/out": "Driver", "/stage": "Lop"}.get(parent.path(), "Sop")
 
 
+# Section: the node types a session knows, read without a node
+
+# Where the stand in's own assets say their library is. A check sets `HFS` to
+# the folder above it to see it written as `$HFS`.
+HFS_LIBRARY = "/opt/hfs/houdini/otls/OPlibSop.hda"
+
+WRANGLE_DIALOG = """{
+    name\tattribwrangle
+    inputlabel\t1\t"Geometry to Process with Wrangle"
+    inputlabel\t2\t"Ancillary Input, point(1, ...) to Access"
+    inputlabel\t3\t"Ancillary Input, point(2, ...) to Access"
+    inputlabel\t4\t"Ancillary Input, point(3, ...) to Access"
+}"""
+
+TOOL_DIALOG = """{
+    name\ttool
+    inputlabel\t1\t"Mesh to \\"Fix\\""
+    outputlabel\t1\t"Kept"
+    outputlabel\t2\t"Discarded"
+}"""
+
+RAGDOLL_DIALOG = """{
+    name\tragdollsolver
+    inputlabel\t1\tSkeleton
+    inputlabel\t2\t"Constraint Geometry"
+    inputlabel\t3\t""
+    outputlabel\t1\tSkeleton
+}"""
+
+TOOL_HELP = """= Example Tool =
+
+#type: node
+#context: sop
+
+\"\"\"Tidies a mesh and splits off the [pieces|Node:sop/split] it cannot fix.\"\"\"
+
+@inputs
+
+Mesh:
+    The mesh to tidy.
+"""
+
+
+def _wrangle_templates() -> list[ParmTemplate]:
+    """A wrangle's parameters as its type defines them, in folders, with a
+    multiparm, a static and a dynamic menu, code, a range, a ramp and one
+    hidden parameter."""
+    code = ParmTemplate(
+        "Folder",
+        "Code",
+        0,
+        name="folder0",
+        children=(
+            ParmTemplate("String", "Group", ("",), name="group", script="opmenu -l . group"),
+            ParmTemplate(
+                "Menu",
+                "Run Over",
+                2,
+                name="class",
+                menu=("detail", "primitive", "point", "vertex"),
+                labels=("Detail (only once)", "Primitives", "Points", "Vertices"),
+                expression="",
+            ),
+            ParmTemplate(
+                "Int",
+                "Number Count",
+                (10,),
+                name="vex_numcount",
+                span=(0, 10000, True, False),
+                expression=("",),
+            ),
+            ParmTemplate(
+                "String",
+                "VEXpression",
+                ("",),
+                name="snippet",
+                tags={"editor": "1", "editorlang": "VEX"},
+                expression=("",),
+            ),
+            ParmTemplate("Separator", "", name="sepparm"),
+            ParmTemplate(
+                "Toggle", "Enforce Prototypes", False, name="vex_strict", expression="off"
+            ),
+            ParmTemplate(
+                "Menu",
+                "Channels",
+                511,
+                name="channels",
+                menu=("tx", "ty", "tz", "rx", "ry", "rz"),
+                menu_type="StringToggle",
+                hidden=True,
+            ),
+        ),
+    )
+    bindings = ParmTemplate(
+        "Folder",
+        "Bindings",
+        0,
+        name="folder1",
+        children=(
+            ParmTemplate(
+                "Folder",
+                "Number of Bindings",
+                0,
+                name="bindings",
+                folder="MultiparmBlock",
+                children=(
+                    ParmTemplate("String", "Attribute Name", ("",), name="bindname#"),
+                    ParmTemplate("String", "VEX Parameter", ("",), name="bindparm#"),
+                ),
+            ),
+            ParmTemplate(
+                "Float",
+                "Offset",
+                (0.0, 1.0, 0.0),
+                name="offset",
+                size=3,
+                span=(-1.0, 1.0, False, False),
+                expression=("", "$F", ""),
+            ),
+        ),
+    )
+    return [
+        code,
+        bindings,
+        ParmTemplate("Ramp", "Remap", 2, name="remap", ramp="Float"),
+        ParmTemplate("Button", "Compile", name="compile"),
+        ParmTemplate("String", "Label", ("",), name="descriptiveparm", hidden=True),
+    ]
+
+
+def type_library() -> dict[str, NodeTypeCategory]:
+    """The contexts a session has, each with the types a check reads."""
+    transform = [
+        ParmTemplate("String", "Group", ("",), name="group"),
+        ParmTemplate("Float", "Translate", (0.0, 0.0, 0.0), name="t", size=3),
+    ]
+    sops = [
+        NodeType(
+            "attribwrangle",
+            "Sop",
+            inputs=(0, 4),
+            templates=_wrangle_templates(),
+            dialog=WRANGLE_DIALOG,
+            library=HFS_LIBRARY,
+        ),
+        NodeType("volumewrangle", "Sop", label="Volume Wrangle", inputs=(0, 4)),
+        NodeType("wranglehelper", "Sop", label="Wrangle Helper"),
+        NodeType("attribwranglecore", "Sop", label="Attribute Wrangle Core", hidden=True),
+        NodeType("xform", "Sop", templates=transform),
+        NodeType("merge", "Sop", label="Merge", inputs=(0, 9999), unordered=True),
+        NodeType(
+            "copytopoints",
+            "Sop",
+            label="Copy to Points",
+            inputs=(2, 2),
+            order=("copytopoints::2.0", "copytopoints"),
+        ),
+        NodeType(
+            "copytopoints::2.0",
+            "Sop",
+            label="Copy to Points",
+            inputs=(2, 2),
+            templates=[ParmTemplate("String", "Source Group", ("",), name="sourcegroup")],
+            order=("copytopoints::2.0", "copytopoints"),
+        ),
+        NodeType(
+            "com.example::tool::1.0",
+            "Sop",
+            label="Example Tool",
+            outputs=2,
+            templates=[ParmTemplate("Float", "Tolerance", (0.01,), name="tolerance")],
+            dialog=TOOL_DIALOG,
+            help_text=TOOL_HELP,
+            library="/shared/assets/tool.hda",
+        ),
+        NodeType("null", "Sop", label="Null"),
+        # A namespaced name with no version makes the newest version of it.
+        NodeType(
+            "kinefx::ragdollsolver",
+            "Sop",
+            label="Ragdoll Solver",
+            inputs=(1, 4),
+            order=("kinefx::ragdollsolver::2.0", "kinefx::ragdollsolver"),
+        ),
+        NodeType(
+            "kinefx::ragdollsolver::2.0",
+            "Sop",
+            label="Ragdoll Solver",
+            inputs=(1, 3),
+            dialog=RAGDOLL_DIALOG,
+            order=("kinefx::ragdollsolver::2.0", "kinefx::ragdollsolver"),
+        ),
+        # One whose namespace order puts a type of another namespace first,
+        # which making a node of it never goes to.
+        NodeType(
+            "apex::invokegraph",
+            "Sop",
+            label="Invoke Graph",
+            order=("invokegraph", "apex::invokegraph"),
+        ),
+        NodeType("invokegraph", "Sop", label="Invoke Graph (old)"),
+        NodeType("splitter", "Sop", label="Splitter", outputs=2),
+        NodeType("labs::thing::1.0", "Sop", label="Labs Thing"),
+        NodeType(
+            "oldsmooth",
+            "Sop",
+            label="Old Smooth",
+            deprecated={"new_type": NodeType("smooth::2.0", "Sop"), "version": "20.0"},
+        ),
+    ]
+    objects = [
+        NodeType("geo", "Object", label="Geometry", inputs=(0, 1)),
+        NodeType("null", "Object", label="Null", inputs=(0, 1), templates=transform[1:]),
+        NodeType("cam", "Object", label="Camera", inputs=(0, 1)),
+    ]
+    lops = [
+        NodeType("attribwrangle", "Lop", inputs=(0, 4)),
+        NodeType("null", "Lop"),
+        NodeType("wrangler", "Lop", label="Wrangler"),
+    ]
+    # Recipes, and a network that holds another context: a search with no
+    # context leaves both kinds of category out.
+    data = [NodeType("sidefx::recipe::lop::testscene_wrangle", "Data", label="Test Scene")]
+    vopnets = [NodeType("wranglenet", "VopNet", label="Wrangle Network")]
+    return {
+        "Sop": NodeTypeCategory("Sop", sops),
+        "Object": NodeTypeCategory("Object", objects),
+        "Lop": NodeTypeCategory("Lop", lops),
+        "Driver": NodeTypeCategory("Driver", [NodeType("null", "Driver", inputs=(0, 9999))]),
+        "Cop2": NodeTypeCategory("Cop2", [NodeType("vexfilter", "Cop2", label="VEX Filter")]),
+        "Data": NodeTypeCategory("Data", data),
+        "VopNet": NodeTypeCategory("VopNet", vopnets),
+    }
+
+
+def preferred_type(library: dict[str, NodeTypeCategory], name: str) -> NodeType | None:
+    """The type a bare name makes in a context written as `Sop/name`, as Houdini picks it."""
+    category, _, wanted = name.partition("/")
+    found = library.get(category)
+    if found is None:
+        return None
+    types = found.nodeTypes()
+    exact = types.get(wanted)
+    if exact is not None:
+        return types.get(exact.namespaceOrder()[0], exact)
+    same = [kind for kind in types.values() if kind.nameComponents()[2] == wanted]
+    return same[0] if same else None
+
+
 _as_hou(Parm)
 _as_hou(ParmTuple)
 # The names a real session gives them: a node of any context is a subclass
 # whose name ends in `Node`, and its type one whose name ends in `NodeType`.
 _as_hou(NodeType, "OpNodeType")
+_as_hou(NodeTypeCategory, "NodeTypeCategory")
 _as_hou(Node, "OpNode")
 
 
@@ -951,6 +1399,10 @@ class Scene:
         self._counts: dict[str, int] = {}
         # What a person has selected in the interface.
         self.selected: list[Node] = []
+        # Every type the session knows, by context, as a type reads with no node.
+        self.library = type_library()
+        # The folders on the search path, for `findDirectories`.
+        self.search_path: list[str] = []
         self.empty()
         self.undos.labels.clear()
         self.hipFile = HipFile(self, "/Users/somebody/scenes/example.hip")
@@ -960,6 +1412,11 @@ class Scene:
         self.root._children.clear()
         for name in ("obj", "out", "mat", "stage"):
             self.root._children.append(Node(self, name, "network", self.root))
+
+    def find_directories(self, relative: str) -> tuple[str, ...]:
+        """Every folder on the search path that holds `relative`, in path order."""
+        found = [os.path.join(root, relative) for root in self.search_path]
+        return tuple(folder for folder in found if os.path.isdir(folder))
 
     def next_name(self, type_name: str) -> str:
         self._counts[type_name] = self._counts.get(type_name, 0) + 1
@@ -1054,6 +1511,9 @@ class Scene:
             frame=self.frame,
             fps=lambda: 24.0,
             isUIAvailable=lambda: True,
+            nodeTypeCategories=lambda: dict(self.library),
+            preferredNodeType=lambda name, parent=None: preferred_type(self.library, name),
+            findDirectories=self.find_directories,
             Vector3=Vector3,
             Matrix4=Matrix4,
             OperationFailed=OperationFailed,

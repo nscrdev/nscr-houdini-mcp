@@ -33,6 +33,7 @@ CODES: dict[str, str] = {
     "UNKNOWN_TOOL": "no tool is registered under that name",
     "BAD_ARGUMENTS": "an argument is missing, unknown or of the wrong shape",
     "NODE_NOT_FOUND": "no node at that path",
+    "TYPE_NOT_FOUND": "no node type of that name in that context",
     "PARM_NOT_FOUND": "the node has no parameter of that name",
     "PATH_NOT_A_NODE": "the path names a parameter where a node was expected",
     "PATH_NOT_A_PARM": "the path names a node where a parameter was expected",

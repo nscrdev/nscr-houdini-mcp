@@ -796,10 +796,9 @@ def test_work_that_was_never_picked_up_leaves_no_job(tmp_path: Path) -> None:
         assert store.get_job(job_id) is None
 
 
-def test_the_hou_jobs_tool_is_listed_last_and_small(bench: Bench) -> None:
+def test_the_hou_jobs_tool_is_listed_after_hou_python_and_small(bench: Bench) -> None:
     listed, _ = talk(bench.serve())
     names = [tool.name for tool in listed.tools]
-    assert names[-1] == "hou_jobs"
     assert names[names.index("hou_python") + 1] == "hou_jobs"
     [tool] = [tool for tool in listed.tools if tool.name == "hou_jobs"]
     assert set(tool.input_schema["properties"]) == {

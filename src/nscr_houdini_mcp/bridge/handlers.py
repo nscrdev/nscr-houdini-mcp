@@ -18,6 +18,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from nscr_houdini_mcp.bridge import node_types
 from nscr_houdini_mcp.bridge import tools as tool_module
 from nscr_houdini_mcp.bridge.tools import ToolContext
 
@@ -310,6 +311,14 @@ def default_registry(
         arguments=INSPECT_ARGUMENTS,
         context=True,
         summary="read nodes, networks and parameters a page at a time",
+        caps=INSPECT_CAPS,
+    )
+    registry.add(
+        "node.type",
+        node_types.node_type,
+        arguments=node_types.NODE_TYPE_ARGUMENTS,
+        context=True,
+        summary="describe a node type from its definition, or search the types",
         caps=INSPECT_CAPS,
     )
     registry.add(

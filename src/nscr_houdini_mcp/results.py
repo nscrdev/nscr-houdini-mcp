@@ -80,6 +80,7 @@ HINTS: dict[str, str] = {
     "UNKNOWN_TOOL": "call one of the names in the tool list",
     "BAD_ARGUMENTS": "fix the argument named in the details and call again",
     "NODE_NOT_FOUND": "read the scene again and use a path that exists",
+    "TYPE_NOT_FOUND": "use a name from did_you_mean, a context from found_in, or search with query",
     "PARM_NOT_FOUND": "use one of the parameter names in the details",
     "PATH_NOT_A_NODE": "read it with mode parms, or ask for the node named in the details",
     "PATH_NOT_A_PARM": "ask for one of the node's parameters, or read the node itself",

@@ -63,7 +63,7 @@ Run the server on stdio:
 nscr-houdini-mcp
 ```
 
-Six tools so far. `hou_ping` says which session a call reaches and that it
+Seven tools so far. `hou_ping` says which session a call reaches and that it
 answers. `hou_sessions` lists every session with its state (`live`, `busy`,
 `unresponsive`, `crashed` or `gone`) and starts and stops workers under the
 pool's rules; it never closes a Houdini with a user interface. `hou_scene`
@@ -220,6 +220,42 @@ job to follow, rather than its answer, leaves a readable copy of itself
 beside the scene file when it ends, in `.agent/jobs/`, and nothing is made
 beside a scene file that is not there. Jobs are kept for 7 days after they
 end, and their copies go with them.
+
+`hou_node_type` reads a node type from the running Houdini before any node of
+it is made, so installed assets and this build's own versions are the ones
+described. Name a `type` and a `context` (`obj`, `sop`, `lop`, `cop`, `dop`,
+`top`, `chop`, `out`, `mat` or `vop`, or a category name such as `Sop`) for
+its inputs and outputs with their labels and its real parameter names with
+their defaults; `full` adds menus, ranges, folders, hidden parameters and the
+first line of its help. A bare name is the version Houdini would make for it,
+and `resolved_from` says which name was asked for. A multiparm carries its
+instance template under `instances`, and a menu that a script fills in says
+`dynamic` rather than running the script. `query` searches every type by
+keyword: the exact name first, then a name that starts with it, one that
+holds it, the label and the help line. Hidden types come only with `include`
+`hidden`. A name that is not there is `TYPE_NOT_FOUND` with up to five near
+names, or with the contexts that have it. Parameters and search rows page the
+way `hou_inspect` does, and a page after any row or the asset's library
+changed says `changed`. A page token is state the caller holds and can edit,
+as with the other tools, not proof that this tool wrote it: it is checked for
+shape and tied to its session and arguments, and no more.
+
+Everything comes from the node type itself: nothing is cooked or made. An
+asset's input labels come from its dialog script, and a type built into
+Houdini takes them from the headings of its help page, which only
+approximate what the node shows; `labels_from` says which it was. A ramp
+says how many points it starts with in `default_points`. Help is the
+asset's own embedded help, or a page from the `nodes.zip` Houdini ships or
+from any `help/nodes` folder on Houdini's search path, which is where
+packages keep theirs. A search with no context leaves out data recipes,
+managers and the networks that only hold other contexts, and equally close
+matches come in context order, SOPs first. Search ranks by the shipped and
+package help pages only: an asset's embedded help is read for one card, or
+for the rows a page returns, and never changes the order. A query is at most
+200 characters and 16 different words, and a search asked to stop hands back
+what it found with `stopped`. When the shipped help is missing or cannot be
+read, the answer says `help_available: false`, and it is tried again a
+minute later.
 
 ### The Houdini side
 
