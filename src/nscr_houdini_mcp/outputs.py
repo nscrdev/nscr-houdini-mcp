@@ -36,6 +36,7 @@ import json
 import os
 import re
 import secrets
+import tempfile
 import tomllib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
@@ -768,6 +769,36 @@ def plan_path(
     )
 
 
+def sequence_path(path: str, frame_token: str = str(DEFAULT_OUTPUTS["frame_token"])) -> str:
+    """The same output as a numbered sequence: the frame goes before the extension.
+
+    For a kind whose line has no frame of its own, such as a capture that turns
+    out to be several frames. The folder and the name stay as they were
+    handed out, so the sequence sits where the single file would have.
+    """
+    folder, _, leaf = path.rpartition("/")
+    stem, dot, extension = leaf.rpartition(".")
+    if not dot or not stem:
+        stem, extension = leaf, ""
+    numbered = f"{stem}.{frame_token}" + (f".{extension}" if extension else "")
+    return f"{folder}/{numbered}" if folder else numbered
+
+
+def temporary_beside(path: str) -> str:
+    """A new, empty file beside an output, for one writer to fill and then move over it.
+
+    It is made exclusively with a random part in its name, so two writers
+    finishing the same output never share one, and the move over the output
+    is on the same disk. The writer takes it away if it does not move it.
+    """
+    folder = os.path.dirname(path) or "."
+    handle, name = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.", suffix=".partial", dir=folder
+    )
+    os.close(handle)
+    return name
+
+
 def expand(
     text: str,
     *,
@@ -1160,6 +1191,18 @@ def allocate(
         release(store, plan, drop_run=recorded)
         raise
     return replace(plan, source_node=node_path)
+
+
+def record_files(store: Store, plan: OutputPlan, files: Iterable[str]) -> None:
+    """Name the files a run really wrote, in its record and in the file beside it.
+
+    For an output that turned out to be several files, such as the frames of
+    a capture, so the record lists each one rather than the path it was
+    handed out under.
+    """
+    paths = {**plan.as_record(), "files": [str(item) for item in files]}
+    store.set_run_paths(plan.run_id, paths)
+    write_export(store.run_export(plan.run_id), plan.sidecar)
 
 
 def release(store: Store, plan: OutputPlan, *, drop_run: bool = True) -> None:

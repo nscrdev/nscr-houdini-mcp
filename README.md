@@ -63,7 +63,7 @@ Run the server on stdio:
 nscr-houdini-mcp
 ```
 
-Seven tools so far. `hou_ping` says which session a call reaches and that it
+Eleven tools so far. `hou_ping` says which session a call reaches and that it
 answers. `hou_sessions` lists every session with its state (`live`, `busy`,
 `unresponsive`, `crashed` or `gone`) and starts and stops workers under the
 pool's rules; it never closes a Houdini with a user interface. `hou_scene`
@@ -412,6 +412,55 @@ evaluated and nothing cooks: values are expanded from the table's variables
 and the node's and scene's own names. `list` and `lint` page with `limit` and
 `next_page`, the way reads do.
 
+`hou_capture` saves a picture of what a session shows: the `viewport`, one
+`node` on its own, the `network` editor, a `cop` output or a `pane` by name.
+Every file goes under the `capture` kind of the output table below, and the
+answer carries the path, the width and height, the frame, the camera, the
+`route` that made it and `image_stats`: the mean, least and most of each
+channel at the image's own depth, `flat` for an image that is one value in
+every channel, and `non_empty`, which is false for an empty file and, for the
+viewport and a node, for an alpha that is zero everywhere. A flat image is a
+picture, with a note. A capture whose every image is empty is
+`CAPTURE_EMPTY`. A thumbnail of at most 512 pixels on its long edge comes back
+as image content beside the text; `return_image` says `thumb`, `full` or
+`none`.
+
+The routes for the viewport, in order: the Scene Viewer that is showing,
+flipbooked with settings of its own (no MPlay, the beauty pass only unless
+`guides`); an existing Scene Viewer made the current tab for the capture and
+then put back; and a flipbook render node made for the capture and taken
+away after. A `camera`, `display` or `frame_target` asked for is applied for
+the capture and the view is put back as it was, camera, pivot and width
+included. The render node looks through a camera made for the capture:
+one that follows a named camera and reads its lens by reference, so the named
+camera is never written, or one fitted to the target's bounds from `persp`,
+`top`, `front`, `right` or an `{orbit, elevation}`. A worker is started on
+Qt's offscreen screen plugin, so it draws at one pixel to a point on any
+display. In a session with a user interface that
+route cannot know what the artist's view frames, so it says
+`framing_unverified`; it is the only route a worker has. `node` draws that
+node's object alone with the node carrying the display flag, and puts the
+flag back. Whatever a capture makes for itself is made and taken away with
+undo turned off. A route that fails part way takes its frames with it; a
+capture stopped on request keeps the frames it wrote and lists them, and the
+run record names each file. The network editor and panes are made the
+current tab and grabbed from their own window, which needs a user interface;
+a worker answers `UI_UNAVAILABLE`. A render Houdini stops with an error is
+`CAPTURE_FAILED`, with that error in the details. Every step that puts the
+scene or the view back is tried, and one that fails makes a capture that
+worked `CLEANUP_FAILED`, naming the step. Crops and the contact sheet are
+made once per operation, so a reply sent again and a job read at the same
+moment do not both write them. A viewport sequence goes a few frames at a
+time, so it can be stopped between them, and its job row names each run and
+the frames written so far.
+
+`views: quad` captures persp, top, front and right, `turntable4` four orbits
+a quarter turn apart, and both add a two by two contact sheet, which is then
+`path`. `region` crops each saved image to `[x0, y0, x1, y1]`, fractions from
+the top left. `frames: [start, end, step]` captures a sequence, which is a
+job: it answers inline when it is done within `inline_wait_s`, and with the
+job to follow in `hou_jobs` when it is not.
+
 ### The Houdini side
 
 `nscr_houdini_mcp.bridge` runs inside Houdini's own Python. It serves two
@@ -472,7 +521,11 @@ Start one in a headless Houdini:
 hython -m nscr_houdini_mcp.bridge.main --home <state folder>
 ```
 
-It stops when its input closes, or on the word `stop`.
+It stops when its input closes, or on the word `stop`. A start like this puts
+Qt on its offscreen screen plugin unless `QT_QPA_PLATFORM` already names one,
+as the pool does for its workers. On another plugin and a dense display a
+render node draws larger than asked; a capture then reads the scale and makes
+up for it, or says `framing_unverified` when it cannot.
 
 ### Installing the Houdini side
 

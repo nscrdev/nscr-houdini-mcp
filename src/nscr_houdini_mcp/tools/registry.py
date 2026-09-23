@@ -8,6 +8,7 @@ else.
 from __future__ import annotations
 
 from nscr_houdini_mcp.tools.base import ToolSpec
+from nscr_houdini_mcp.tools.capture import HOU_CAPTURE
 from nscr_houdini_mcp.tools.compare import HOU_COMPARE
 from nscr_houdini_mcp.tools.docs import HOU_DOCS
 from nscr_houdini_mcp.tools.inspect import HOU_INSPECT
@@ -30,4 +31,5 @@ TOOLS: tuple[ToolSpec, ...] = (
     HOU_DOCS,
     HOU_COMPARE,
     HOU_OUTPUTS,
+    HOU_CAPTURE,
 )

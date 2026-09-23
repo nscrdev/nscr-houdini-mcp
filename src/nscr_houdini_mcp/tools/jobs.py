@@ -57,6 +57,7 @@ from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.results import CallError
 from nscr_houdini_mcp.router import DEAD_STATES
 from nscr_houdini_mcp.store import JobRecord
+from nscr_houdini_mcp.tools import capture as capture_tool
 from nscr_houdini_mcp.tools import python as python_tool
 from nscr_houdini_mcp.tools.base import Call, ToolSpec, inputs, outputs
 
@@ -420,6 +421,11 @@ def job_row(record: JobRecord, call: Call, *, full: bool) -> dict[str, Any]:
         if answer is not None:
             row["outputs"] = answer
             row["error"] = answer.get("error", record.error)
+    if full and record.kind == "capture" and record.state in FINAL:
+        # The paths and the image numbers, as the call would have given them.
+        answer = capture_tool.job_answer(call, record)
+        if answer is not None:
+            row["outputs"] = {**answer, "operation_id": record.operation_id}
     if record.state in FINAL:
         path = job_rules.export_path(record)
         if path is not None:

@@ -12,6 +12,9 @@ license = "MIT"
 dependencies = [
     "mcp>=2.2,<3",
     "numpy>=1.26",
+    # Reads images on the server side: what a comparison lays side by side and
+    # what a capture wrote (its numbers, a crop, a contact sheet and a
+    # thumbnail). The Houdini side never needs it.
     "pillow>=10",
 ]
 

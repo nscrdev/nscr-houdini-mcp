@@ -81,8 +81,17 @@ class Vector3:
 
 
 class Matrix4:
-    def __init__(self, fill: float = 0.0) -> None:
-        self._values = tuple(float(fill) for _ in range(16))
+    def __init__(self, fill: float = 0.0, values: tuple[float, ...] | None = None) -> None:
+        if values is not None:
+            self._values = tuple(float(value) for value in values)
+        else:
+            self._values = tuple(float(fill) for _ in range(16))
+
+    @classmethod
+    def translation(cls, x: float, y: float, z: float) -> Matrix4:
+        """A row major transform that moves a point, as Houdini writes one."""
+        values = [1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0, 0, x, y, z, 1.0]
+        return cls(values=tuple(values))
 
     def asTuple(self) -> tuple[float, ...]:  # noqa: N802 - the name is Houdini's
         return self._values
@@ -586,7 +595,51 @@ TYPE_PARMS: dict[str, tuple[tuple[str, str, tuple[str, ...], Any, dict[str, Any]
             {"string_type": "FileReference", "tags": {"filechooser_mode": "write"}},
         ),
     ),
+    # The flipbook render node, with the parameter names a Houdini 22 build has.
+    "flipbook": (
+        ("camera", "String", ("camera",), "/obj/cam1", {}),
+        ("picture", "String", ("picture",), "$HIP/render/$HIPNAME.$OS.$F4.exr", {}),
+        ("mkpath", "Toggle", ("mkpath",), 1, {}),
+        ("tres", "Toggle", ("tres",), 0, {}),
+        ("res", "Int", ("res1", "res2"), 1280, {}),
+        ("trange", "Menu", ("trange",), "off", {"menu": ("off", "normal", "on")}),
+        ("f", "Float", ("f1", "f2", "f3"), 1.0, {}),
+        ("sopsource", "Menu", ("sopsource",), "render", {"menu": ("display", "render")}),
+        (
+            "shadingmode",
+            "Menu",
+            ("shadingmode",),
+            "smooth",
+            {"menu": ("wire", "matcap", "smooth", "smoothwire")},
+        ),
+        ("vobjects", "String", ("vobjects",), "*", {}),
+        ("forceobjects", "String", ("forceobjects",), "", {}),
+    ),
+    # A camera, with the names a Houdini 22 build has.
+    "cam": (
+        *_STANDARD[:1],
+        ("r", "Float", ("rx", "ry", "rz"), 0.0, {}),
+        ("resx", "Int", ("resx",), 1920, {}),
+        ("resy", "Int", ("resy",), 1080, {}),
+        ("focal", "Float", ("focal",), 50.0, {}),
+        ("aperture", "Float", ("aperture",), 41.4214, {}),
+        ("near", "Float", ("near",), 0.001, {}),
+        ("far", "Float", ("far",), 10000.0, {}),
+        (
+            "projection",
+            "Menu",
+            ("projection",),
+            "perspective",
+            {"menu": ("perspective", "ortho")},
+        ),
+        ("orthowidth", "Float", ("orthowidth",), 2.0, {}),
+        ("win", "Float", ("winx", "winy"), 0.0, {}),
+        ("winsize", "Float", ("winsizex", "winsizey"), 1.0, {}),
+    ),
 }
+
+# What a box draws, in its own object's space.
+UNIT_BOX = ((-0.5, -0.5, -0.5), (0.5, 0.5, 0.5))
 
 # What each instance of a multiparm holds, by the multiparm's name.
 MULTIPARM_INSTANCE = {
@@ -829,6 +882,10 @@ class Node:
         scene._next_sid = getattr(scene, "_next_sid", 0) + 1
         self._sid = scene._next_sid
         self.parm_state_updates = 0
+        # What a capture reads: whether an object is hidden, and the box a
+        # geometry node draws when it is not a box.
+        self.hidden = False
+        self.bounds: tuple[tuple[float, ...], tuple[float, ...]] | None = None
 
     def name(self) -> str:
         return self._name
@@ -1009,9 +1066,80 @@ class Node:
     def childTypeCategory(self) -> Any:  # noqa: N802 - the name is Houdini's
         return SimpleNamespace(nodeTypes=lambda: dict.fromkeys(self._scene.types, None))
 
+    # Section: what a capture reads and changes
+
+    def parent(self) -> Node | None:
+        return self._parent
+
     def destroy(self) -> None:
-        if self._parent is not None:
-            self._parent._children.remove(self)
+        if self._type.name() in self._scene.capture.undestroyable:
+            raise OperationFailed("the node cannot be deleted")
+        parent = self._parent
+        if parent is None or self not in parent._children:
+            raise ObjectWasDeleted("the node is gone")
+        index = parent._children.index(self)
+        parent._children.remove(self)
+        self._scene.undos.record(lambda: parent._children.insert(index, self))
+
+    def setDisplayFlag(self, on: bool) -> None:  # noqa: N802 - the name is Houdini's
+        """The display flag: one geometry node in an object carries it at a time."""
+        if self._parent is None:
+            return
+        before = [node for node in self._parent._children if "Display" in node.flags]
+        if on:
+            for sibling in self._parent._children:
+                sibling.flags.discard("Display")
+            self.flags.add("Display")
+        else:
+            self.flags.discard("Display")
+
+        def undo() -> None:
+            for sibling in self._parent._children:
+                sibling.flags.discard("Display")
+            for node in before:
+                node.flags.add("Display")
+
+        self._scene.undos.record(undo)
+
+    def isDisplayFlagSet(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return "Display" in self.flags
+
+    def displayNode(self) -> Node | None:  # noqa: N802 - the name is Houdini's
+        return next((child for child in self._children if "Display" in child.flags), None)
+
+    def isObjectDisplayed(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return not self.hidden
+
+    def worldTransform(self) -> Matrix4:  # noqa: N802 - the name is Houdini's
+        t = self.parmTuple("t")
+        return Matrix4.translation(*(float(parm.eval()) for parm in t)) if t else Matrix4(0.0)
+
+    def geometry(self) -> Geometry:
+        bounds = self.bounds
+        if bounds is None and self._type.name() == "box":
+            bounds = UNIT_BOX
+        return Geometry(bounds)
+
+    def render(self, frame_range: Any = None, **rest: Any) -> None:
+        """What a flipbook render node does: one picture per frame, at the picture's path."""
+        if self._type.name() != "flipbook":
+            raise OperationFailed("only a render node renders")
+        self._scene.capture.render_rop(self, frame_range)
+
+    def layer(self) -> ImageLayer:
+        return self._scene.capture.layer_of(self, None)
+
+    def layerAtFrame(self, frame: float) -> ImageLayer:  # noqa: N802 - the name is Houdini's
+        return self._scene.capture.layer_of(self, frame)
+
+    def saveImage(self, path: str, frame_range: Any = ()) -> None:  # noqa: N802
+        self._scene.capture.save_cop2(self, path, frame_range)
+
+    def xRes(self) -> int:  # noqa: N802 - the name is Houdini's
+        return self._scene.capture.cop_size[0]
+
+    def yRes(self) -> int:  # noqa: N802 - the name is Houdini's
+        return self._scene.capture.cop_size[1]
 
     def createNode(self, type_name: str, name: str | None = None) -> Node:  # noqa: N802
         if type_name not in self._scene.types:
@@ -1031,6 +1159,11 @@ def _category(parent: Node | None) -> str:
         return "Manager"
     if parent._parent is None:
         return "Manager"
+    kind = parent._type.name()
+    if kind == "copnet":
+        return "Cop"
+    if kind in ("img", "cop2net"):
+        return "Cop2"
     return {"/obj": "Object", "/out": "Driver", "/stage": "Lop"}.get(parent.path(), "Sop")
 
 
@@ -1304,6 +1437,7 @@ class Undos:
         self.labels: list[tuple[str, list[Any]]] = []
         self._pending: list[Any] | None = None
         self.performed = 0
+        self.disabled = 0
         # How many entries the stack keeps, the oldest going first past it,
         # as Houdini's undo levels do. Nothing means no limit.
         self.limit: int | None = None
@@ -1324,7 +1458,21 @@ class Undos:
             if done:
                 self._keep((label, done))
 
+    @contextmanager
+    def disabler(self):
+        """Nothing done inside is kept, as with undos turned off in Houdini."""
+        self.disabled += 1
+        try:
+            yield
+        finally:
+            self.disabled -= 1
+
+    def areEnabled(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return self.disabled == 0
+
     def record(self, undo: Any) -> None:
+        if self.disabled:
+            return
         if self._pending is None:
             self._keep(("edit", [undo]))
         else:
@@ -1393,6 +1541,21 @@ class MainThread:
 
     def eventLoopCallbacks(self) -> tuple[Any, ...]:  # noqa: N802 - the name is Houdini's
         return tuple(self._loop_callbacks)
+
+    # The pane tabs a desktop shows, for the captures that need a user
+    # interface. A scene with no desktop has none.
+    desktop: Desktop | None = None
+    # The main window's device pixel ratio, as the screen it is on has it.
+    ratio = 1.0
+
+    def mainQtWindow(self) -> Any:  # noqa: N802 - the name is Houdini's
+        return SimpleNamespace(devicePixelRatioF=lambda: self.ratio)
+
+    def paneTabs(self) -> tuple[Any, ...]:  # noqa: N802 - the name is Houdini's
+        return tuple(self.desktop.tabs) if self.desktop is not None else ()
+
+    def findPaneTab(self, name: str) -> Any:  # noqa: N802 - the name is Houdini's
+        return next((tab for tab in self.paneTabs() if tab.name() == name), None)
 
     def cook(self, seconds: float) -> None:
         """Hold the main thread, and the lock with it, for that long.
@@ -1596,6 +1759,7 @@ class Scene:
         # counted, as the real one starts a server the first time it is asked.
         self.help_url: str | None = None
         self.help_asked = 0
+        self.capture = CaptureStandIn(self)
 
     def empty(self) -> None:
         """Throw the scene away and put the empty networks back."""
@@ -1731,6 +1895,20 @@ class Scene:
             nodeTypeCategories=lambda: dict(self.library),
             preferredNodeType=lambda name, parent=None: preferred_type(self.library, name),
             findDirectories=self.find_directories,
+            ropNodeTypeCategory=lambda: "Driver",
+            nodeType=lambda category, name: name if name in self.types else None,
+            paneTabType=PaneTabType,
+            geometryViewportType=SimpleNamespace(
+                Perspective="Perspective", Top="Top", Front="Front", Right="Right"
+            ),
+            glShadingType=SimpleNamespace(
+                Smooth="Smooth", Wire="Wire", SmoothWire="SmoothWire", MatCap="MatCap"
+            ),
+            displaySetType=SimpleNamespace(SceneObject="SceneObject", DisplayModel="DisplayModel"),
+            imageLayerStorageType=SimpleNamespace(Fixed8="Fixed8", Float32="Float32"),
+            ImageLayer=ImageLayer,
+            BoundingBox=BoundingBox,
+            hmath=SimpleNamespace(buildRotate=build_rotate),
             Vector3=Vector3,
             Matrix4=Matrix4,
             OperationFailed=OperationFailed,
@@ -1739,3 +1917,646 @@ class Scene:
             PermissionError=PermissionError,
             LoadWarning=LoadWarning,
         )
+
+
+# Section: what a capture needs
+
+
+class BoundingBox:
+    def __init__(self, *values: float) -> None:
+        values = values or (0.0,) * 6
+        self._low = tuple(float(value) for value in values[:3])
+        self._high = tuple(float(value) for value in values[3:6])
+        self.valid = bool(values)
+
+    def minvec(self) -> Vector3:
+        return Vector3(*self._low)
+
+    def maxvec(self) -> Vector3:
+        return Vector3(*self._high)
+
+    def isValid(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return self.valid
+
+
+class Geometry:
+    def __init__(self, bounds: Any) -> None:
+        self._bounds = bounds
+
+    def boundingBox(self) -> BoundingBox:  # noqa: N802 - the name is Houdini's
+        if self._bounds is None:
+            box = BoundingBox()
+            box.valid = False
+            return box
+        low, high = self._bounds
+        return BoundingBox(*low, *high)
+
+
+class Matrix3:
+    """A rotation, kept as the angles it was built from so a check can read them."""
+
+    def __init__(self, euler: tuple[float, float, float] = (0.0, 0.0, 0.0)) -> None:
+        self.euler = tuple(float(value) for value in euler)
+
+    def asTuple(self) -> tuple[float, ...]:  # noqa: N802 - the name is Houdini's
+        return self.euler
+
+
+class Rotation:
+    def __init__(self, euler: Any) -> None:
+        self.euler = tuple(float(value) for value in euler)
+
+    def extractRotationMatrix3(self) -> Matrix3:  # noqa: N802 - the name is Houdini's
+        return Matrix3(self.euler)
+
+
+def build_rotate(values: Any, *rest: Any) -> Rotation:
+    return Rotation(values if not rest else (values, *rest[:2]))
+
+
+class PaneTabType:
+    SceneViewer = "SceneViewer"
+    NetworkEditor = "NetworkEditor"
+    Parm = "Parm"
+
+
+class ViewCamera:
+    """What a viewport's own camera holds: where it is, how it turns, its pivot and width."""
+
+    def __init__(
+        self,
+        translation: tuple[float, ...] = (0.0, 0.0, 10.0),
+        rotation: Matrix3 | None = None,
+        pivot: tuple[float, ...] = (0.0, 0.0, 0.0),
+        ortho_width: float = 4.0,
+    ) -> None:
+        self._translation = tuple(translation)
+        self._rotation = rotation or Matrix3()
+        self._pivot = tuple(pivot)
+        self._ortho_width = float(ortho_width)
+
+    def translation(self) -> tuple[float, ...]:
+        return self._translation
+
+    def setTranslation(self, value: Any) -> None:  # noqa: N802 - the name is Houdini's
+        self._translation = tuple(value)
+
+    def rotation(self) -> Matrix3:
+        return self._rotation
+
+    def setRotation(self, value: Matrix3) -> None:  # noqa: N802 - the name is Houdini's
+        self._rotation = value
+
+    def pivot(self) -> tuple[float, ...]:
+        return self._pivot
+
+    def setPivot(self, value: Any) -> None:  # noqa: N802 - the name is Houdini's
+        self._pivot = tuple(value)
+
+    def orthoWidth(self) -> float:  # noqa: N802 - the name is Houdini's
+        return self._ortho_width
+
+    def setOrthoWidth(self, value: float) -> None:  # noqa: N802 - the name is Houdini's
+        self._ortho_width = float(value)
+
+    def stash(self) -> ViewCamera:
+        return ViewCamera(self._translation, self._rotation, self._pivot, self._ortho_width)
+
+    def state(self) -> tuple[Any, ...]:
+        return (self._translation, self._rotation.euler, self._pivot, self._ortho_width)
+
+
+class DisplaySet:
+    def __init__(self) -> None:
+        self._mode = "Smooth"
+
+    def shadedMode(self) -> str:  # noqa: N802 - the name is Houdini's
+        return self._mode
+
+    def setShadedMode(self, mode: str) -> None:  # noqa: N802 - the name is Houdini's
+        self._mode = mode
+
+
+class ViewportSettings:
+    def __init__(self) -> None:
+        self.sets = {"SceneObject": DisplaySet(), "DisplayModel": DisplaySet()}
+
+    def displaySet(self, kind: str) -> DisplaySet:  # noqa: N802 - the name is Houdini's
+        return self.sets[kind]
+
+
+class Viewport:
+    """One viewport: its type, the camera it looks through and its own camera."""
+
+    def __init__(self) -> None:
+        self._type = "Perspective"
+        self._camera: Node | None = None
+        self._default = ViewCamera()
+        self._settings = ViewportSettings()
+        self.framed: list[Any] = []
+        # Set to make putting the viewport's own camera back fail.
+        self.refuse_default = False
+
+    def type(self) -> str:
+        return self._type
+
+    def changeType(self, kind: str) -> None:  # noqa: N802 - the name is Houdini's
+        # Houdini keeps a camera per view type; changing type moves the view.
+        self._type = kind
+        self._default = ViewCamera((0.0, 20.0, 0.0), Matrix3((-90.0, 0.0, 0.0)), (1, 2, 3), 9.0)
+
+    def camera(self) -> Node | None:
+        return self._camera
+
+    def setCamera(self, node: Node) -> None:  # noqa: N802 - the name is Houdini's
+        self._camera = node
+
+    def useDefaultCamera(self) -> None:  # noqa: N802 - the name is Houdini's
+        self._camera = None
+
+    def defaultCamera(self) -> ViewCamera:  # noqa: N802 - the name is Houdini's
+        return self._default.stash()
+
+    def setDefaultCamera(self, view: ViewCamera) -> None:  # noqa: N802 - the name is Houdini's
+        if self.refuse_default:
+            raise OperationFailed("the viewport would not take its camera")
+        self._default = view.stash()
+
+    def settings(self) -> ViewportSettings:
+        return self._settings
+
+    def frameAll(self) -> None:  # noqa: N802 - the name is Houdini's
+        self.framed.append("all")
+        self._default.setTranslation((5.0, 5.0, 5.0))
+        self._default.setPivot((0.5, 0.5, 0.5))
+
+    def frameSelected(self) -> None:  # noqa: N802 - the name is Houdini's
+        self.framed.append("selection")
+        self._default.setTranslation((6.0, 6.0, 6.0))
+
+    def frameBoundingBox(self, box: BoundingBox) -> None:  # noqa: N802 - the name is Houdini's
+        self.framed.append((tuple(box.minvec()), tuple(box.maxvec())))
+        self._default.setTranslation((7.0, 7.0, 7.0))
+
+    def viewTransform(self) -> Matrix4:  # noqa: N802 - the name is Houdini's
+        translation = self._default.translation()
+        return Matrix4.translation(*translation)
+
+    def shading(self) -> dict[str, str]:
+        return {name: shown.shadedMode() for name, shown in self._settings.sets.items()}
+
+    def tearOffCopy(self) -> None:  # noqa: N802 - the name is Houdini's
+        raise AssertionError("a torn off viewport draws nothing and must never be made")
+
+    def createFloatingViewport(self) -> None:  # noqa: N802 - the name is Houdini's
+        raise AssertionError("a floating viewport draws nothing and must never be made")
+
+
+class FlipbookSettings:
+    """Settings a flipbook takes, each a getter with no argument and a setter with one.
+
+    The defaults are what an artist might have left in the flipbook dialog,
+    so a check can see that a capture sets each one rather than carrying it.
+    """
+
+    ARTIST = {
+        "outputToMPlay": True,
+        "output": "",
+        "frameRange": (100.0, 200.0),
+        "frameIncrement": 2.0,
+        "useResolution": False,
+        "resolution": (640, 480),
+        "beautyPassOnly": False,
+        "visibleObjects": "geo1",
+        "visibleTypes": "GeoOnly",
+        "useSheetSize": True,
+        "useMotionBlur": True,
+        "useDepthOfField": True,
+        "leaveFrameAtEnd": True,
+        "appendFramesToCurrent": True,
+        "backgroundImage": "plate.jpg",
+        "overrideGamma": True,
+        "overrideLUT": True,
+        "initializeSimulations": True,
+        "renderAllViewports": True,
+        "scopeChannelKeyframesOnly": True,
+        "audioFilename": "take.wav",
+        "outputZoom": 50,
+        "cropOutMaskOverlay": False,
+        "antialias": "Fast",
+        "setUseFrameTimeLimit": True,
+        "setUseFrameProgressLimit": True,
+    }
+    FIELDS = tuple(ARTIST)
+
+    def __init__(self, values: dict[str, Any] | None = None) -> None:
+        self.values = dict(values or FlipbookSettings.ARTIST)
+
+    def stash(self) -> FlipbookSettings:
+        return FlipbookSettings(self.values)
+
+    def __getattr__(self, name: str) -> Any:
+        if name not in FlipbookSettings.FIELDS:
+            raise AttributeError(name)
+
+        def field(*value: Any) -> Any:
+            if value:
+                self.values[name] = value[0]
+                return None
+            return self.values[name]
+
+        return field
+
+
+class Pane:
+    def __init__(self) -> None:
+        self.tabs: list[Any] = []
+        self.current: Any = None
+
+    def currentTab(self) -> Any:  # noqa: N802 - the name is Houdini's
+        return self.current
+
+    def add(self, tab: Any) -> Any:
+        self.tabs.append(tab)
+        tab._pane = self
+        if self.current is None:
+            self.current = tab
+        return tab
+
+
+class Tab:
+    """One pane tab: its kind, its name, and whether it is the one its pane shows."""
+
+    def __init__(self, scene: Scene, kind: str, name: str) -> None:
+        self._scene = scene
+        self._kind = kind
+        self._name = name
+        self._pane: Pane | None = None
+        self.window: Window | None = None
+        self.geometry = Rect(0, 0, 0, 0)
+
+    def type(self) -> str:
+        return self._kind
+
+    def name(self) -> str:
+        return self._name
+
+    def pane(self) -> Pane | None:
+        return self._pane
+
+    def isCurrentTab(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return self._pane is not None and self._pane.current is self
+
+    def setIsCurrentTab(self) -> None:  # noqa: N802 - the name is Houdini's
+        if self._pane is not None:
+            self._pane.current = self
+
+    def qtParentWindow(self) -> Window | None:  # noqa: N802 - the name is Houdini's
+        return self.window
+
+    def qtScreenGeometry(self) -> Rect:  # noqa: N802 - the name is Houdini's
+        return self.geometry
+
+
+class SceneViewerTab(Tab):
+    def __init__(self, scene: Scene, name: str = "panetab1") -> None:
+        super().__init__(scene, PaneTabType.SceneViewer, name)
+        self.viewport = Viewport()
+        self.settings = FlipbookSettings()
+
+    def curViewport(self) -> Viewport:  # noqa: N802 - the name is Houdini's
+        return self.viewport
+
+    def flipbookSettings(self) -> FlipbookSettings:  # noqa: N802 - the name is Houdini's
+        return self.settings
+
+    def flipbook(
+        self, viewport: Viewport | None = None, settings: Any = None, open_dialog: bool = False
+    ) -> None:
+        self._scene.capture.flipbook(self, viewport or self.viewport, settings or self.settings)
+
+    def createFloatingViewport(self) -> None:  # noqa: N802 - the name is Houdini's
+        raise AssertionError("a floating viewport draws nothing and must never be made")
+
+
+class NetworkEditorTab(Tab):
+    def __init__(self, scene: Scene, name: str = "panetab2") -> None:
+        super().__init__(scene, PaneTabType.NetworkEditor, name)
+        self._pwd = scene.node("/obj")
+
+    def pwd(self) -> Node | None:
+        return self._pwd
+
+    def setPwd(self, node: Node) -> None:  # noqa: N802 - the name is Houdini's
+        self._pwd = node
+
+
+class Desktop:
+    def __init__(self) -> None:
+        self.tabs: list[Any] = []
+
+
+class Point:
+    def __init__(self, x: float, y: float) -> None:
+        self._x, self._y = x, y
+
+    def x(self) -> float:
+        return self._x
+
+    def y(self) -> float:
+        return self._y
+
+
+class Rect:
+    def __init__(self, x: float, y: float, width: float, height: float) -> None:
+        self._x, self._y, self._w, self._h = x, y, width, height
+
+    def x(self) -> float:
+        return self._x
+
+    def y(self) -> float:
+        return self._y
+
+    def width(self) -> float:
+        return self._w
+
+    def height(self) -> float:
+        return self._h
+
+    def topLeft(self) -> Point:  # noqa: N802 - the name is Qt's
+        return Point(self._x, self._y)
+
+
+class Pixmap:
+    """A grab: device pixels in a Pillow image, and the ratio they were taken at."""
+
+    def __init__(self, image: Any, ratio: float) -> None:
+        self.image = image
+        self.ratio = ratio
+
+    def width(self) -> int:
+        return self.image.size[0]
+
+    def height(self) -> int:
+        return self.image.size[1]
+
+    def devicePixelRatio(self) -> float:  # noqa: N802 - the name is Qt's
+        return self.ratio
+
+    def copy(self, x: int, y: int, width: int, height: int) -> Pixmap:
+        return Pixmap(self.image.crop((x, y, x + width, y + height)), self.ratio)
+
+    def save(self, path: str, kind: str = "PNG") -> bool:
+        self.image.save(path, format=kind)
+        return True
+
+
+class Window:
+    """A window on screen: where it is in points, and what its panes look like."""
+
+    def __init__(self, x: float, y: float, width: int, height: int, ratio: float = 1.0) -> None:
+        self.origin = (x, y)
+        self.size = (width, height)
+        self.ratio = ratio
+        # Screen rectangles painted a colour of their own, for the crop checks.
+        self.painted: list[tuple[Rect, tuple[int, int, int, int]]] = []
+        self.grabs = 0
+
+    def grab(self) -> Pixmap:
+        from PIL import Image, ImageDraw
+
+        self.grabs += 1
+        width, height = (round(value * self.ratio) for value in self.size)
+        image = Image.new("RGBA", (width, height), (0, 0, 255, 255))
+        draw = ImageDraw.Draw(image)
+        for rect, colour in self.painted:
+            left = round((rect.x() - self.origin[0]) * self.ratio)
+            top = round((rect.y() - self.origin[1]) * self.ratio)
+            right = round((rect.x() - self.origin[0] + rect.width()) * self.ratio) - 1
+            bottom = round((rect.y() - self.origin[1] + rect.height()) * self.ratio) - 1
+            draw.rectangle((left, top, right, bottom), fill=colour)
+        return Pixmap(image, self.ratio)
+
+    def mapToGlobal(self, point: Point) -> Point:  # noqa: N802 - the name is Qt's
+        return Point(point.x() + self.origin[0], point.y() + self.origin[1])
+
+    def rect(self) -> Rect:
+        return Rect(0, 0, *self.size)
+
+    def children(self) -> None:
+        raise AssertionError("a capture never walks the widget tree")
+
+
+class ImageLayer:
+    """A Copernicus image: its size and its pixels, bottom row first."""
+
+    def __init__(self, width: int, height: int, rgba_top_down: bytes) -> None:
+        self._size = (width, height)
+        stride = width * 4
+        rows = [rgba_top_down[index * stride : (index + 1) * stride] for index in range(height)]
+        self._bottom_up = b"".join(reversed(rows))
+
+    def bufferResolution(self) -> tuple[int, int]:  # noqa: N802 - the name is Houdini's
+        return self._size
+
+    def allBufferElements(self, storage: str, channels: int) -> bytes:  # noqa: N802
+        if storage != "Fixed8" or channels != 4:
+            raise OperationFailed("the stand in only reads 8 bit RGBA")
+        return self._bottom_up
+
+
+class CaptureStandIn:
+    """What renders, flipbooks and image reads do in the stand in, and what each saw.
+
+    A picture is drawn with Pillow: a grey square on a clear background when
+    something is shown, and nothing but the clear background when not, so an
+    empty capture is one the checks can make on purpose.
+    """
+
+    def __init__(self, scene: Scene) -> None:
+        self.scene = scene
+        # Every render and flipbook, with what the scene looked like at the time.
+        self.seen: list[dict[str, Any]] = []
+        # Set to make a render or a flipbook finish and write nothing.
+        self.writes = True
+        # Set to make every picture empty, or one flat colour.
+        self.blank = False
+        self.flat: tuple[int, int, int, int] | None = None
+        # Set to make a flipbook raise the way a failed one does.
+        self.flipbook_error: BaseException | None = None
+        self.cop_size = (64, 32)
+        self.cop_frames: list[float | None] = []
+        # How long each rendered frame takes, for the checks on a sequence run as a job.
+        self.delay_s = 0.0
+        # How much larger than asked a render node draws, and the renders
+        # that worked it out, kept apart from the ones a check looks at.
+        self.backing = 1.0
+        # Node types whose nodes refuse to be taken away, and a call made
+        # after each frame a render writes.
+        self.undestroyable: set[str] = set()
+        self.after_frame: Any = None
+        # A frame at which a render raises after writing it, as a failed cook does.
+        self.fail_at_frame: float | None = None
+        self.probes: list[dict[str, Any]] = []
+
+    # Section: pictures
+
+    def draw(
+        self, path: str, size: tuple[int, int], shown: bool, camera: Node | None = None
+    ) -> None:
+        """The middle half of the frame covered, as a render node's picture would be.
+
+        With `backing` above one, the render node's drawing is modelled as
+        it is on a dense display: the frame drawn that many times larger and
+        only the bottom left corner kept, unless the camera's window makes up
+        for it.
+        """
+        from PIL import Image, ImageDraw
+
+        image = Image.new("RGBA", size, self.flat or (0, 0, 0, 0))
+        if shown and not self.blank and not self.flat:
+            width, height = size
+            window = (0.0, 0.0, 1.0, 1.0)
+            if camera is not None and camera.parm("winx") is not None:
+                window = tuple(
+                    float(camera.parm(name).eval())
+                    for name in ("winx", "winy", "winsizex", "winsizey")
+                )
+            scale = self.backing if camera is not None else 1.0
+
+            def placed(value: float, offset: float, span: float) -> float:
+                return ((value - 0.5 - offset) / span + 0.5) * scale
+
+            left = placed(0.25, window[0], window[2]) * width
+            right = placed(0.75, window[0], window[2]) * width
+            low = placed(0.25, window[1], window[3])
+            high = placed(0.75, window[1], window[3])
+            top, bottom = (1.0 - high) * height, (1.0 - low) * height
+            ImageDraw.Draw(image).rectangle(
+                (round(left), round(top), round(right) - 1, round(bottom) - 1),
+                fill=(128, 128, 128, 255),
+            )
+        image.save(path, format="PNG")
+
+    def shown_objects(self, vobjects: str = "*", forced: str = "") -> list[Node]:
+        root = self.scene.node("/obj")
+        objects = [] if root is None else list(root._children)
+        wanted = set(vobjects.split())
+        picked = [
+            node for node in objects if ("*" in wanted and not node.hidden) or node.path() in wanted
+        ]
+        picked += [node for node in objects if node.path() in forced.split()]
+        return [node for node in picked if node._type.name() != "cam"]
+
+    def anything_shown(self, objects: list[Node]) -> bool:
+        for node in objects:
+            shown = node.displayNode()
+            if shown is not None and shown.geometry().boundingBox().isValid():
+                return True
+        return False
+
+    # Section: the flipbook render node
+
+    def render_rop(self, rop: Node, frame_range: Any) -> None:
+        camera_path = str(rop.parm("camera").eval())
+        camera = self.scene.node(camera_path) if camera_path else None
+        if camera is None:
+            raise OperationFailed("No camera specified for render.")
+        start, end = float(frame_range[0]), float(frame_range[1])
+        step = float(frame_range[2]) if len(frame_range) > 2 else 1.0
+        size = (
+            (int(rop.parm("res1").eval()), int(rop.parm("res2").eval()))
+            if rop.parm("tres").eval()
+            else (1280, 720)
+        )
+        objects = self.shown_objects(
+            str(rop.parm("vobjects").eval()), str(rop.parm("forceobjects").eval())
+        )
+        frame = start
+        while frame <= end:
+            if self.delay_s:
+                time.sleep(self.delay_s)
+            picture = str(rop.parm("picture").eval()).replace("$F4", f"{int(frame):04d}")
+            kept = self.probes if picture.endswith(".probe.png") else self.seen
+            kept.append(
+                {
+                    "route": "rop",
+                    "frame": frame,
+                    "picture": picture,
+                    "size": size,
+                    "camera": camera_path,
+                    "t": tuple(parm.eval() for parm in camera.parmTuple("t")),
+                    "r": tuple(parm.eval() for parm in camera.parmTuple("r")),
+                    "projection": camera.parm("projection").eval()
+                    if camera.parm("projection")
+                    else None,
+                    "orthowidth": camera.parm("orthowidth").eval()
+                    if camera.parm("orthowidth")
+                    else None,
+                    "vobjects": rop.parm("vobjects").eval(),
+                    "forceobjects": rop.parm("forceobjects").eval(),
+                    "sopsource": rop.parm("sopsource").eval(),
+                    "shadingmode": rop.parm("shadingmode").eval(),
+                    "trange": rop.parm("trange").eval(),
+                    "displayed": {
+                        node.path(): (node.displayNode().path() if node.displayNode() else None)
+                        for node in objects
+                    },
+                    "undo_enabled": self.scene.undos.disabled == 0,
+                    "window": tuple(parm.eval() for parm in camera.parmTuple("win"))
+                    + tuple(parm.eval() for parm in camera.parmTuple("winsize")),
+                    "follows": camera.inputs_now[0][0].path() if 0 in camera.inputs_now else None,
+                    "focal": camera.parm("focal").eval(),
+                }
+            )
+            if self.writes:
+                self.draw(picture, size, self.anything_shown(objects), camera)
+            if self.after_frame is not None:
+                self.after_frame(frame)
+            if self.fail_at_frame is not None and frame >= self.fail_at_frame:
+                raise OperationFailed("the render stopped with an error")
+            frame += step
+
+    # Section: the viewport flipbook
+
+    def flipbook(self, tab: SceneViewerTab, viewport: Viewport, settings: FlipbookSettings) -> None:
+        if self.flipbook_error is not None:
+            raise self.flipbook_error
+        values = dict(settings.values)
+        start, end = values["frameRange"]
+        step = float(values["frameIncrement"] or 1.0)
+        size = tuple(values["resolution"]) if values["useResolution"] else (640, 480)
+        self.seen.append(
+            {
+                "route": "viewer",
+                "tab": tab.name(),
+                "current": tab.isCurrentTab(),
+                "settings": values,
+                "camera": viewport.camera().path() if viewport.camera() else None,
+                "type": viewport.type(),
+                "view": viewport._default.state(),
+                "shading": viewport.shading(),
+            }
+        )
+        if not self.writes:
+            return
+        shown = self.anything_shown(self.shown_objects())
+        frame = float(start)
+        while frame <= float(end):
+            path = str(values["output"]).replace("$F4", f"{int(frame):04d}")
+            self.draw(path, size, shown)
+            frame += step
+
+    # Section: COP images
+
+    def layer_of(self, node: Node, frame: float | None) -> ImageLayer:
+        self.cop_frames.append(frame)
+        width, height = self.cop_size
+        top = bytes((255, 255, 255, 255)) * (width * (height // 2))
+        bottom = bytes((0, 0, 0, 255)) * (width * (height - height // 2))
+        return ImageLayer(width, height, top + bottom)
+
+    def save_cop2(self, node: Node, path: str, frame_range: Any) -> None:
+        self.cop_frames.append(frame_range[0] if frame_range else None)
+        if self.writes:
+            self.draw(path, self.cop_size, True)

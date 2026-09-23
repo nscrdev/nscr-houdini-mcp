@@ -1044,10 +1044,10 @@ def test_a_dead_workers_record_from_a_scene_never_saved_is_dropped(
 # Section: the tool as a client sees it
 
 
-def test_the_tool_is_listed_last_and_is_not_read_only(bench: Bench) -> None:
+def test_the_tool_is_listed_after_hou_jobs_and_is_not_read_only(bench: Bench) -> None:
     listed, _ = talk(bench.serve())
     names = [tool.name for tool in listed.tools]
-    assert names[-1] == "hou_outputs"
+    assert names.index("hou_outputs") > names.index("hou_jobs")
     [tool] = [tool for tool in listed.tools if tool.name == "hou_outputs"]
     assert tool.annotations is not None
     assert tool.annotations.read_only_hint is None

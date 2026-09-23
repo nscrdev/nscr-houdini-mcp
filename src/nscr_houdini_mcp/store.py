@@ -2462,6 +2462,16 @@ class Store:
         with self._txn(write=True) as db:
             return db.execute("DELETE FROM runs WHERE run_id = ?", (run_id,)).rowcount > 0
 
+    def set_run_paths(self, run_id: str, paths: Any) -> bool:
+        """Replace the paths a run records, once it is known what it wrote."""
+        with self._txn(write=True) as db:
+            return (
+                db.execute(
+                    "UPDATE runs SET paths = ? WHERE run_id = ?", (_dump(paths), run_id)
+                ).rowcount
+                > 0
+            )
+
     def get_run(self, run_id: str) -> RunRecord | None:
         """One run by id."""
         row = self._read_one("SELECT * FROM runs WHERE run_id = ?", (run_id,))

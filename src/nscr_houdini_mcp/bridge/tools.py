@@ -296,18 +296,16 @@ def _renderers(hou: Any) -> list[str]:
 
 
 def _capture_routes(hou: Any) -> list[str]:
-    """The ways this session can produce a picture.
+    """The ways this session can produce a picture, named as `capture.image` names them.
 
-    A viewport flipbook needs a user interface, so a worker never has one. The
-    render node route is there whenever the type is registered.
+    The viewport flipbook and the pane grabs need a user interface, so a
+    worker never has them. The flipbook render node route is there whenever
+    its type is registered, and the image layer read of a COP whenever the
+    build has image layers.
     """
-    routes: list[str] = []
-    if _quiet(hou.isUIAvailable):
-        routes.append("viewport_flipbook")
-    category = _quiet(hou.ropNodeTypeCategory)
-    if category is not None and _quiet(lambda: hou.nodeType(category, "opengl")) is not None:
-        routes.append("opengl_rop")
-    return routes
+    from nscr_houdini_mcp.bridge import capture
+
+    return capture.routes(hou)
 
 
 def _unsaved(hou: Any, context: ToolContext) -> dict[str, Any]:
@@ -2668,7 +2666,7 @@ class _Outputs:
     """
 
     def __init__(self, context: ToolContext, hou: Any) -> None:
-        self._home = context.home
+        self._context = context
         self._open_store = context.open_store
         self._session_id = context.session_id
         self._hou = hou
@@ -2679,32 +2677,13 @@ class _Outputs:
 
     def allocate(self, kind: str, name: str | None, ext: str | None) -> str:
         from nscr_houdini_mcp import outputs
-        from nscr_houdini_mcp.bridge import outputs as bridge_outputs
 
-        if self._home is None or self._open_store is None:
-            raise RuntimeError("this session keeps no state folder, so it has no output paths")
         if kind in (*outputs.RECORD_KINDS, outputs.SPILL_KIND):
             raise outputs.UnknownKind(
                 f"{kind} paths are not handed to code; ask for one of "
                 + ", ".join(outputs.CODE_KINDS)
             )
-        hou = self._hou
-        hip = None if _quiet(hou.hipFile.isNewFile) else _quiet(hou.hipFile.path)
-        # The same scratch folder the server picks for a scene with no file.
-        scratch = None if os.environ.get("HOUDINI_TEMP_DIR") else Path(self._home) / "temp"
-        conventions = outputs.load_conventions(home=self._home, hip_path=hip)
-        with self._open_store() as store:
-            plan = outputs.allocate(
-                store,
-                kind,
-                name=name,
-                hip_path=hip,
-                session_id=self._session_id or None,
-                ext=ext,
-                conventions=conventions,
-                scratch_root=scratch,
-                variables=bridge_outputs.session_variables(hou),
-            )
+        plan = output_plan(self._context, self._hou, kind, name, ext)
         self._handed[plan.path] = plan.run_id
         return plan.path
 
@@ -2779,6 +2758,38 @@ def _parm_address(parm: Any) -> tuple[str, str]:
     if node is None or not name:
         raise TypeError("freeze_parm takes a hou.Parm or a parameter path")
     return str(node.path()), str(name)
+
+
+def output_plan(
+    context: ToolContext, hou: Any, kind: str, name: str | None, ext: str | None
+) -> Any:
+    """One managed output for this session and the scene it holds, claimed and recorded.
+
+    The same table, the same version sequence and the same variables the
+    server uses, with $HIP, $JOB and $HOUDINI_TEMP_DIR read from this session.
+    A scene with no file writes to the scratch folder the server picks for one.
+    """
+    from nscr_houdini_mcp import outputs
+    from nscr_houdini_mcp.bridge import outputs as bridge_outputs
+
+    home, open_store, session_id = context.home, context.open_store, context.session_id
+    if home is None or open_store is None:
+        raise RuntimeError("this session keeps no state folder, so it has no output paths")
+    hip = None if _quiet(hou.hipFile.isNewFile) else _quiet(hou.hipFile.path)
+    scratch = None if os.environ.get("HOUDINI_TEMP_DIR") else Path(home) / "temp"
+    conventions = outputs.load_conventions(home=home, hip_path=hip)
+    with open_store() as store:
+        return outputs.allocate(
+            store,
+            kind,
+            name=name,
+            hip_path=hip,
+            session_id=session_id or None,
+            ext=ext,
+            conventions=conventions,
+            scratch_root=scratch,
+            variables=bridge_outputs.session_variables(hou),
+        )
 
 
 class _Capture:

@@ -89,7 +89,17 @@ def wait_for_stop(stream) -> None:
             return
 
 
+# A hython has no windows to draw in. On Qt's own screen plugin a dense
+# display makes a render node draw at twice the size asked and keep only its
+# bottom left corner; the offscreen plugin draws one pixel to a point. Qt
+# reads this when it first draws, so it is set before the bridge starts and
+# only when nothing named a plugin already.
+QT_PLATFORM_ENV_VAR = "QT_QPA_PLATFORM"
+QT_PLATFORM = "offscreen"
+
+
 def main(argv: list[str] | None = None) -> int:
+    os.environ.setdefault(QT_PLATFORM_ENV_VAR, QT_PLATFORM)
     args = build_parser().parse_args(argv)
     config = BridgeConfig(
         home=args.home,

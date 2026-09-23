@@ -751,6 +751,14 @@ def test_an_inherited_thread_cap_does_not_reach_a_light_worker(config: pool.Pool
     assert pool.THREADS_ENV_VAR not in given
 
 
+def test_a_worker_draws_offscreen_unless_its_shell_says_otherwise(
+    config: pool.PoolConfig,
+) -> None:
+    assert pool.worker_env(config, base={})[pool.QT_PLATFORM_ENV_VAR] == "offscreen"
+    kept = pool.worker_env(config, base={pool.QT_PLATFORM_ENV_VAR: "xcb"})
+    assert kept[pool.QT_PLATFORM_ENV_VAR] == "xcb"
+
+
 def test_a_heavy_worker_is_given_the_machine(home: Path, store: Store, hython: Path) -> None:
     config = pool.PoolConfig(home=home)
     launcher = FakeLauncher(home)

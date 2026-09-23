@@ -104,6 +104,10 @@ TOKEN_ENV_VAR = "NSCR_MCP_WORKER_TOKEN"
 # Houdini's own thread control, which the pool decides rather than inherits.
 THREADS_ENV_VAR = "HOUDINI_MAXTHREADS"
 
+# The Qt screen plugin a worker starts with, unless its shell names one.
+QT_PLATFORM_ENV_VAR = "QT_QPA_PLATFORM"
+QT_PLATFORM = "offscreen"
+
 # How large one worker's log may get before it is rolled over, and how many
 # rolled files are kept. A worker that runs for days and says something on
 # every job must not fill the state folder.
@@ -301,6 +305,11 @@ def worker_env(
         environment[TOKEN_ENV_VAR] = token
     if config.selfcheck:
         environment[bridge_app.SELFCHECK_ENV_VAR] = "1"
+    # A worker has no windows, and Qt's own screen plugin on a dense display
+    # makes the render nodes draw the frame at twice the size asked and keep
+    # only its bottom left corner. The offscreen plugin reports one pixel to a
+    # point on every system. A value the shell already sets is kept.
+    environment.setdefault(QT_PLATFORM_ENV_VAR, QT_PLATFORM)
     return environment
 
 
