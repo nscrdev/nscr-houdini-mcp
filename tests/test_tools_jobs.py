@@ -187,45 +187,122 @@ def test_background_false_times_out_with_the_job_to_follow(bench: Bench, module:
 # Section: waiting
 
 
-def test_a_wait_returns_at_its_deadline_when_nothing_changes(bench: Bench, module: Any) -> None:
-    handle = in_the_background(bench, "hou.gate.wait(10)")
-    support.wait_until(lambda: row(bench, handle["job_id"]).state == "running", timeout_s=5.0)
-    began = time.monotonic()
-    held = job(bench, handle["job_id"], wait_s=0.6)
-    assert 0.5 <= time.monotonic() - began < 3.0
+class HeldClock:
+    """The clock a held status reads, moved by its own pauses.
+
+    Each pause moves the clock on and then runs whatever the check asked to
+    happen at that moment, so the order of events is fixed and no check
+    waits on real time.
+    """
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.pauses = 0
+        self.at: dict[int, Any] = {}
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        self.pauses += 1
+        happen = self.at.get(self.pauses)
+        if happen is not None:
+            happen()
+
+
+@pytest.fixture
+def held_clock(monkeypatch: pytest.MonkeyPatch) -> HeldClock:
+    made = HeldClock()
+    monkeypatch.setattr(jobs_tool, "monotonic", made.monotonic)
+    monkeypatch.setattr(jobs_tool, "sleep", made.sleep)
+    return made
+
+
+def a_running_job(bench: Bench, job_id: str) -> None:
+    with bench.store() as store:
+        store.create_job(
+            job_id, kind="python", session_id="s-1", state="running", worker_pid=os.getpid()
+        )
+
+
+def test_a_wait_returns_at_its_deadline_when_nothing_changes(
+    bench: Bench, held_clock: HeldClock
+) -> None:
+    a_running_job(bench, "job-still")
+    held = job(bench, "job-still", wait_s=3)
     assert held["changed"] is False
     assert held["state"] == "running"
-    module.gate.set()
-    idle(bench)
+    # Three seconds of pauses a quarter of a second long, and not one more.
+    assert held_clock.pauses == 12
 
 
-def test_a_wait_returns_when_the_job_ends(bench: Bench, module: Any) -> None:
-    handle = in_the_background(bench, "hou.gate.wait(10)\nresult = 'there'")
-    support.wait_until(lambda: row(bench, handle["job_id"]).state == "running", timeout_s=5.0)
-    threading.Timer(0.3, module.gate.set).start()
-    began = time.monotonic()
-    held = job(bench, handle["job_id"], wait_s=20)
-    assert time.monotonic() - began < 10.0
+def test_a_wait_returns_when_the_job_ends(bench: Bench, held_clock: HeldClock) -> None:
+    a_running_job(bench, "job-ends")
+
+    def end() -> None:
+        with bench.store() as store:
+            store.update_job("job-ends", state="done", outputs={"answer": {"result": 1}})
+
+    held_clock.at[3] = end
+    held = job(bench, "job-ends", wait_s=20)
     assert held["changed"] is True
     assert held["state"] == "done"
-    assert held["outputs"]["result"] == "there"
+    assert held_clock.pauses == 3
 
 
-def test_a_wait_returns_when_progress_moves(bench: Bench, module: Any) -> None:
-    code = "mcp.progress(1, 4, 'one of four')\nhou.gate.wait(10)\nmcp.progress(4, 4, 'done')"
-    handle = in_the_background(bench, code)
-    job_id = handle["job_id"]
-    support.wait_until(lambda: row(bench, job_id).state == "running", timeout_s=5.0)
-    held = job(bench, job_id, wait_s=10)
-    if held["progress"] is None:
-        # The wait began before the first note was written; the next change is it.
-        held = job(bench, job_id, wait_s=10)
+def test_a_wait_returns_when_progress_moves(bench: Bench, held_clock: HeldClock) -> None:
+    a_running_job(bench, "job-moves")
+
+    def note() -> None:
+        with bench.store() as store:
+            store.beat_job("job-moves", progress={"done": 1, "total": 4, "message": "one"})
+
+    held_clock.at[2] = note
+    held = job(bench, "job-moves", wait_s=20)
     assert held["changed"] is True
-    assert held["progress"] == {"done": 1, "total": 4, "message": "one of four"}
-    module.gate.set()
-    ended = job(bench, job_id, wait_s=10)
-    assert ended["state"] == "done"
-    assert ended["progress"] == {"done": 4, "total": 4, "message": "done"}
+    assert held["state"] == "running"
+    assert held["progress"] == {"done": 1, "total": 4, "message": "one"}
+    assert held_clock.pauses == 2
+
+
+def test_a_wait_ends_when_the_session_is_found_gone(bench: Bench, held_clock: HeldClock) -> None:
+    bench.session("s-2", "w2")
+    with bench.store() as store:
+        store.create_job("job-orphan", kind="python", session_id="s-2", state="running")
+
+    def gone() -> None:
+        # The process behind the session ends, as a crash ends it: nothing
+        # writes to the store, so only a look at the session can tell.
+        raw = sqlite3.connect(str(bench.store_path))
+        raw.execute("UPDATE sessions SET pid_start = 'another' WHERE session_id = 's-2'")
+        raw.commit()
+        raw.close()
+
+    held_clock.at[1] = gone
+    held = job(bench, "job-orphan", wait_s=20)
+    assert held["state"] == "lost"
+    assert held["error"]["code"] == "SESSION_ENDED"
+    assert held["changed"] is True
+    # Found at the first look at the session, two seconds in.
+    assert held_clock.pauses == 8
+
+
+def test_a_progress_note_written_before_the_hold_began_is_no_change(
+    bench: Bench, held_clock: HeldClock
+) -> None:
+    with bench.store() as store:
+        store.create_job(
+            "job-noted",
+            kind="python",
+            session_id="s-1",
+            state="running",
+            worker_pid=os.getpid(),
+            progress={"done": 1, "total": 4, "message": "one"},
+        )
+    held = job(bench, "job-noted", wait_s=1)
+    assert held["changed"] is False
+    assert held["progress"] == {"done": 1, "total": 4, "message": "one"}
 
 
 def test_waiting_on_a_job_that_has_ended_answers_at_once(bench: Bench) -> None:
@@ -249,9 +326,8 @@ def test_cancel_reaches_a_running_call_and_it_ends_cancelled(bench: Bench) -> No
     assert asked["cancel"]["reached_session"] is True
     assert asked["cancel"]["asked"] is True
     assert asked["cancel_requested"] is True
-    ended = job(bench, job_id, wait_s=20)
-    if ended["state"] == "running":
-        ended = job(bench, job_id, wait_s=20)
+    idle(bench)
+    ended = job(bench, job_id)
     assert ended["state"] == "cancelled"
     assert ended["outputs"]["result"] < 2000
     assert ended["cancel_requested"] is True
@@ -376,6 +452,8 @@ def test_an_id_nobody_knows_is_refused_with_a_way_on(bench: Bench) -> None:
     assert error["details"]["kept_days"] == 7
     error = refused(jobs(bench, action="status"))
     assert error["code"] == "BAD_ARGUMENTS"
+    error = refused(jobs(bench, job_id="job-nothing", max_chars=0))
+    assert (error["code"], error["details"]["argument"]) == ("BAD_ARGUMENTS", "max_chars")
 
 
 def test_list_pages_newest_first_and_filters(bench: Bench) -> None:
@@ -412,13 +490,12 @@ def test_list_pages_newest_first_and_filters(bench: Bench) -> None:
 
 def test_a_second_server_follows_a_job_by_id(bench: Bench, module: Any) -> None:
     handle = in_the_background(bench, "hou.gate.wait(10)\nresult = 'across'")
+    module.gate.set()
+    idle(bench)
     # A new server object, as a client restart makes: nothing is carried over
     # but the store.
-    threading.Timer(0.3, module.gate.set).start()
     _, [held] = talk(bench.serve(), ("hou_jobs", {"job_id": handle["job_id"], "wait_s": 20}))
     body = ok(held)
-    if body["state"] == "running":
-        body = job(bench, handle["job_id"], wait_s=20)
     assert body["state"] == "done"
     assert body["outputs"]["result"] == "across"
 

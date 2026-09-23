@@ -58,7 +58,7 @@ from nscr_houdini_mcp.results import CallError
 from nscr_houdini_mcp.router import DEAD_STATES
 from nscr_houdini_mcp.store import JobRecord
 from nscr_houdini_mcp.tools import python as python_tool
-from nscr_houdini_mcp.tools.base import SESSION, Call, ToolSpec, inputs, outputs
+from nscr_houdini_mcp.tools.base import Call, ToolSpec, inputs, outputs
 
 ACTIONS = ("status", "cancel", "list")
 STATES = ("queued", "running", "done", "failed", "cancelled", "lost")
@@ -104,6 +104,13 @@ sleep: Callable[[float], None] = time.sleep
 
 def jobs(call: Call) -> Mapping[str, Any]:
     action = call.arguments.get("action") or "status"
+    max_chars = call.arguments.get("max_chars")
+    if max_chars is not None and not 1 <= max_chars <= python_tool.MAX_MAX_CHARS:
+        raise CallError(
+            "BAD_ARGUMENTS",
+            f"max_chars must be from 1 to {python_tool.MAX_MAX_CHARS}",
+            details={"argument": "max_chars", "given": max_chars},
+        )
     return ACTION_HANDLERS[action](call)
 
 
@@ -653,18 +660,19 @@ HOU_JOBS = ToolSpec(
     name="hou_jobs",
     description=(
         "Status, wait, cancel or list long running jobs. wait_s holds the call until the "
-        "job changes state, so do not poll with sleeps. Job ids are kept for 7 days."
+        "job changes, so do not poll with sleeps. Jobs are kept 7 days."
     ),
     input_schema=inputs(
         {
             "action": {"type": "string", "enum": list(ACTIONS)},
             "job_id": {"type": "string"},
             "wait_s": {"type": "number", "minimum": 0, "maximum": 50},
-            "session": SESSION,
+            # A list filter, an id or alias, so it names nothing to route to.
+            "session": {"type": "string"},
             "state": {"type": "string", "enum": list(STATES)},
             "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT},
             "page": {"type": "string"},
-            "max_chars": {"type": "integer", "minimum": 1, "maximum": python_tool.MAX_MAX_CHARS},
+            "max_chars": {"type": "integer"},
         }
     ),
     output_schema=outputs({}),
