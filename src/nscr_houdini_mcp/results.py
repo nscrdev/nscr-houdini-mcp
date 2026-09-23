@@ -100,6 +100,7 @@ HINTS: dict[str, str] = {
     "CAPTURE_EMPTY": "check the camera and the node shown, then capture again",
     "BAD_ENVELOPE": "the server sent a request the bridge could not read; report it",
     "UNAUTHORIZED": "the session's token changed; call again so the session is read afresh",
+    "FLOOD_GUARD": "wait the retry_after_s in the details, then call again",
     "FORBIDDEN": "the request did not come from this machine's loopback; report it",
     "METHOD_REFUSED": "the server used the wrong method; report it",
     "NOT_FOUND": "the bridge is a different version; restart the session",

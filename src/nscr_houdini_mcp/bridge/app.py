@@ -724,13 +724,44 @@ class Bridge:
             self._verifier.check(
                 headers, method=request.method, path=request.path, body=request.body
             )
+        except signing.FloodGuard as flood:
+            # The signature matched, so the caller holds the token and is told
+            # what the limit is and how long to wait, not that it is a stranger.
+            self._log(f"refused a request to {request.path}: {flood.reason}")
+            return self._refuse(
+                request,
+                429,
+                "FLOOD_GUARD",
+                f"more than {flood.limit} signed requests arrived inside"
+                f" {flood.window_s} seconds, so this one was refused",
+                hint=(
+                    f"the bridge takes at most {flood.limit} requests in any"
+                    f" {flood.window_s} seconds; wait {flood.wait_s} seconds, then call"
+                    " again with the same operation_id"
+                ),
+                details={
+                    "limit": flood.limit,
+                    "window_s": flood.window_s,
+                    "retry_after_s": flood.wait_s,
+                },
+            )
         except signing.SignatureRefused as refused:
             self._log(f"refused a request to {request.path}: {refused.reason}")
             return self._refuse(request, 401, "UNAUTHORIZED", "the request was not signed for me")
         return None
 
-    def _refuse(self, request: RawRequest, status: int, code: str, message: str) -> RawReply:
-        return self._answer(request, Reply(status, error_payload(code, message)))
+    def _refuse(
+        self,
+        request: RawRequest,
+        status: int,
+        code: str,
+        message: str,
+        *,
+        hint: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> RawReply:
+        payload = error_payload(code, message, hint=hint, details=details)
+        return self._answer(request, Reply(status, payload))
 
     def _answer(self, request: RawRequest, reply: Reply) -> RawReply:
         """Sign an answer, so a caller can tell this bridge from a squatter."""

@@ -115,8 +115,40 @@ def test_the_nonce_table_does_not_grow_without_end() -> None:
     log = signing.NonceLog(window_s=1000, limit=3)
     for index in range(3):
         assert log.claim(f"n{index}", 100.0) is True
-    assert log.claim("n3", 100.0) is False
+    with pytest.raises(signing.FloodGuard):
+        log.claim("n3", 100.0)
     assert len(log) == 3
+
+
+def test_a_full_table_says_the_limit_the_window_and_how_long_to_wait() -> None:
+    log = signing.NonceLog(window_s=120, limit=2)
+    assert log.claim("a", 100.0) is True
+    assert log.claim("b", 130.0) is True
+    # A nonce already taken is still a replay, full table or not.
+    assert log.claim("a", 150.0) is False
+    with pytest.raises(signing.FloodGuard) as raised:
+        log.claim("c", 150.5)
+    flood = raised.value
+    assert (flood.limit, flood.window_s) == (2, 120)
+    # The oldest nonce ages out at 220, so room comes free in 69.5 seconds.
+    assert flood.wait_s == 70
+    assert isinstance(flood, signing.SignatureRefused)
+    # Once the oldest has gone there is room again.
+    assert log.claim("c", 220.5) is True
+
+
+def test_the_verifier_raises_the_flood_guard_only_for_a_good_signature() -> None:
+    verifier = signing.Verifier("token", "session", nonces=signing.NonceLog(limit=1))
+    body = b"{}"
+    first = sign("token", "session", body=body)
+    verifier.check(first, method="POST", path="/nscr-mcp/call", body=body)
+    forged = sign("other", "session", body=body)
+    with pytest.raises(signing.SignatureRefused) as refused:
+        verifier.check(forged, method="POST", path="/nscr-mcp/call", body=body)
+    assert not isinstance(refused.value, signing.FloodGuard)
+    second = sign("token", "session", body=body)
+    with pytest.raises(signing.FloodGuard):
+        verifier.check(second, method="POST", path="/nscr-mcp/call", body=body)
 
 
 def test_an_answer_is_signed_for_the_nonce_that_asked_for_it() -> None:

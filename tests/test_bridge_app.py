@@ -458,6 +458,37 @@ def test_the_same_signature_cannot_be_sent_twice(tmp_path: Path, driver: str) ->
         bridge.stop()
 
 
+def test_a_flood_of_signed_requests_gets_a_coded_answer_with_the_limit_and_the_wait(
+    tmp_path: Path, driver: str
+) -> None:
+    bridge, backend = make_bridge(tmp_path, driver=driver)
+    bridge.start()
+    try:
+        assert send(bridge, backend, CALL_PATH, envelope()).status == 200
+        # Fill the table the way a flood would. The bridge's own self check
+        # spends nonces too, in the background, so the fill goes until the
+        # table refuses rather than to a count worked out beforehand.
+        nonces = bridge._verifier.nonces
+        limit = nonces.limit = len(nonces) + 5
+        with pytest.raises(signing.FloodGuard):
+            for index in range(limit + 1):
+                nonces.claim(f"flood-{index:04d}", time.time())
+        reply = send(bridge, backend, CALL_PATH, envelope())
+        assert reply.status == 429
+        error = body_of(reply)["error"]
+        assert error["code"] == "FLOOD_GUARD"
+        window = signing.DEFAULT_SKEW_S
+        assert error["details"]["limit"] == limit
+        assert error["details"]["window_s"] == window
+        assert 1 <= error["details"]["retry_after_s"] <= window
+        assert f"at most {limit} requests in any {window} seconds" in error["hint"]
+        window = error["details"]["retry_after_s"]
+        assert f"wait {window} seconds" in error["hint"]
+        assert "not signed" not in error["message"]
+    finally:
+        bridge.stop()
+
+
 def test_a_signature_from_outside_the_time_window_is_refused(tmp_path: Path, driver: str) -> None:
     bridge, backend = make_bridge(tmp_path, driver=driver)
     bridge.start()

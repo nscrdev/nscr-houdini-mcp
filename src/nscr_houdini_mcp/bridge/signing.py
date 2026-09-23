@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import math
 import secrets
 import threading
 import time
@@ -54,6 +55,21 @@ class SignatureRefused(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class FloodGuard(SignatureRefused):
+    """A signed request arrived while the nonce table was full.
+
+    Only a request whose signature matched gets this far, so the caller holds
+    the token and may be told plainly what happened: how many requests the
+    window holds, how long the window is and how long until room comes free.
+    """
+
+    def __init__(self, *, limit: int, window_s: int, wait_s: int) -> None:
+        super().__init__(f"{limit} signed requests arrived inside {window_s} seconds")
+        self.limit = limit
+        self.window_s = window_s
+        self.wait_s = wait_s
 
 
 def body_digest(body: bytes) -> str:
@@ -149,14 +165,21 @@ class NonceLog:
         self._lock = threading.Lock()
 
     def claim(self, nonce: str, now: float) -> bool:
-        """Take a nonce, or say it has already been used."""
+        """Take a nonce, or say it has already been used.
+
+        Raises `FloodGuard` when the table is full: something is sending more
+        signed requests than the window can remember, and refusing is the
+        safe answer. The refusal says how long until the oldest nonce ages
+        out and a request can be taken again.
+        """
         with self._lock:
             self._forget(now)
             if nonce in self._seen:
                 return False
             if len(self._seen) >= self.limit:
-                # Full means something is flooding. Refusing is the safe answer.
-                return False
+                oldest = min(self._seen.values())
+                wait = max(1, math.ceil(oldest + self.window_s - now))
+                raise FloodGuard(limit=self.limit, window_s=self.window_s, wait_s=wait)
             self._seen[nonce] = now
             return True
 
@@ -184,7 +207,8 @@ class Verifier:
         self._token = token
         self._session_id = session_id
         self.skew_s = skew_s
-        self.nonces = nonces or NonceLog(window_s=skew_s)
+        # An empty log has no length and so reads as false: test for None.
+        self.nonces = nonces if nonces is not None else NonceLog(window_s=skew_s)
 
     def nonce_of(self, headers: Mapping[str, str]) -> str:
         """The nonce a request carried, for signing the answer to it."""
@@ -232,7 +256,8 @@ class Verifier:
         )
         if not equal(signature, expected):
             raise SignatureRefused("the signature does not match")
-        # Last, so a wrong signature cannot spend a nonce.
+        # Last, so a wrong signature cannot spend a nonce. A full table raises
+        # `FloodGuard` from here, which is a `SignatureRefused` as well.
         if not self.nonces.claim(nonce, moment):
             raise SignatureRefused("the nonce has been used")
 
