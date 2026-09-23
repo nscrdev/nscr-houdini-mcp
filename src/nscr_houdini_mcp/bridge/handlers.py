@@ -18,6 +18,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from nscr_houdini_mcp.bridge import capture as capture_module
 from nscr_houdini_mcp.bridge import tools as tool_module
 from nscr_houdini_mcp.bridge.tools import ToolContext
 
@@ -191,6 +192,24 @@ INSPECT_ARGUMENTS = (
 # process, and a retry from a restarted server is still the same call.
 PYTHON_ARGUMENTS = ("code", "namespace", "default_namespace", "reset", "undo_label")
 
+# What `capture.image` takes. The server has already checked them against its
+# schema; the bridge checks them again against the scene. `region` is the
+# server's crop, carried through so a job read back later can apply it.
+CAPTURE_ARGUMENTS = (
+    "source",
+    "path",
+    "camera",
+    "frame_target",
+    "display",
+    "guides",
+    "resolution",
+    "frame",
+    "frames",
+    "views",
+    "name",
+    "region",
+)
+
 # A page can hold two thousand rows, and a full read of fifty nodes a great
 # many values. The server spills an answer that large to a file rather than
 # cut it, so the bridge carries all of it.
@@ -326,6 +345,22 @@ def default_registry(
         caps=tool_module.PYTHON_CAPS,
         job_kind="python",
         job_spec=python_job_spec,
+    )
+    registry.add(
+        "capture.image",
+        capture_module.capture_image,
+        # A capture changes nothing the artist keeps: what it makes for itself
+        # is made and taken away with undo turned off. It still takes a
+        # receipt, so a lost reply sent again names the same files rather
+        # than rendering twice, and it runs as a job, so a long sequence can
+        # be followed.
+        mutating=True,
+        arguments=CAPTURE_ARGUMENTS,
+        context=True,
+        label="capture",
+        summary="save a picture of the viewport, a node, the network, a COP or a pane",
+        job_kind="capture",
+        job_spec=capture_module.job_spec,
     )
     registry.add_report("namespaces", namespaces.state)
     return registry

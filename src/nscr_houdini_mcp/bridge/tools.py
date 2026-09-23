@@ -278,18 +278,16 @@ def _renderers(hou: Any) -> list[str]:
 
 
 def _capture_routes(hou: Any) -> list[str]:
-    """The ways this session can produce a picture.
+    """The ways this session can produce a picture, named as `capture.image` names them.
 
-    A viewport flipbook needs a user interface, so a worker never has one. The
-    render node route is there whenever the type is registered.
+    The viewport flipbook and the pane grabs need a user interface, so a
+    worker never has them. The flipbook render node route is there whenever
+    its type is registered, and the image layer read of a COP whenever the
+    build has image layers.
     """
-    routes: list[str] = []
-    if _quiet(hou.isUIAvailable):
-        routes.append("viewport_flipbook")
-    category = _quiet(hou.ropNodeTypeCategory)
-    if category is not None and _quiet(lambda: hou.nodeType(category, "opengl")) is not None:
-        routes.append("opengl_rop")
-    return routes
+    from nscr_houdini_mcp.bridge import capture
+
+    return capture.routes(hou)
 
 
 def _unsaved(hou: Any, context: ToolContext) -> dict[str, Any]:
@@ -2625,31 +2623,40 @@ def _allocator(context: ToolContext, hou: Any) -> Any:
     The state folder and the store stay inside this function, out of reach of
     the object the code holds.
     """
-    home, open_store, session_id = context.home, context.open_store, context.session_id
 
     def allocate(kind: str, name: str | None, ext: str | None) -> str:
-        from nscr_houdini_mcp import outputs
-
-        if home is None or open_store is None:
-            raise RuntimeError("this session keeps no state folder, so it has no output paths")
-        hip = None if _quiet(hou.hipFile.isNewFile) else _quiet(hou.hipFile.path)
-        # The same scratch folder the server picks for a scene with no file.
-        scratch = None if os.environ.get("HOUDINI_TEMP_DIR") else Path(home) / "temp"
-        conventions = outputs.load_conventions(home=home, hip_path=hip)
-        with open_store() as store:
-            plan = outputs.allocate(
-                store,
-                kind,
-                name=name,
-                hip_path=hip,
-                session_id=session_id or None,
-                ext=ext,
-                conventions=conventions,
-                scratch_root=scratch,
-            )
-        return plan.path
+        return output_plan(context, hou, kind, name, ext).path
 
     return allocate
+
+
+def output_plan(
+    context: ToolContext, hou: Any, kind: str, name: str | None, ext: str | None
+) -> Any:
+    """One managed output for this session and the scene it holds, claimed and recorded.
+
+    The same table and the same version sequence the server uses. A scene
+    with no file writes to the scratch folder the server picks for one.
+    """
+    from nscr_houdini_mcp import outputs
+
+    home, open_store, session_id = context.home, context.open_store, context.session_id
+    if home is None or open_store is None:
+        raise RuntimeError("this session keeps no state folder, so it has no output paths")
+    hip = None if _quiet(hou.hipFile.isNewFile) else _quiet(hou.hipFile.path)
+    scratch = None if os.environ.get("HOUDINI_TEMP_DIR") else Path(home) / "temp"
+    conventions = outputs.load_conventions(home=home, hip_path=hip)
+    with open_store() as store:
+        return outputs.allocate(
+            store,
+            kind,
+            name=name,
+            hip_path=hip,
+            session_id=session_id or None,
+            ext=ext,
+            conventions=conventions,
+            scratch_root=scratch,
+        )
 
 
 class _Capture:
