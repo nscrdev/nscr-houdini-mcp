@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nscr-houdini-mcp"
-version = "0.0.1"
+version = "0.1.0"
 description = "MCP server for SideFX Houdini 22"
 readme = "README.md"
 requires-python = ">=3.11"
