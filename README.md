@@ -117,39 +117,61 @@ Every tool that reads takes the same three `detail` levels:
 `expressions`, `code`, `notes` or `cook_time`.
 
 `hou_python` runs Python inside a session with the whole `hou` API. What the
-code leaves in a variable named `result` comes back, turned into JSON the way
-every answer is: a node or a parameter as its path, a vector or an array as a
-list, up to the usual caps. Variables stay between calls in a namespace, one
-dict per session and name, seeded with `hou` and `mcp` and nothing else. A
-call that names none uses this server's own, `c_` and an id drawn when the
-server starts; `shared` is the name to use when agents should share. A
-namespace goes when a call passes `reset`, when the session ends, or after a
-day nobody used it. Separate namespaces keep variables apart, never the
-scene: every one of them works on the same node graph.
+code leaves in a variable named `result` comes back, turned into JSON on the
+session's own thread the way every answer is: a node or a parameter as its
+path, a vector or an array as a list, a numpy scalar as its number, up to the
+usual caps. A collection is read only as far as its cap. Variables stay
+between calls in a namespace, one dict per session and name, seeded with
+`hou` and `mcp` and nothing else. A call that names none uses this server's
+own, `c_` and an id drawn when the server starts; `shared` is the name to use
+when agents should share. A namespace goes when a call passes `reset`, when
+the session ends, or when nobody has used it for an hour (a `c_` default) or
+a day (any other name). A session keeps at most 32, dropping the least
+recently used, and its health says how many there are and roughly how big.
+Separate namespaces keep variables apart, never the scene: every one of them
+works on the same node graph.
 
-What the code prints, on either stream, comes back as `stdout_tail`.
-`max_chars` (12,000 unless you say) is the budget for the result and the
-printed text together; what does not fit is counted in `elided_chars` and
-written whole to the spill folder, named in `spill_path`. An exception in the
-code is not a failed call: the result carries `error` with the type, the
-message and the last twenty lines of the traceback, a syntax error its line
-and offset, places on disk taken out, and the client sees it marked as an
-error. The namespace and the scene are left as the code left them.
+What the code prints, on either stream, comes back as `stdout_tail`. Only
+what the call's own thread prints is taken, and whatever the code does to
+`sys.stdout` or `sys.stderr` is undone when the call ends. `max_chars`
+(12,000 unless you say) is the budget for the result and the printed text
+together; what does not fit is counted in `elided_chars`, and what the
+session kept is written to the spill folder, named in `spill_path`. The
+session keeps the last 512,000 characters of output and the result as it was
+encoded, which is bounded too, so the spill holds that much and no more. Text
+UTF-8 cannot carry, such as a lone surrogate in a file name, comes back as its
+escape, and `lossy` with `cut` says where anything was changed or cut.
+
+An exception in the code is not a failed call: the result carries `error`
+with the type, the message and the last twenty lines of the traceback, places
+on disk taken out, and the client sees it marked as an error. Code that will
+not compile is the same, with a syntax error's line and offset. The namespace
+and the scene are left as the code left them, on purpose: what the code did
+before it raised stays as one undo entry, for a person to keep or take back.
 
 Every call counts as a change. It runs in one undo group, named `undo_label`
 or `hou_python` and the operation id, takes a receipt under that id and
-follows the same busy, cancel and retry rules as any other change. A call
-that runs past `timeout_s` (a minute unless you say, at most
-`python_timeout_cap_s` from `config.toml`) answers `TIMEOUT` with
-`still_running`; the code carries on, and the same operation id fetches its
-answer once it ends.
+follows the same busy and retry rules as any other change. Because the call
+is inside its own undo group, `hou.undos.performUndo()` in the code raises;
+taking a whole call back is for a person in a session with a user interface.
+The receipt is bound to the arguments the caller sent, so a lost reply sent
+again with the same operation id is answered from it, even by a server
+started since and even when the call named no namespace, and the answer names
+the namespace the code ran in. A call that runs past `timeout_s` (a minute
+unless you say; anything above `python_timeout_cap_s` in `config.toml`, at
+most an hour, is lowered to it) answers `TIMEOUT` with `still_running`; the
+code carries on, and the same operation id fetches its answer once it ends,
+also when sent while the code is still running.
 
-`mcp` in every namespace has three things. `mcp.output_path(kind, name, ext)`
-hands out a managed path for this session and scene from the output table
-below, for `render`, `flipbook`, `comp`, `cache`, `usd`, `hip`, `capture` or
-`compare`. `mcp.progress(done, total, message)` leaves a note that health, and
-`hou_ping`, show while the call runs. `mcp.cancelled()` says whether somebody
-asked the call to stop, for a long loop to look at between pieces of work.
+`mcp` in every namespace has three things, made afresh for each call and
+answering only on that call's thread while it runs. `mcp.output_path(kind,
+name, ext)` hands out a managed path for this session and scene from the
+output table below, for `render`, `flipbook`, `comp`, `cache`, `usd`, `hip`,
+`capture` or `compare`. `mcp.progress(done, total, message)` leaves a note,
+finite numbers only, that health and `hou_ping` show while the call runs.
+`mcp.cancelled()` says whether the call should stop, for a long loop to look
+at between pieces of work. Today it turns true when the session is going
+down; a tool that asks a running call to stop comes with background jobs.
 
 ### The Houdini side
 
