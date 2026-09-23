@@ -433,7 +433,11 @@ class Router:
         once rather than a place in the queue, including behind a main thread
         that is away.
         """
-        if not self.paces(target, tool):
+        # The same operation id as the call out is a resend: the bridge
+        # answers it from that call's receipt without the main thread, so it
+        # never waits for a turn behind the very call it asks about.
+        resend = self.pacer.holds(target.session_id, operation_id)
+        if resend or not self.paces(target, tool):
             return self._call(
                 target,
                 tool,
@@ -454,6 +458,9 @@ class Router:
                 budget_s=budget,
                 skip_if_busy=skip_if_busy,
                 cancelled=cancelled.is_set if cancelled is not None else None,
+                operation_id=operation_id,
+                runs_s=BRIDGE_TIMEOUT_S if timeout_s is None else timeout_s,
+                runs_known=timeout_s is not None,
             )
         except NoTurn as refused:
             raise paced_busy(target, refused) from None

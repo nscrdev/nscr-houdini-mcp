@@ -507,7 +507,10 @@ in its trace, as `throttled_ms`, and when it was let through, as
 The pace is kept per server process and per session. Two agents sharing one
 server process share its one allowance; two server processes, one per
 client, each have their own, so together they get no more than twice it.
-At most 32 calls wait on one session's turn; one more is answered
+A call sent again under the operation id of the call that is out goes
+straight through, since the bridge answers it from that call's receipt, and a
+call behind one that named a timeout running past its own wait is refused at
+once. At most 32 calls wait on one session's turn; one more is answered
 `SESSION_BUSY` at once, and a call whose client cancels leaves the queue
 without being sent. Workers are headless and are not paced. A cancel is never
 paced either, since it runs beside the call it stops.

@@ -280,17 +280,31 @@ def test_a_call_whose_caller_went_away_leaves_the_queue() -> None:
 class CountingBridge:
     """A stand in bridge that takes a little while per call and counts them."""
 
-    def __init__(self, *, takes_s: float = 0.02, hold: threading.Event | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        takes_s: float = 0.02,
+        hold: threading.Event | None = None,
+        hold_first_only: bool = False,
+    ) -> None:
         self.takes_s = takes_s
         self.hold = hold
+        self.hold_first_only = hold_first_only
         self.tools: list[str] = []
         self.lock = threading.Lock()
 
     def __call__(self, session: client.Session, tool: str, **rest: Any) -> client.Answer:
         with self.lock:
             self.tools.append(tool)
-        if self.hold is not None:
+            first = len(self.tools) == 1
+        if self.hold is not None and (first or not self.hold_first_only):
             self.hold.wait(10)
+            time.sleep(self.takes_s)
+            return client.Answer(200, {"ok": True, "data": {}}, {})
+        if self.hold_first_only:
+            # A resend meets the first call still running, as the bridge
+            # answers it from the receipt: at once, with the job to follow.
+            return client.Answer(200, {"ok": True, "data": {"state": "running"}}, {})
         time.sleep(self.takes_s)
         return client.Answer(200, {"ok": True, "data": {}}, {})
 
@@ -589,3 +603,83 @@ def test_the_reply_carries_throttled_ms_and_admitted_at_in_its_trace() -> None:
     assert "throttled_ms" not in first.structured_content["trace"]
     assert first.structured_content["trace"]["admitted_at"] == pytest.approx(100.0)
     assert second.structured_content["trace"]["throttled_ms"] == 50
+
+
+def test_a_resend_of_the_call_that_is_out_goes_straight_to_the_bridge() -> None:
+    release = threading.Event()
+    bridge = CountingBridge(hold=release, hold_first_only=True)
+    routed = real_router([record("s-1", "scene", kind="gui")], bridge)
+    target = routed.resolve(None)
+    first = threading.Thread(
+        target=lambda: routed.call(
+            target, "python.run", operation_id="op-1", wait_s=5.0, timeout_s=10.0
+        )
+    )
+    first.start()
+    try:
+        while not bridge.tools:
+            time.sleep(0.005)
+        started = time.monotonic()
+        again = routed.call(target, "python.run", operation_id="op-1", wait_s=5.0)
+        took = time.monotonic() - started
+        assert took < 0.1
+        assert again["data"] == {"state": "running"}
+        # Never paced: no turn was taken, so no admission time either.
+        assert "admitted_at" not in again and "throttled_ms" not in again
+        assert len(routed.pacer._paces["s-1"].queue) == 0
+        assert bridge.tools == ["python.run", "python.run"]
+    finally:
+        release.set()
+        first.join(10)
+
+
+def test_a_call_behind_one_out_past_its_wait_is_refused_at_once_with_when() -> None:
+    release = threading.Event()
+    bridge = CountingBridge(hold=release)
+    routed = real_router([record("s-1", "scene", kind="gui")], bridge)
+    target = routed.resolve(None)
+    first = threading.Thread(
+        target=lambda: routed.call(
+            target, "python.run", operation_id="op-1", wait_s=0.0, timeout_s=3.0
+        )
+    )
+    first.start()
+    try:
+        while not bridge.tools:
+            time.sleep(0.005)
+        started = time.monotonic()
+        with pytest.raises(CallError) as refused:
+            routed.call(target, "bridge.ping", wait_s=1.0)
+        took = time.monotonic() - started
+        error = refused.value
+        assert took < 0.1
+        assert error.code == "SESSION_BUSY"
+        reason = error.details["reason"]
+        assert reason == "another call holds the session longer than this call will wait"
+        # When to come back: the rest of the three seconds, then the pause.
+        assert 2.5 < error.details["retry_after_s"] <= 3.05
+        assert error.details["throttled_ms"] == 0
+        assert bridge.tools == ["python.run"]
+    finally:
+        release.set()
+        first.join(10)
+
+
+def test_a_call_behind_one_with_no_timeout_of_its_own_still_waits_its_turn() -> None:
+    # A default timeout is a ceiling, not an estimate: a short call behind it
+    # is given its wait, and is let through once the first ends.
+    release = threading.Event()
+    bridge = CountingBridge(hold=release, hold_first_only=True)
+    routed = real_router([record("s-1", "scene", kind="gui")], bridge)
+    target = routed.resolve(None)
+    first = threading.Thread(target=lambda: routed.call(target, "bridge.ping", wait_s=5.0))
+    first.start()
+    try:
+        while not bridge.tools:
+            time.sleep(0.005)
+        threading.Timer(0.2, release.set).start()
+        second = routed.call(target, "bridge.ping", wait_s=2.0)
+        assert second["throttled_ms"] >= 200
+    finally:
+        release.set()
+        first.join(10)

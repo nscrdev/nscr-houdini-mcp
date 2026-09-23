@@ -107,8 +107,14 @@ def server_params(home: Path, config: Path) -> StdioServerParameters:
     )
 
 
-async def hammer(home: Path, config: Path, alias: str, ready: asyncio.Barrier) -> dict[str, Any]:
-    """One client: connect, wait for the other, then send every call back to back."""
+async def hammer(
+    home: Path, config: Path, alias: str, ready: asyncio.Barrier, name: str
+) -> dict[str, Any]:
+    """One client: connect, wait for the other, then send every call back to back.
+
+    The first failure is printed as it happens, so a run that goes wrong once
+    can be read from the captured output.
+    """
     async with Client(
         server_params(home, config), mode="auto", read_timeout_seconds=READ_TIMEOUT_S
     ) as connected:
@@ -116,7 +122,7 @@ async def hammer(home: Path, config: Path, alias: str, ready: asyncio.Barrier) -
         await ready.wait()
         sent: list[float] = []
         waited: list[int] = []
-        failed: list[str] = []
+        failed: list[dict[str, str]] = []
         started = time.time()
         admitted: list[float] = []
         for _ in range(CALLS):
@@ -124,7 +130,14 @@ async def hammer(home: Path, config: Path, alias: str, ready: asyncio.Barrier) -
             # A wait long enough for any turn, so none is refused as too far off.
             result = await connected.call_tool("hou_ping", {"session": alias, "wait_s": 10})
             if result.is_error:
-                failed.append(result.content[0].text[:200])
+                error = (result.structured_content or {}).get("error") or {}
+                failure = {
+                    "code": str(error.get("code") or "UNKNOWN"),
+                    "message": str(error.get("message") or result.content[0].text)[:300],
+                }
+                if not failed:
+                    print(f"\n{name}: first failure: {failure['code']}: {failure['message']}")
+                failed.append(failure)
                 continue
             trace = result.structured_content["trace"]
             waited.append(int(trace.get("throttled_ms") or 0))
@@ -142,11 +155,26 @@ async def hammer(home: Path, config: Path, alias: str, ready: asyncio.Barrier) -
     }
 
 
-async def two_clients(home: Path, config: Path, alias: str) -> list[dict[str, Any]]:
+async def two_clients(home: Path, config: Path, alias: str, run: str) -> list[dict[str, Any]]:
     ready = asyncio.Barrier(2)
     return list(
-        await asyncio.gather(hammer(home, config, alias, ready), hammer(home, config, alias, ready))
+        await asyncio.gather(
+            hammer(home, config, alias, ready, f"{run} client 1"),
+            hammer(home, config, alias, ready, f"{run} client 2"),
+        )
     )
+
+
+def no_failures(label: str, runs: list[dict[str, Any]]) -> None:
+    """Fail with every failure's code and message, before anything is counted."""
+    failures = [
+        f"client {index}: {failure['code']}: {failure['message']}"
+        for index, run in enumerate(runs, start=1)
+        for failure in run["failed"]
+    ]
+    if failures:
+        print(f"\n{label} failures:\n" + "\n".join(failures))
+    assert failures == [], f"{label}: {len(failures)} calls failed, first: {failures[0]}"
 
 
 # How far a moment may sit from the edge of a second and still be taken as on
@@ -166,7 +194,8 @@ def busiest_second(times: list[float]) -> int:
 
 def smallest_gap(times: list[float]) -> float:
     ordered = sorted(times)
-    return min(later - earlier for earlier, later in zip(ordered, ordered[1:], strict=False))
+    gaps = [later - earlier for earlier, later in zip(ordered, ordered[1:], strict=False)]
+    return min(gaps, default=0.0)
 
 
 def summary(runs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -208,8 +237,14 @@ def test_two_clients_on_one_session_are_each_held_to_the_cap_and_never_refused(
     paced_config = settings(home, "paced", pause_ms=PAUSE_MS, per_s=PER_S)
     open_config = settings(home, "open", pause_ms=0, per_s=0)
 
-    paced = summary(asyncio.run(two_clients(home, paced_config, record.alias)))
-    unpaced = summary(asyncio.run(two_clients(home, open_config, record.alias)))
+    paced_runs = asyncio.run(two_clients(home, paced_config, record.alias, "paced"))
+    unpaced_runs = asyncio.run(two_clients(home, open_config, record.alias, "unpaced"))
+    # Past the cap a call waits, inside its wait_s; none may be refused. Said
+    # with every failure's code and message before any number is worked out.
+    no_failures("paced", paced_runs)
+    no_failures("unpaced", unpaced_runs)
+    paced = summary(paced_runs)
+    unpaced = summary(unpaced_runs)
     print("\npaced: " + json.dumps(paced))
     print("unpaced: " + json.dumps(unpaced))
 
