@@ -4,19 +4,26 @@ Three modes, all read only.
 
 - `search` looks for `query` in page titles and first paragraphs. Results are
   ranked: a title that is the query, then one that starts with it, then one
-  that holds it, then a page whose first paragraph or path holds every word.
-  The last part of a page's path counts as a title too, so a node's internal
-  name finds it. The first result's `note` says how big the index is and how
-  long it took to build.
-- `page` reads one page by its help path, such as `nodes/sop/attribwrangle`.
+  that holds it, then a page whose path or first paragraph holds every word.
+  Under `nodes/`, `vex/` and `hom/` the last part of a page's path counts as a
+  title too, so a node's internal name finds it. Among equals the current
+  version of a page comes before older ones and deprecated ones, and release
+  notes come last of all. The first result's `note` says how big the index is
+  and how long it took to build.
+- `page` reads one page by its help path, such as `nodes/sop/attribwrangle`,
+  or a node type with its namespace or version, such as
+  `nodes/sop/copytopoints::2.0`.
 - `vex` reads the page of one VEX function, such as `noise`.
 
-Where the pages come from, in order: the help server of the session the call
-reaches, then the help folder of the install. `session` only decides which
-build and which help server: a read never queues behind a busy session, and
-with no session at all the install named in config (`hython` or
-`houdini_build`) is read, or the newest one on this machine. `source` says
-which answered. With neither, the call is `HELP_UNAVAILABLE`.
+Where the pages come from. The help folder of the install comes first: with a
+session, only the folder of exactly the session's build, and with no session,
+the install named in config (`hython` or `houdini_build`), or the newest one on
+this machine. The session's help server is read only when there is no folder
+for its build here, or for a page that folder does not have. The help server
+runs inside the session, so it is slow and does not answer while the session
+is busy: asking where it is never queues, and a help server that timed out is
+left alone for a minute. `source` says which answered and `build` which build
+was read. With neither, the call is `HELP_UNAVAILABLE`.
 
 A page's text is cut at `max_chars` (20,000 unless you say), with `truncated`
 and the whole page written to the spill folder, named in `spill_path`.
@@ -53,14 +60,17 @@ MIN_MAX_CHARS = 100
 MAX_MAX_CHARS = 1_000_000
 
 # Asking a session where its help server is never queues: a busy session is
-# read from the help folder instead, and asked again on the next call.
+# told apart at once, and asked again on the next call.
 ASK_WAIT_S = 0.0
-ASK_TIMEOUT_S = 10.0
+ASK_TIMEOUT_S = 2.0
 
 # Where a cut may move back to the end of a line, at most.
 CUT_SLACK = 500
 
 VEX_FOLDER = "vex/functions/"
+
+HELP_SERVER = "help_server"
+CORPUS = "corpus"
 
 # Why a call that named no session goes on without one.
 NO_SESSION_CODES = frozenset({"NO_SESSION", "SESSION_AMBIGUOUS", "STORE_UNAVAILABLE"})
@@ -73,18 +83,20 @@ class Place:
     """Where this call's pages can come from."""
 
     target: Target | None = None
+    # The session's build, when there is a session.
+    session_build: str | None = None
+    # A help folder of exactly the session's build, or with no session the
+    # configured or newest install's.
     corpus: helpdocs.Corpus | None = None
     notes: list[str] = field(default_factory=list)
     # Whether a help server answered this call, with a page or with none.
     served: bool = False
 
-    @property
-    def build(self) -> str | None:
-        if self.corpus is not None and self.corpus.build:
-            return self.corpus.build
-        if self.target is not None:
-            return self.target.houdini_version
-        return None
+    def build_of(self, source: str) -> str | None:
+        """The build a page from `source` was read for."""
+        if source == CORPUS and self.corpus is not None:
+            return self.corpus.build or None
+        return self.session_build
 
 
 def docs(call: Call) -> Mapping[str, Any]:
@@ -150,7 +162,7 @@ def _bad(argument: str, message: str) -> CallError:
 
 
 def locate(call: Call) -> Place:
-    """The session to ask, if any, and the install whose help folder to read."""
+    """The session to ask, if any, and the help folder to read."""
     place = Place()
     try:
         place.target = call.target()
@@ -158,36 +170,59 @@ def locate(call: Call) -> Place:
         if call.arguments.get("session") or error.code not in NO_SESSION_CODES:
             raise
         place.notes.append(f"no session to ask ({error.code}), so the help folder was read")
-    hfs, build = _from_session(place.target)
-    if hfs is None:
-        hfs = _configured_hfs(call, build, place)
-    if hfs is not None:
-        place.corpus = helpdocs.Corpus(hfs, build or _build_of(hfs))
+    if place.target is not None:
+        place.corpus = _session_corpus(place)
+    else:
+        hfs = _configured_hfs(call, place)
+        if hfs is not None:
+            corpus = helpdocs.Corpus(hfs, _build_of(hfs))
+            place.corpus = corpus if corpus.exists() else None
     return place
 
 
-def _from_session(target: Target | None) -> tuple[Path | None, str | None]:
-    if target is None:
-        return None, None
-    facts = target.record.capabilities if isinstance(target.record.capabilities, dict) else {}
-    build = target.houdini_version or facts.get("houdini_version")
-    hfs = facts.get("hfs")
-    return (Path(hfs) if isinstance(hfs, str) and hfs else None), build
+def _session_corpus(place: Place) -> helpdocs.Corpus | None:
+    """The help folder of exactly the session's build, or nothing.
 
-
-def _configured_hfs(call: Call, build: str | None, place: Place) -> Path | None:
-    """The install to read: the session's build, then config, then this machine.
-
-    A session whose own folder is not known is matched to an install by its
-    build. Without a session, the config's `hython` or `houdini_build` names
-    the install, then `NSCR_MCP_HYTHON`, then the newest install found.
+    The session's own install first, then any install of the same build. A
+    folder of another build is never read for a session: its pages would be
+    another Houdini's.
     """
-    installs = install_module.find_installs()
+    target = place.target
+    assert target is not None
+    facts = target.record.capabilities if isinstance(target.record.capabilities, dict) else {}
+    build = target.houdini_version or facts.get("houdini_version") or None
+    place.session_build = build
+    candidates: list[Path] = []
+    hfs = facts.get("hfs")
+    if isinstance(hfs, str) and hfs:
+        candidates.append(Path(hfs))
     if build:
-        for found in installs:
-            if found.version == build:
-                return found.hfs
-    if place.target is None and call.config is not None:
+        candidates.extend(found.hfs for found in install_module.find_installs())
+    for candidate in candidates:
+        said = helpdocs.build_of(candidate)
+        if said is None and build and str(candidate) == hfs:
+            # The session's own install, whose header is missing: its build
+            # is the session's.
+            said = build
+        if build is not None and said != build:
+            continue
+        corpus = helpdocs.Corpus(candidate, said or "")
+        if corpus.exists():
+            return corpus
+    place.notes.append(
+        f"no help folder for Houdini {build or 'of this session'} on this machine,"
+        " so the session's help server was read"
+    )
+    return None
+
+
+def _configured_hfs(call: Call, place: Place) -> Path | None:
+    """The install to read with no session: config, then this machine.
+
+    The config's `hython` or `houdini_build` names the install, then
+    `NSCR_MCP_HYTHON`, then the newest install found.
+    """
+    if call.config is not None:
         try:
             hython = resolve_hython(call.config)
         except ConfigError as error:
@@ -198,6 +233,7 @@ def _configured_hfs(call: Call, build: str | None, place: Place) -> Path | None:
     named = os.environ.get(pool.HYTHON_ENV_VAR, "").strip()
     if named:
         return helpdocs.hfs_of_hython(Path(named).expanduser())
+    installs = install_module.find_installs()
     return installs[0].hfs if installs else None
 
 
@@ -215,11 +251,27 @@ def _state_home(call: Call) -> Path:
     return call.config.state_home if call.config is not None else store_module.default_home()
 
 
+def _cache_folder(call: Call, place: Place, source: str) -> Path:
+    build = place.build_of(source)
+    hfs = place.corpus.hfs if place.corpus is not None and place.corpus.build == build else None
+    return helpdocs.docs_home(_state_home(call), build, hfs)
+
+
 # Section: the help server
 
 
-def help_base(call: Call, place: Place, *, refresh: bool = False) -> str | None:
-    """The session's help server address: kept from before, or asked for now."""
+def help_base(
+    call: Call,
+    place: Place,
+    *,
+    refresh: bool = False,
+    after: helpdocs.HelpServerError | None = None,
+) -> str | None:
+    """The session's help server address: kept from before, or asked for now.
+
+    The ask never waits behind other work: a session that is busy says so at
+    once, and nothing is kept, so the next call asks again.
+    """
     target = place.target
     if target is None:
         return None
@@ -228,17 +280,18 @@ def help_base(call: Call, place: Place, *, refresh: bool = False) -> str | None:
         if known:
             return url
     try:
-        reply = call.bridge("help.server", {}, wait_s=ASK_WAIT_S, timeout_s=ASK_TIMEOUT_S)
+        reply = call.bridge(
+            "help.server", {}, wait_s=ASK_WAIT_S, timeout_s=ASK_TIMEOUT_S, skip_if_busy=True
+        )
     except CallError as error:
-        # Not kept: a session busy now can say on the next call.
-        place.notes.append(f"the session did not say where its help server is ({error.code})")
+        said = f"the session did not say where its help server is ({error.code})"
+        place.notes.append(f"{after}, and {said}" if after is not None else said)
         return None
     data = reply.get("data") if isinstance(reply.get("data"), dict) else {}
     url = helpdocs.usable_url(data.get("url"))
     helpdocs.URLS.put(target.session_id, url)
-    if place.corpus is None and isinstance(data.get("hfs"), str) and data["hfs"]:
-        hfs = Path(data["hfs"])
-        place.corpus = helpdocs.Corpus(hfs, data.get("houdini_version") or _build_of(hfs))
+    if url is None:
+        place.notes.append("the session serves no help on this machine's loopback")
     return url
 
 
@@ -248,9 +301,18 @@ def from_server(
     """A page from the help server, or nothing when there is none to ask.
 
     Raises `helpdocs.PageMissing` when the help server says it has no such
-    page. Any other failure asks the session for the address once more and
-    tries again, then gives up for the help folder.
+    page. A timeout leaves the help server alone for a minute. Any other
+    failure asks the session for the address once more and tries again.
     """
+    target = place.target
+    if target is None:
+        return None
+    resting = helpdocs.URLS.quiet_for(target.session_id)
+    if resting > 0:
+        place.notes.append(
+            f"the help server timed out lately and is left alone for {resting:.0f} s more"
+        )
+        return None
     base = help_base(call, place)
     for attempt in range(2):
         if base is None:
@@ -261,10 +323,16 @@ def from_server(
             place.served = True
             raise
         except helpdocs.HelpServerError as error:
-            if attempt:
-                place.notes.append(f"{error}, so the help folder was read")
+            if error.timed_out:
+                helpdocs.URLS.timed_out(target.session_id)
+                place.notes.append(
+                    f"{error}; it is left alone for {helpdocs.QUIET_AFTER_TIMEOUT_S:.0f} s"
+                )
                 return None
-            base = help_base(call, place, refresh=True)
+            if attempt:
+                place.notes.append(str(error))
+                return None
+            base = help_base(call, place, refresh=True, after=error)
             continue
         place.served = True
         return text
@@ -274,70 +342,87 @@ def from_server(
 # Section: page
 
 
+@dataclass
+class Found:
+    title: str | None
+    text: str
+    source: str
+    version: str | None = None
+
+
 def read_page(
     call: Call, place: Place, path: str, *, markdown: bool, budget: int, mode: str
 ) -> dict[str, Any]:
-    found: tuple[str | None, str, str] | None = None
-    try:
-        page = from_server(call, place, path)
-    except helpdocs.PageMissing:
-        page = None
-    if page is not None:
-        title, text = helptext.html_to_text(page, markdown=markdown)
-        if text:
-            found = (title, text, "help_server")
-    shipped = place.corpus is not None and place.corpus.exists()
-    if found is None and shipped:
-        read = read_corpus(call, place.corpus, path, markdown=markdown)
-        if read is not None:
-            found = (read[0], read[1], "corpus")
+    found = read_corpus(call, place, path, markdown=markdown) if place.corpus else None
     if found is None:
-        if not place.served and not shipped:
+        found = read_server(call, place, path, markdown=markdown)
+    if found is None:
+        if not place.served and place.corpus is None:
             raise unavailable(place)
         raise not_found(call, place, path, mode)
-    title, text, source = found
-    return finish(call, place, path, title, text, source, budget=budget, mode=mode)
+    return finish(call, place, path, found, budget=budget, mode=mode)
 
 
-def read_corpus(
-    call: Call, corpus: helpdocs.Corpus, path: str, *, markdown: bool
-) -> tuple[str | None, str] | None:
+def read_corpus(call: Call, place: Place, path: str, *, markdown: bool) -> Found | None:
     """One page from the help folder, through the cache."""
+    corpus = place.corpus
+    assert corpus is not None
     form = "markdown" if markdown else "plain"
-    fingerprint = corpus.fingerprint()
-    folder = helpdocs.docs_home(_state_home(call), corpus)
-    key = helpdocs.cache_key(corpus, path, form, fingerprint)
+    folder = _cache_folder(call, place, CORPUS)
+    key = helpdocs.cache_key(corpus.build, CORPUS, path, form, corpus.fingerprint())
     kept = helpdocs.cache_get(folder, key)
     if kept is not None:
-        return kept.get("title"), kept["text"]
+        return Found(kept.get("title"), kept["text"], CORPUS, kept.get("version"))
     source = corpus.read(path)
     if source is None:
         return None
     page = helptext.markup_to_text(source, markdown=markdown, read=corpus.read, where=path)
     title = page.title or path.rsplit("/", 1)[-1]
-    helpdocs.cache_put(folder, key, {"path": path, "title": title, "text": page.text})
-    return title, page.text
+    version = page.properties.get("version") or None
+    body = {"path": path, "title": title, "text": page.text, "version": version}
+    helpdocs.cache_put(folder, key, body)
+    return Found(title, page.text, CORPUS, version)
+
+
+def read_server(call: Call, place: Place, path: str, *, markdown: bool) -> Found | None:
+    """One page from the session's help server, through the cache."""
+    if place.target is None:
+        return None
+    form = "markdown" if markdown else "plain"
+    folder = _cache_folder(call, place, HELP_SERVER)
+    key = helpdocs.cache_key(place.session_build, HELP_SERVER, path, form, "")
+    kept = helpdocs.cache_get(folder, key)
+    if kept is not None:
+        return Found(kept.get("title"), kept["text"], HELP_SERVER)
+    try:
+        page = from_server(call, place, path)
+    except helpdocs.PageMissing:
+        return None
+    if page is None:
+        return None
+    title, text = helptext.html_to_text(page, markdown=markdown)
+    if not text:
+        return None
+    if place.session_build:
+        # A page is only kept under a build that is known.
+        helpdocs.cache_put(folder, key, {"path": path, "title": title, "text": text})
+    return Found(title, text, HELP_SERVER)
 
 
 def finish(
-    call: Call,
-    place: Place,
-    path: str,
-    title: str | None,
-    text: str,
-    source: str,
-    *,
-    budget: int,
-    mode: str,
+    call: Call, place: Place, path: str, found: Found, *, budget: int, mode: str
 ) -> dict[str, Any]:
+    text = found.text
     result: dict[str, Any] = {
         "mode": mode,
         "path": path,
-        "title": title,
-        "source": source,
-        "build": place.build,
+        "title": found.title,
+        "source": found.source,
+        "build": place.build_of(found.source),
         "truncated": len(text) > budget,
     }
+    if found.version:
+        result["version"] = found.version
     if len(text) > budget:
         cut = text[:budget]
         line_end = cut.rfind("\n")
@@ -345,7 +430,7 @@ def finish(
             cut = cut[:line_end]
         result["text"] = cut.rstrip()
         result["total_chars"] = len(text)
-        result["spill_path"] = spill(call, path, title, source, text)
+        result["spill_path"] = spill(call, path, found)
     else:
         result["text"] = text
     if place.notes:
@@ -353,24 +438,28 @@ def finish(
     return result
 
 
-def spill(call: Call, path: str, title: str | None, source: str, text: str) -> str | None:
-    """Write the whole page to the spill folder and say where it went."""
+def spill(call: Call, path: str, found: Found) -> str:
+    """Write the whole page to the spill folder and say where it went.
+
+    Raises `SPILL_FAILED` when it cannot be written: a cut page with nowhere
+    to find the rest is not an answer.
+    """
     if call.config is None:
-        return None
-    body = json.dumps(
-        {"path": path, "title": title, "source": source, "text": text}, ensure_ascii=False
-    )
-    try:
-        written = Spill(call.config.spill_folder, call.config.spill_over_bytes).write(
-            body, tool="hou_docs"
+        raise CallError(
+            "SPILL_FAILED", "the page was too long to return and no spill folder is set"
         )
-    except CallError:
-        return None
+    body = json.dumps(
+        {"path": path, "title": found.title, "source": found.source, "text": found.text},
+        ensure_ascii=False,
+    )
+    written = Spill(call.config.spill_folder, call.config.spill_over_bytes).write(
+        body, tool="hou_docs"
+    )
     return written["path"]
 
 
 def unavailable(place: Place) -> CallError:
-    details: dict[str, Any] = {"build": place.build}
+    details: dict[str, Any] = {"build": place.session_build}
     if place.notes:
         details["notes"] = place.notes
     return CallError(
@@ -382,18 +471,22 @@ def unavailable(place: Place) -> CallError:
 
 def not_found(call: Call, place: Place, path: str, mode: str) -> CallError:
     near: list[str] = []
-    if place.corpus is not None and place.corpus.exists():
+    if place.corpus is not None:
         paths = [row[0] for row in helpdocs.load_index(_state_home(call), place.corpus).pages]
         if mode == "vex":
             names = [each[len(VEX_FOLDER) :] for each in paths if each.startswith(VEX_FOLDER)]
             near = did_you_mean(path[len(VEX_FOLDER) :], names)
         else:
             near = did_you_mean(path, paths)
+    build = place.build_of(CORPUS if place.corpus is not None else HELP_SERVER)
     what = f"function {path[len(VEX_FOLDER) :]}" if mode == "vex" else f"page at {path}"
+    details: dict[str, Any] = {"path": path, "did_you_mean": near, "build": build}
+    if place.notes:
+        details["notes"] = place.notes
     return CallError(
         "DOC_NOT_FOUND",
-        f"the help for Houdini {place.build or 'this build'} has no {what}",
-        details={"path": path, "did_you_mean": near, "build": place.build},
+        f"the help for Houdini {build or 'this build'} has no {what}",
+        details=details,
     )
 
 
@@ -401,42 +494,55 @@ def not_found(call: Call, place: Place, path: str, mode: str) -> CallError:
 
 
 def search(call: Call, place: Place, query: str, limit: int) -> dict[str, Any]:
-    rows: dict[str, dict[str, Any]] = {}
-    tiers: dict[str, int] = {}
-    try:
-        page = from_server(call, place, "_search", query={"q": query})
-    except helpdocs.PageMissing:
-        page = None
-    if page is not None:
-        for hit in helptext.search_hits(page):
-            tier = helpdocs.rank(query, hit["title"], hit["path"], hit["excerpt"])
-            # The help server found it, in the body if not in the title.
-            tiers[hit["path"]] = 3 if tier is None else tier
-            rows[hit["path"]] = {**hit, "source": "help_server"}
-    index = None
-    if place.corpus is not None and place.corpus.exists():
+    if place.corpus is not None:
         index = helpdocs.load_index(_state_home(call), place.corpus)
-        for tier, path, title, excerpt in helpdocs.search_index(index, query, max(limit, 50)):
-            if path in rows:
-                if not rows[path]["excerpt"]:
-                    rows[path]["excerpt"] = excerpt
-                continue
-            tiers[path] = tier
-            rows[path] = {"path": path, "title": title, "excerpt": excerpt, "source": "corpus"}
-    if not place.served and index is None:
-        raise unavailable(place)
-    ordered = sorted(
-        rows.values(), key=lambda row: (tiers[row["path"]], len(row["title"]), row["path"])
-    )
-    results = ordered[:limit]
-    notes = ([index.note()] if index is not None else ["help server search only"]) + place.notes
-    result: dict[str, Any] = {"mode": "search", "query": query, "build": place.build}
+        results = [
+            _row(path, title, excerpt, CORPUS, version)
+            for _, (path, title, excerpt, version, _) in helpdocs.search_index(index, query, limit)
+        ]
+        notes = [index.note(), *place.notes]
+        source = CORPUS
+    else:
+        results = search_server(call, place, query, limit)
+        if not place.served:
+            raise unavailable(place)
+        notes = ["the help server's own search", *place.notes]
+        source = HELP_SERVER
+    result: dict[str, Any] = {"mode": "search", "query": query, "build": place.build_of(source)}
     if results:
         results[0] = {**results[0], "note": "; ".join(notes)}
     else:
         result["note"] = "; ".join(notes)
     result["results"] = results
     return result
+
+
+def search_server(call: Call, place: Place, query: str, limit: int) -> list[dict[str, Any]]:
+    """The help server's own search, ranked the way the index is."""
+    try:
+        page = from_server(call, place, "_search", query={"q": query})
+    except helpdocs.PageMissing:
+        return []
+    if page is None:
+        return []
+    ranked = []
+    for hit in helptext.search_hits(page, helpdocs.tidy_path):
+        tier = helpdocs.rank(query, hit["title"], hit["path"], hit["excerpt"])
+        # The help server found it, in the body if not in the title.
+        tier = 3 if tier is None else tier
+        ranked.append((helpdocs.order(tier, hit["path"], hit["title"]), hit))
+    ranked.sort(key=lambda item: item[0])
+    return [
+        _row(hit["path"], hit["title"], hit["excerpt"], HELP_SERVER, None)
+        for _, hit in ranked[:limit]
+    ]
+
+
+def _row(path: str, title: str, excerpt: str, source: str, version: str | None) -> dict[str, Any]:
+    row: dict[str, Any] = {"path": path, "title": title, "excerpt": excerpt, "source": source}
+    if version:
+        row["version"] = version
+    return row
 
 
 # Section: the one line a long result is summed up in

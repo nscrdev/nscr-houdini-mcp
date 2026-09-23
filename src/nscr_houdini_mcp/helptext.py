@@ -33,6 +33,22 @@ FORMATS = ("plain", "markdown")
 # How deep one include may pull in another.
 MAX_INCLUDE_DEPTH = 4
 
+# What all the includes of one page may pull in together, by count and by
+# the size of the markup read.
+MAX_INCLUDES = 64
+MAX_INCLUDED_CHARS = 2 * 1024 * 1024
+
+# What one help server page may make the reader do: how deep its tags may
+# nest before deeper ones are read as plain text, how many tags and pieces
+# of text it looks at, and how much text it keeps.
+MAX_HTML_DEPTH = 200
+MAX_HTML_TOKENS = 400_000
+MAX_HTML_TEXT = 4 * 1024 * 1024
+
+# How many hits a search page gives, and how long any one field of a hit is.
+MAX_HITS = 300
+MAX_HIT_FIELD = 1000
+
 # The longest excerpt a search result carries.
 EXCERPT_CHARS = 240
 
@@ -66,6 +82,7 @@ _TAG_LINE = re.compile(r"^</?[A-Za-z][^>]*>$")
 _BULLET = re.compile(r"^(?:[*-]|#|::)\s+(.*)$")
 _LABEL = re.compile(r"^(.+?):\s*$")
 _ID = re.compile(r"^\s*#id\s*:\s*(\S+)\s*$")
+_DEPRECATED = re.compile(r"^:\w+:\s*deprecated\b", re.IGNORECASE)
 
 _CODE_SPAN = re.compile(r"(`[^`\n]*`)")
 _LINK = re.compile(r"\[([^\[\]]+)\]")
@@ -95,6 +112,8 @@ class MarkupPage:
     title: str | None = None
     summary: str | None = None
     properties: dict[str, str] = field(default_factory=dict)
+    # Whether the page says at its top that what it describes is deprecated.
+    deprecated: bool = False
     text: str = ""
 
 
@@ -107,6 +126,7 @@ def markup_head(source: str) -> MarkupPage:
     page = MarkupPage()
     lines = source.splitlines()
     index = 0
+    first: str | None = None
     while index < len(lines):
         stripped = lines[index].strip()
         index += 1
@@ -123,15 +143,25 @@ def markup_head(source: str) -> MarkupPage:
             body, index = _quoted(lines, index - 1)
             page.summary = _squash(inline(body, markdown=False))
             break
+        if _DEPRECATED.match(stripped):
+            page.deprecated = True
+        if _HEADING.match(stripped) or _SECTION.match(stripped):
+            # The body has begun: no summary line is coming.
+            break
         if _not_a_paragraph(stripped):
             continue
-        # No summary line: the first paragraph stands in for it.
+        # A paragraph before any summary line stands in for one, unless a
+        # summary line follows it.
         paragraph = [stripped]
         while index < len(lines) and lines[index].strip():
             paragraph.append(lines[index].strip())
             index += 1
-        page.summary = _squash(inline(" ".join(paragraph), markdown=False))
-        break
+        if first is None:
+            first = _squash(inline(" ".join(paragraph), markdown=False))
+    if page.summary is None:
+        page.summary = first
+    if "deprecated" in page.properties.get("status", "").lower():
+        page.deprecated = True
     return page
 
 
@@ -187,6 +217,9 @@ class _Markup:
     def __init__(self, *, markdown: bool, read: Callable[[str], str | None] | None) -> None:
         self.markdown = markdown
         self.read = read
+        # Shared by every include of the page, however deep.
+        self.includes_left = MAX_INCLUDES
+        self.chars_left = MAX_INCLUDED_CHARS
 
     def render(self, source: str, *, where: str, depth: int, seen: frozenset[str]) -> list[str]:
         out: list[str] = []
@@ -196,16 +229,19 @@ class _Markup:
         # Where the last label ended, so the blank line under it is dropped
         # and the label sits on its text.
         labelled = -1
+        rows = _Rows(out)
         while index < len(lines):
             line = lines[index]
             stripped = line.strip()
             index += 1
             if not stripped:
-                if len(out) != labelled:
+                if len(out) != labelled and not rows.open:
                     out.append("")
                 continue
             if stripped.startswith("{{{"):
                 index = self._code(lines, index - 1, out)
+                continue
+            if rows.take(stripped, _indent(line), self.inline):
                 continue
             if not titled and depth == 0 and _TITLE.match(stripped):
                 if not _HEADING.match(stripped):
@@ -247,11 +283,6 @@ class _Markup:
                 if directive.group(2):
                     out.append(self.inline(directive.group(2)))
                 continue
-            table = _TABLE.match(stripped)
-            if table:
-                if table.group(2):
-                    out.append(self.inline(table.group(2)))
-                continue
             if _TAG_LINE.match(stripped):
                 continue
             if stripped.startswith("[") and stripped.endswith("]") and not self.inline(stripped):
@@ -268,6 +299,7 @@ class _Markup:
                 labelled = len(out)
                 continue
             out.append(self.inline(stripped))
+        rows.end()
         return out
 
     def _heading(self, out: list[str], level: int, text: str) -> None:
@@ -313,9 +345,13 @@ class _Markup:
         key = f"{path}#{anchor}"
         if key in seen:
             return []
-        source = self.read(path)
-        if source is None:
+        if self.includes_left <= 0:
             return []
+        self.includes_left -= 1
+        source = self.read(path)
+        if source is None or len(source) > self.chars_left:
+            return []
+        self.chars_left -= len(source)
         if anchor:
             source = block_of(source, anchor, inner=inner)
             if source is None:
@@ -326,6 +362,53 @@ class _Markup:
 
     def inline(self, text: str) -> str:
         return inline(text, markdown=self.markdown)
+
+
+class _Rows:
+    """A table's rows, each kept on one line with its cells apart."""
+
+    def __init__(self, out: list[str]) -> None:
+        self.out = out
+        self.cells: list[str] | None = None
+        self.indent = 0
+
+    @property
+    def open(self) -> bool:
+        return self.cells is not None
+
+    def take(self, stripped: str, indent: int, inline: Callable[[str], str]) -> bool:
+        """Whether this line belongs to a table, taking it if so."""
+        table = _TABLE.match(stripped)
+        if table:
+            kind, text = table.group(1), table.group(2)
+            if kind in ("table", "tr"):
+                self.end()
+                if kind == "tr":
+                    self.cells = []
+                    self.indent = indent
+            elif kind in ("td", "th"):
+                if self.cells is None:
+                    self.cells = []
+                    self.indent = max(indent - 1, 0)
+                self.cells.append(inline(text) if text else "")
+            return True
+        if self.cells is not None and indent > self.indent:
+            # What a cell says on the lines under it joins the cell.
+            piece = inline(stripped)
+            if self.cells:
+                self.cells[-1] = f"{self.cells[-1]} {piece}".strip()
+            else:
+                self.cells.append(piece)
+            return True
+        if self.cells is not None:
+            self.end()
+            self.out.append("")
+        return False
+
+    def end(self) -> None:
+        if self.cells is not None and any(self.cells):
+            self.out.append(" | ".join(self.cells))
+        self.cells = None
 
 
 def _without_head(source: str) -> str:
@@ -384,8 +467,8 @@ def resolve_link(target: str, where: str) -> str:
     """
     target = target.strip()
     kind, colon, rest = target.partition(":")
-    if colon and kind in _LINK_ROOTS and not rest.startswith("//"):
-        return (_LINK_ROOTS[kind] + rest.strip().strip("/")).strip("/")
+    if colon and kind in LINK_ROOTS and not rest.startswith("//"):
+        return (LINK_ROOTS[kind] + rest.strip().strip("/")).strip("/")
     if target.startswith("/"):
         return target.strip("/")
     folder = where.rsplit("/", 1)[0] if "/" in where else ""
@@ -400,7 +483,7 @@ def resolve_link(target: str, where: str) -> str:
     return "/".join(tidy)
 
 
-_LINK_ROOTS = {"Node": "nodes/", "Vex": "vex/functions/", "Hom": "hom/hou/", "Cmd": "commands/"}
+LINK_ROOTS = {"Node": "nodes/", "Vex": "vex/functions/", "Hom": "hom/hou/", "Cmd": "commands/"}
 
 
 def inline(text: str, *, markdown: bool) -> str:
@@ -437,7 +520,7 @@ def _link_text(found: re.Match[str]) -> str:
     if colon and (kind in ("Image", "Icon") or _MEDIA.search(rest.strip())):
         # A picture or a clip shown on the page: nothing to read.
         return ""
-    if colon and kind in _LINK_ROOTS:
+    if colon and kind in LINK_ROOTS:
         return rest.strip().rsplit("/", 1)[-1] if kind != "Node" else rest.strip()
     return body.strip()
 
@@ -456,7 +539,7 @@ def _indent(line: str) -> int:
 
 
 def _squash(text: str) -> str:
-    return _SPACES.sub(" ", text).strip()
+    return " ".join(text.split())
 
 
 def _finish(lines: list[str]) -> str:
@@ -544,12 +627,28 @@ class _HtmlText(HTMLParser):
         self._has_text = False
         # A label that turned out to head a list of tags, which is dropped.
         self._drop_label = False
+        # Table cells open, and cells so far in the row: a row is one line.
+        self._cell = 0
+        self._cells_in_row = 0
+        # What the page has made this reader do, against the caps.
+        self._tokens = 0
+        self._kept = 0
+        self.cut = False
+
+    def _spent(self) -> bool:
+        """Count one tag or piece of text; say whether the page is over its caps."""
+        self._tokens += 1
+        if self._tokens > MAX_HTML_TOKENS or self._kept > MAX_HTML_TEXT:
+            self.cut = True
+        return self.cut
 
     def lines(self) -> list[str]:
         self._flush()
         return self._lines
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self._spent() or (tag not in _VOID and len(self._stack) >= MAX_HTML_DEPTH):
+            return
         found = dict(attrs)
         classes = set((found.get("class") or "").split())
         if tag in _VOID:
@@ -605,6 +704,21 @@ class _HtmlText(HTMLParser):
         elif tag in ("strong", "b") and self.markdown:
             self._marker("**")
             role = "strong"
+        elif tag == "tr":
+            self._flush()
+            self._cells_in_row = 0
+            role = "row"
+        elif tag in ("td", "th"):
+            if self._cells_in_row and self._has_text:
+                self._trim()
+                self._marker(" | ")
+            else:
+                self._flush()
+            self._cells_in_row += 1
+            self._cell += 1
+            role = "cell"
+        elif tag in _BLOCKS and self._cell:
+            role = "inline block"
         elif tag in _BLOCKS:
             # A paragraph opening a list item keeps the item's marker.
             if self._has_text:
@@ -613,9 +727,10 @@ class _HtmlText(HTMLParser):
         self._stack.append((tag, role))
 
     def handle_endtag(self, tag: str) -> None:
-        if tag in _VOID:
+        if self._spent() or tag in _VOID:
             return
         # Close back to the matching tag; loose HTML closes what it left open.
+        # The stack is never deeper than the cap, so this look is bounded.
         for depth in range(len(self._stack) - 1, -1, -1):
             if self._stack[depth][0] == tag:
                 break
@@ -657,12 +772,20 @@ class _HtmlText(HTMLParser):
         elif role == "para":
             self._flush()
             self._lines.append("")
+        elif role == "row":
+            self._flush()
+        elif role == "cell":
+            self._cell -= 1
+        elif role == "inline block" and self._has_text:
+            self._marker(" ")
 
     def handle_data(self, data: str) -> None:
-        if self._skip:
+        if self._spent() or self._skip:
             return
+        self._kept += len(data)
         if self._in_title:
-            self._title_parts.append(data)
+            if sum(len(part) for part in self._title_parts) < MAX_HIT_FIELD:
+                self._title_parts.append(data)
             return
         if self._pre:
             parts = data.split("\n")
@@ -714,15 +837,21 @@ class _HtmlText(HTMLParser):
             self._lines.append(text)
 
 
-def search_hits(page: str) -> list[dict[str, str]]:
-    """The hits on a help server search page: path, title and what it says."""
+def search_hits(page: str, tidy: Callable[[str], str | None] | None = None) -> list[dict[str, str]]:
+    """The hits on a help server search page: path, title and what it says.
+
+    `tidy` turns each link into a help path the way every other path is
+    named, or refuses it; a hit whose link it refuses is left out. At most
+    `MAX_HITS` are read.
+    """
     reader = _Hits()
     reader.feed(page)
     reader.close()
     hits: list[dict[str, str]] = []
     seen: set[str] = set()
     for hit in reader.hits:
-        path = hit.get("href", "").split("#", 1)[0].split("?", 1)[0].strip("/")
+        href = hit.get("href", "")
+        path = tidy(href) if tidy is not None else href.split("#", 1)[0].strip("/")
         if not path or path.startswith(("find", "_")) or path in seen:
             continue
         seen.add(path)
@@ -749,6 +878,9 @@ class _Hits(HTMLParser):
         found = dict(attrs)
         classes = (found.get("class") or "").split()
         if tag == "div" and "hit" in classes and not {"more", "findpage"} & set(classes):
+            if len(self.hits) >= MAX_HITS:
+                self._hit = None
+                return
             self._hit = {}
             self.hits.append(self._hit)
             self._depth = 1
@@ -758,7 +890,7 @@ class _Hits(HTMLParser):
         if tag == "div":
             self._depth += 1
         if tag == "a" and "label" in classes and "href" not in self._hit:
-            self._hit["href"] = found.get("href") or ""
+            self._hit["href"] = (found.get("href") or "")[:MAX_HIT_FIELD]
             self._field, self._field_tag = "title", "a"
         elif tag == "small" and "desc" in classes:
             self._field, self._field_tag = "desc", "small"
@@ -777,4 +909,6 @@ class _Hits(HTMLParser):
 
     def handle_data(self, data: str) -> None:
         if self._hit is not None and self._field:
-            self._hit[self._field] = self._hit.get(self._field, "") + data
+            held = self._hit.get(self._field, "")
+            if len(held) < MAX_HIT_FIELD:
+                self._hit[self._field] = (held + data)[:MAX_HIT_FIELD]
