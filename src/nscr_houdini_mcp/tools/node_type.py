@@ -127,8 +127,16 @@ def node_type(call: Call) -> Mapping[str, Any]:
 
 
 def query_of(mode: str, arguments: Mapping[str, Any]) -> str:
-    """A short fingerprint of the arguments that decide which rows a lookup has."""
+    """A short fingerprint of the arguments that decide which rows a lookup has.
+
+    `include` is a set, so its order does not count. A search's rows are the
+    same at every level, so there `detail` does not count either.
+    """
     asked = {"mode": mode, **{name: arguments.get(name) for name in QUERY_ARGUMENTS}}
+    if asked["include"] is not None:
+        asked["include"] = sorted(set(asked["include"]))
+    if mode == "query":
+        asked.pop("detail")
     text = json.dumps(asked, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
@@ -211,7 +219,8 @@ HOU_NODE_TYPE = ToolSpec(
     name="hou_node_type",
     description=(
         "A node type in the running Houdini: inputs, outputs, parm names, defaults, menus, "
-        "help. type with context (sop, obj...), or query to search."
+        "help; labels_from help is approximate. type with context (sop, obj...), or query "
+        "to search."
     ),
     input_schema=inputs(
         {

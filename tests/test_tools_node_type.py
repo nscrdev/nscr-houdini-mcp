@@ -55,7 +55,28 @@ PAGES = {
     "obj/null.txt": (
         '#type: node\n#context: obj\n#internal: null\n\n"""Serves as a place-holder."""\n'
     ),
+    "sop/splitter.txt": (
+        "#type: node\n#context: sop\n#internal: splitter\n\n"
+        '"""Splits its input in two."""\n\n'
+        "@inputs\n\n:include standard_inputs:\n\nNOTE:\n    Read this first.\n\n"
+        "Geometry:\n    What is split.\n\nStale Second Input:\n    Gone from the node.\n\n"
+        "@outputs\n\nKept:\n    One half.\n\nTip:\n    x\n\nDropped:\n    The other half.\n"
+    ),
     "sop/notanode.txt": "No header here.\n",
+}
+
+# A package's own help folder: a page for its own type, with the namespace
+# and version written into the name, and a page for a type the shipped help
+# already documents, which the shipped page wins over.
+PACKAGE_PAGES = {
+    "sop/labs--thing-1.0.txt": (
+        "= Labs Thing =\n\n#type: node\n#context: sop\n#internal: labs::thing::1.0\n\n"
+        '""" Makes a thing from its input. """\n\n@inputs\n\nSource:\n    Anything.\n'
+    ),
+    "sop/attribwrangle.txt": (
+        '#type: node\n#context: sop\n#internal: attribwrangle\n\n"""Not the shipped page."""\n'
+    ),
+    "sop/readme.md": "not a page",
 }
 
 
@@ -73,8 +94,20 @@ def hfs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture
-def scene(hfs: Path) -> Any:
+def package(tmp_path: Path) -> Path:
+    """A package folder on the search path, holding its own help pages."""
+    root = tmp_path / "package"
+    for name, text in PACKAGE_PAGES.items():
+        page = root / "help" / "nodes" / name
+        page.parent.mkdir(parents=True, exist_ok=True)
+        page.write_text(text, encoding="utf-8")
+    return root
+
+
+@pytest.fixture
+def scene(hfs: Path, package: Path) -> Any:
     made = Scene(types=("geo", "null", "cam"))
+    made.search_path = [str(package), str(package.parent / "nothing-here")]
     wrangle = made.library["Sop"].types["attribwrangle"]
     wrangle._library = str(hfs / "houdini" / "otls" / "OPlibSop.hda")
     try:
@@ -149,6 +182,8 @@ def test_a_standard_read_has_the_inputs_outputs_and_visible_parameters(bench: Be
         {"index": 3, "label": "Ancillary Input, point(3, ...) to Access", "optional": True},
     ]
     assert body["outputs"] == [{"index": 0, "label": None}]
+    # The dialog script names labels, so none come from the help page.
+    assert body["labels_from"] == "dialog_script"
     assert body["namespace"] is None and body["version"] is None
     assert body["is_asset"] is True
     assert body["asset_library"] == "$HFS/houdini/otls/OPlibSop.hda"
@@ -183,7 +218,7 @@ def test_a_standard_read_has_the_inputs_outputs_and_visible_parameters(bench: Be
         "label": "Remap",
         "type": "Ramp",
         "size": 1,
-        "default": 2,
+        "default_points": 2,
         "ramp": "float",
     }
     assert "default" not in rows["compile"]
@@ -379,6 +414,7 @@ def test_a_bare_name_is_the_version_houdini_makes_and_says_so(bench: Bench) -> N
         {"index": 0, "label": "Geometry to Copy", "optional": False},
         {"index": 1, "label": "Target Points to Copy to", "optional": False},
     ]
+    assert body["labels_from"] == "help"
     assert [row["name"] for row in body["parms"]] == ["sourcegroup"]
     helped = ok(lookup(bench, context="sop", type="copytopoints::2.0", include=["help"]))
     assert "resolved_from" not in helped
@@ -409,6 +445,7 @@ def test_a_type_with_no_help_page_says_so_with_nothing(bench: Bench) -> None:
     body = ok(lookup(bench, context="sop", type="wranglehelper", detail="full"))
     assert body["help_summary"] is None and body["help_path"] is None
     assert body["inputs"] == [{"index": 0, "label": None, "optional": False}]
+    assert body["labels_from"] is None
 
 
 def test_a_type_that_takes_any_number_of_inputs_lists_what_it_can_say(bench: Bench) -> None:
@@ -670,3 +707,130 @@ def test_an_embedded_help_page_is_read_whole_for_its_labels() -> None:
     page = node_types._HELP.page_for(None, kind, kind.category())
     assert page["summary"] == "One line."
     assert page["inputs"] == ["First"]
+
+
+# Section: labels, ramps, search order, package help and page tokens
+
+
+def test_a_label_written_without_quotes_is_read(bench: Bench) -> None:
+    body = ok(lookup(bench, context="sop", type="kinefx::ragdollsolver", detail="standard"))
+    assert body["inputs"] == [
+        {"index": 0, "label": "Skeleton", "optional": False},
+        {"index": 1, "label": "Constraint Geometry", "optional": True},
+        {"index": 2, "label": "", "optional": True},
+    ]
+    assert body["outputs"] == [{"index": 0, "label": "Skeleton"}]
+    assert body["labels_from"] == "dialog_script"
+
+
+def test_help_labels_skip_directives_and_notes_and_stop_at_the_count(bench: Bench) -> None:
+    body = ok(lookup(bench, context="sop", type="splitter", detail="standard"))
+    # One input: the directive and the note are not inputs, and the stale
+    # second heading is past what the type takes.
+    assert body["inputs"] == [{"index": 0, "label": "Geometry", "optional": False}]
+    assert body["outputs"] == [
+        {"index": 0, "label": "Kept"},
+        {"index": 1, "label": "Dropped"},
+    ]
+    assert body["labels_from"] == "help"
+
+
+def test_the_description_says_help_labels_are_approximate(bench: Bench) -> None:
+    listed, _ = talk(bench.serve())
+    tool = listed.tools[-1]
+    assert "help" in tool.description and "approximate" in tool.description
+
+
+def test_a_ramp_says_how_many_points_it_starts_with_and_has_no_default(bench: Bench) -> None:
+    body = ok(
+        lookup(bench, context="sop", type="attribwrangle", detail="full", parm_filter="remap")
+    )
+    [row] = body["parms"]
+    assert row["default_points"] == 2
+    assert "default" not in row
+
+
+def test_a_search_with_no_context_leaves_out_recipes_and_networks(bench: Bench) -> None:
+    found = ok(lookup(bench, query="wrangle"))
+    places = {row["category"] for row in found["rows"]}
+    assert not places & {"Data", "VopNet"}
+    # Named, the context is searched like any other, by the base name.
+    [recipe] = ok(lookup(bench, context="Data", query="testscene_wrangle"))["rows"]
+    assert recipe["type"] == "sidefx::recipe::lop::testscene_wrangle"
+    assert ok(lookup(bench, context="VopNet", query="wranglenet"))["rows"][0]["type"] == (
+        "wranglenet"
+    )
+
+
+def test_a_recipes_base_name_comes_from_the_type_not_its_name() -> None:
+    kind = NodeType("sidefx::recipe::lop::testscene_wrangle", "Data")
+    assert node_types._components(kind)[2] == "testscene_wrangle"
+    assert node_types._base_name("sidefx::recipe::lop::testscene_wrangle") == "testscene_wrangle"
+    assert node_types._split_name("labs::thing::1.0") == ("labs", "thing", "1.0")
+    assert node_types._split_name("copytopoints::2.0") == ("", "copytopoints", "2.0")
+
+
+def test_equally_close_matches_go_by_context_before_length(bench: Bench) -> None:
+    rows = ok(lookup(bench, query="wrangle"))["rows"]
+    prefixed = [(row["category"], row["type"]) for row in rows[:2]]
+    # A shorter name in a later context does not jump ahead of a Sop.
+    assert prefixed == [("Sop", "wranglehelper"), ("Lop", "wrangler")]
+
+
+def test_a_packages_help_folder_gives_the_help_and_the_labels(bench: Bench) -> None:
+    body = ok(lookup(bench, context="sop", type="labs::thing::1.0", detail="full"))
+    assert body["help_summary"] == "Makes a thing from its input."
+    assert body["help_path"] == "/nodes/sop/labs--thing-1.0"
+    assert body["inputs"] == [{"index": 0, "label": "Source", "optional": False}]
+    assert body["labels_from"] == "help"
+    [row] = ok(lookup(bench, context="sop", query="labs thing"))["rows"]
+    assert row["one_line"] == "Makes a thing from its input."
+    # The shipped page wins over a package page for the same type.
+    shipped = ok(lookup(bench, context="sop", type="attribwrangle", include=["help"]))
+    assert shipped["help_summary"] == "Runs a VEX snippet to modify attribute values."
+
+
+def test_a_package_page_added_later_is_found(bench: Bench, package: Path) -> None:
+    ok(lookup(bench, context="sop", query="wrangle"))
+    page = package / "help" / "nodes" / "sop" / "splitter2.txt"
+    page.write_text('#internal: merge\n\n"""Joins in a package page."""\n', encoding="utf-8")
+    [row] = ok(lookup(bench, context="sop", query="package page"))["rows"]
+    assert row["type"] == "merge"
+
+
+def test_include_order_and_a_searchs_detail_do_not_change_its_pages(bench: Bench) -> None:
+    arguments = {"context": "sop", "type": "attribwrangle", "detail": "full", "limit": 3}
+    first = ok(lookup(bench, **arguments, include=["help", "hidden"]))
+    second = ok(lookup(bench, **arguments, include=["hidden", "help"], page=first["next_page"]))
+    assert second["parms"][0]["name"] == "snippet"
+    searched = ok(lookup(bench, query="null", limit=2))
+    more = ok(lookup(bench, query="null", limit=2, detail="full", page=searched["next_page"]))
+    assert more["rows"]
+    assert query_of("query", {"query": "x", "detail": "full"}) == query_of("query", {"query": "x"})
+    assert query_of("type", {"type": "x", "detail": "full"}) != query_of("type", {"type": "x"})
+
+
+def test_a_search_reads_the_help_index_once_and_a_card_reuses_the_open_archive(
+    bench: Bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stamped: list[Any] = []
+    opened: list[Any] = []
+    real_stamp, real_open = node_types._stamp, node_types._open_archive
+
+    def stamp(path: Any) -> Any:
+        stamped.append(path)
+        return real_stamp(path)
+
+    def open_archive(path: Any) -> Any:
+        opened.append(path)
+        return real_open(path)
+
+    monkeypatch.setattr(node_types, "_stamp", stamp)
+    monkeypatch.setattr(node_types, "_open_archive", open_archive)
+    ok(lookup(bench, query="wrangle"))
+    assert len(stamped) == 1
+    for _ in range(2):
+        body = ok(lookup(bench, context="sop", type="copytopoints", detail="standard"))
+        assert body["inputs"][0]["label"] == "Geometry to Copy"
+    # Opened once, when the index was made, and read from since.
+    assert len(opened) == 1

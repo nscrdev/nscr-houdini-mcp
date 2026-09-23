@@ -20,11 +20,18 @@ says which.
 
 Input and output labels come from the asset's dialog script where there is
 one. A type compiled into Houdini carries none, so its labels come from the
-headings of its help page, and are left out where that has none either.
+headings of its help page, which only approximate what the node shows, and
+are left out where that has none either. `labels_from` says which it was.
 
-Help pages are read from the `nodes.zip` Houdini ships. The first line of each
-page, its tags and which type it documents are gathered once per process, the
-first time a search or a help line needs them, from the head of each page.
+Help pages are read from the `nodes.zip` Houdini ships and from every
+`help/nodes` folder on Houdini's search path, where packages keep theirs. The
+first line of each page, its tags and which type it documents are gathered
+once per process, the first time a search or a help line needs them, from
+the head of each page.
+
+A search with no context leaves out the categories that hold no node a
+person places: data recipes, the managers and the networks that only hold
+other contexts.
 """
 
 from __future__ import annotations
@@ -87,7 +94,12 @@ HELP_FOLDERS: dict[str, str] = {**SHORT_NAMES, "Cop2": "cop2", "Shop": "shop", "
 
 # The order a search with no context goes through the categories in, and the
 # order equally close matches from different ones come back in.
-CATEGORY_ORDER = ("Sop", "Object", "Lop", "Cop", "Dop", "Top", "Chop", "Driver", "Vop")
+CATEGORY_ORDER = ("Sop", "Object", "Lop", "Dop", "Cop", "Chop", "Top", "Driver", "Vop")
+
+# Categories a search with no context leaves out: they hold no node a person
+# places in a network of their own, such as the recipes and the networks
+# that only hold other contexts.
+UNSEARCHED = frozenset({"Data", "Manager", "Director"})
 
 TYPE_INCLUDES = ("help", "hidden")
 NODE_TYPE_ARGUMENTS = (
@@ -121,12 +133,19 @@ HELP_HEAD_BYTES = 3000
 # How close a search match is, closest first.
 EXACT, PREFIX, IN_NAME, IN_LABEL, IN_HELP, ALL_WORDS = range(6)
 
-_LABEL_LINE = re.compile(r'^\s*(input|output)label\s+(\d+)\s+"((?:[^"\\]|\\.)*)"', re.MULTILINE)
+# A label is quoted when it has a space in it and bare when it is one word.
+_LABEL_LINE = re.compile(
+    r'^[ \t]*(input|output)label[ \t]+(\d+)[ \t]+(?:"((?:[^"\\\n]|\\.)*)"|(\S.*?))[ \t]*$',
+    re.MULTILINE,
+)
 _SUMMARY = re.compile(r'"""(.*?)"""', re.DOTALL)
 _HEADER = re.compile(r"^#(\w+):\s*(.*?)\s*$", re.MULTILINE)
 _LINK = re.compile(r"\[([^\]|]*)(?:\|[^\]]*)?\]")
 _SECTION = re.compile(r"^@(\w+)\s*$", re.MULTILINE)
 _HEADING = re.compile(r"^(\S[^\n]*?):\s*$", re.MULTILINE)
+
+# Headings in a help page's inputs that are not inputs: a note to the reader.
+NOTE_WORDS = frozenset({"NOTE", "NOTES", "TIP", "TIPS", "WARNING", "IMPORTANT", "CAUTION"})
 
 
 def node_type(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, Any]:
@@ -310,8 +329,8 @@ def near_types(wanted: str, types: Mapping[str, Any], *, limit: int = MAX_SUGGES
     names = list(types)
     found = did_you_mean(wanted, names, limit=limit)
     by_base: dict[str, list[str]] = {}
-    for name in names:
-        base = _base_name(name)
+    for name, kind in types.items():
+        base = (_components(kind)[2] if kind is not None else "") or _base_name(name)
         by_base.setdefault(base, []).append(name)
     for base in did_you_mean(_base_name(wanted), list(by_base), limit=limit):
         for name in sorted(by_base[base], key=len):
@@ -322,12 +341,20 @@ def near_types(wanted: str, types: Mapping[str, Any], *, limit: int = MAX_SUGGES
 
 def _base_name(name: str) -> str:
     """`attribwrangle` for `Sop/attribwrangle`, `tool` for `com.example::tool::1.0`."""
-    parts = name.rsplit("/", 1)[-1].split("::")
-    if len(parts) >= 3:
-        return parts[-2]
-    if len(parts) == 2:
-        return parts[0] if re.fullmatch(r"\d+(\.\d+)*", parts[1]) else parts[1]
-    return parts[0]
+    return _split_name(name.rsplit("/", 1)[-1])[1]
+
+
+def _split_name(name: str) -> tuple[str, str, str]:
+    """The namespace, base name and version written into a full type name.
+
+    Only for a name with no type to ask: a type's own `nameComponents` is
+    what says this where there is one.
+    """
+    parts = name.split("::")
+    version = ""
+    if len(parts) > 1 and re.fullmatch(r"\d+(\.\d+)*", parts[-1]):
+        version = parts.pop()
+    return ("::".join(parts[:-1]), parts[-1], version)
 
 
 def _components(node_type: Any) -> tuple[str, str, str, str]:
@@ -393,7 +420,11 @@ class _TypeReader:
 
         if self.standard:
             result.update(_identity(node_type))
-            labels = _labels(node_type, lambda: _HELP.whole(help_page()))
+            labels, source = _labels(
+                node_type,
+                lambda: _HELP.whole(help_page()),
+                {"input": most, "output": outputs},
+            )
             result["inputs"], more = _inputs(least, most, labels["input"])
             if more:
                 result["more_inputs"] = True
@@ -403,6 +434,7 @@ class _TypeReader:
                 {"index": index, "label": labels["output"].get(index)}
                 for index in range(min(outputs, MAX_LISTED_INPUTS))
             ]
+            result["labels_from"] = source
             offset, limit = page
             chosen_rows = rows[offset : offset + limit]
             result["parms"] = chosen_rows
@@ -472,7 +504,11 @@ class _TypeReader:
         }
         size = _ask(template, "numComponents")
         row["size"] = int(size) if isinstance(size, int) else 1
-        if kind != "Button":
+        if kind == "Ramp":
+            points = _ask(template, "defaultValue")
+            if isinstance(points, int):
+                row["default_points"] = points
+        elif kind != "Button":
             default = _default(template, kind)
             if default is not None:
                 row["default"] = default
@@ -629,22 +665,36 @@ def _library(definition: Any) -> str | None:
     return text
 
 
-def _labels(node_type: Any, page: Callable[[], Mapping[str, Any] | None]) -> dict[str, Any]:
-    """Input and output labels by index, from the dialog script or else the help.
+def _labels(
+    node_type: Any,
+    page: Callable[[], Mapping[str, Any] | None],
+    counts: Mapping[str, int],
+) -> tuple[dict[str, dict[int, str]], str | None]:
+    """Input and output labels by index, and where they came from.
 
-    The whole help page is read only when the dialog script has no labels.
+    An asset's dialog script says what the node shows, so when it names any
+    label the labels are its alone. Otherwise the headings of the help page's
+    inputs and outputs stand in, which is an approximation: the page is
+    written by hand and can name an input differently from the node, or lag
+    behind it. The whole page is read only then, and no more headings are
+    taken than the type has inputs or outputs.
     """
     found: dict[str, dict[int, str]] = {"input": {}, "output": {}}
     if _ask(node_type, "hasSectionData", "DialogScript"):
         script = str(_ask(node_type, "sectionData", "DialogScript") or "")
-        for side, number, text in _LABEL_LINE.findall(script):
-            found[side][int(number) - 1] = text.replace('\\"', '"')
-    if not found["input"] or not found["output"]:
-        whole = page() or {}
-        for side in ("input", "output"):
-            if not found[side]:
-                found[side] = dict(enumerate(whole.get(f"{side}s") or ()))
-    return found
+        for match in _LABEL_LINE.finditer(script):
+            side, number, quoted, bare = match.groups()
+            text = quoted.replace('\\"', '"') if quoted is not None else bare
+            found[side][int(number) - 1] = text
+    if found["input"] or found["output"]:
+        return found, "dialog_script"
+    whole = page() or {}
+    for side in ("input", "output"):
+        headings = list(whole.get(f"{side}s") or ())[: counts[side]]
+        found[side] = dict(enumerate(headings))
+    if found["input"] or found["output"]:
+        return found, "help"
+    return found, None
 
 
 def _inputs(least: int, most: int, labels: Mapping[int, str]) -> tuple[list[dict[str, Any]], bool]:
@@ -677,7 +727,16 @@ def _search(
     if not wanted:
         raise BridgeError("BAD_ARGUMENTS", "query needs a word to look for", {"argument": "query"})
     words = wanted.split()
-    looked = [chosen] if chosen is not None else _ordered(categories)
+    if chosen is not None:
+        looked = [chosen]
+    else:
+        looked = [
+            category
+            for category in _ordered(categories)
+            if _category_name(category) not in UNSEARCHED
+            and not _category_name(category).endswith("Net")
+        ]
+    pages = _HELP.pages(hou)
     ranked: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
     for order, category in enumerate(looked):
         place = _category_name(category)
@@ -686,8 +745,9 @@ def _search(
             if hidden and "hidden" not in included:
                 continue
             label = str(_ask(node_type, "description") or "")
-            page_help = _HELP.page_for(hou, node_type, category, embedded=False)
-            closeness = _closeness(wanted, words, name, label, page_help)
+            page_help = _HELP.page_for(hou, node_type, category, embedded=False, pages=pages)
+            base = _components(node_type)[2] or _base_name(name)
+            closeness = _closeness(wanted, words, name, base, label, page_help)
             if closeness is None:
                 continue
             deprecated = bool(_ask(node_type, "deprecated"))
@@ -703,7 +763,7 @@ def _search(
                 row["deprecated"] = True
             # Among equally close matches: more of the words in the name or
             # label, then a type still in use, then the version Houdini makes
-            # for the bare name, then the shorter name.
+            # for the bare name, then the context, then the shorter name.
             named = f"{name} {label}".lower()
             words_named = sum(1 for word in words if word in named)
             order_of = _ask(node_type, "namespaceOrder") or ()
@@ -714,8 +774,8 @@ def _search(
                 hidden,
                 deprecated,
                 superseded,
-                len(_base_name(name)),
                 order,
+                len(base),
                 name,
             )
             ranked.append((key, row))
@@ -728,7 +788,11 @@ def _search(
             # An asset's own help, read only for the rows that are sent.
             category = categories.get(row["category"])
             node_type = _types_of(category).get(row["type"]) if category is not None else None
-            own = _HELP.page_for(hou, node_type, category) if node_type is not None else None
+            own = (
+                _HELP.page_for(hou, node_type, category, pages=pages)
+                if node_type is not None
+                else None
+            )
             row["one_line"] = own["summary"] if own else None
     result: dict[str, Any] = {
         "query": query,
@@ -745,10 +809,15 @@ def _search(
 
 
 def _closeness(
-    wanted: str, words: list[str], name: str, label: str, page: Mapping[str, Any] | None
+    wanted: str,
+    words: list[str],
+    name: str,
+    base: str,
+    label: str,
+    page: Mapping[str, Any] | None,
 ) -> int | None:
     lowered = name.lower()
-    base = _base_name(lowered)
+    base = base.lower()
     if wanted in (lowered, base):
         return EXACT
     if lowered.startswith(wanted) or base.startswith(wanted):
@@ -772,71 +841,100 @@ def _closeness(
 
 
 class _HelpIndex:
-    """What the help pages Houdini ships say about each type, gathered once.
+    """What the help pages say about each type, gathered once per process.
 
-    Keyed by the help folder, namespace, type name and version each page
-    names in its header. The index is made again when the file changes, which
-    it does only when Houdini is updated.
+    Two places are read: the `nodes.zip` Houdini ships, and every `help/nodes`
+    folder on Houdini's search path, which is where a package such as a set
+    of add on tools keeps the pages for its own types. Pages are keyed by the
+    help folder, namespace, type name and version each one names in its
+    header, and a shipped page wins over a package page for the same type.
+
+    The index is made again when the archive or a folder changes, which is
+    rare. The archive stays open with it, so reading a whole page for its
+    input headings does not open the file again.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._source: tuple[str, int, int] | None = None
+        self._source: tuple[Any, ...] | None = None
         self._pages: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        self._archive: zipfile.ZipFile | None = None
+
+    def pages(self, hou: Any) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+        """The index, made again first when anything it was made from has changed."""
+        archive = _help_archive(hou)
+        folders = _help_folders(hou)
+        source = (_stamp(archive), tuple(_folder_stamp(folder) for folder in folders))
+        with self._lock:
+            if self._source != source:
+                self._close()
+                opened = _open_archive(archive)
+                pages = _read_archive(opened) if opened is not None else {}
+                for folder in folders:
+                    for key, page in _read_folder(folder).items():
+                        pages.setdefault(key, page)
+                self._archive = opened
+                self._pages = pages
+                self._source = source
+            return self._pages
 
     def page_for(
-        self, hou: Any, node_type: Any, category: Any, *, embedded: bool = True
+        self,
+        hou: Any,
+        node_type: Any,
+        category: Any,
+        *,
+        embedded: bool = True,
+        pages: Mapping[tuple[str, str, str, str], dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
-        """The help for one type: its own embedded help first, then the shipped page.
+        """The help for one type: its own embedded help first, then a page.
 
-        A search leaves the embedded help out: reading it from every asset
-        installed would be the slow part of the search.
+        A search leaves the embedded help out, since reading it from every
+        asset installed would be the slow part, and hands in the index it
+        read once rather than having it looked up again for every type.
         """
         own = str(_ask(node_type, "embeddedHelp") or "") if embedded else ""
         if own.strip():
             parsed = _parse_page(own, whole=True)
             parsed["path"] = str(_ask(node_type, "defaultHelpUrl") or "") or None
             return parsed
-        pages = self._index(hou)
-        if not pages:
+        index = self.pages(hou) if pages is None else pages
+        if not index:
             return None
         folder = HELP_FOLDERS.get(_category_name(category), _category_name(category).lower())
         _, namespace, base, version = _components(node_type)
-        found = pages.get((folder, namespace, base, version))
+        found = index.get((folder, namespace, base, version))
         if found is None and version:
-            found = pages.get((folder, namespace, base, ""))
+            found = index.get((folder, namespace, base, ""))
         return found
 
     def whole(self, page: Mapping[str, Any] | None) -> dict[str, Any] | None:
         """The whole of one page, for its input and output headings."""
         if page is None or "inputs" in page:
             return None if page is None else dict(page)
-        member = page.get("member")
-        source = self._source
-        if not member or source is None:
-            return dict(page)
+        text = None
         try:
-            with zipfile.ZipFile(source[0]) as archive:
-                text = archive.read(member).decode("utf-8", "replace")
-        except (OSError, KeyError, zipfile.BadZipFile):
+            if page.get("file"):
+                with open(page["file"], encoding="utf-8", errors="replace") as opened:
+                    text = opened.read()
+            elif page.get("member"):
+                with self._lock:
+                    if self._archive is not None:
+                        text = self._archive.read(page["member"]).decode("utf-8", "replace")
+        except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+            text = None
+        if text is None:
             return dict(page)
         whole = _parse_page(text, whole=True)
         return {**page, "inputs": whole.get("inputs"), "outputs": whole.get("outputs")}
 
-    def _index(self, hou: Any) -> dict[tuple[str, str, str, str], dict[str, Any]]:
-        path = _help_archive(hou)
-        if path is None:
-            return {}
-        try:
-            stat = os.stat(path)
-        except OSError:
-            return {}
-        source = (path, int(stat.st_mtime), int(stat.st_size))
-        with self._lock:
-            if self._source != source:
-                self._pages = _read_archive(path)
-                self._source = source
-            return self._pages
+    def _close(self) -> None:
+        if self._archive is not None:
+            try:
+                self._archive.close()
+            except OSError:
+                pass
+            self._archive = None
 
 
 def _help_archive(hou: Any) -> str | None:
@@ -847,26 +945,114 @@ def _help_archive(hou: Any) -> str | None:
     return path if os.path.isfile(path) else None
 
 
-def _read_archive(path: str) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+def _help_folders(hou: Any) -> list[str]:
+    """Every `help/nodes` folder on Houdini's search path, in its order."""
+    found = _quiet(lambda: hou.findDirectories("help/nodes")) or ()
+    return [str(folder) for folder in found if os.path.isdir(str(folder))]
+
+
+def _stamp(path: str | None) -> tuple[str, int, int] | None:
+    if path is None:
+        return None
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return (path, stat.st_mtime_ns, stat.st_size)
+
+
+def _folder_stamp(folder: str) -> tuple[str, int]:
+    """A folder and the latest change to it or to a context folder in it."""
+    latest = 0
+    for place in [folder, *_subfolders(folder)]:
+        try:
+            latest = max(latest, os.stat(place).st_mtime_ns)
+        except OSError:
+            continue
+    return (folder, latest)
+
+
+def _subfolders(folder: str) -> list[str]:
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return []
+    return [
+        os.path.join(folder, name) for name in names if os.path.isdir(os.path.join(folder, name))
+    ]
+
+
+def _open_archive(path: str | None) -> zipfile.ZipFile | None:
+    if path is None:
+        return None
+    try:
+        return zipfile.ZipFile(path)
+    except (OSError, zipfile.BadZipFile):
+        return None
+
+
+def _page_key(folder: str, parsed: dict[str, Any]) -> tuple[str, str, str, str] | None:
+    """Where one page goes in the index, from what its header says it documents.
+
+    A page names its type in `#internal`, with the namespace and version in
+    headers of their own or, as package pages do, written into the name.
+    """
+    internal = parsed.pop("internal", None)
+    namespace = parsed.pop("namespace", "")
+    version = parsed.pop("version", "")
+    if not internal:
+        return None
+    if "::" in internal and not namespace and not version:
+        namespace, internal, version = _split_name(internal)
+    return (folder, namespace, internal, version)
+
+
+def _read_archive(archive: zipfile.ZipFile) -> dict[tuple[str, str, str, str], dict[str, Any]]:
     pages: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     try:
-        with zipfile.ZipFile(path) as archive:
-            for member in archive.namelist():
-                folder, _, leaf = member.partition("/")
-                if not leaf.endswith(".txt") or "/" in leaf:
-                    continue
-                with archive.open(member) as opened:
-                    head = opened.read(HELP_HEAD_BYTES).decode("utf-8", "replace")
-                parsed = _parse_page(head, whole=False)
-                internal = parsed.pop("internal", None)
-                if not internal:
-                    continue
-                parsed["path"] = f"/nodes/{member[: -len('.txt')]}"
-                parsed["member"] = member
-                key = (folder, parsed.pop("namespace", ""), internal, parsed.pop("version", ""))
-                pages.setdefault(key, parsed)
+        for member in archive.namelist():
+            folder, _, leaf = member.partition("/")
+            if not leaf.endswith(".txt") or "/" in leaf:
+                continue
+            with archive.open(member) as opened:
+                head = opened.read(HELP_HEAD_BYTES).decode("utf-8", "replace")
+            parsed = _parse_page(head, whole=False)
+            key = _page_key(folder, parsed)
+            if key is None:
+                continue
+            parsed["path"] = f"/nodes/{member[: -len('.txt')]}"
+            parsed["member"] = member
+            pages.setdefault(key, parsed)
     except (OSError, zipfile.BadZipFile):
         return {}
+    return pages
+
+
+def _read_folder(root: str) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+    """The pages under one `help/nodes` folder, one folder per context."""
+    pages: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for place in _subfolders(root):
+        folder = os.path.basename(place)
+        try:
+            leaves = sorted(os.listdir(place))
+        except OSError:
+            continue
+        for leaf in leaves:
+            path = os.path.join(place, leaf)
+            if not leaf.endswith(".txt") or not os.path.isfile(path):
+                continue
+            try:
+                with open(path, encoding="utf-8", errors="replace") as opened:
+                    head = opened.read(HELP_HEAD_BYTES)
+            except OSError:
+                continue
+            parsed = _parse_page(head, whole=False)
+            key = _page_key(folder, parsed)
+            if key is None:
+                continue
+            parsed["path"] = f"/nodes/{folder}/{leaf[: -len('.txt')]}"
+            parsed["file"] = path
+            pages.setdefault(key, parsed)
     return pages
 
 
@@ -898,7 +1084,15 @@ def _headings(text: str, section: str) -> list[str]:
         if found.group(1) != section:
             continue
         end = bounds[index + 1].start() if index + 1 < len(bounds) else len(text)
-        return [_plain(match.group(1)) for match in _HEADING.finditer(text[found.end() : end])]
+        headings: list[str] = []
+        for match in _HEADING.finditer(text[found.end() : end]):
+            heading = match.group(1).strip()
+            # A directive such as `:include ...:` and a note to the reader
+            # sit among the headings without being inputs.
+            if heading.startswith(":") or heading.upper() in NOTE_WORDS:
+                continue
+            headings.append(_plain(heading))
+        return headings
     return []
 
 

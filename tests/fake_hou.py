@@ -10,6 +10,7 @@ a real headless session before it was written here.
 
 from __future__ import annotations
 
+import os
 import queue
 import re
 import threading
@@ -477,14 +478,11 @@ class NodeType:
         return self._name
 
     def nameComponents(self) -> tuple[str, str, str, str]:  # noqa: N802 - the name is Houdini's
+        # A version is the last part when it is a number; the base name is the
+        # part before it, and everything in front is the namespace.
         parts = self._name.split("::")
-        if len(parts) >= 3:
-            return ("", "::".join(parts[:-2]), parts[-2], parts[-1])
-        if len(parts) == 2:
-            if parts[1].replace(".", "").isdigit():
-                return ("", "", parts[0], parts[1])
-            return ("", parts[0], parts[1], "")
-        return ("", "", self._name, "")
+        version = parts.pop() if len(parts) > 1 and parts[-1].replace(".", "").isdigit() else ""
+        return ("", "::".join(parts[:-1]), parts[-1], version)
 
     def nameWithCategory(self) -> str:  # noqa: N802 - the name is Houdini's
         return f"{self._category}/{self._name}"
@@ -868,6 +866,14 @@ TOOL_DIALOG = """{
     outputlabel\t2\t"Discarded"
 }"""
 
+RAGDOLL_DIALOG = """{
+    name\tragdollsolver
+    inputlabel\t1\tSkeleton
+    inputlabel\t2\t"Constraint Geometry"
+    inputlabel\t3\t""
+    outputlabel\t1\tSkeleton
+}"""
+
 TOOL_HELP = """= Example Tool =
 
 #type: node
@@ -1008,6 +1014,15 @@ def type_library() -> dict[str, NodeTypeCategory]:
         ),
         NodeType("null", "Sop", label="Null"),
         NodeType(
+            "kinefx::ragdollsolver",
+            "Sop",
+            label="Ragdoll Solver",
+            inputs=(1, 3),
+            dialog=RAGDOLL_DIALOG,
+        ),
+        NodeType("splitter", "Sop", label="Splitter", outputs=2),
+        NodeType("labs::thing::1.0", "Sop", label="Labs Thing"),
+        NodeType(
             "oldsmooth",
             "Sop",
             label="Old Smooth",
@@ -1019,13 +1034,23 @@ def type_library() -> dict[str, NodeTypeCategory]:
         NodeType("null", "Object", label="Null", inputs=(0, 1), templates=transform[1:]),
         NodeType("cam", "Object", label="Camera", inputs=(0, 1)),
     ]
-    lops = [NodeType("attribwrangle", "Lop", inputs=(0, 4)), NodeType("null", "Lop")]
+    lops = [
+        NodeType("attribwrangle", "Lop", inputs=(0, 4)),
+        NodeType("null", "Lop"),
+        NodeType("wrangler", "Lop", label="Wrangler"),
+    ]
+    # Recipes, and a network that holds another context: a search with no
+    # context leaves both kinds of category out.
+    data = [NodeType("sidefx::recipe::lop::testscene_wrangle", "Data", label="Test Scene")]
+    vopnets = [NodeType("wranglenet", "VopNet", label="Wrangle Network")]
     return {
         "Sop": NodeTypeCategory("Sop", sops),
         "Object": NodeTypeCategory("Object", objects),
         "Lop": NodeTypeCategory("Lop", lops),
         "Driver": NodeTypeCategory("Driver", [NodeType("null", "Driver", inputs=(0, 9999))]),
         "Cop2": NodeTypeCategory("Cop2", [NodeType("vexfilter", "Cop2", label="VEX Filter")]),
+        "Data": NodeTypeCategory("Data", data),
+        "VopNet": NodeTypeCategory("VopNet", vopnets),
     }
 
 
@@ -1332,6 +1357,8 @@ class Scene:
         self.selected: list[Node] = []
         # Every type the session knows, by context, as a type reads with no node.
         self.library = type_library()
+        # The folders on the search path, for `findDirectories`.
+        self.search_path: list[str] = []
         self.empty()
         self.undos.labels.clear()
         self.hipFile = HipFile(self, "/Users/somebody/scenes/example.hip")
@@ -1341,6 +1368,11 @@ class Scene:
         self.root._children.clear()
         for name in ("obj", "out", "mat", "stage"):
             self.root._children.append(Node(self, name, "network", self.root))
+
+    def find_directories(self, relative: str) -> tuple[str, ...]:
+        """Every folder on the search path that holds `relative`, in path order."""
+        found = [os.path.join(root, relative) for root in self.search_path]
+        return tuple(folder for folder in found if os.path.isdir(folder))
 
     def next_name(self, type_name: str) -> str:
         self._counts[type_name] = self._counts.get(type_name, 0) + 1
@@ -1437,6 +1469,7 @@ class Scene:
             isUIAvailable=lambda: True,
             nodeTypeCategories=lambda: dict(self.library),
             preferredNodeType=lambda name, parent=None: preferred_type(self.library, name),
+            findDirectories=self.find_directories,
             Vector3=Vector3,
             Matrix4=Matrix4,
             OperationFailed=OperationFailed,
