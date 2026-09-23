@@ -14,6 +14,8 @@ from nscr_houdini_mcp.store import (
     CLEAR,
     AliasInUse,
     DuplicateRecord,
+    JobIdTaken,
+    JobMoveRefused,
     OperationMismatch,
     PoolFull,
     SceneReplaced,
@@ -866,13 +868,106 @@ def test_a_job_keeps_its_operation_what_it_runs_and_when_it_began(store: Store) 
     assert again.started_at == running.started_at
 
 
-def test_a_job_id_taken_again_replaces_the_row_only_when_asked(store: Store) -> None:
-    store.create_job("j1", kind="python", state="done")
+def test_a_job_id_is_taken_again_only_once_its_job_ended_long_ago(timed_store, clock) -> None:
+    timed_store.create_job("j1", kind="python", state="running")
+    with pytest.raises(JobIdTaken):
+        timed_store.create_job("j1", kind="python", replace_after_s=60.0)
+    timed_store.update_job("j1", state="done")
+    clock.step(30.0)
+    with pytest.raises(JobIdTaken):
+        timed_store.create_job("j1", kind="python", replace_after_s=60.0)
     with pytest.raises(DuplicateRecord):
-        store.create_job("j1", kind="python")
-    fresh = store.create_job("j1", kind="python", state="queued", replace=True)
-    assert fresh.state == "queued"
-    assert fresh.finished_at is None
+        timed_store.create_job("j1", kind="python")
+    clock.step(31.0)
+    fresh = timed_store.create_job("j1", kind="python", replace_after_s=60.0)
+    assert (fresh.state, fresh.finished_at) == ("queued", None)
+
+
+def test_a_job_moves_only_the_way_the_rules_allow(store: Store) -> None:
+    store.create_job("j1", kind="python")
+    store.update_job("j1", state="running")
+    with pytest.raises(JobMoveRefused):
+        store.update_job("j1", state="queued")
+    record = store.update_job("j1", state="failed", error={"code": "X"})
+    assert record.state == "failed"
+    with pytest.raises(JobMoveRefused):
+        store.update_job("j1", state="done")
+    with pytest.raises(JobMoveRefused):
+        store.update_job("j1", state="done", late=True)
+
+
+def test_an_ended_job_takes_no_more_progress_and_keeps_when_it_ended(timed_store, clock) -> None:
+    timed_store.create_job("j1", kind="python", state="running")
+    ended = timed_store.update_job("j1", state="done", progress={"done": 1})
+    clock.step(10.0)
+    after = timed_store.update_job("j1", progress={"done": 9}, outputs={"late": True})
+    assert (after.progress, after.outputs, after.finished_at) == (
+        {"done": 1},
+        None,
+        ended.finished_at,
+    )
+    timed_store.touch_job("j1")
+    assert timed_store.get_job("j1").heartbeat_at == ended.heartbeat_at
+    assert timed_store.beat_job("j1", progress={"done": 5}).progress == {"done": 1}
+    assert timed_store.get_job("j1").updated_at == ended.updated_at
+
+
+def test_a_late_finish_over_lost_takes_the_real_ending_and_clears_the_loss(
+    timed_store, clock
+) -> None:
+    timed_store.create_job("j1", kind="python", state="running")
+    [lost] = timed_store.lose_jobs(["j1"], error=store_module.SESSION_ENDED_ERROR)
+    assert lost.error == store_module.SESSION_ENDED_ERROR
+    with pytest.raises(JobMoveRefused):
+        timed_store.update_job("j1", state="done")
+    clock.step(5.0)
+    late = timed_store.update_job("j1", state="done", outputs={"answer": 1}, late=True)
+    assert (late.state, late.error, late.outputs) == ("done", None, {"answer": 1})
+    assert late.finished_at == lost.finished_at + 5.0
+    failed = timed_store.create_job("j2", kind="python", state="running")
+    timed_store.lose_jobs([failed.job_id])
+    record = timed_store.update_job("j2", state="failed", error={"type": "E"}, late=True)
+    assert record.error == {"type": "E"}
+
+
+def test_starting_a_job_moves_only_a_queued_one(store: Store) -> None:
+    store.create_job("j1", kind="python")
+    started = store.start_job("j1", scene={"hip_path": "/p/a.hip"})
+    assert (started.state, started.scene) == ("running", {"hip_path": "/p/a.hip"})
+    assert started.started_at is not None
+    assert store.start_job("j1") is None
+    store.lose_jobs(["j1"])
+    assert store.start_job("j1") is None
+    assert store.get_job("j1").state == "lost"
+    assert store.start_job("missing") is None
+
+
+def test_a_heartbeat_mends_a_missing_or_queued_row(store: Store) -> None:
+    store.create_job("j1", kind="python")
+    beaten = store.beat_job("j1", progress={"done": 2})
+    assert (beaten.state, beaten.progress) == ("running", {"done": 2})
+    assert store.beat_job("j1").progress == {"done": 2}
+    assert store.beat_job("gone") is None
+    repair = {"kind": "python", "session_id": "s1", "operation_id": "op-9", "spec": {"n": 1}}
+    made = store.beat_job("job-op-9", progress={"done": 1}, worker_pid=LIVE_PID, repair=repair)
+    assert (made.state, made.kind, made.session_id, made.operation_id) == (
+        "running",
+        "python",
+        "s1",
+        "op-9",
+    )
+    assert made.spec == {"n": 1}
+
+
+def test_a_round_of_upkeep_is_taken_once_a_minute_per_store(timed_store, clock) -> None:
+    assert timed_store.take_sweep("jobs", 60.0) is True
+    assert timed_store.take_sweep("jobs", 60.0) is False
+    clock.step(59.0)
+    assert timed_store.take_sweep("jobs", 60.0) is False
+    clock.step(2.0)
+    assert timed_store.take_sweep("jobs", 60.0) is True
+    clock.step(-3600.0)
+    assert timed_store.take_sweep("jobs", 60.0) is True
 
 
 def test_unfinished_jobs_are_lost_with_their_session(store: Store) -> None:
@@ -931,7 +1026,7 @@ def test_jobs_page_from_the_last_row_a_caller_has(timed_store, clock) -> None:
 
 
 def test_a_file_from_before_jobs_named_their_operation_reads_right(tmp_path) -> None:
-    """A schema 7 file with a job in it, opened by a build at schema 8."""
+    """A schema 7 file with a job in it, opened by a build that knows more."""
     path = tmp_path / "coord.sqlite"
     raw = sqlite3.connect(str(path))
     for statements in store_module.MIGRATIONS[:7]:
@@ -952,8 +1047,25 @@ def test_a_file_from_before_jobs_named_their_operation_reads_right(tmp_path) -> 
 
 def test_old_jobs_are_pruned(store: Store) -> None:
     store.create_job("j1", kind="render")
+    store.update_job("j1", state="done")
     assert store.prune_jobs(max_age_s=-1) == 1
     assert store.get_job("j1") is None
+
+
+def test_pruning_keeps_jobs_that_are_still_going_by_when_they_ended(timed_store, clock) -> None:
+    timed_store.create_job("running", kind="python", state="running")
+    timed_store.create_job("queued", kind="python")
+    timed_store.create_job("ended", kind="python", state="running")
+    timed_store.update_job("ended", state="done")
+    clock.step(10.0)
+    timed_store.touch_job("running")
+    # A heartbeat is not an ending, and an old start is not either.
+    clock.step(8 * 24 * 3600.0)
+    timed_store.update_job("running", progress={"done": 1})
+    gone = timed_store.prune_final_jobs(7 * 24 * 3600.0)
+    assert [record.job_id for record in gone] == ["ended"]
+    assert timed_store.get_job("running").state == "running"
+    assert timed_store.get_job("queued").state == "queued"
 
 
 # -- versions and runs ----------------------------------------------------

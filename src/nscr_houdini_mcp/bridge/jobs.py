@@ -22,8 +22,13 @@ that finished without ever looking is `done`, with `cancel_requested` still
 on the row. Work that raised, or a call that failed, is `failed` with the
 error. A finished job leaves a readable copy of its row beside the scene.
 
-Every write is best effort: a store that cannot be reached is logged and the
-work goes on, because a missing row is better than work that stopped for it.
+The row has to be there before the work may run: the write at accept is tried
+a few times over a busy store, and the call is refused when it cannot land,
+as it is when a job under the same id is still kept. After that the writes
+mend the row rather than give up on it: a heartbeat makes a missing row again
+and moves a queued one on, and the ending is written over a row found `lost`
+meanwhile as a late finish. Every write goes through the store's rules for
+how a job may move, so nothing brings an ended job back.
 
 This module never imports `hou` itself; the one it is handed is read only on
 the thread that runs the work.
@@ -33,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -47,16 +53,32 @@ from nscr_houdini_mcp import store as store_module
 PROGRESS_WRITE_S = 1.0
 CANCEL_POLL_S = 2.0
 
+# The pauses between tries at a write that has to land, such as the row a
+# job needs before its work may run.
+ACCEPT_BACKOFF_S = (0.05, 0.2, 0.5)
+
 # How much of a Python answer the row keeps. The whole answer is on the
 # receipt under the operation id.
 RESULT_KEPT_CHARS = 4000
 STDOUT_KEPT_CHARS = 2000
 
 
+class JobNotAccepted(Exception):
+    """The job row could not be written, so the call must not run."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 @dataclass
 class _Job:
     job_id: str
     kind: str
+    # What the row says about the job, kept here so a heartbeat can make the
+    # row again when it is missing.
+    repair: dict[str, Any] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
     closed: bool = False
     written: Any = None
@@ -75,6 +97,8 @@ class JobKeeper:
         log: Callable[[str], None] | None = None,
         write_every_s: float = PROGRESS_WRITE_S,
         poll_every_s: float = CANCEL_POLL_S,
+        backoff_s: tuple[float, ...] = ACCEPT_BACKOFF_S,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._open_store = open_store
         self._session_id = session_id
@@ -83,6 +107,8 @@ class JobKeeper:
         self._log = log or (lambda text: None)
         self._write_every_s = write_every_s
         self._poll_every_s = poll_every_s
+        self._backoff_s = backoff_s
+        self._clock = clock
         self._jobs: dict[int, _Job] = {}
         self._lock = threading.Lock()
 
@@ -96,32 +122,57 @@ class JobKeeper:
         spec: Mapping[str, Any] | None,
         identity: Mapping[str, Any],
     ) -> str:
-        """Write the row for work the session has taken, and start watching it."""
+        """Write the row for work the session has taken, and start watching it.
+
+        The row is written before the work may run, retried a few times over
+        a busy store, and `JobNotAccepted` when it cannot be: a caller must
+        never be handed a job that has no row. An id whose job is still kept
+        is refused the same way, so an old job and its copy are never
+        written over.
+        """
         job_id = job_rules.job_id_for(running.operation_id)
-        running.job_id = job_id
-        job = _Job(job_id=job_id, kind=kind)
-        with self._lock:
-            self._jobs[id(running)] = job
         scene = {
             "session_id": identity.get("session_id") or self._session_id,
             "alias": identity.get("alias"),
             "scene_epoch": identity.get("scene_epoch"),
         }
-        self._write(
-            lambda store: store.create_job(
-                job_id,
-                kind=kind,
-                session_id=self._session_id or None,
-                state="queued",
-                scene=scene,
-                worker_pid=self._pid,
-                operation_id=running.operation_id,
-                spec=dict(spec or {}),
-                # The same operation id taken again, once everything the
-                # earlier run answered for has gone, is a new run of it.
-                replace=True,
+        repair = {
+            "kind": kind,
+            "session_id": self._session_id or None,
+            "operation_id": running.operation_id,
+            "spec": dict(spec or {}),
+            "scene": scene,
+        }
+        try:
+            self._durably(
+                lambda store: store.create_job(
+                    job_id,
+                    kind=kind,
+                    session_id=self._session_id or None,
+                    state="queued",
+                    scene=scene,
+                    worker_pid=self._pid,
+                    operation_id=running.operation_id,
+                    spec=repair["spec"],
+                    # The same operation id taken again once its job has
+                    # gone past keeping is a new run of it; before that the
+                    # job and its answer stay.
+                    replace_after_s=job_rules.KEEP_S,
+                )
             )
-        )
+        except store_module.JobIdTaken:
+            raise JobNotAccepted(
+                "JOB_ID_TAKEN", f"a job is still kept under {job_id}; use a new operation id"
+            ) from None
+        except (store_module.StoreError, sqlite3.Error, OSError) as error:
+            raise JobNotAccepted(
+                "STORE_UNAVAILABLE",
+                f"the job row could not be written ({type(error).__name__}), so nothing ran",
+            ) from None
+        running.job_id = job_id
+        job = _Job(job_id=job_id, kind=kind, repair=repair)
+        with self._lock:
+            self._jobs[id(running)] = job
         if self._session_id:
             self._write(lambda store: store.hold_worker_for_job(self._session_id, job_id))
         threading.Thread(
@@ -130,18 +181,23 @@ class JobKeeper:
         return job_id
 
     def started(self, running: Any, hou: Any) -> None:
-        """The work has been picked up. On the thread that runs it, so `hou` is safe."""
+        """The work has been picked up. On the thread that runs it, so `hou` is safe.
+
+        Only a queued row moves to running here; a row found lost meanwhile
+        stays lost until the work says how it really ended.
+        """
         job = self._job(running)
         if job is None:
             return
-        scene = {
-            "session_id": self._session_id or None,
+        facts = {
             "hip_path": _quiet(lambda: str(hou.hipFile.path())) if hou is not None else None,
             "untitled": _quiet(lambda: bool(hou.hipFile.isNewFile())) if hou is not None else None,
             "houdini_version": _quiet(hou.applicationVersionString) if hou is not None else None,
         }
         with job.lock:
-            self._write(lambda store: _merge_scene(store, job.job_id, scene, state="running"))
+            job.repair["scene"].update({k: v for k, v in facts.items() if v is not None})
+            scene = dict(job.repair["scene"])
+            self._write(lambda store: store.start_job(job.job_id, scene=scene))
 
     def finish(self, running: Any, payload: Mapping[str, Any]) -> None:
         """Write how the work ended, and leave the readable copy beside the scene."""
@@ -149,17 +205,17 @@ class JobKeeper:
         if job is None:
             return
         state, outputs, error = ending(job.kind, running, payload)
+        progress = job_rules.progress_of(latest(running)) or None
         with job.lock:
             job.closed = True
-            self._write(
-                lambda store: store.update_job(
-                    job.job_id,
-                    state=state,
-                    progress=job_rules.progress_of(latest(running)) or None,
-                    outputs=outputs,
-                    error=error,
+            try:
+                self._durably(
+                    lambda store: settle(
+                        store, job, state=state, progress=progress, outputs=outputs, error=error
+                    )
                 )
-            )
+            except Exception as error:  # noqa: BLE001 - logged; the receipt holds the answer
+                self._log(f"could not write how job {job.job_id} ended: {error}")
         self._free(job)
         self._write(lambda store: job_rules.export(store, job.job_id, home=self._home))
 
@@ -191,40 +247,38 @@ class JobKeeper:
 
     def _watch(self, running: Any, job: _Job) -> None:
         """Progress, the cancel request and the heartbeat, until the work ends."""
-        last = time.monotonic()
+        last = self._clock()
         while not running.ended.is_set():
             running.noted.wait(self._poll_every_s)
             if running.noted.is_set():
                 # A burst of notes is written once a second, not once a note.
-                wait = self._write_every_s - (time.monotonic() - last)
+                wait = self._write_every_s - (self._clock() - last)
                 if wait > 0 and running.ended.wait(wait):
                     break
                 running.noted.clear()
             if running.ended.is_set():
                 break
             self._beat(running, job)
-            last = time.monotonic()
+            last = self._clock()
 
     def _beat(self, running: Any, job: _Job) -> None:
         with job.lock:
             if job.closed:
                 return
             note = job_rules.progress_of(latest(running))
-
-            def beat(store: store_module.Store) -> store_module.JobRecord | None:
-                if note is not None and note != job.written:
-                    record = store.update_job(job.job_id, progress=note)
-                    job.written = note
-                    return record
-                store.touch_job(job.job_id)
-                return store.get_job(job.job_id)
-
-            def lease(store: store_module.Store) -> bool:
-                return store.renew_worker_of_session(self._session_id)
-
-            record = self._write(beat)
+            fresh = note if note is not None and note != job.written else None
+            repair = {**job.repair, "scene": dict(job.repair["scene"])}
+            # One write that also mends the row: made again when it is
+            # missing, moved on from queued, left alone once it has ended.
+            record = self._write(
+                lambda store: store.beat_job(
+                    job.job_id, progress=fresh, worker_pid=self._pid, repair=repair
+                )
+            )
+            if record is not None and fresh is not None:
+                job.written = fresh
             if self._session_id:
-                self._write(lease)
+                self._write(lambda store: store.renew_worker_of_session(self._session_id))
         if record is not None and record.cancel_requested and not running.cancel.is_set():
             self._log(f"job {job.job_id} was asked to stop")
             running.cancel.set()
@@ -251,14 +305,51 @@ class JobKeeper:
         finally:
             store.close()
 
+    def _durably(self, change: Callable[[store_module.Store], Any]) -> Any:
+        """One write that has to land, tried again over a busy store, or raised."""
+        last: BaseException | None = None
+        for pause in (*self._backoff_s, None):
+            try:
+                store = self._open_store()
+                try:
+                    return change(store)
+                finally:
+                    store.close()
+            except store_module.JobIdTaken:
+                raise
+            except (store_module.StoreError, sqlite3.Error, OSError) as error:
+                last = error
+                self._log(f"a job write did not land: {type(error).__name__}: {error}")
+                if pause is not None:
+                    time.sleep(pause)
+        assert last is not None
+        raise last
 
-def _merge_scene(
-    store: store_module.Store, job_id: str, scene: Mapping[str, Any], *, state: str
+
+def settle(
+    store: store_module.Store,
+    job: _Job,
+    *,
+    state: str,
+    progress: Any,
+    outputs: Any,
+    error: Any,
 ) -> store_module.JobRecord:
-    record = store.get_job(job_id)
-    kept = dict(record.scene) if record is not None and isinstance(record.scene, dict) else {}
-    kept.update({key: value for key, value in scene.items() if value is not None})
-    return store.update_job(job_id, state=state, scene=kept)
+    """Write how a job ended, whatever its row went through meanwhile.
+
+    A missing row is made again first. A row found lost while the work ran
+    takes the real ending as a late finish, which clears the loss.
+    """
+    if store.get_job(job.job_id) is None:
+        store.beat_job(job.job_id, repair={**job.repair, "scene": dict(job.repair["scene"])})
+    try:
+        return store.update_job(
+            job.job_id, state=state, progress=progress, outputs=outputs, error=error
+        )
+    except store_module.JobMoveRefused:
+        return store.update_job(
+            job.job_id, state=state, progress=progress, outputs=outputs, error=error, late=True
+        )
 
 
 def latest(running: Any) -> Any:

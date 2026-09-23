@@ -46,6 +46,8 @@ CODES: dict[str, str] = {
     "FILE_EXISTS": "a file is already at that path and is never written over",
     "UNSAVED_CHANGES": "the scene has changes that are not saved",
     "SCENE_UNTITLED": "the scene has never been saved, so it has no file to save to",
+    "STORE_UNAVAILABLE": "the coordination store could not be read or written",
+    "JOB_ID_TAKEN": "a job is still kept under the id that operation id makes",
     # The transport refuses these before a tool is ever chosen.
     "BAD_ENVELOPE": "the request envelope could not be read",
     "UNAUTHORIZED": "the request was not signed for this bridge",

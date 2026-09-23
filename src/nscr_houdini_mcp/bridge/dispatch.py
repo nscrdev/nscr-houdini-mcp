@@ -77,7 +77,7 @@ from nscr_houdini_mcp.bridge.errors import BridgeError, did_you_mean, map_except
 from nscr_houdini_mcp.bridge.gate import Gate
 from nscr_houdini_mcp.bridge.handlers import Tool, ToolRegistry, UnknownTool
 from nscr_houdini_mcp.bridge.identity import Identity
-from nscr_houdini_mcp.bridge.jobs import JobKeeper
+from nscr_houdini_mcp.bridge.jobs import JobKeeper, JobNotAccepted
 from nscr_houdini_mcp.bridge.tools import ToolContext
 from nscr_houdini_mcp.bridge.undo import run_in_undo_group
 
@@ -433,12 +433,26 @@ class Dispatcher:
             dirty=self.identity.dirty,
         )
         if tool.job_kind and self._jobs is not None:
-            self._jobs.accept(
-                running,
-                kind=tool.job_kind,
-                spec=tool.job_spec(envelope.arguments) if tool.job_spec else None,
-                identity=self.identity.trace(),
-            )
+            try:
+                self._jobs.accept(
+                    running,
+                    kind=tool.job_kind,
+                    spec=tool.job_spec(envelope.arguments) if tool.job_spec else None,
+                    identity=self.identity.trace(),
+                )
+            except JobNotAccepted as refused:
+                # A job nobody could follow must not run: the session goes
+                # back and the receipt with it, so the same id can try again.
+                self._never_ran(wanted, running)
+                hint = (
+                    "use a new operation_id"
+                    if refused.code == "JOB_ID_TAKEN"
+                    else "call again shortly; the store was busy or could not be written"
+                )
+                return self._refuse(
+                    BridgeError(refused.code, refused.message, {"tool": tool.name}, hint=hint),
+                    trace,
+                )
 
         work = marshal.Work(
             lambda: self._work(tool, envelope.arguments, context, running, carried, wanted, trace)

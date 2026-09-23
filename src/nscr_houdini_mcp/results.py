@@ -120,6 +120,7 @@ HINTS: dict[str, str] = {
     "UNSAVED_CHANGES": "save the scene first, or pass discard_unsaved true to drop the changes",
     "SCENE_UNTITLED": "use save_increment, which picks a versioned file for the scene",
     "JOB_UNKNOWN": "list the jobs to see the ids that are kept; a job is kept for 7 days",
+    "JOB_ID_TAKEN": "use a new operation_id; the job under this one is kept for 7 days",
 }
 
 # The largest result whose text block repeats the whole JSON. Larger ones get a

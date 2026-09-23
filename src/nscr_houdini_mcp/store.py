@@ -45,7 +45,7 @@ APP_DIR_NAME = "nscr-houdini-mcp"
 HOME_ENV_VAR = "NSCR_MCP_HOME"
 STORE_FILE_NAME = "coord.sqlite"
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SESSION_KINDS = frozenset({"gui", "hython"})
 SESSION_STATES = frozenset({"live", "busy", "unresponsive", "crashed", "gone"})
@@ -74,6 +74,15 @@ OPERATION_STATES = frozenset({"running", "done", "failed", OPERATION_ABANDONED})
 JOB_STATES = frozenset({"queued", "running", "done", "failed", "cancelled", "lost"})
 JOB_FINAL_STATES = frozenset({"done", "failed", "cancelled", "lost"})
 JOB_LIVE_STATES = ("queued", "running")
+
+# Where a job may go from where it is. A job that has ended stays ended, with
+# one exception: a job found `lost` whose work then turns out to have ended
+# after all takes how it really ended, as a late finish.
+JOB_MOVES = {
+    "queued": frozenset({"running", "done", "failed", "cancelled", "lost"}),
+    "running": frozenset({"done", "failed", "cancelled", "lost"}),
+}
+LATE_FINISHES = frozenset({"done", "failed", "cancelled"})
 
 # What a job that was still going says once its session is known to have ended.
 SESSION_ENDED_ERROR = {"code": "SESSION_ENDED", "message": "the session running this job ended"}
@@ -123,6 +132,14 @@ class PoolFull(StoreError):
 
 class WorkerTaken(StoreError):
     """That worker is already on another job."""
+
+
+class JobIdTaken(DuplicateRecord):
+    """A job is kept under that id, and it is too soon to take the id again."""
+
+
+class JobMoveRefused(StoreError):
+    """A job cannot move from the state it is in to the one asked for."""
 
 
 class AliasInUse(DuplicateRecord):
@@ -589,6 +606,11 @@ class JobRecord:
     operation_id: str | None = None
     spec: Any = None
     started_at: float | None = None
+    # Where the readable copy and a spilled answer were written, when they were.
+    export_path: str | None = None
+    spill_path: str | None = None
+    # Whether a caller was handed the job to follow, rather than its answer.
+    promoted: bool = False
     # Where the row sits in the table, for a list that goes on from a row.
     seq: int | None = None
 
@@ -614,6 +636,9 @@ class JobRecord:
             operation_id=row["operation_id"],
             spec=_load(row["spec"]),
             started_at=row["started_at"],
+            export_path=row["export_path"],
+            spill_path=row["spill_path"],
+            promoted=bool(row["promoted"]),
             seq=row["seq"] if "seq" in keys else None,
         )
 
@@ -795,6 +820,27 @@ _SCHEMA_8 = (
     "CREATE INDEX jobs_by_session ON jobs(session_id, state)",
 )
 
+# Where a job's readable copy and spilled answer went, whether it was handed
+# out to follow, the indexes the lists and the retention read by, and the
+# claim several processes take turns on for upkeep.
+_SCHEMA_9 = (
+    "ALTER TABLE jobs ADD COLUMN export_path TEXT",
+    "ALTER TABLE jobs ADD COLUMN spill_path TEXT",
+    "ALTER TABLE jobs ADD COLUMN promoted INTEGER NOT NULL DEFAULT 0",
+    "DROP INDEX IF EXISTS jobs_by_session",
+    "CREATE INDEX jobs_by_created ON jobs(created_at)",
+    "CREATE INDEX jobs_by_state_created ON jobs(state, created_at)",
+    "CREATE INDEX jobs_by_session_state_created ON jobs(session_id, state, created_at)",
+    "CREATE INDEX jobs_by_state_finished ON jobs(state, finished_at)",
+    """
+    CREATE TABLE sweeps (
+        name     TEXT PRIMARY KEY,
+        holder   TEXT,
+        taken_at REAL NOT NULL
+    )
+    """,
+)
+
 MIGRATIONS = (
     _SCHEMA_1,
     _SCHEMA_2,
@@ -804,6 +850,7 @@ MIGRATIONS = (
     _SCHEMA_6,
     _SCHEMA_7,
     _SCHEMA_8,
+    _SCHEMA_9,
 )
 
 
@@ -1622,24 +1669,36 @@ class Store:
         worker_pid: int | None = None,
         operation_id: str | None = None,
         spec: Any = None,
-        replace: bool = False,
+        replace_after_s: float | None = None,
     ) -> JobRecord:
         """Record an accepted job, including the scene identity it consumes.
 
-        `replace` writes over a row with the same id, for a job id that is
-        taken again once everything the earlier one answered for has gone.
+        An id already in the table is refused with `JobIdTaken`, unless
+        `replace_after_s` is given and the row there is a job that ended at
+        least that long ago: then the id is taken again for a new run and the
+        old row goes.
         """
         if state not in JOB_STATES:
             raise ValueError(f"unknown job state: {state}")
         now = self._now()
         started = now if state == "running" else None
-        verb = "INSERT OR REPLACE" if replace else "INSERT"
         with self._txn(write=True) as db:
+            old = db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if old is not None:
+                done_long_ago = (
+                    replace_after_s is not None
+                    and old["state"] in JOB_FINAL_STATES
+                    and old["finished_at"] is not None
+                    and _age(now, old["finished_at"]) >= replace_after_s
+                )
+                if not done_long_ago:
+                    raise JobIdTaken(f"job {job_id} is kept and is {old['state']}")
+                db.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
             db.execute(
-                f"{verb} INTO jobs (job_id, session_id, kind, state, weight, progress, outputs,"
+                "INSERT INTO jobs (job_id, session_id, kind, state, weight, progress, outputs,"
                 " error, scene, cancel_requested, worker_pid, heartbeat_at, created_at,"
                 " updated_at, finished_at, operation_id, spec, started_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0, ?, ?, ?, ?, NULL, ?, ?, ?)",
+                " VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     job_id,
                     session_id,
@@ -1652,14 +1711,13 @@ class Store:
                     now,
                     now,
                     now,
+                    now if state in JOB_FINAL_STATES else None,
                     operation_id,
                     _dump(spec),
                     started,
                 ),
             )
-            return JobRecord._from_row(
-                db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
-            )
+            return self._job_row(db, job_id)
 
     def update_job(
         self,
@@ -1671,10 +1729,16 @@ class Store:
         error: Any = None,
         worker_pid: int | None = None,
         scene: Any = None,
+        late: bool = False,
     ) -> JobRecord:
-        """Write progress, outputs so far or a final state.
+        """Write progress, outputs so far or a final state, under the job rules.
 
-        A job moving to `running` is stamped with when it began, once.
+        A job moves only as `JOB_MOVES` allows, and anything else raises
+        `JobMoveRefused`. A row that has ended takes no more writes: progress
+        and the rest are left as they are, and so is when it ended. The one
+        move out of an ending is a late finish, `late` set, from `lost` to
+        how the work really ended: it writes the error it is given, or none,
+        in the same step, so the reason it was lost does not stay behind.
         """
         if state is not None and state not in JOB_STATES:
             raise ValueError(f"unknown job state: {state}")
@@ -1683,8 +1747,20 @@ class Store:
             row = db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
             if row is None:
                 raise UnknownRecord(f"no job {job_id}")
-            new_state = state or row["state"]
-            finished = now if new_state in JOB_FINAL_STATES else row["finished_at"]
+            current = row["state"]
+            moving = state is not None and state != current
+            if not moving:
+                if current in JOB_FINAL_STATES:
+                    return JobRecord._from_row(row)
+                new_state, finished, new_error = current, row["finished_at"], _keep(error, row)
+            elif state in JOB_MOVES.get(current, ()):
+                new_state, new_error = state, _keep(error, row)
+                finished = now if state in JOB_FINAL_STATES else None
+            elif late and current == "lost" and state in LATE_FINISHES:
+                # How the work really ended, over a loss that was only a guess.
+                new_state, finished, new_error = state, now, _dump(error)
+            else:
+                raise JobMoveRefused(f"job {job_id} cannot move from {current} to {state}")
             started = row["started_at"]
             if started is None and new_state == "running":
                 started = now
@@ -1696,7 +1772,7 @@ class Store:
                     new_state,
                     _dump(progress) if progress is not None else row["progress"],
                     _dump(outputs) if outputs is not None else row["outputs"],
-                    _dump(error) if error is not None else row["error"],
+                    new_error,
                     row["worker_pid"] if worker_pid is None else worker_pid,
                     _dump(scene) if scene is not None else row["scene"],
                     now,
@@ -1706,17 +1782,94 @@ class Store:
                     job_id,
                 ),
             )
-            return JobRecord._from_row(
-                db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
-            )
+            return self._job_row(db, job_id)
 
-    def touch_job(self, job_id: str, *, worker_pid: int | None = None) -> float:
-        """Heartbeat from whoever is running the job."""
+    def start_job(self, job_id: str, *, scene: Any = None) -> JobRecord | None:
+        """Move a queued job to running, and only a queued one.
+
+        Nothing when the row is not queued: a job the session has already
+        marked, or one found lost meanwhile, is never brought back to running.
+        """
         now = self._now()
         with self._txn(write=True) as db:
-            row = db.execute("SELECT worker_pid FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            written = db.execute(
+                "UPDATE jobs SET state = 'running', started_at = COALESCE(started_at, ?),"
+                " scene = COALESCE(?, scene), heartbeat_at = ?, updated_at = ?"
+                " WHERE job_id = ? AND state = 'queued'",
+                (now, _dump(scene), now, now, job_id),
+            )
+            return self._job_row(db, job_id) if written.rowcount else None
+
+    def beat_job(
+        self,
+        job_id: str,
+        *,
+        progress: Any = None,
+        worker_pid: int | None = None,
+        repair: Mapping[str, Any] | None = None,
+    ) -> JobRecord | None:
+        """The heartbeat of a running job, with its latest progress.
+
+        One write that also mends the row: a queued row moves to running, and
+        a missing one is made again from `repair`, which holds what
+        `create_job` would have been given. A row that has ended is left as
+        it is. Nothing when there is no row and nothing to make it from.
+        """
+        now = self._now()
+        with self._txn(write=True) as db:
+            row = db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if row is None:
+                if repair is None:
+                    return None
+                db.execute(
+                    "INSERT INTO jobs (job_id, session_id, kind, state, weight, progress,"
+                    " scene, cancel_requested, worker_pid, heartbeat_at, created_at, updated_at,"
+                    " operation_id, spec, started_at)"
+                    " VALUES (?, ?, ?, 'running', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        job_id,
+                        repair.get("session_id"),
+                        repair.get("kind") or "unknown",
+                        repair.get("weight") or "light",
+                        _dump(progress),
+                        _dump(repair.get("scene")),
+                        worker_pid,
+                        now,
+                        now,
+                        now,
+                        repair.get("operation_id"),
+                        _dump(repair.get("spec")),
+                        now,
+                    ),
+                )
+                return self._job_row(db, job_id)
+            if row["state"] in JOB_FINAL_STATES:
+                return JobRecord._from_row(row)
+            db.execute(
+                "UPDATE jobs SET state = 'running', started_at = COALESCE(started_at, ?),"
+                " progress = COALESCE(?, progress), worker_pid = COALESCE(?, worker_pid),"
+                " heartbeat_at = ?, updated_at = ? WHERE job_id = ?",
+                (now, _dump(progress), worker_pid, now, now, job_id),
+            )
+            return self._job_row(db, job_id)
+
+    @staticmethod
+    def _job_row(db: sqlite3.Connection, job_id: str) -> JobRecord:
+        return JobRecord._from_row(
+            db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        )
+
+    def touch_job(self, job_id: str, *, worker_pid: int | None = None) -> float:
+        """Heartbeat from whoever is running the job. A job that has ended is left alone."""
+        now = self._now()
+        with self._txn(write=True) as db:
+            row = db.execute(
+                "SELECT worker_pid, state FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
             if row is None:
                 raise UnknownRecord(f"no job {job_id}")
+            if row["state"] in JOB_FINAL_STATES:
+                return now
             db.execute(
                 "UPDATE jobs SET heartbeat_at = ?, worker_pid = ? WHERE job_id = ?",
                 (now, row["worker_pid"] if worker_pid is None else worker_pid, job_id),
@@ -1801,6 +1954,26 @@ class Store:
             (_dump(error), now, now, job_id),
         )
 
+    def note_job_paths(
+        self, job_id: str, *, export_path: str | None = None, spill_path: str | None = None
+    ) -> None:
+        """Say where a job's readable copy or spilled answer was written.
+
+        The one write a job that has ended still takes: it changes nothing
+        about the job, only where to find what it left.
+        """
+        with self._txn(write=True) as db:
+            db.execute(
+                "UPDATE jobs SET export_path = COALESCE(?, export_path),"
+                " spill_path = COALESCE(?, spill_path) WHERE job_id = ?",
+                (export_path, spill_path, job_id),
+            )
+
+    def promote_job(self, job_id: str) -> None:
+        """Mark a job as one a caller was handed to follow."""
+        with self._txn(write=True) as db:
+            db.execute("UPDATE jobs SET promoted = 1 WHERE job_id = ?", (job_id,))
+
     def drop_job(self, job_id: str) -> bool:
         """Take a job row off, for work that was accepted and never ran."""
         with self._txn(write=True) as db:
@@ -1847,10 +2020,45 @@ class Store:
         return [JobRecord._from_row(row) for row in self._read_all(sql, args)]
 
     def prune_jobs(self, max_age_s: float) -> int:
-        """Drop job rows older than the retention window. Returns the count."""
+        """Drop jobs that ended longer ago than the retention window. Returns the count."""
+        return len(self.prune_final_jobs(max_age_s))
+
+    def prune_final_jobs(self, max_age_s: float) -> list[JobRecord]:
+        """Drop jobs that ended longer ago than the retention window.
+
+        Only jobs that have ended, by when they ended: a job that is still
+        running is kept however long it runs. Returns the rows that went, so
+        whatever was written beside them can go too.
+        """
         cutoff = self._now() - max_age_s
+        finals = ", ".join("?" * len(JOB_FINAL_STATES))
         with self._txn(write=True) as db:
-            return db.execute("DELETE FROM jobs WHERE updated_at < ?", (cutoff,)).rowcount
+            rows = db.execute(
+                f"SELECT * FROM jobs WHERE state IN ({finals}) AND finished_at < ?",
+                (*sorted(JOB_FINAL_STATES), cutoff),
+            ).fetchall()
+            for row in rows:
+                db.execute("DELETE FROM jobs WHERE job_id = ?", (row["job_id"],))
+            return [JobRecord._from_row(row) for row in rows]
+
+    def take_sweep(self, name: str, every_s: float, *, holder: str | None = None) -> bool:
+        """Claim one round of upkeep, at most once every `every_s` per store.
+
+        Several processes share one store and each would sweep it, so the
+        round is claimed here first: the claim is a row with when it was last
+        taken, and only the process that moves it on does the round.
+        """
+        now = self._now()
+        with self._txn(write=True) as db:
+            row = db.execute("SELECT taken_at FROM sweeps WHERE name = ?", (name,)).fetchone()
+            # A claim from the future, after the clock stepped back, is spent.
+            if row is not None and 0.0 <= now - row["taken_at"] < every_s:
+                return False
+            db.execute(
+                "INSERT OR REPLACE INTO sweeps (name, holder, taken_at) VALUES (?, ?, ?)",
+                (name, holder or str(os.getpid()), now),
+            )
+            return True
 
     # -- version allocation ----------------------------------------------
 
@@ -2064,6 +2272,11 @@ def _export_dict(record: Any, times: Mapping[str, str]) -> dict[str, Any]:
     for field, label in times.items():
         data[f"{label}_utc"] = _iso(data.get(field))
     return data
+
+
+def _keep(error: Any, row: sqlite3.Row) -> Any:
+    """A new error when one is given, otherwise the stored one."""
+    return _dump(error) if error is not None else row["error"]
 
 
 def _settle(given: Any, stored: Any) -> Any:

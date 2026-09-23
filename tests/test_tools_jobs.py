@@ -26,7 +26,7 @@ from nscr_houdini_mcp import jobs as job_rules
 from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge import tools
 from nscr_houdini_mcp.bridge.envelope import Envelope
-from nscr_houdini_mcp.bridge.jobs import JobKeeper
+from nscr_houdini_mcp.bridge.jobs import JobKeeper, JobNotAccepted, _Job
 from nscr_houdini_mcp.tools import jobs as jobs_tool
 from test_server import talk, text_of
 from test_tools_python import Clock, Through, ok, python, refused, through
@@ -461,37 +461,201 @@ class Running:
         self.noted.set()
 
 
-def test_progress_is_written_at_most_once_a_second(tmp_path: Path) -> None:
-    path = tmp_path / "coord.sqlite"
-    writes: list[Any] = []
+class FakeTime:
+    """A clock the keeper's waits move, instead of sleeping."""
 
-    class Counting(store_module.Store):
-        def update_job(self, job_id: str, **rest: Any) -> Any:
-            if rest.get("progress") is not None and rest.get("state") is None:
-                writes.append(rest["progress"])
-            return super().update_job(job_id, **rest)
+    def __init__(self) -> None:
+        self.now = 0.0
 
-    keeper = JobKeeper(lambda: Counting(path), session_id="s-1", write_every_s=0.5)
-    running = Running("op-notes")
-    keeper.accept(running, kind="python", spec=None, identity={"alias": "w1"})
-    began = time.monotonic()
-    while time.monotonic() - began < 1.6:
-        running.note(len(running.progress))
-        time.sleep(0.005)
-    running.ended.set()
-    assert 2 <= len(writes) <= 5, len(writes)
-    assert len(running.progress) > 50
+    def __call__(self) -> float:
+        return self.now
 
 
-def test_the_keeper_sets_the_cancel_flag_from_the_store(tmp_path: Path) -> None:
-    path = tmp_path / "coord.sqlite"
-    keeper = JobKeeper(lambda: store_module.Store(path), session_id="s-1", poll_every_s=0.1)
-    running = Running("op-flag")
-    job_id = keeper.accept(running, kind="python", spec=None, identity={})
+class Ended:
+    """The end of the work, reached once the fake clock gets to `at`."""
+
+    def __init__(self, clock: FakeTime, at: float) -> None:
+        self.clock = clock
+        self.at = at
+
+    def is_set(self) -> bool:
+        return self.clock.now >= self.at
+
+    def set(self) -> None:
+        self.at = self.clock.now
+
+    def wait(self, seconds: float) -> bool:
+        self.clock.now += seconds
+        return self.is_set()
+
+
+class Flood:
+    """Progress notes that never stop coming: fifty more on every look."""
+
+    def __init__(self, running: Running) -> None:
+        self.running = running
+
+    def wait(self, seconds: float) -> bool:
+        for _ in range(50):
+            self.running.note(len(self.running.progress))
+        return True
+
+    def is_set(self) -> bool:
+        return True
+
+    def set(self) -> None:
+        pass
+
+    def clear(self) -> None:
+        pass
+
+
+class Quiet:
+    """No progress notes at all: every look waits out the whole poll."""
+
+    def __init__(self, clock: FakeTime) -> None:
+        self.clock = clock
+
+    def wait(self, seconds: float) -> bool:
+        self.clock.now += seconds
+        return False
+
+    def is_set(self) -> bool:
+        return False
+
+    def clear(self) -> None:
+        pass
+
+
+class Counting(store_module.Store):
+    beats: list[Any] = []
+
+    def beat_job(self, job_id: str, **rest: Any) -> Any:
+        Counting.beats.append(rest.get("progress"))
+        return super().beat_job(job_id, **rest)
+
+
+def watched(path: Path, job_id: str) -> _Job:
+    """A running job's row and the keeper's own note of it, with no thread watching."""
     with store_module.Store(path) as store:
-        store.request_job_cancel(job_id)
-    support.wait_until(running.cancel.is_set, timeout_s=5.0)
+        store.create_job(job_id, kind="python", session_id="s-1", state="running")
+    return _Job(job_id=job_id, kind="python", repair={"kind": "python", "scene": {}})
+
+
+def test_a_flood_of_progress_is_written_once_a_second(tmp_path: Path) -> None:
+    path = tmp_path / "coord.sqlite"
+    clock = FakeTime()
+    Counting.beats = []
+    keeper = JobKeeper(lambda: Counting(path), session_id="s-1", clock=clock)
+    running = Running("op-notes")
+    job = watched(path, "job-op-notes")
+    running.ended = Ended(clock, 10.0)  # type: ignore[assignment]
+    running.noted = Flood(running)  # type: ignore[assignment]
+    keeper._watch(running, job)
+    # Ten fake seconds of notes, hundreds of them, written ten times.
+    assert len(Counting.beats) in (9, 10), Counting.beats
+    assert all(note is not None for note in Counting.beats)
+    assert len(running.progress) >= 450
+    with store_module.Store(path) as store:
+        assert store.get_job(job.job_id).progress["done"] >= 400
+
+
+def test_the_keeper_finds_a_cancel_in_the_store_within_two_seconds(tmp_path: Path) -> None:
+    path = tmp_path / "coord.sqlite"
+    clock = FakeTime()
+    keeper = JobKeeper(lambda: store_module.Store(path), session_id="s-1", clock=clock)
+    running = Running("op-flag")
+    job = watched(path, "job-op-flag")
+    with store_module.Store(path) as store:
+        store.request_job_cancel(job.job_id)
+    ended = Ended(clock, 60.0)
+    running.ended = ended  # type: ignore[assignment]
+    running.noted = Quiet(clock)  # type: ignore[assignment]
+    seen: list[float] = []
+    running.cancel = SeenAt(clock, seen, ended)  # type: ignore[assignment]
+    keeper._watch(running, job)
+    assert seen == [2.0]
+
+
+class SeenAt:
+    """A cancel flag that notes when it was set and ends the watch there."""
+
+    def __init__(self, clock: FakeTime, seen: list[float], ended: Ended) -> None:
+        self.clock = clock
+        self.seen = seen
+        self.ended = ended
+
+    def is_set(self) -> bool:
+        return bool(self.seen)
+
+    def set(self) -> None:
+        self.seen.append(self.clock.now)
+        self.ended.set()
+
+
+def test_a_locked_store_at_accept_refuses_the_call_before_the_code_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "coord.sqlite"
+    opened: list[int] = []
+
+    def locked() -> store_module.Store:
+        opened.append(1)
+        raise store_module.StoreBusy("the store is locked by another process")
+
+    keeper = JobKeeper(locked, session_id="s-1", backoff_s=(0.0, 0.0))
+    running = Running("op-locked")
+    with pytest.raises(JobNotAccepted) as refused:
+        keeper.accept(running, kind="python", spec=None, identity={})
+    assert refused.value.code == "STORE_UNAVAILABLE"
+    assert len(opened) == 3
+    assert running.job_id is None
+    # One busy moment and then the write lands: the job is accepted.
+    tries = iter([store_module.StoreBusy("locked"), None])
+
+    def once_locked() -> store_module.Store:
+        trouble = next(tries, None)
+        if trouble is not None:
+            raise trouble
+        return store_module.Store(path)
+
+    keeper = JobKeeper(once_locked, session_id="s-1", backoff_s=(0.0,))
+    running = Running("op-late")
+    job_id = keeper.accept(running, kind="python", spec=None, identity={})
     running.ended.set()
+    with store_module.Store(path) as store:
+        assert store.get_job(job_id).state == "queued"
+
+
+def test_a_locked_store_at_accept_answers_the_caller_and_runs_nothing(
+    bench: Bench, scene: Scene, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    keeper = through(bench).dispatcher._jobs
+    monkeypatch.setattr(keeper, "_backoff_s", (0.0,))
+
+    def locked() -> store_module.Store:
+        raise store_module.StoreBusy("the store is locked by another process")
+
+    monkeypatch.setattr(keeper, "_open_store", locked)
+    error = refused(python(bench, code="hou.node('/obj').createNode('geo')", operation_id="op-x"))
+    assert error["code"] == "STORE_UNAVAILABLE"
+    assert scene.node("/obj").children() == ()
+    assert through(bench).dispatcher.state()["busy"] is False
+    monkeypatch.undo()
+    # The receipt went back with the refusal, so the same id runs now.
+    body = ok(python(bench, code="hou.node('/obj').createNode('geo')", operation_id="op-x"))
+    assert body["state"] == "done"
+    assert len(scene.node("/obj").children()) == 1
+
+
+def test_an_operation_id_whose_job_is_still_kept_is_refused(bench: Bench) -> None:
+    body = ok(python(bench, code="result = 1", operation_id="op-kept"))
+    with bench.store() as store:
+        store.prune_operations(max_age_s=-1)
+    error = refused(python(bench, code="result = 2", operation_id="op-kept"))
+    assert error["code"] == "JOB_ID_TAKEN"
+    assert "new operation_id" in error["hint"]
+    assert job(bench, body["job_id"])["outputs"]["result"] == 1
 
 
 def test_work_that_was_never_picked_up_leaves_no_job(tmp_path: Path) -> None:
@@ -578,3 +742,18 @@ def test_a_running_job_sits_on_its_worker_row_until_it_ends(bench: Bench, module
     support.wait_until(lambda: row(bench, handle["job_id"]).state == "done", timeout_s=5.0)
     with bench.store() as store:
         assert store.get_worker("wk-1").job_id is None
+
+
+def test_work_that_ends_after_its_job_was_found_lost_takes_its_real_ending(
+    bench: Bench, module: Any
+) -> None:
+    handle = in_the_background(bench, "hou.gate.wait(10)\nresult = 'late'")
+    job_id = handle["job_id"]
+    support.wait_until(lambda: row(bench, job_id).state == "running", timeout_s=5.0)
+    with bench.store() as store:
+        store.lose_jobs([job_id], error=store_module.SESSION_ENDED_ERROR)
+    assert row(bench, job_id).state == "lost"
+    module.gate.set()
+    idle(bench)
+    ended = row(bench, job_id)
+    assert (ended.state, ended.error) == ("done", None)
