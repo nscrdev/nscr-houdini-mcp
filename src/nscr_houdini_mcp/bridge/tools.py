@@ -2761,13 +2761,22 @@ def _parm_address(parm: Any) -> tuple[str, str]:
 
 
 def output_plan(
-    context: ToolContext, hou: Any, kind: str, name: str | None, ext: str | None
+    context: ToolContext,
+    hou: Any,
+    kind: str,
+    name: str | None,
+    ext: str | None,
+    *,
+    node_path: str | None = None,
+    job_id: str | None = None,
 ) -> Any:
     """One managed output for this session and the scene it holds, claimed and recorded.
 
     The same table, the same version sequence and the same variables the
     server uses, with $HIP, $JOB and $HOUDINI_TEMP_DIR read from this session.
     A scene with no file writes to the scratch folder the server picks for one.
+    `node_path` and `job_id` go on the run's record, for a later look up of
+    what a node or a job made.
     """
     from nscr_houdini_mcp import outputs
     from nscr_houdini_mcp.bridge import outputs as bridge_outputs
@@ -2785,6 +2794,8 @@ def output_plan(
             name=name,
             hip_path=hip,
             session_id=session_id or None,
+            node_path=node_path,
+            job_id=job_id,
             ext=ext,
             conventions=conventions,
             scratch_root=scratch,

@@ -2488,6 +2488,16 @@ class Store:
         args.append(limit)
         return [RunRecord._from_row(row) for row in self._read_all(sql, args)]
 
+    def runs_made_by(
+        self, *, job_id: str | None = None, source_node: str | None = None, limit: int = 50
+    ) -> list[RunRecord]:
+        """The runs of one job, or of one node, newest first."""
+        if (job_id is None) == (source_node is None):
+            raise ValueError("name a job or a node, not both")
+        column, value = ("job_id", job_id) if job_id is not None else ("source_node", source_node)
+        sql = f"SELECT * FROM runs WHERE {column} = ? ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        return [RunRecord._from_row(row) for row in self._read_all(sql, [value, limit])]
+
     def find_runs(
         self,
         *,

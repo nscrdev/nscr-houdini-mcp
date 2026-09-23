@@ -1093,17 +1093,31 @@ def on_disk(path: str) -> bool:
         return False
     if not _FRAME_IN_PATH.search(text):
         return os.path.exists(text)
+    return bool(_frames_there(text))
+
+
+def files_on_disk(path: str) -> list[str]:
+    """The files an output wrote that are there and hold something: its file, or its frames."""
+    text = str(path).rstrip("/")
+    if not text:
+        return []
+    found = _frames_there(text) if _FRAME_IN_PATH.search(text) else [text]
+    return [item for item in found if os.path.isfile(item) and os.path.getsize(item) > 0]
+
+
+def _frames_there(text: str) -> list[str]:
+    """The frames of a sequence path that are on disk, in name order."""
     folder, _, leaf = text.rpartition("/")
     if _FRAME_IN_PATH.search(folder):
-        return False
+        return []
     pattern = re.compile(
         "^" + r"-?\d+".join(re.escape(piece) for piece in _FRAME_IN_PATH.split(leaf)) + "$"
     )
     try:
         names = os.listdir(folder or ".")
     except OSError:
-        return False
-    return any(pattern.match(name) for name in names)
+        return []
+    return [f"{folder}/{name}" if folder else name for name in sorted(names) if pattern.match(name)]
 
 
 # -- allocation -----------------------------------------------------------

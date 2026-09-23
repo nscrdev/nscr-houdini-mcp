@@ -390,12 +390,13 @@ def capture_image(arguments: Mapping[str, Any], context: ToolContext) -> dict[st
     unsaved = False
     stopped = False
     written = JobOutputs(context)
+    made_by = {"node_path": _owner(spec, hou), "job_id": written.job_id}
     for label, camera in wanted:
         if shots and context.should_stop():
             stopped = True
             break
         name = spec.name if len(wanted) == 1 else f"{spec.name}_{label}"
-        plan = output_plan(context, hou, "capture", name, "png")
+        plan = output_plan(context, hou, "capture", name, "png", **made_by)
         unsaved = unsaved or bool(plan.unsaved_hip)
         warnings.extend(item for item in plan.warnings if item not in warnings)
         path = sequence_path(plan.path) if spec.sequence else plan.path
@@ -437,7 +438,7 @@ def capture_image(arguments: Mapping[str, Any], context: ToolContext) -> dict[st
         shots.append({"view": label, "run_id": plan.run_id, "template": plan.template, **shot})
     sheet = None
     if len(wanted) > 1 and len(shots) == len(wanted) and not stopped:
-        plan = output_plan(context, hou, "capture", f"{spec.name}_sheet", "png")
+        plan = output_plan(context, hou, "capture", f"{spec.name}_sheet", "png", **made_by)
         sheet = {"path": plan.path, "run_id": plan.run_id, "template": plan.template}
     return {
         "source": spec.source,
@@ -451,6 +452,14 @@ def capture_image(arguments: Mapping[str, Any], context: ToolContext) -> dict[st
         "warnings": warnings,
         "region": _region(arguments.get("region")),
     }
+
+
+def _owner(spec: Spec, hou: Any) -> str | None:
+    """The node a capture of one node's output is a picture of, as its run records it."""
+    if spec.source not in ("node", "cop") or spec.path is None:
+        return None
+    node = _quiet(lambda: hou.node(spec.path))
+    return (_quiet(node.path) if node is not None else None) or spec.path
 
 
 class JobOutputs:
@@ -474,6 +483,11 @@ class JobOutputs:
             else None
         )
         self.runs: list[dict[str, Any]] = []
+
+    @property
+    def job_id(self) -> str | None:
+        """The job this capture runs as, when it runs as one."""
+        return self._job_id
 
     def planned(self, view: str, plan: Any, path: str) -> int:
         self.runs.append(
