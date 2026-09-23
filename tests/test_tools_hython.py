@@ -18,6 +18,7 @@ import asyncio
 import shutil
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -277,3 +278,64 @@ def _busy(home: Path, session_id: str) -> bool:
     except (client.BridgeUnreachable, client.SessionGone, client.SessionDead):
         return False
     return bool((answer.payload or {}).get("data", {}).get("busy"))
+
+
+# How long the cook in the ping check holds the worker.
+COOK_S = 6.0
+
+COOK_CODE = f"""
+geo = hou.node('/obj').createNode('geo', 'held')
+sop = geo.createNode('python', 'slow')
+sop.parm('python').set('import time\\ntime.sleep({COOK_S})')
+sop.cook(force=True)
+result = sop.path()
+"""
+
+
+def test_hou_ping_answers_from_health_while_a_cook_holds_the_worker(
+    place: dict[str, Path],
+) -> None:
+    async def check() -> dict[str, Any]:
+        seen: dict[str, Any] = {}
+        async with Client(
+            server_params(place), mode="auto", read_timeout_seconds=READ_TIMEOUT_S
+        ) as connected:
+            started = ok(await connected.call_tool("hou_sessions", {"action": "start"}))
+            session_id = started["session"]["session_id"]
+            try:
+                cook = asyncio.ensure_future(
+                    connected.call_tool(
+                        "hou_python", {"session": session_id, "code": COOK_CODE, "timeout_s": 60}
+                    )
+                )
+                await asyncio.to_thread(
+                    support.wait_until, lambda: _busy(place["home"], session_id), timeout_s=30.0
+                )
+                began = time.monotonic()
+                seen["during"] = ok(await connected.call_tool("hou_ping", {"session": session_id}))
+                seen["during_s"] = time.monotonic() - began
+                seen["cooked"] = ok(await cook)
+                seen["after"] = ok(await connected.call_tool("hou_ping", {"session": session_id}))
+            finally:
+                await connected.call_tool(
+                    "hou_sessions", {"action": "stop", "session": session_id, "force": True}
+                )
+        return seen
+
+    seen = asyncio.run(check())
+    during = seen["during"]
+    # Health answers from memory, so the ping does not wait on the cook.
+    assert seen["during_s"] < 0.5, seen["during_s"]
+    assert during["call"]["ok"] is False
+    assert during["call"]["code"] == "SESSION_BUSY"
+    assert during["call"]["skipped"] is True
+    health = during["health"]
+    assert health["busy"] is True
+    assert health["current_op"] == "python.run"
+    assert health["busy_cause"] == "running python.run"
+    assert 0 <= health["busy_for_s"] < COOK_S + 30.0
+    assert health["busy_since"] <= time.time()
+    assert seen["cooked"]["result"].endswith("/held/slow")
+    # Once the cook is over the ping goes through the main thread path again.
+    assert seen["after"]["call"]["ok"] is True
+    assert seen["after"]["health"]["busy"] is False
