@@ -2683,7 +2683,7 @@ class _Outputs:
                 f"{kind} paths are not handed to code; ask for one of "
                 + ", ".join(outputs.CODE_KINDS)
             )
-        plan = output_plan(self._context, self._hou, kind, name, ext)
+        plan = output_plan(self._context, self._hou, kind, name, ext, job_id=job_of(self._context))
         self._handed[plan.path] = plan.run_id
         return plan.path
 
@@ -2758,6 +2758,15 @@ def _parm_address(parm: Any) -> tuple[str, str]:
     if node is None or not name:
         raise TypeError("freeze_parm takes a hou.Parm or a parameter path")
     return str(node.path()), str(name)
+
+
+def job_of(context: ToolContext) -> str | None:
+    """The job a call runs as, named on the runs it writes so they can be found by it."""
+    if not context.operation_id or context.open_store is None:
+        return None
+    from nscr_houdini_mcp import jobs as job_rules
+
+    return job_rules.job_id_for(context.operation_id)
 
 
 def output_plan(
