@@ -924,7 +924,10 @@ What goes where:
 - `server.log`: the MCP server. It also writes the same lines to standard
   error, which a client that starts the server over stdio usually keeps.
   Every call that ends in an error leaves one warning here with the tool and
-  the error code, for example `hou_scene refused: SESSION_BUSY: ...`. Each
+  the error code and nothing else, for example `hou_scene refused:
+  SESSION_BUSY`. A failure a tool reports without a code of ours, such as
+  code in `hou_python` that raised, is `TOOL_REPORTED_ERROR`. The message,
+  which can hold text from your own code, is written only at `debug`. Each
   line carries the process id, since several servers can share the file. The
   file starts again at `server.log.1` when a server starts and finds it over
   five megabytes.

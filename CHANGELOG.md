@@ -35,7 +35,8 @@ inside Houdini, and one agent skill.
 - Calls to a Houdini with a user interface are paced so an agent cannot keep
   its interface busy without a break.
 - A log in the state folder and on standard error, with one warning for every
-  call that ends in an error. `NSCR_MCP_LOG_LEVEL` sets the level.
+  call that ends in an error, naming the tool and the code only.
+  `NSCR_MCP_LOG_LEVEL` sets the level.
 
 ### The Houdini side
 
@@ -44,8 +45,6 @@ inside Houdini, and one agent skill.
 - A scene counter that moves whenever the scene is replaced, so a call written
   against a scene that has gone is refused rather than run.
 - A pool of hython workers kept warm for heavy work, within a cap.
-- Store writes made from Houdini's main thread wait a moment at most, so
-  another process holding the store never freezes the interface.
 
 ### The command line
 
@@ -59,6 +58,12 @@ inside Houdini, and one agent skill.
 
 - `houdini-artist`: how an agent plans, builds, checks its work against a
   reference and hands a scene on, with a block of house conventions to edit.
+
+### Known limits
+
+- A coordination store held by another process can stall a call in a GUI
+  session, and Houdini's interface with it, for up to the store's busy
+  timeout of ten seconds.
 
 ### Tested on
 
