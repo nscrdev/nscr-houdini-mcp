@@ -415,3 +415,58 @@ def test_a_long_result_is_a_summary_line_in_text(bench: Bench) -> None:
     text = result.content[0].text
     assert text.startswith("hou_capture: viewport via flipbook_rop, 128x72")
     assert "structuredContent" in text
+
+
+# Section: what counts as empty, and images of more than 8 bits
+
+
+def test_what_is_empty_and_what_is_only_flat(tmp_path: Path) -> None:
+    opaque = tmp_path / "opaque.png"
+    Image.new("RGBA", (8, 8), (40, 90, 200, 255)).save(opaque)
+    stats, size = capture_tool.look(str(opaque))
+    assert stats["non_empty"] is True and stats["flat"] is True
+    assert size == (8, 8)
+    clear = tmp_path / "clear.png"
+    Image.new("RGBA", (8, 8), (0, 0, 0, 0)).save(clear)
+    assert capture_tool.look(str(clear))[0]["non_empty"] is False
+    # A clear COP or pane is still a picture: only a camera sees nothing.
+    assert capture_tool.look(str(clear), rendered=False)[0]["non_empty"] is True
+    nothing = tmp_path / "nothing.png"
+    nothing.write_bytes(b"")
+    assert capture_tool.look(str(nothing), rendered=False)[0]["non_empty"] is False
+
+
+def test_a_16_bit_grey_image_is_read_at_its_depth(tmp_path: Path) -> None:
+    path = tmp_path / "deep.png"
+    Image.new("I;16", (6, 4), 40000).save(path)
+    stats, _ = capture_tool.look(str(path), rendered=False)
+    assert stats["max"] == [40000] and stats["min"] == [40000]
+    assert stats["mean"] == [40000.0]
+    assert stats["depth"] == 16 and stats["stats_depth"] == 16
+    assert stats["flat"] is True and stats["non_empty"] is True
+    data, mime, size = capture_tool.thumbnail(str(path))
+    assert mime == "image/png" and size == (6, 4)
+    assert (
+        decoded(
+            ImageContent(type="image", data=base64.b64encode(data).decode(), mime_type=mime)
+        ).getpixel((0, 0))
+        == 156
+    )
+
+
+def test_a_crop_is_made_once_whatever_the_session_said(tmp_path: Path) -> None:
+    path = tmp_path / "cut.png"
+    Image.new("RGBA", (100, 50), (1, 2, 3, 255)).save(path)
+    capture_tool.crop(str(path), [0.0, 0.0, 0.5, 0.5])
+    capture_tool.crop(str(path), [0.0, 0.0, 0.5, 0.5])
+    with Image.open(path) as image:
+        assert image.size == (50, 25)
+        assert image.info[capture_tool.CROP_KEY] == "0,0,0.5,0.5"
+
+
+def test_a_flat_capture_is_a_picture_with_a_note(bench: Bench, scene: Scene) -> None:
+    scene.capture.flat = (70, 70, 70, 255)
+    body = ok(shoot(bench, return_image="none"))
+    assert body["image_stats"]["flat"] is True
+    assert body["image_stats"]["non_empty"] is True
+    assert any("flat colour" in item for item in body["warnings"])

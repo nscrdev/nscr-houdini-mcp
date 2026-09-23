@@ -5,14 +5,16 @@ and writes every file under the `capture` kind of the output table
 (`$HIP/.agent/captures/<date>/<time>_<name>_<run_id>.png`). This side reads
 what was written, with Pillow, and says what is in it:
 
-- `image_stats`: the mean, the least and the most of each channel, and
-  `non_empty`, which is false for an image with nothing in it: every channel
-  one value, or an alpha channel that is zero everywhere. A capture whose
-  every image is empty is `CAPTURE_EMPTY`, with the files left where they are.
+- `image_stats`: the mean, the least and the most of each channel, the
+  depth, `flat` for an image that is one value in every channel, and
+  `non_empty`, which is false for an empty file and, for the viewport and
+  node sources, for an alpha that is zero everywhere. A flat image is a
+  picture, with a note. A capture whose every image is empty is
+  `CAPTURE_EMPTY`, with the files left where they are.
 - `region` crops each saved image in place, at its native size, to
   `[x0, y0, x1, y1]` as fractions of the width and height from the top left.
-  A crop is made once: an image that is no longer the size the session wrote
-  is taken as cropped already, so a reply sent again does not crop twice.
+  A crop is made once: the cut image carries a note saying so, and one that
+  carries it is left alone, so a reply sent again does not crop twice.
 - `views: quad` writes persp, top, front and right, and `turntable4` four
   orbits a quarter turn apart; both add a contact sheet of the four, two by
   two, whose path is `path`. Each view is listed with its own route, camera
@@ -49,6 +51,7 @@ from typing import Any
 
 from mcp_types import ImageContent
 from PIL import Image, ImageStat, UnidentifiedImageError
+from PIL.PngImagePlugin import PngInfo
 
 from nscr_houdini_mcp import config as config_module
 from nscr_houdini_mcp import jobs as job_rules
@@ -61,6 +64,8 @@ SOURCES = ("viewport", "node", "network", "cop", "pane")
 DISPLAYS = ("shaded", "wire", "shaded_wire", "matcap")
 VIEW_SETS = ("single", "quad", "turntable4")
 RETURN_IMAGE = ("thumb", "none", "full")
+# Sources a camera draws, where a clear frame means nothing was in view.
+RENDERED = ("viewport", "node")
 
 DEFAULT_RESOLUTION = [1280, 720]
 MAX_RESOLUTION = 8192
@@ -222,6 +227,8 @@ def finish(data: Mapping[str, Any], *, strict: bool) -> dict[str, Any]:
     """
     region = data.get("region")
     sequence = bool(data.get("sequence"))
+    rendered = data.get("source") in RENDERED
+    notes: list[str] = []
     shaped: list[dict[str, Any]] = []
     sizes: list[tuple[int, int] | None] = []
     all_empty = True
@@ -231,8 +238,8 @@ def finish(data: Mapping[str, Any], *, strict: bool) -> dict[str, Any]:
         frames = list(view.get("frames") or ())
         if region is not None:
             for item in files:
-                crop(item, region, view.get("native"))
-        read = [look(item) for item in files]
+                crop(item, region)
+        read = [look(item, rendered=rendered) for item in files]
         entry: dict[str, Any] = {
             "view": view.get("view"),
             "path": files[0] if files else None,
@@ -253,6 +260,8 @@ def finish(data: Mapping[str, Any], *, strict: bool) -> dict[str, Any]:
                 all_empty = False
             elif sequence and index < len(frames):
                 empty_frames.append(frames[index])
+        if read and read[0][0].get("flat") and read[0][0]["non_empty"]:
+            notes.append(f"the {entry['view']} image is one flat colour")
         shaped.append(entry)
     if not shaped:
         raise CallError("CAPTURE_EMPTY", "the session answered with no image")
@@ -276,7 +285,7 @@ def finish(data: Mapping[str, Any], *, strict: bool) -> dict[str, Any]:
     sheet = data.get("sheet")
     if isinstance(sheet, Mapping) and sheet.get("path") and len(shaped) > 1:
         stitch(str(sheet["path"]), [str(item["path"]) for item in shaped])
-        stats, size = look(str(sheet["path"]))
+        stats, size = look(str(sheet["path"]), rendered=False)
         said.update(path=sheet["path"], run_id=sheet.get("run_id"), image_stats=stats)
         said["width"], said["height"] = size or (None, None)
         said["views"] = shaped
@@ -309,53 +318,105 @@ def finish(data: Mapping[str, Any], *, strict: bool) -> dict[str, Any]:
     for key in ("unsaved_hip", "stopped_early"):
         if data.get(key):
             said[key] = True
-    if data.get("warnings"):
-        said["warnings"] = list(data["warnings"])
+    if data.get("warnings") or notes:
+        said["warnings"] = list(data.get("warnings") or []) + notes
     if not strict and all_empty:
         said["empty"] = True
     return said
 
 
-def look(path: str) -> tuple[dict[str, Any], tuple[int, int] | None]:
-    """What is in one image: its numbers, and its size."""
+def look(path: str, *, rendered: bool = True) -> tuple[dict[str, Any], tuple[int, int] | None]:
+    """What is in one image: its numbers, and its size.
+
+    Empty means a file with nothing in it, or for a rendered source an alpha
+    that is zero everywhere: the camera saw nothing. A flat image, one value
+    in every channel, is not empty, since a constant colour COP or a close up
+    of one surface is a real picture; it says `flat`. A 16 bit grey image is
+    read at its own depth. Pillow reads a 16 bit colour image at 8 bits, and
+    `stats_depth` says so.
+    """
     try:
+        if os.path.getsize(path) == 0:
+            return {"readable": False, "non_empty": False}, None
         with Image.open(path) as opened:
             image = opened.copy()
+            depth = _file_depth(opened)
     except (OSError, UnidentifiedImageError):
         return {"readable": False, "non_empty": False}, None
-    if image.mode not in ("RGB", "RGBA", "L", "LA"):
-        image = image.convert("RGBA")
-    bands = image.getbands()
-    stat = ImageStat.Stat(image)
-    low = [int(pair[0]) for pair in stat.extrema]
-    high = [int(pair[1]) for pair in stat.extrema]
-    varies = any(a != b for a, b in zip(low, high, strict=True))
-    if "A" in bands and high[bands.index("A")] == 0:
-        varies = False
-    stats = {
-        "channels": "".join(bands),
-        "mean": [round(value, 2) for value in stat.mean],
-        "min": low,
-        "max": high,
-        "non_empty": varies,
-    }
+    if image.mode.startswith("I;16") or image.mode in ("I", "F"):
+        stats = _deep_grey(image)
+    else:
+        if image.mode not in ("RGB", "RGBA", "L", "LA"):
+            image = image.convert("RGBA")
+        stat = ImageStat.Stat(image)
+        stats = {
+            "channels": "".join(image.getbands()),
+            "mean": [round(value, 2) for value in stat.mean],
+            "min": [int(pair[0]) for pair in stat.extrema],
+            "max": [int(pair[1]) for pair in stat.extrema],
+            "stats_depth": 8,
+        }
+    stats["depth"] = depth or stats["stats_depth"]
+    bands = stats["channels"]
+    stats["flat"] = all(a == b for a, b in zip(stats["min"], stats["max"], strict=True))
+    clear = rendered and "A" in bands and stats["max"][bands.index("A")] == 0
+    stats["non_empty"] = not clear
     return stats, image.size
 
 
-def crop(path: str, region: Sequence[float], native: Any) -> None:
-    """Cut one saved image down to the region, once, in place."""
+def _file_depth(opened: Image.Image) -> int | None:
+    """The bits a channel holds in the file, where the file says."""
+    if opened.format == "PNG":
+        try:
+            with open(opened.filename, "rb") as handle:
+                header = handle.read(26)
+        except (OSError, TypeError):
+            return None
+        return header[24] if len(header) == 26 else None
+    return None
+
+
+def _deep_grey(image: Image.Image) -> dict[str, Any]:
+    """Numbers for a grey image of more than 8 bits, at its own depth."""
+    wide = image.convert("F" if image.mode == "F" else "I")
+    low, high = wide.getextrema()
+    # The newer name where this Pillow has it, the older one otherwise.
+    flattened = getattr(wide, "get_flattened_data", None) or wide.getdata
+    values = list(flattened())
+    mean = sum(values) / len(values) if values else 0.0
+    as_number = float if image.mode == "F" else int
+    return {
+        "channels": "L",
+        "mean": [round(mean, 2)],
+        "min": [as_number(low)],
+        "max": [as_number(high)],
+        "stats_depth": 32 if image.mode in ("I", "F") else 16,
+    }
+
+
+# The note a crop leaves in the PNG it cut, so the same image is never cut twice.
+CROP_KEY = "nscr_crop"
+
+
+def crop(path: str, region: Sequence[float]) -> None:
+    """Cut one saved image down to the region, once, in place.
+
+    The region is written into the image as a text note. An image that
+    carries one has been cut already, whatever size the session said it
+    wrote, so a reply sent again, or a job read back twice, leaves it alone.
+    """
     try:
         with Image.open(path) as opened:
             image = opened.copy()
+            done = opened.info.get(CROP_KEY)
     except (OSError, UnidentifiedImageError):
         return
-    width, height = image.size
-    if isinstance(native, (list, tuple)) and len(native) == 2 and None not in native:
-        if (width, height) != (int(native[0]), int(native[1])):
-            # Not the size the session wrote: this image was cropped already.
-            return
-    left, top, right, bottom = crop_box(region, (width, height))
-    save(image.crop((left, top, right, bottom)), path)
+    if done is not None:
+        return
+    left, top, right, bottom = crop_box(region, image.size)
+    note = PngInfo()
+    note.add_text(CROP_KEY, ",".join(f"{value:g}" for value in region))
+    save(image.crop((left, top, right, bottom)), path, note)
 
 
 def crop_box(region: Sequence[float], size: tuple[int, int]) -> tuple[int, int, int, int]:
@@ -385,9 +446,9 @@ def stitch(path: str, parts: Sequence[str]) -> None:
     save(sheet, path)
 
 
-def save(image: Image.Image, path: str) -> None:
+def save(image: Image.Image, path: str, note: PngInfo | None = None) -> None:
     partial = f"{path}.part"
-    image.save(partial, format="PNG")
+    image.save(partial, format="PNG", pnginfo=note)
     os.replace(partial, path)
 
 
@@ -436,6 +497,10 @@ def thumbnail(
     """A small copy of an image: at most `edge` on its long side and `max_bytes` whole."""
     with Image.open(path) as opened:
         image = opened.copy()
+    if image.mode.startswith("I") or image.mode == "F":
+        # Shown at 8 bits: the top byte of a 16 bit value.
+        scale = 1.0 if image.mode == "F" else 1.0 / 256.0
+        image = image.convert("I").convert("F").point(lambda value: value * scale).convert("L")
     image.thumbnail((edge, edge))
     data = encode(image, "PNG")
     if len(data) <= max_bytes:
