@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from nscr_houdini_mcp import agent_skills, cli
+from nscr_houdini_mcp import agent_skills, cli, outputs
 from nscr_houdini_mcp.tools.registry import TOOLS
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -75,10 +75,10 @@ def test_the_skill_is_under_two_hundred_lines() -> None:
 
 def test_the_frontmatter_names_the_skill_and_what_it_needs() -> None:
     fields, _ = frontmatter(skill_text())
+    assert set(fields) == {"name", "description", "compatibility"}
     assert fields["name"] == "houdini-artist"
     assert fields["compatibility"] == "Works best with a Houdini 22 MCP server connection."
     assert len(fields["description"]) > 100
-    assert "allowed-tools" not in fields
 
 
 def test_the_skill_has_exactly_the_five_parts_in_order() -> None:
@@ -98,7 +98,10 @@ def test_the_short_parts_stay_short() -> None:
 def test_the_conventions_match_the_server_defaults() -> None:
     _, body = frontmatter(skill_text())
     conventions = "\n".join(sections(body)["House conventions (edit these)"])
-    assert "`null`" in conventions and "`OUT_" in conventions
+    marker_type = outputs.DEFAULT_CONVENTIONS["output_marker_type"]
+    marker_prefix = outputs.DEFAULT_CONVENTIONS["output_marker_prefix"]
+    assert f"`{marker_type}`" in conventions
+    assert f"`{marker_prefix}" in conventions
     assert "[conventions]" in conventions
     assert "$HIP" in conventions
 
@@ -114,7 +117,7 @@ def test_no_client_prefix_on_tool_names() -> None:
     assert not re.search(r"\w+__hou_\w+", skill_text())
 
 
-def test_the_skill_has_no_dashes_links_or_quotes_of_sources() -> None:
+def test_the_skill_has_no_long_dashes_double_hyphens_or_links() -> None:
     lines = skill_text().splitlines()
     for number, line in enumerate(lines, start=1):
         if line == "---":
@@ -144,11 +147,19 @@ def test_the_skills_travel_inside_the_package() -> None:
 def test_the_skills_next_to_the_package_are_preferred(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    beside = tmp_path / "nscr_houdini_mcp"
-    (beside / "skills" / "one").mkdir(parents=True)
-    (beside / "skills" / "one" / "SKILL.md").write_text("x\n", encoding="utf-8")
-    monkeypatch.setattr(agent_skills, "__file__", str(beside / "agent_skills.py"))
-    assert agent_skills.skills_root() == beside / "skills"
+    # A checkout layout with a copy inside the package as well, as an
+    # installed copy would have: the one inside the package wins.
+    checkout = tmp_path / "project"
+    package = checkout / "src" / "nscr_houdini_mcp"
+    for skills in (package / "skills", checkout / "skills"):
+        (skills / "one").mkdir(parents=True)
+        (skills / "one" / "SKILL.md").write_text("x\n", encoding="utf-8")
+    monkeypatch.setattr(agent_skills, "__file__", str(package / "agent_skills.py"))
+    assert agent_skills.skills_root() == package / "skills"
+
+    # Without it, the checkout's own folder is the one used.
+    (package / "skills" / "one" / "SKILL.md").unlink()
+    assert agent_skills.skills_root() == checkout / "skills"
 
 
 def test_skills_path_prints_the_folder(capsys: pytest.CaptureFixture[str]) -> None:
