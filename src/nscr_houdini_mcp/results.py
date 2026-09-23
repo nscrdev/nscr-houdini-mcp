@@ -63,6 +63,7 @@ SERVER_CODES: dict[str, str] = {
     "OUTPUT_BUSY": "every version tried was taken by another writer first",
     "OUTPUT_UNWRITABLE": "the folder for an output could not be made",
     "BAD_CURSOR": "the page token is not one this read handed out",
+    "JOB_UNKNOWN": "no job is kept under that id",
 }
 
 CODES: dict[str, str] = {**BRIDGE_CODES, **SERVER_CODES}
@@ -71,7 +72,10 @@ CODES: dict[str, str] = {**BRIDGE_CODES, **SERVER_CODES}
 HINTS: dict[str, str] = {
     "SESSION_BUSY": "pass wait_s to queue behind the running call, or call again later",
     "UNKNOWN_SESSION": "list the sessions and address the one you mean",
-    "TIMEOUT": "the work may still be running; send the same operation_id again to get its result",
+    "TIMEOUT": (
+        "the work may still be running; follow job_id with hou_jobs, or send the same"
+        " operation_id again to get its result"
+    ),
     "TOOL_FAILED": "the session log has the detail; check the arguments and try again",
     "UNKNOWN_TOOL": "call one of the names in the tool list",
     "BAD_ARGUMENTS": "fix the argument named in the details and call again",
@@ -115,6 +119,7 @@ HINTS: dict[str, str] = {
     "FILE_EXISTS": "ask for the next version rather than writing over this one",
     "UNSAVED_CHANGES": "save the scene first, or pass discard_unsaved true to drop the changes",
     "SCENE_UNTITLED": "use save_increment, which picks a versioned file for the scene",
+    "JOB_UNKNOWN": "list the jobs to see the ids that are kept; a job is kept for 7 days",
 }
 
 # The largest result whose text block repeats the whole JSON. Larger ones get a

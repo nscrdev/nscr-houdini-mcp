@@ -239,7 +239,7 @@ def test_code_past_its_timeout_answers_and_a_queued_retry_gets_its_answer(
     operation_id = call["operation_id"]
     slow, fetched, counted, after = run(
         place,
-        ("hou_python", {**call, "timeout_s": 1}),
+        ("hou_python", {**call, "timeout_s": 1, "background": False}),
         # Sent while the code still runs: it queues behind it and gets the
         # answer the code came to, never a receipt that still says running.
         ("hou_python", {**call, "wait_s": 20}),

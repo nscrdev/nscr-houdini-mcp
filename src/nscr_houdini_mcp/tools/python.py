@@ -41,6 +41,18 @@ that outruns `timeout_s` answers `TIMEOUT` with `still_running`; the code
 carries on, and the same operation id fetches its answer once it ends.
 `timeout_s` above `python_timeout_cap_s` in the config is lowered to it.
 
+Every call is a job, followed by `hou_jobs` under the `job_id` every answer
+carries; the id comes from the operation id, so it is known even when a reply
+is lost. `background` decides how long the call itself waits:
+
+- `auto`, the default: up to `inline_wait_s` from the config (ten seconds
+  unless it says otherwise, or `timeout_s` when that is shorter). Code that
+  finishes in that time answers as usual, with `state`. Slower code answers
+  with the job handle at that moment and carries on.
+- `true`: the job handle as soon as the session has taken the call.
+- `false`: up to `timeout_s`, then `TIMEOUT` with `still_running` and the
+  `job_id`.
+
 The `mcp` helper in every namespace:
 
 - `mcp.output_path(kind, name=None, ext=None)`: a managed path for this
@@ -49,8 +61,9 @@ The `mcp` helper in every namespace:
 - `mcp.progress(done, total=None, message=None)`: a note health and
   `hou_ping` show while the call runs. Finite numbers only.
 - `mcp.cancelled()`: whether the call should stop, for a long loop to look
-  at. It turns true when the session is going down; a tool that asks a call
-  to stop comes with background jobs.
+  at. It turns true when `hou_jobs` cancels the job or the session is going
+  down. Code that stops once it has seen it ends `cancelled`; code that never
+  looks runs to the end and ends `done`.
 
 This module never imports `hou`.
 """
@@ -59,10 +72,13 @@ from __future__ import annotations
 
 import re
 import secrets
+import sqlite3
 from collections.abc import Mapping
 from typing import Any
 
 from nscr_houdini_mcp import config as config_module
+from nscr_houdini_mcp import jobs as job_rules
+from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge.dispatch import DEFAULT_TIMEOUT_S
 from nscr_houdini_mcp.results import CallError, Spill, compact, scrub
 from nscr_houdini_mcp.tools.base import (
@@ -98,6 +114,14 @@ RUN_FOR_S = {"type": TIMEOUT_S["type"], "minimum": TIMEOUT_S["minimum"]}
 
 LABEL_PREFIX = "hou_python"
 
+# How long the call waits: until the session has taken it, a short while, or
+# the whole run budget.
+BACKGROUND = ("auto", True, False)
+
+# Errors after which the code may still be running, so the job is worth
+# following by its id.
+FOLLOWABLE = frozenset({"TIMEOUT", "SESSION_UNREACHABLE", "OUTCOME_UNKNOWN"})
+
 
 def run_python(call: Call) -> dict[str, Any]:
     arguments = call.arguments
@@ -117,6 +141,7 @@ def run_python(call: Call) -> dict[str, Any]:
             details={"argument": "max_chars", "given": max_chars},
         )
     budget = DEFAULT_MAX_CHARS if max_chars is None else int(max_chars)
+    background = arguments.get("background", "auto")
     # The session is asked to wait no longer than the config allows. The code
     # is never stopped: past this the call answers TIMEOUT and the code goes on.
     cap = (
@@ -125,7 +150,14 @@ def run_python(call: Call) -> dict[str, Any]:
         else config_module.DEFAULT_PYTHON_TIMEOUT_CAP_S
     )
     asked = arguments.get("timeout_s")
-    call.arguments["timeout_s"] = min(DEFAULT_TIMEOUT_S if asked is None else float(asked), cap)
+    run_for = min(DEFAULT_TIMEOUT_S if asked is None else float(asked), cap)
+    if background is True:
+        # Answered as soon as the session has picked the call up.
+        run_for = 0.0
+    elif background == "auto":
+        inline = call.config.inline_wait_s if call.config else config_module.DEFAULT_INLINE_WAIT_S
+        run_for = min(float(inline), run_for)
+    call.arguments["timeout_s"] = run_for
 
     # The arguments as the caller chose them, which is what the receipt is
     # bound to. The default namespace goes under a key the receipt leaves out.
@@ -137,7 +169,39 @@ def run_python(call: Call) -> dict[str, Any]:
     sent["undo_label"] = undo_label(arguments, call.operation_id())
     if arguments.get("reset"):
         sent["reset"] = True
-    reply = call.bridge("python.run", sent, mutating=True)
+    job_id = job_rules.job_id_for(call.operation_id())
+    try:
+        reply = call.bridge("python.run", sent, mutating=True)
+    except CallError as error:
+        still = error.code == "TIMEOUT" and error.details.get("still_running")
+        if still and background is not False:
+            # The code goes on; the caller follows it by id from here.
+            return handle(call, job_id, named)
+        if error.code in FOLLOWABLE:
+            error.details["job_id"] = job_id
+        raise
+    if background is True:
+        # It finished before the session answered, which the row says too.
+        return handle(call, job_id, named, state="done")
+    said = shape(call, reply, budget=budget, named=named, label=sent["undo_label"])
+    said["job_id"] = job_id
+    said["state"] = job_state(call, job_id, said)
+    return said
+
+
+def shape(
+    call: Call,
+    reply: Mapping[str, Any],
+    *,
+    budget: int,
+    named: str | None,
+    label: str | None = None,
+) -> dict[str, Any]:
+    """One answer from the session, fitted to the caller's budget.
+
+    The same for an answer that has just arrived and one read back from its
+    receipt when a job is looked at later.
+    """
     data = scrub(dict(reply.get("data") or {}))
 
     result = data.get("result")
@@ -158,14 +222,48 @@ def run_python(call: Call) -> dict[str, Any]:
         said["error"] = error
     said["duration_ms"] = data.get("duration_ms")
     undo = reply.get("undo") if isinstance(reply.get("undo"), Mapping) else {}
-    said["undo_label"] = undo.get("label") or sent["undo_label"]
+    said["undo_label"] = undo.get("label") or label
     said["namespace"] = data.get("namespace") or named or DEFAULT_NAMESPACE
-    said["scene_epoch"] = call.trace.get("scene_epoch")
+    said["scene_epoch"] = reply.get("scene_epoch", call.trace.get("scene_epoch"))
     cut = list(data.get("cut") or []) + list(reply.get("cut") or [])
     if data.get("lossy") or reply.get("lossy"):
         said["lossy"] = True
         said["cut"] = cut
     return said
+
+
+def read_job(call: Call, job_id: str) -> store_module.JobRecord | None:
+    """The job's row, or nothing when the store will not say."""
+    try:
+        with call.router.store() as store:
+            return None if store is None else store.get_job(job_id)
+    except (CallError, store_module.StoreError, sqlite3.Error):
+        return None
+
+
+def job_state(call: Call, job_id: str, said: Mapping[str, Any]) -> str:
+    """How the job ended, as its row says, or as the answer implies."""
+    record = read_job(call, job_id)
+    if record is not None and record.state in store_module.JOB_FINAL_STATES:
+        return record.state
+    return "failed" if said.get("error") is not None else "done"
+
+
+def handle(call: Call, job_id: str, named: str | None, *, state: str = "running") -> dict[str, Any]:
+    """What a call that is still running answers: the job to follow."""
+    record = read_job(call, job_id)
+    scene = record.scene if record is not None and isinstance(record.scene, dict) else {}
+    spec = record.spec if record is not None and isinstance(record.spec, dict) else {}
+    return {
+        "job_id": job_id,
+        "state": record.state if record is not None else state,
+        "session": call.trace.get("session_id"),
+        "kind": "python",
+        "started_at": (record.started_at or record.created_at) if record is not None else None,
+        "namespace": spec.get("namespace") or named or DEFAULT_NAMESPACE,
+        "operation_id": call.trace.get("operation_id"),
+        "scene_epoch": scene.get("scene_epoch", call.trace.get("scene_epoch")),
+    }
 
 
 def undo_label(arguments: Mapping[str, Any], operation_id: str) -> str:
@@ -223,6 +321,8 @@ def summary_line(data: Mapping[str, Any]) -> str:
     """What a client that reads only text is shown of a long result."""
     error = data.get("error")
     namespace = data.get("namespace")
+    if "result" not in data and data.get("job_id"):
+        return f"hou_python in {namespace}: {data.get('state')} as job {data['job_id']}"
     if isinstance(error, Mapping):
         lines = [f"hou_python in {namespace}: {error.get('type')}: {error.get('message')}"]
     else:
@@ -246,7 +346,7 @@ HOU_PYTHON = ToolSpec(
     description=(
         "Run Python with the full hou API. Set result to return data. Variables persist "
         "in the echoed namespace; pass it back, or shared. Filter and summarize in "
-        "Houdini; return only what you need."
+        "Houdini; return only what you need. Slow code returns a job_id for hou_jobs."
     ),
     input_schema=inputs(
         {
@@ -260,6 +360,7 @@ HOU_PYTHON = ToolSpec(
             "timeout_s": RUN_FOR_S,
             "max_chars": {"type": "integer"},
             "wait_s": WAIT_S,
+            "background": {"enum": list(BACKGROUND)},
         },
         required=("code",),
     ),

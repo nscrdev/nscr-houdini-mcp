@@ -467,12 +467,13 @@ def test_a_scene_epoch_from_a_scene_since_replaced_is_refused_before_the_code_ru
 
 def test_code_that_outruns_its_timeout_answers_and_keeps_running(bench: Bench, module: Any) -> None:
     code = "hou.gate.wait(10)\nresult = 'finished'"
-    result = python(bench, code=code, timeout_s=0.2)
+    result = python(bench, code=code, timeout_s=0.2, background=False)
     error = refused(result)
     assert error["code"] == "TIMEOUT"
     assert error["details"]["still_running"] is True
     operation_id = result.structured_content["trace"]["operation_id"]
     assert error["details"]["operation_id"] == operation_id
+    assert error["details"]["job_id"] == f"job-{operation_id}"
     assert through(bench).dispatcher.state()["busy"] is True
     module.gate.set()
     support.wait_until(lambda: not through(bench).dispatcher.state()["busy"], timeout_s=10.0)
@@ -484,14 +485,23 @@ def test_code_that_outruns_its_timeout_answers_and_keeps_running(bench: Bench, m
 def test_the_run_budget_defaults_to_a_minute_and_is_capped_by_the_config(
     bench: Bench,
 ) -> None:
-    ok(python(bench, code="x = 1"))
+    ok(python(bench, code="x = 1", background=False))
     assert sent(bench)[-1]["timeout_s"] == 60.0
     # Past the cap is lowered to it, never refused.
-    ok(python(bench, code="x = 1", timeout_s=7200))
+    ok(python(bench, code="x = 1", timeout_s=7200, background=False))
     assert sent(bench)[-1]["timeout_s"] == 3600
     bench.config = replace(bench.config, python_timeout_cap_s=5)
-    ok(python(bench, code="x = 1", timeout_s=900))
+    ok(python(bench, code="x = 1", timeout_s=900, background=False))
     assert sent(bench)[-1]["timeout_s"] == 5
+    # Left to decide, a call waits no longer than the inline wait, or than a
+    # shorter budget of its own.
+    ok(python(bench, code="x = 1"))
+    assert sent(bench)[-1]["timeout_s"] == 5
+    bench.config = replace(bench.config, python_timeout_cap_s=3600)
+    ok(python(bench, code="x = 1"))
+    assert sent(bench)[-1]["timeout_s"] == 10
+    ok(python(bench, code="x = 1", timeout_s=3))
+    assert sent(bench)[-1]["timeout_s"] == 3
 
 
 def test_progress_shows_in_health_while_the_code_runs(bench: Bench, module: Any) -> None:
@@ -652,7 +662,7 @@ def test_the_tool_is_listed_after_hou_inspect_as_one_that_changes_things(bench: 
     assert tool.annotations is None or tool.annotations.read_only_hint is None
     assert tool.input_schema["required"] == ["code"]
     assert "justification" not in tool.input_schema["properties"]
-    assert "background" not in tool.input_schema["properties"]
+    assert tool.input_schema["properties"]["background"] == {"enum": ["auto", True, False]}
 
 
 # Section: a reply lost on the way back
@@ -720,7 +730,9 @@ def test_a_retry_queued_behind_timed_out_code_gets_the_stored_answer(
 ) -> None:
     code = "hou.gate.wait(10)\nhou.node('/obj').createNode('geo')\nresult = 'finished'"
     through(bench).dispatcher.receipts.finish_s = 0.5  # type: ignore[attr-defined]
-    late = refused(python(bench, code=code, timeout_s=0.2, operation_id="op-queued"))
+    late = refused(
+        python(bench, code=code, timeout_s=0.2, operation_id="op-queued", background=False)
+    )
     assert late["code"] == "TIMEOUT"
     dispatcher = through(bench).dispatcher
     done: list[Any] = []
@@ -744,7 +756,9 @@ def test_running_code_keeps_its_receipt_lease(tmp_path: Path, module: Any, clock
     made.sent = Through(  # type: ignore[assignment]
         module, home, tools.Namespaces(clock=clock), lease_renew_s=0.05
     )
-    late = refused(python(made, code="hou.gate.wait(10)", timeout_s=0.1, operation_id="op-l"))
+    late = refused(
+        python(made, code="hou.gate.wait(10)", timeout_s=0.1, operation_id="op-l", background=False)
+    )
     assert late["code"] == "TIMEOUT"
     with made.store() as store:
         first = store.get_operation("op-l").updated_at
