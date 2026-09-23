@@ -25,7 +25,7 @@ compatibility: "Works best with a Houdini 22 MCP server connection."
 
 **Plan the system, then build and inspect at its boundaries.** Before placing anything, sketch the stages and what crosses between them: which attributes, which groups, what scale and orientation. Build one stage, inspect it where it hands off to the next, then move on. Checking after every single node is slow, and checking only at the end hides where things went wrong. For a quick experiment the plan can be one sentence, but it should still exist.
 
-**Leave something a person can pick up.** The scene is read far more often than it is built.
+**Leave something a person can pick up.** Someone will open this scene without you there to explain it, so the scene has to explain itself.
 - Name the boundaries that other nodes and people refer to: a stage's input and output, the controls, the caches. Leave the rest with default names; renaming everything adds noise without adding meaning.
 - Expose the few controls that carry the intent in one obvious place, and channel reference them wherever they are used, so no value is typed twice and nothing drifts out of step.
 - Instance and link rather than duplicate. A copy is a second thing to keep in step.
@@ -51,7 +51,7 @@ Work to the budget in the house conventions. Each attempt on one detail should t
 The closing message contains:
 
 - The checks you ran and what they showed: cook errors or their absence, which views you looked at, and what you saw in them.
-- If a reference was supplied and `hou_compare` is available: the compare run folder, the numbers it produced, and the three largest remaining differences in plain words. A closing message with no compare path is not done.
+- If a reference was supplied and a compare tool is available, `hou_compare` here: the compare run folder, the numbers it produced, and the three largest remaining differences in plain words. A closing message with no compare path is not done.
 - If a reference was supplied and there is no compare tool: say that no compare run was possible, and list the differences you saw in the matched views, largest first.
 - The scene path and the version you saved.
 - What a person must know to pick it up: where the controls are, which `OUT_` nodes to read from, what is cached and where.
