@@ -512,27 +512,44 @@ class CountedStores:
         return Counted(self.rows)
 
 
-def counted_router(stores: CountedStores) -> Router:
+def counted_router(stores: CountedStores, *, send: Any = None, health: Any = None) -> Router:
     return Router(
         home=Path("."),
         open_store=stores,
         open_session=FakeFiles(["s-1"]).open,
-        send=Sent(),
+        send=send or Sent(),
+        ask_health=health
+        or (lambda session, **rest: client.Answer(200, {"ok": True, "data": {}}, {})),
         renew_lease=lambda store, session_id: None,
     )
 
 
-def test_a_worker_call_opens_the_store_once_inside_one_store() -> None:
+def test_a_worker_call_shares_a_handle_on_each_side_of_its_wait() -> None:
     stores = CountedStores([record("s-1", "w1")])
-    router = counted_router(stores)
+    held_while_waiting: list[int] = []
+    sent = Sent()
+
+    def send(session: client.Session, tool: str, **rest: Any) -> client.Answer:
+        held_while_waiting.append(stores.opened - stores.closed)
+        return sent(session, tool, **rest)
+
+    def health(session: client.Session, **rest: Any) -> client.Answer:
+        held_while_waiting.append(stores.opened - stores.closed)
+        return client.Answer(200, {"ok": True, "data": {}}, {})
+
+    router = counted_router(stores, send=send, health=health)
     with router.one_store():
         target = router.resolve(None)
+        router.health(target)
         router.call(target, "bridge.ping")
         with router.store() as store:
             assert store.list_sessions() == stores.rows
-        assert stores.closed == 0
-    # Resolve, the renewal before, the renewal after and the read: one open.
-    assert (stores.opened, stores.closed) == (1, 1)
+        assert stores.opened - stores.closed == 1
+    # No handle is open while the session is asked anything.
+    assert held_while_waiting == [0, 0]
+    # Resolve and the renewal before share one open, the renewal after and
+    # the read another: two opens where there were four.
+    assert (stores.opened, stores.closed) == (2, 2)
 
 
 def test_without_one_store_every_read_opens_and_closes_its_own_handle() -> None:

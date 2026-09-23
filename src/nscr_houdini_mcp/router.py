@@ -415,8 +415,9 @@ class Router:
         A call reads the store several times: to resolve its session, to renew
         a worker's lease before and after, to read its job. Opening the file
         each time costs more than the reads. Inside this, the first open is
-        kept and handed out again, and closed when the call ends, so no handle
-        outlives the call that opened it. Each read still runs in its own
+        kept and handed out again until the call waits on a session, which
+        closes it, and it is closed when the call ends, so no handle is held
+        while Houdini works or outlives the call that opened it. Each read still runs in its own
         short transaction and sees what other processes have written since.
         """
         if getattr(self._held, "active", False):
@@ -432,6 +433,17 @@ class Router:
             self._held.store = None
             if kept is not None:
                 kept.__exit__(None, None, None)
+
+    def _let_go_of_store(self) -> None:
+        """Close the handle `one_store` shares, before a wait on a session.
+
+        No handle is held while a call waits on Houdini, which can be for a
+        long time, or after its caller has gone. The next read opens again.
+        """
+        kept = getattr(self._held, "store", None)
+        if kept is not None:
+            self._held.store = None
+            kept.__exit__(None, None, None)
 
     def _opened_store(self) -> Any:
         """The store, or nothing when none exists, shared inside `one_store`."""
@@ -545,6 +557,7 @@ class Router:
         once rather than a place in the queue, including behind a main thread
         that is away.
         """
+        self._let_go_of_store()
         # The same operation id as the call out is a resend: the bridge
         # answers it from that call's receipt without the main thread, so it
         # never waits for a turn behind the very call it asks about.
@@ -652,6 +665,7 @@ class Router:
 
     def health(self, target: Target) -> dict[str, Any]:
         """What the session says about itself. Answers even while it is busy."""
+        self._let_go_of_store()
         started = time.monotonic()
         try:
             answer = self._ask_health(target.session, timeout_s=HEALTH_TIMEOUT_S)
