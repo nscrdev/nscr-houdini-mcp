@@ -216,6 +216,52 @@ def test_a_kept_start_stamp_is_dropped_when_its_process_exits(monkeypatch) -> No
     assert child.pid not in known._kept
 
 
+class FakeWatch:
+    """A watch on one process's exit, fired by the test."""
+
+    def __init__(self) -> None:
+        self.exited = False
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_kept_start_stamps_drop_ended_processes_first_then_the_oldest(monkeypatch) -> None:
+    watches: dict[int, FakeWatch] = {}
+
+    def watch(pid: int) -> FakeWatch:
+        watches[pid] = FakeWatch()
+        return watches[pid]
+
+    monkeypatch.setattr(store_module, "_watch_exit", watch)
+    monkeypatch.setattr(store_module, "_has_exited", lambda made: made.exited)
+    monkeypatch.setattr(store_module, "_ps_start", lambda pid: f"stamp {pid}")
+    known = store_module._KnownStarts()
+    known.LIMIT = 4
+    for pid in (1, 2, 3, 4):
+        assert known.stamp(pid) == f"stamp {pid}"
+    # Two of them end. The next new process takes their room, and the live
+    # ones are kept, the oldest included.
+    watches[2].exited = True
+    watches[3].exited = True
+    known.stamp(5)
+    assert list(known._kept) == [1, 4, 5]
+    assert watches[2].closed and watches[3].closed
+    assert not watches[1].closed
+    # Full with live processes: the oldest goes, not the newest.
+    known.stamp(6)
+    known.stamp(7)
+    assert list(known._kept) == [4, 5, 6, 7]
+    assert watches[1].closed
+    # A long run of short lived processes takes one room, not every room:
+    # the first of them pushes out the oldest, and each ended one makes way.
+    for pid in range(100, 200):
+        known.stamp(pid)
+        watches[pid].exited = True
+    assert [pid for pid in known._kept if pid < 100] == [5, 6, 7]
+
+
 def test_same_process_tells_a_reused_pid_apart_after_the_first_look() -> None:
     stamp = store_module.process_start_stamp()
     if not stamp:

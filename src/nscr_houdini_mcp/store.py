@@ -391,12 +391,15 @@ class _KnownStarts:
             watch.close()
             return stamp
         with self._lock:
-            while len(self._kept) >= self.LIMIT:
-                _, (_, oldest) = self._kept.popitem()
-                oldest.close()
             replaced = self._kept.pop(pid, None)
             if replaced is not None:
                 replaced[1].close()
+            # Processes that have ended go first, then the oldest kept. A read
+            # happens once per new process, so the sweep is rare.
+            for ended in [key for key, (_, kept) in self._kept.items() if _has_exited(kept)]:
+                self._kept.pop(ended)[1].close()
+            while len(self._kept) >= self.LIMIT:
+                self._kept.pop(next(iter(self._kept)))[1].close()
             self._kept[pid] = (stamp, watch)
         return stamp
 
