@@ -3,7 +3,10 @@
 Four actions.
 
 - `info` reads the scene through `scene.info`. `full` adds what the scene
-  points at that is not on this machine.
+  points at that is not on this machine. `unsaved` comes from Houdini in a
+  session with a user interface and from the bridge's own mark in a worker,
+  which cannot say for itself, and `unsaved_source` says which; it is nothing
+  when the mark cannot tell.
 - `open` loads a scene file. The path is checked here before anything is
   sent, so a mistyped path is refused without the session touching its own
   scene. What the load could not resolve comes back as data. The scene is
@@ -72,6 +75,7 @@ SUMMARY_KEYS = (
     "hip_name",
     "untitled",
     "unsaved",
+    "unsaved_source",
     "frame",
     "fps",
     "frame_range",
