@@ -621,6 +621,32 @@ none, so `pytest -q` is complete everywhere. Run only those with `pytest -m
 houdini`, or skip them with `pytest -m "not houdini"`. The bridge is found
 through `NSCR_MCP_HYTHON`, then `HFS`, then the usual install folder.
 
+### Running the sequence yourself
+
+`tests/sequence.py` is one scripted pass over every tool, the way a client
+would go about a first piece of work: list the tools, find a session, start a
+worker, read its scene, build three nodes with a lost reply sent again under
+the same operation id, read them back, look up `attribwrangle` and its help
+page, take a cache path, save the next version, follow slow code that became a
+job, compare two images and stop the worker. Every step checks the shape of
+its result and records the tool, how long it took, and whether the reply
+carried structured content, a text block and an image.
+
+```sh
+pytest -m houdini -s tests/test_sequence_hython.py
+```
+
+runs it three times, each with a server process of its own over stdio: under
+the current protocol revision, under the older handshake revision, and through
+the SDK's lower level client class. `-s` prints each run's steps. A last check
+holds the three to the same shapes. The only difference the revision makes is
+its own: the current one stamps every result with the server's details in its
+metadata. Everything the pass writes stays in pytest's temporary folder.
+
+`tests/test_storm_cap_hython.py` has two server processes hammer one worker
+that is paced as if it had an interface, which the test only key
+`treat_workers_as_gui` allows, and prints the rates with and without the pace.
+
 ## Output folders
 
 No tool takes an output path. You name a kind and a name, and the server
