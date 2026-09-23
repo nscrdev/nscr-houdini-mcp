@@ -63,6 +63,11 @@ class SlowReceipts(receipt_module.Receipts):
         time.sleep(self.finish_s)
         super().finish(operation_id, payload)
 
+    def settlement(self, operation_id: str, payload: Any) -> Any:
+        # The receipt and the job are written together; the wait comes first.
+        time.sleep(self.finish_s)
+        return super().settlement(operation_id, payload)
+
 
 class Through:
     """Sends each call to a real dispatcher, with receipts, over the stand in."""

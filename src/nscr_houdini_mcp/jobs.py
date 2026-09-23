@@ -23,6 +23,7 @@ This module never imports `hou`.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -113,3 +114,32 @@ def progress_of(note: Any) -> dict[str, Any] | None:
     if not isinstance(note, dict):
         return None
     return {key: note.get(key) for key in ("done", "total", "message")}
+
+
+def ending(
+    kind: str,
+    operation_id: str | None,
+    payload: Mapping[str, Any],
+    *,
+    cancelled: bool = False,
+) -> tuple[str, dict[str, Any], Any]:
+    """How a job ended, what it made and what went wrong, from its call's answer.
+
+    Work that saw its cancel and stopped is `cancelled`. Otherwise a call
+    that failed, or Python code that raised, is `failed`, and the rest is
+    `done`. The outputs hold the answer the call gave, so a job can be read
+    back whole after the receipt that also holds it has gone.
+    """
+    outputs: dict[str, Any] = {"operation_id": operation_id}
+    if not payload.get("ok"):
+        return ("cancelled" if cancelled else "failed"), outputs, payload.get("error")
+    data = payload.get("data")
+    data = dict(data) if isinstance(data, Mapping) else {}
+    outputs["answer"] = data
+    for key in ("undo", "scene_epoch", "cut", "lossy"):
+        if payload.get(key) is not None:
+            outputs[key] = payload[key]
+    error = data.get("error") if kind == "python" else None
+    if cancelled:
+        return "cancelled", outputs, error
+    return ("failed" if error is not None else "done"), outputs, error

@@ -349,7 +349,7 @@ def job_row(
         "operation_id": record.operation_id,
     }
     if full and record.kind == "python" and record.state in FINAL and store is not None:
-        answer = python_answer(call, store, record)
+        answer = python_answer(call, record)
         if answer is not None:
             row["outputs"] = answer
             row["error"] = answer.get("error", record.error)
@@ -360,25 +360,46 @@ def job_row(
     return row
 
 
-def python_answer(
-    call: Call, store: store_module.Store, record: JobRecord
-) -> dict[str, Any] | None:
-    """The answer a Python job's call gave, read back from its receipt."""
-    if not record.operation_id:
+def python_answer(call: Call, record: JobRecord) -> dict[str, Any] | None:
+    """The answer a Python job's call gave, as the job row keeps it.
+
+    The row holds the whole answer, written in the same step as the call's
+    receipt, so this never needs the receipt, which goes sooner.
+    """
+    kept = record.outputs if isinstance(record.outputs, Mapping) else {}
+    answer = kept.get("answer")
+    if not isinstance(answer, Mapping):
         return None
-    try:
-        receipt = store.get_operation(record.operation_id)
-    except (store_module.StoreError, sqlite3.Error):
-        return None
-    outcome = receipt.outcome if receipt is not None else None
-    if not isinstance(outcome, Mapping) or not outcome.get("ok"):
-        return None
+    reply = {key: kept[key] for key in ("undo", "scene_epoch", "cut", "lossy") if key in kept}
+    reply["data"] = answer
     spec = record.spec if isinstance(record.spec, dict) else {}
     said = python_tool.shape(
-        call, outcome, budget=python_tool.DEFAULT_MAX_CHARS, named=spec.get("namespace")
+        call, reply, budget=python_tool.DEFAULT_MAX_CHARS, named=spec.get("namespace")
     )
     said["operation_id"] = record.operation_id
     return said
+
+
+def reconcile(store: store_module.Store, record: JobRecord) -> JobRecord | None:
+    """Take a job's ending from its call's receipt, when the receipt has one.
+
+    The session writes both in one step, so this is for a row an older
+    session wrote, or one whose joint write did not land and whose receipt
+    was written alone. A job found lost takes it as a late finish.
+    """
+    if not record.operation_id:
+        return None
+    receipt = store.get_operation(record.operation_id)
+    if receipt is None or receipt.state not in ("done", "failed"):
+        return None
+    outcome = receipt.outcome
+    if not isinstance(outcome, Mapping):
+        return None
+    state, outputs, error = job_rules.ending(record.kind, record.operation_id, outcome)
+    try:
+        return store.finish_job(record.job_id, state=state, outputs=outputs, error=error)
+    except store_module.JobMoveRefused:
+        return None
 
 
 # Section: the sweep
@@ -401,6 +422,10 @@ def sweep(store: store_module.Store, call: Call, *, force: bool = False) -> None
     home = call.router.home
 
     def mark() -> list[JobRecord]:
+        # A job whose call has ended by its receipt takes that ending before
+        # anything could call it lost.
+        for record in store.list_jobs(states=list(store_module.JOB_LIVE_STATES), limit=MAX_LIMIT):
+            reconcile(store, record)
         # A session whose process has gone loses its jobs as it is marked.
         store.reclaim_sessions()
         lost: list[JobRecord] = []
@@ -417,6 +442,9 @@ def sweep(store: store_module.Store, call: Call, *, force: bool = False) -> None
             session = store.get_session(record.session_id)
             if session is None or session.state in DEAD_STATES:
                 lost += store.lose_jobs([record.job_id], error=store_module.SESSION_ENDED_ERROR)
+        # A job lost with its session may still have ended before it went.
+        for record in store.list_jobs(states=["lost"], limit=EXPORT_BATCH):
+            reconcile(store, record)
         return lost
 
     stored(mark)

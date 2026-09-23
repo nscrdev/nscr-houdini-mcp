@@ -1616,21 +1616,42 @@ class Store:
         job_id: str | None = None,
     ) -> OperationRecord:
         """Store the outcome so a retry can be answered without redoing work."""
+        with self._txn(write=True) as db:
+            return self._finish_operation(
+                db,
+                self._now(),
+                operation_id=operation_id,
+                state=state,
+                outcome=outcome,
+                error=error,
+                job_id=job_id,
+            )
+
+    @staticmethod
+    def _finish_operation(
+        db: sqlite3.Connection,
+        now: float,
+        *,
+        operation_id: str,
+        state: str = "done",
+        outcome: Any = None,
+        error: Any = None,
+        job_id: str | None = None,
+    ) -> OperationRecord:
         if state not in OPERATION_STATES:
             raise ValueError(f"unknown operation state: {state}")
-        with self._txn(write=True) as db:
-            written = db.execute(
-                "UPDATE operations SET state = ?, outcome = ?, error = ?, job_id = ?,"
-                " updated_at = ? WHERE operation_id = ?",
-                (state, _dump(outcome), _dump(error), job_id, self._now(), operation_id),
-            )
-            if written.rowcount == 0:
-                raise UnknownRecord(f"no operation {operation_id}")
-            return OperationRecord._from_row(
-                db.execute(
-                    "SELECT * FROM operations WHERE operation_id = ?", (operation_id,)
-                ).fetchone()
-            )
+        written = db.execute(
+            "UPDATE operations SET state = ?, outcome = ?, error = ?, job_id = ?,"
+            " updated_at = ? WHERE operation_id = ?",
+            (state, _dump(outcome), _dump(error), job_id, now, operation_id),
+        )
+        if written.rowcount == 0:
+            raise UnknownRecord(f"no operation {operation_id}")
+        return OperationRecord._from_row(
+            db.execute(
+                "SELECT * FROM operations WHERE operation_id = ?", (operation_id,)
+            ).fetchone()
+        )
 
     def get_operation(self, operation_id: str) -> OperationRecord | None:
         """One receipt by id."""
@@ -1742,47 +1763,74 @@ class Store:
         """
         if state is not None and state not in JOB_STATES:
             raise ValueError(f"unknown job state: {state}")
-        now = self._now()
         with self._txn(write=True) as db:
-            row = db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
-            if row is None:
-                raise UnknownRecord(f"no job {job_id}")
-            current = row["state"]
-            moving = state is not None and state != current
-            if not moving:
-                if current in JOB_FINAL_STATES:
-                    return JobRecord._from_row(row)
-                new_state, finished, new_error = current, row["finished_at"], _keep(error, row)
-            elif state in JOB_MOVES.get(current, ()):
-                new_state, new_error = state, _keep(error, row)
-                finished = now if state in JOB_FINAL_STATES else None
-            elif late and current == "lost" and state in LATE_FINISHES:
-                # How the work really ended, over a loss that was only a guess.
-                new_state, finished, new_error = state, now, _dump(error)
-            else:
-                raise JobMoveRefused(f"job {job_id} cannot move from {current} to {state}")
-            started = row["started_at"]
-            if started is None and new_state == "running":
-                started = now
-            db.execute(
-                "UPDATE jobs SET state = ?, progress = ?, outputs = ?, error = ?, worker_pid = ?,"
-                " scene = ?, heartbeat_at = ?, updated_at = ?, finished_at = ?, started_at = ?"
-                " WHERE job_id = ?",
-                (
-                    new_state,
-                    _dump(progress) if progress is not None else row["progress"],
-                    _dump(outputs) if outputs is not None else row["outputs"],
-                    new_error,
-                    row["worker_pid"] if worker_pid is None else worker_pid,
-                    _dump(scene) if scene is not None else row["scene"],
-                    now,
-                    now,
-                    finished,
-                    started,
-                    job_id,
-                ),
+            return self._update_job(
+                db,
+                job_id,
+                self._now(),
+                state=state,
+                progress=progress,
+                outputs=outputs,
+                error=error,
+                worker_pid=worker_pid,
+                scene=scene,
+                late=late,
             )
-            return self._job_row(db, job_id)
+
+    def _update_job(
+        self,
+        db: sqlite3.Connection,
+        job_id: str,
+        now: float,
+        *,
+        state: str | None,
+        progress: Any = None,
+        outputs: Any = None,
+        error: Any = None,
+        worker_pid: int | None = None,
+        scene: Any = None,
+        late: bool = False,
+    ) -> JobRecord:
+        """`update_job` inside a transaction the caller holds."""
+        row = db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        if row is None:
+            raise UnknownRecord(f"no job {job_id}")
+        current = row["state"]
+        moving = state is not None and state != current
+        if not moving:
+            if current in JOB_FINAL_STATES:
+                return JobRecord._from_row(row)
+            new_state, finished, new_error = current, row["finished_at"], _keep(error, row)
+        elif state in JOB_MOVES.get(current, ()):
+            new_state, new_error = state, _keep(error, row)
+            finished = now if state in JOB_FINAL_STATES else None
+        elif late and current == "lost" and state in LATE_FINISHES:
+            # How the work really ended, over a loss that was only a guess.
+            new_state, finished, new_error = state, now, _dump(error)
+        else:
+            raise JobMoveRefused(f"job {job_id} cannot move from {current} to {state}")
+        started = row["started_at"]
+        if started is None and new_state == "running":
+            started = now
+        db.execute(
+            "UPDATE jobs SET state = ?, progress = ?, outputs = ?, error = ?, worker_pid = ?,"
+            " scene = ?, heartbeat_at = ?, updated_at = ?, finished_at = ?, started_at = ?"
+            " WHERE job_id = ?",
+            (
+                new_state,
+                _dump(progress) if progress is not None else row["progress"],
+                _dump(outputs) if outputs is not None else row["outputs"],
+                new_error,
+                row["worker_pid"] if worker_pid is None else worker_pid,
+                _dump(scene) if scene is not None else row["scene"],
+                now,
+                now,
+                finished,
+                started,
+                job_id,
+            ),
+        )
+        return self._job_row(db, job_id)
 
     def start_job(self, job_id: str, *, scene: Any = None) -> JobRecord | None:
         """Move a queued job to running, and only a queued one.
@@ -1821,27 +1869,7 @@ class Store:
             if row is None:
                 if repair is None:
                     return None
-                db.execute(
-                    "INSERT INTO jobs (job_id, session_id, kind, state, weight, progress,"
-                    " scene, cancel_requested, worker_pid, heartbeat_at, created_at, updated_at,"
-                    " operation_id, spec, started_at)"
-                    " VALUES (?, ?, ?, 'running', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        job_id,
-                        repair.get("session_id"),
-                        repair.get("kind") or "unknown",
-                        repair.get("weight") or "light",
-                        _dump(progress),
-                        _dump(repair.get("scene")),
-                        worker_pid,
-                        now,
-                        now,
-                        now,
-                        repair.get("operation_id"),
-                        _dump(repair.get("spec")),
-                        now,
-                    ),
-                )
+                self._make_job_again(db, job_id, now, repair, progress, worker_pid)
                 return self._job_row(db, job_id)
             if row["state"] in JOB_FINAL_STATES:
                 return JobRecord._from_row(row)
@@ -1852,6 +1880,81 @@ class Store:
                 (now, _dump(progress), worker_pid, now, now, job_id),
             )
             return self._job_row(db, job_id)
+
+    @staticmethod
+    def _make_job_again(
+        db: sqlite3.Connection,
+        job_id: str,
+        now: float,
+        repair: Mapping[str, Any],
+        progress: Any = None,
+        worker_pid: int | None = None,
+    ) -> None:
+        """Write a running job's row again from what its runner knows of it."""
+        db.execute(
+            "INSERT INTO jobs (job_id, session_id, kind, state, weight, progress,"
+            " scene, cancel_requested, worker_pid, heartbeat_at, created_at, updated_at,"
+            " operation_id, spec, started_at)"
+            " VALUES (?, ?, ?, 'running', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                job_id,
+                repair.get("session_id"),
+                repair.get("kind") or "unknown",
+                repair.get("weight") or "light",
+                _dump(progress),
+                _dump(repair.get("scene")),
+                worker_pid,
+                now,
+                now,
+                now,
+                repair.get("operation_id"),
+                _dump(repair.get("spec")),
+                now,
+            ),
+        )
+
+    def finish_job(
+        self,
+        job_id: str,
+        *,
+        state: str,
+        progress: Any = None,
+        outputs: Any = None,
+        error: Any = None,
+        repair: Mapping[str, Any] | None = None,
+        operation: Mapping[str, Any] | None = None,
+    ) -> JobRecord:
+        """Write how a job ended, and the receipt of its call with it, in one step.
+
+        `operation` holds what `finish_operation` takes, with its id, so the
+        receipt and the job can never disagree about whether the call ended.
+        A missing row is made again from `repair` first, and a row found
+        `lost` meanwhile takes the real ending as a late finish.
+        """
+        if state not in JOB_FINAL_STATES:
+            raise ValueError(f"not a final job state: {state}")
+        now = self._now()
+        with self._txn(write=True) as db:
+            if operation is not None:
+                self._finish_operation(db, now, **operation)
+            row = db.execute("SELECT state FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if row is None:
+                if repair is None:
+                    raise UnknownRecord(f"no job {job_id}")
+                self._make_job_again(db, job_id, now, repair)
+                current = "running"
+            else:
+                current = row["state"]
+            return self._update_job(
+                db,
+                job_id,
+                now,
+                state=state,
+                progress=progress,
+                outputs=outputs,
+                error=error,
+                late=current == "lost",
+            )
 
     @staticmethod
     def _job_row(db: sqlite3.Connection, job_id: str) -> JobRecord:

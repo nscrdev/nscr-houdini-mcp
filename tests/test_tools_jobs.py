@@ -757,3 +757,56 @@ def test_work_that_ends_after_its_job_was_found_lost_takes_its_real_ending(
     idle(bench)
     ended = row(bench, job_id)
     assert (ended.state, ended.error) == ("done", None)
+
+
+def test_the_receipt_and_the_job_end_in_one_step(bench: Bench) -> None:
+    body = ok(python(bench, code="result = 5", operation_id="op-joint"))
+    with bench.store() as store:
+        receipt = store.get_operation("op-joint")
+        record = store.get_job(body["job_id"])
+    assert receipt.state == "done"
+    assert record.state == "done"
+    assert record.outputs["answer"]["result"] == 5
+    assert receipt.updated_at == record.updated_at
+
+
+def test_a_receipt_settled_without_its_job_is_reconciled_by_the_sweep(bench: Bench) -> None:
+    """The session wrote the receipt and went before the job row: not lost, done."""
+    bench.session("s-dead", "w2", pid=DEAD_PID)
+    payload = {"ok": True, "data": {"result": 7, "stdout": "", "namespace": "n"}}
+    with bench.store() as store:
+        store.create_job(
+            "job-op-crash",
+            kind="python",
+            session_id="s-dead",
+            state="running",
+            operation_id="op-crash",
+            spec={"namespace": "n"},
+        )
+        store.begin_operation("op-crash", "digest", session_id="s-dead")
+        store.finish_operation("op-crash", outcome=payload)
+    status = job(bench, "job-op-crash")
+    assert status["state"] == "done"
+    assert status["error"] is None
+    assert status["outputs"]["result"] == 7
+
+
+def test_a_joint_write_that_does_not_land_leaves_the_receipt_for_the_sweep(
+    bench: Bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    keeper = through(bench).dispatcher._jobs
+    monkeypatch.setattr(keeper, "_backoff_s", ())
+
+    def busy(self: Any, job_id: str, **rest: Any) -> Any:
+        raise store_module.StoreBusy("the store is locked by another process")
+
+    monkeypatch.setattr(store_module.Store, "finish_job", busy)
+    body = ok(python(bench, code="result = 11", operation_id="op-split"))
+    assert body["result"] == 11
+    with bench.store() as store:
+        assert store.get_operation("op-split").state == "done"
+        assert store.get_job(body["job_id"]).state == "running"
+    monkeypatch.undo()
+    status = job(bench, body["job_id"])
+    assert status["state"] == "done"
+    assert status["outputs"]["result"] == 11

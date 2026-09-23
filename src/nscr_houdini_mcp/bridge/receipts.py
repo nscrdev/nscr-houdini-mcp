@@ -111,6 +111,17 @@ def digest_call(tool: str, arguments: Mapping[str, Any]) -> str:
     return store_module.digest_arguments({"tool": tool, "arguments": dict(arguments)})
 
 
+def settlement(operation_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    """The receipt's ending for one answer, as `finish_operation` takes it."""
+    done = bool(payload.get("ok"))
+    return {
+        "operation_id": operation_id,
+        "state": "done" if done else "failed",
+        "outcome": dict(payload),
+        "error": None if done else dict(payload.get("error") or {}),
+    }
+
+
 class Receipts:
     """The receipt table, as one call sees it.
 
@@ -238,15 +249,13 @@ class Receipts:
 
     def finish(self, operation_id: str, payload: Mapping[str, Any]) -> None:
         """Store the answer, so a retry with the same id is answered from it."""
-        done = bool(payload.get("ok"))
-        self._write(
-            lambda store: store.finish_operation(
-                operation_id,
-                state="done" if done else "failed",
-                outcome=dict(payload),
-                error=None if done else dict(payload.get("error") or {}),
-            )
-        )
+        settled = settlement(operation_id, payload)
+        self._write(lambda store: store.finish_operation(**settled))
+
+    def settlement(self, operation_id: str, payload: Mapping[str, Any]) -> dict[str, Any] | None:
+        """What finishing this receipt writes, for a caller that writes it in
+        the same step as something else. Nothing when there is no store."""
+        return None if self._store is None else settlement(operation_id, payload)
 
     def drop(self, operation_id: str) -> None:
         """Take a receipt off a call that was refused before the tool ran.

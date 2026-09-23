@@ -543,10 +543,7 @@ class Dispatcher:
             # The work failed outside the tool, which leaves no answer and no
             # receipt behind it. Both are made here instead.
             reply = self._failed(tool, work.error or RuntimeError("no answer"), running, trace)
-            if wanted:
-                self.receipts.finish(wanted, reply.payload)
-            if running.job_id and self._jobs is not None:
-                self._jobs.finish(running, reply.payload)
+            self._settle_call(running, wanted, reply.payload)
             return reply
         if work.picked_by is not None:
             # Which route to the main thread reached the work first, so a check
@@ -754,15 +751,29 @@ class Dispatcher:
                 self.identity.dirty.ended(tool.name, ok=error is None)
             timing_ms = (time.monotonic() - began) * 1000.0
             reply = self._settle(tool, value, error, running, dict(trace or {}), timing_ms)
-            if wanted:
-                self.receipts.finish(wanted, reply.payload)
-            if running.job_id and self._jobs is not None:
-                # Written before the session is given back, as the receipt
-                # is, so a caller following the job sees it end with the call.
-                self._jobs.finish(running, reply.payload)
+            # Written before the session is given back, so a retry queued
+            # behind the work and a caller following its job both find the
+            # answer rather than a call that still says running.
+            self._settle_call(running, wanted, reply.payload)
             return reply
         finally:
             self._release(running)
+
+    def _settle_call(
+        self, running: Running, wanted: str | None, payload: Mapping[str, Any]
+    ) -> None:
+        """Write the call's receipt, and its job's ending in the same step.
+
+        When the joint write cannot land, the receipt is written on its own,
+        and the sweep that finds the job still running takes the ending from
+        the receipt.
+        """
+        if running.job_id and self._jobs is not None:
+            operation = self.receipts.settlement(wanted, payload) if wanted else None
+            if self._jobs.finish(running, payload, operation=operation) or not wanted:
+                return
+        if wanted:
+            self.receipts.finish(wanted, payload)
 
     def _never_ran(self, wanted: str | None, running: Running) -> None:
         """Give the session back, and take back the receipt with it.

@@ -20,7 +20,9 @@ runs, one small thread per job does three things:
 How it ends. Work that saw the cancel flag and stopped is `cancelled`. Work
 that finished without ever looking is `done`, with `cancel_requested` still
 on the row. Work that raised, or a call that failed, is `failed` with the
-error. A finished job leaves a readable copy of its row beside the scene.
+error. The ending and the call's receipt are written in one step, with the
+whole answer on the row. A finished job leaves a readable copy of its row
+beside the scene.
 
 The row has to be there before the work may run: the write at accept is tried
 a few times over a busy store, and the call is refused when it cannot land,
@@ -36,7 +38,6 @@ the thread that runs the work.
 
 from __future__ import annotations
 
-import json
 import os
 import sqlite3
 import threading
@@ -56,11 +57,6 @@ CANCEL_POLL_S = 2.0
 # The pauses between tries at a write that has to land, such as the row a
 # job needs before its work may run.
 ACCEPT_BACKOFF_S = (0.05, 0.2, 0.5)
-
-# How much of a Python answer the row keeps. The whole answer is on the
-# receipt under the operation id.
-RESULT_KEPT_CHARS = 4000
-STDOUT_KEPT_CHARS = 2000
 
 
 class JobNotAccepted(Exception):
@@ -199,25 +195,51 @@ class JobKeeper:
             scene = dict(job.repair["scene"])
             self._write(lambda store: store.start_job(job.job_id, scene=scene))
 
-    def finish(self, running: Any, payload: Mapping[str, Any]) -> None:
-        """Write how the work ended, and leave the readable copy beside the scene."""
+    def finish(
+        self,
+        running: Any,
+        payload: Mapping[str, Any],
+        *,
+        operation: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Write how the work ended, with its receipt when one is given.
+
+        The job row and the receipt are written in one step, so no process
+        exit or busy store can leave one ended and the other running. The
+        answer goes on the job row, so the job can be read back whole after
+        its receipt has gone. Returns whether that step landed; when it did
+        not, the caller settles the receipt on its own, and the next sweep
+        takes the job's ending from it.
+        """
         job = self._job(running, forget=True)
         if job is None:
-            return
-        state, outputs, error = ending(job.kind, running, payload)
+            return False
+        state, outputs, error = job_rules.ending(
+            job.kind, running.operation_id, payload, cancelled=bool(running.cancel_seen)
+        )
         progress = job_rules.progress_of(latest(running)) or None
+        repair = {**job.repair, "scene": dict(job.repair["scene"])}
+        landed = False
         with job.lock:
             job.closed = True
             try:
                 self._durably(
-                    lambda store: settle(
-                        store, job, state=state, progress=progress, outputs=outputs, error=error
+                    lambda store: store.finish_job(
+                        job.job_id,
+                        state=state,
+                        progress=progress,
+                        outputs=outputs,
+                        error=error,
+                        repair=repair,
+                        operation=operation,
                     )
                 )
-            except Exception as error:  # noqa: BLE001 - logged; the receipt holds the answer
-                self._log(f"could not write how job {job.job_id} ended: {error}")
+                landed = True
+            except Exception as failure:  # noqa: BLE001 - reported; the caller falls back
+                self._log(f"could not write how job {job.job_id} ended: {failure}")
         self._free(job)
         self._write(lambda store: job_rules.export(store, job.job_id, home=self._home))
+        return landed
 
     def asked_to_stop(self, running: Any) -> None:
         """Put a stop asked of the session directly on the row as well."""
@@ -326,71 +348,9 @@ class JobKeeper:
         raise last
 
 
-def settle(
-    store: store_module.Store,
-    job: _Job,
-    *,
-    state: str,
-    progress: Any,
-    outputs: Any,
-    error: Any,
-) -> store_module.JobRecord:
-    """Write how a job ended, whatever its row went through meanwhile.
-
-    A missing row is made again first. A row found lost while the work ran
-    takes the real ending as a late finish, which clears the loss.
-    """
-    if store.get_job(job.job_id) is None:
-        store.beat_job(job.job_id, repair={**job.repair, "scene": dict(job.repair["scene"])})
-    try:
-        return store.update_job(
-            job.job_id, state=state, progress=progress, outputs=outputs, error=error
-        )
-    except store_module.JobMoveRefused:
-        return store.update_job(
-            job.job_id, state=state, progress=progress, outputs=outputs, error=error, late=True
-        )
-
-
 def latest(running: Any) -> Any:
     progress = getattr(running, "progress", None)
     return dict(progress[-1]) if progress else None
-
-
-def ending(kind: str, running: Any, payload: Mapping[str, Any]) -> tuple[str, dict[str, Any], Any]:
-    """The final state, the outputs and the error, from the call's answer."""
-    stopped = bool(getattr(running, "cancel_seen", False))
-    outputs: dict[str, Any] = {"operation_id": running.operation_id}
-    if not payload.get("ok"):
-        error = payload.get("error")
-        return ("cancelled" if stopped else "failed"), outputs, error
-    data = payload.get("data")
-    data = data if isinstance(data, Mapping) else {}
-    error = data.get("error") if kind == "python" else None
-    if kind == "python":
-        outputs.update(python_outputs(data))
-    if stopped:
-        return "cancelled", outputs, error
-    return ("failed" if error is not None else "done"), outputs, error
-
-
-def python_outputs(data: Mapping[str, Any]) -> dict[str, Any]:
-    """What a job row keeps of one Python answer: a short form of it."""
-    kept: dict[str, Any] = {
-        "namespace": data.get("namespace"),
-        "duration_ms": data.get("duration_ms"),
-    }
-    result = data.get("result")
-    text = json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str)
-    if data.get("result_text_chars") is None and len(text) <= RESULT_KEPT_CHARS:
-        kept["result"] = result
-    else:
-        kept["result_chars"] = int(data.get("result_text_chars") or len(text))
-    stdout = str(data.get("stdout") or "")
-    kept["stdout_tail"] = stdout[-STDOUT_KEPT_CHARS:]
-    if len(stdout) > STDOUT_KEPT_CHARS:
-        kept["stdout_chars"] = len(stdout)
-    return kept
 
 
 def _quiet(read: Callable[[], Any]) -> Any:
