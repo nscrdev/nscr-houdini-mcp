@@ -38,13 +38,17 @@ Checks, the same ones CI runs:
 ruff check . && ruff format --check .
 pytest -q
 python scripts/lint_client_names.py   # shipped text must not name any client or vendor
-python scripts/tools_list_cost.py     # estimated token cost of the tools/list payload
+python scripts/tools_list_cost.py     # token cost of the tools/list payload
 ```
 
 `scripts/tools_list_cost.py` serialises the tool list the way a client receives
-it and estimates tokens as bytes divided by four, rounded up. That is a budget
-signal to watch across commits, not an exact count. Pass `--max-tokens N` to
-make it fail over a budget.
+it and counts its tokens, in total and per tool, against a budget of 4,000.
+With the dev extras installed it counts with `tiktoken` and the `o200k_base`
+encoding (`--encoding` names another); without them it falls back to bytes
+divided by four, rounded up, and says so. `tiktoken` is only ever a dev
+dependency. Either count is a budget signal to watch across commits, since a
+client on another encoding pays a somewhat different number. Pass
+`--max-tokens N` to make it fail over a budget.
 
 Git hooks:
 
