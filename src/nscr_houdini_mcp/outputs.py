@@ -58,6 +58,7 @@ OUTPUT_KINDS = (
     "capture",
     "compare",
     "job",
+    "reference",
 )
 
 # Kinds whose path is only ever for a record the server or a session writes
@@ -106,6 +107,7 @@ DEFAULT_GRAMMAR = {
     "capture": "<output_root>/.agent/captures/<date>/<time>_<name>_<run_id>.<ext>",
     "compare": "<output_root>/.agent/compare/<date>_<name>/<ver>_<run_id>/",
     "job": "<output_root>/.agent/jobs/<name>.<ext>",
+    "reference": "<output_root>/.agent/reference/<name>_<run_id>.<ext>",
 }
 
 DEFAULT_EXTENSIONS = {
@@ -118,6 +120,7 @@ DEFAULT_EXTENSIONS = {
     "capture": "png",
     "compare": "",
     "job": "json",
+    "reference": "png",
 }
 
 # Roots are templates too, so a studio can point a kind somewhere else without
