@@ -71,6 +71,11 @@ MAX_SPILL_KEEP_DAYS = 365
 DEFAULT_PYTHON_TIMEOUT_CAP_S = 3600
 MAX_PYTHON_TIMEOUT_CAP_S = 3600
 
+# How long `hou_python` waits for code before it hands back a job to follow
+# instead. The code goes on either way.
+DEFAULT_INLINE_WAIT_S = 10
+MAX_INLINE_WAIT_S = 300
+
 _BUILD = re.compile(r"^\d+\.\d+(\.\d+)*$")
 
 # Every key the file may hold, in the order `config show` prints them.
@@ -85,6 +90,7 @@ KEYS = (
     "spill_over_bytes",
     "spill_keep_days",
     "python_timeout_cap_s",
+    "inline_wait_s",
     "transport",
 )
 
@@ -127,6 +133,10 @@ spill_keep_days = {DEFAULT_SPILL_KEEP_DAYS}
 
 # The most seconds hou_python waits for its code, whatever a call asks for.
 python_timeout_cap_s = {DEFAULT_PYTHON_TIMEOUT_CAP_S}
+
+# Seconds hou_python waits for its code before it answers with a job id to
+# follow with hou_jobs. The code carries on either way. From 1 to {MAX_INLINE_WAIT_S}.
+inline_wait_s = {DEFAULT_INLINE_WAIT_S}
 
 # How clients reach the server. Only "stdio" is served by this build.
 transport = "stdio"
@@ -175,6 +185,7 @@ class Config:
     spill_over_bytes: int = DEFAULT_SPILL_OVER_BYTES
     spill_keep_days: int = DEFAULT_SPILL_KEEP_DAYS
     python_timeout_cap_s: int = DEFAULT_PYTHON_TIMEOUT_CAP_S
+    inline_wait_s: int = DEFAULT_INLINE_WAIT_S
     transport: str = TRANSPORTS[0]
     # Which keys the file set. The rest are defaults.
     from_file: frozenset[str] = frozenset()
@@ -200,6 +211,7 @@ class Config:
             "spill_over_bytes": self.spill_over_bytes,
             "spill_keep_days": self.spill_keep_days,
             "python_timeout_cap_s": self.python_timeout_cap_s,
+            "inline_wait_s": self.inline_wait_s,
             "transport": self.transport,
         }
         return {key: values[key] for key in KEYS}
@@ -362,6 +374,10 @@ def _python_timeout_cap(value: Any, key: str, path: Path) -> int:
     return _whole(value, key, path, 1, MAX_PYTHON_TIMEOUT_CAP_S)
 
 
+def _inline_wait(value: Any, key: str, path: Path) -> int:
+    return _whole(value, key, path, 1, MAX_INLINE_WAIT_S)
+
+
 def _transport(value: Any, key: str, path: Path) -> str | None:
     text = _text(value, key, path)
     if text is not None and text not in TRANSPORTS:
@@ -388,6 +404,7 @@ _CHECKS = {
     "spill_over_bytes": _spill_over,
     "spill_keep_days": _keep_days,
     "python_timeout_cap_s": _python_timeout_cap,
+    "inline_wait_s": _inline_wait,
     "transport": _transport,
 }
 
