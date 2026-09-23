@@ -156,8 +156,9 @@ inline_wait_s = {DEFAULT_INLINE_WAIT_S}
 # Pacing for a Houdini with a user interface, so agents cannot keep its main
 # thread busy without a break: one call from this server out at a time, the
 # least milliseconds from one ending to the next starting, and the most that
-# may start in any one second. The wait comes out of a call's wait_s, and a
-# call whose turn is further off is answered SESSION_BUSY with retry_after_s.
+# may start in any one second. The wait comes out of a call's wait_s; a call
+# that cannot have its turn within that is answered SESSION_BUSY with an
+# estimated retry_after_s.
 # Workers are not paced. 0 turns that rule off, and both at 0 turn pacing off.
 gui_min_pause_ms = {pacing.DEFAULT_MIN_PAUSE_MS}
 gui_max_calls_per_s = {pacing.DEFAULT_MAX_CALLS_PER_S}

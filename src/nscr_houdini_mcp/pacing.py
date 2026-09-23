@@ -17,19 +17,27 @@ rules:
 
 The wait for a turn is part of the caller's own `wait_s`, the time it said it
 would queue for the session, never added to it: what is left of it goes on to
-the bridge. When the turn is plainly further off than that, or the call asked
-to be skipped when the session is busy, the call is refused at once with the
-time until the turn, rather than sent late to a caller that has given up.
+the bridge. A call is refused at once only when the pacer's own rules put its
+turn past that wait: the pause after each call ahead of it and the rate cap
+alone come too late, however quickly those calls run. Otherwise it queues,
+however long the call out may still run, and is refused only if its wait runs
+out first. A call that asked to be skipped when the session is busy is
+refused at once when anything stands in its way.
+
+A refusal says when to come back, in `retry_after_s`: an estimate from the
+calls queued ahead, the median time of the session's last few calls, the
+pause and the cap, never less than the pause and never more than
+`RETRY_CAP_S`. A timeout a call names is a ceiling, not an estimate, so it
+plays no part in this.
 
 A call sent again under the operation id of the call that is out skips the
 pace altogether: the bridge answers it from that call's receipt, with no need
-of the main thread. A call queued behind one whose time on the session is
-known, because it named its own timeout, and runs past the queued call's wait,
-is refused at once rather than after waiting out its whole budget.
+of the main thread.
 
 The queue is bounded: past `max_queued` calls waiting on one session, a new
-one is refused at once. A call whose caller has gone, by a cancel or its own
-deadline, leaves the queue before it can reach the bridge.
+one is refused at once and told how many wait ahead of it. A call whose
+caller has gone, by a cancel or its own deadline, leaves the queue before it
+can reach the bridge.
 
 The pace is kept per server process and per session: a second session is
 paced on its own. Several agents sharing one server process share its one
@@ -42,6 +50,7 @@ Nothing here is kept anywhere but in memory, and nothing here imports `hou`.
 from __future__ import annotations
 
 import itertools
+import statistics
 import threading
 import time
 from collections import deque
@@ -60,21 +69,32 @@ DEFAULT_MAX_QUEUED = 32
 # How often a waiting call looks at whether its caller has gone.
 CANCEL_POLL_S = 0.05
 
+# How many of a session's last calls its time per call is the median of, what
+# is assumed before any has ended, and the longest a refusal says to wait.
+DURATIONS_KEPT = 8
+RUN_SEED_S = 0.25
+RETRY_CAP_S = 30.0
+
 
 class NoTurn(Exception):
     """The call's turn would come too late for it, or it asked not to wait.
 
-    `waited_s` is how long it had already waited. `retry_after_s` is how long
-    until a turn could come: when only the pause and the cap stand in the way,
-    exactly that; when another call is out, the most it may still hold the
-    session, from its own wait and timeout, and the pause after it.
+    `waited_s` is how long it had already waited. `ahead` is how many calls
+    were queued ahead of it. `retry_after_s` is an estimate of how long until
+    a turn could come: what the call out may still take, then a turn for each
+    call ahead at the session's recent time per call and the pause, and never
+    sooner than the pause and the cap allow. It is at least the pause and at
+    most `RETRY_CAP_S`.
     """
 
-    def __init__(self, *, waited_s: float, retry_after_s: float, reason: str) -> None:
+    def __init__(
+        self, *, waited_s: float, retry_after_s: float, reason: str, ahead: int = 0
+    ) -> None:
         super().__init__(reason)
         self.waited_s = waited_s
         self.retry_after_s = retry_after_s
         self.reason = reason
+        self.ahead = ahead
 
 
 @dataclass(frozen=True)
@@ -90,14 +110,14 @@ class _Pace:
     """What one session has had from this server lately."""
 
     out: bool = False
-    # The call that is out: its operation id, the latest it may hold the
-    # session until, and whether that latest comes from a timeout it named.
+    # The call that is out: its operation id, and when it was let through.
     out_id: str | None = None
-    out_until: float | None = None
-    out_known: bool = False
+    out_since: float | None = None
     last_end: float | None = None
     starts: deque[float] = field(default_factory=deque)
     queue: deque[int] = field(default_factory=deque)
+    # How long the last few calls held their turns, for the estimates.
+    durations: deque[float] = field(default_factory=lambda: deque(maxlen=DURATIONS_KEPT))
 
 
 class Pacer:
@@ -142,20 +162,14 @@ class Pacer:
         skip_if_busy: bool = False,
         cancelled: Callable[[], bool] | None = None,
         operation_id: str | None = None,
-        runs_s: float | None = None,
-        runs_known: bool = False,
     ) -> Turn:
         """Wait for this call's turn, no longer than `budget_s`.
 
-        Raises `NoTurn` at once when the turn is known to be further off than
-        the budget, when the queue is full, or when anything at all stands in
-        the way of a call that asked to be skipped; and when the budget runs
-        out, or `cancelled` says the caller has gone, while it waits. Turns go
-        in the order they were asked for.
-
-        `runs_s` is the longest this call may run once let through, so the
-        calls behind it can be told how long it may hold the session; with
-        `runs_known` it is a timeout the caller named, not a default.
+        Raises `NoTurn` at once when the pause and the cap alone put the turn
+        past the budget, when the queue is full, or when anything at all
+        stands in the way of a call that asked to be skipped; and when the
+        budget runs out, or `cancelled` says the caller has gone, while it
+        waits. Turns go in the order they were asked for.
         """
         if not self.active:
             return Turn(0.0, self._wall())
@@ -163,9 +177,7 @@ class Pacer:
             pace = self._paces.setdefault(key, _Pace())
             if len(pace.queue) >= self.max_queued:
                 now = self._clock()
-                raise self._refuse(
-                    pace, now, now, self._earliest(pace, now), "too many calls are queued"
-                )
+                raise self._refuse(pace, now, now, len(pace.queue), "too many calls are queued")
             ticket = next(self._tickets)
             pace.queue.append(ticket)
             started = self._clock()
@@ -174,32 +186,28 @@ class Pacer:
             try:
                 while True:
                     now = self._clock()
-                    first = pace.queue[0] == ticket
+                    ahead = pace.queue.index(ticket)
+                    first = ahead == 0
                     turn = self._earliest(pace, now)
                     if cancelled is not None and cancelled():
-                        raise self._refuse(pace, started, now, turn, "the caller went away")
+                        raise self._refuse(pace, started, now, ahead, "the caller went away")
                     if first and not pace.out and turn <= now:
                         granted = True
                         break
                     if skip_if_busy:
-                        raise self._refuse(pace, started, now, turn, "the caller asked not to wait")
-                    if (
-                        pace.out
-                        and pace.out_known
-                        and pace.out_until is not None
-                        and pace.out_until + self.min_pause_s > deadline
-                    ):
                         raise self._refuse(
-                            pace,
-                            started,
-                            now,
-                            turn,
-                            "another call holds the session longer than this call will wait",
+                            pace, started, now, ahead, "the caller asked not to wait"
                         )
-                    if first and not pace.out and turn > deadline:
-                        raise self._refuse(pace, started, now, turn, "the turn is past the wait")
+                    # However quickly the calls ahead run, the pause after
+                    # each and the cap still stand between this call and its
+                    # turn. When those alone come past the wait, stop now.
+                    if self._soonest(pace, now, ahead) > deadline:
+                        reason = (
+                            "the wait ran out" if now > started else "the turn is past the wait"
+                        )
+                        raise self._refuse(pace, started, now, ahead, reason)
                     if now >= deadline:
-                        raise self._refuse(pace, started, now, turn, "the wait ran out")
+                        raise self._refuse(pace, started, now, ahead, "the wait ran out")
                     until = deadline if (pace.out or not first) else min(turn, deadline)
                     if cancelled is not None:
                         until = min(until, now + CANCEL_POLL_S)
@@ -211,26 +219,30 @@ class Pacer:
             pace.queue.popleft()
             pace.out = True
             pace.out_id = operation_id
-            # Whatever is left of its wait goes to the bridge, then it may run.
-            pace.out_until = None if runs_s is None else deadline + max(0.0, runs_s)
-            pace.out_known = runs_known
+            pace.out_since = now
             if self.max_per_s > 0:
                 pace.starts.append(now)
                 while len(pace.starts) > self.max_per_s:
                     pace.starts.popleft()
             return Turn(max(0.0, now - started), self._wall())
 
-    def done(self, key: str) -> None:
-        """Mark the end of a call that had a turn, and wake whoever is next."""
+    def done(self, key: str, *, ran: bool = True) -> None:
+        """Mark the end of a call that had a turn, and wake whoever is next.
+
+        `ran` is false for a turn given back unused, which says nothing about
+        how long the session's calls take.
+        """
         if not self.active:
             return
         with self._ready:
             pace = self._paces.setdefault(key, _Pace())
+            now = self._clock()
+            if ran and pace.out and pace.out_since is not None:
+                pace.durations.append(max(0.0, now - pace.out_since))
             pace.out = False
             pace.out_id = None
-            pace.out_until = None
-            pace.out_known = False
-            pace.last_end = self._clock()
+            pace.out_since = None
+            pace.last_end = now
             self._ready.notify_all()
 
     def holds(self, key: str, operation_id: str | None) -> bool:
@@ -242,7 +254,8 @@ class Pacer:
             return pace is not None and pace.out and pace.out_id == operation_id
 
     def forget(self, key: str) -> None:
-        """Drop what is kept for a session that has gone, when nothing waits on it."""
+        """Drop what is kept for a session that has gone, what its calls took
+        with the rest, when nothing waits on it."""
         with self._ready:
             pace = self._paces.get(key)
             if pace is not None and not pace.out and not pace.queue:
@@ -257,16 +270,46 @@ class Pacer:
             turn = max(turn, pace.starts[-self.max_per_s] + WINDOW_S)
         return turn
 
-    def _refuse(self, pace: _Pace, started: float, now: float, turn: float, reason: str) -> NoTurn:
-        ahead = turn - now
+    def _soonest(self, pace: _Pace, now: float, ahead: int) -> float:
+        """The first moment a call with `ahead` calls queued before it could
+        have its turn were every call to take no time at all. Only the pause
+        and the cap count here, so no turn can come sooner."""
+        starts = list(pace.starts)
+        turn = now
         if pace.out:
-            # The call that is out has to end first, and then the pause runs.
-            left = 0.0 if pace.out_until is None else max(0.0, pace.out_until - now)
-            ahead = max(ahead, left + self.min_pause_s)
+            # The call out ends no sooner than now, and the pause follows.
+            turn = now + self.min_pause_s
+        elif self.min_pause_s > 0 and pace.last_end is not None:
+            turn = max(turn, pace.last_end + self.min_pause_s)
+        for index in range(ahead + 1):
+            if index:
+                # The call before ends no sooner than it starts.
+                turn += self.min_pause_s
+            if self.max_per_s > 0 and len(starts) >= self.max_per_s:
+                turn = max(turn, starts[-self.max_per_s] + WINDOW_S)
+            starts.append(turn)
+        return turn
+
+    def _estimate(self, pace: _Pace, now: float, ahead: int) -> float:
+        """Seconds until a turn could come with `ahead` calls queued first."""
+        took = statistics.median(pace.durations) if pace.durations else RUN_SEED_S
+        left = 0.0
+        if pace.out:
+            since = now if pace.out_since is None else pace.out_since
+            # The call out has to end first, and then the pause runs.
+            left = max(0.0, took - (now - since)) + self.min_pause_s
+        guess = max(
+            left + ahead * (took + self.min_pause_s),
+            self._soonest(pace, now, ahead) - now,
+        )
+        return min(max(guess, self.min_pause_s, 0.001), RETRY_CAP_S)
+
+    def _refuse(self, pace: _Pace, started: float, now: float, ahead: int, reason: str) -> NoTurn:
         return NoTurn(
             waited_s=max(0.0, now - started),
-            retry_after_s=round(max(ahead, 0.001), 3),
+            retry_after_s=round(self._estimate(pace, now, ahead), 3),
             reason=reason,
+            ahead=ahead,
         )
 
 

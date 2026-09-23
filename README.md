@@ -589,10 +589,16 @@ A value of 0 turns that rule off, and both at 0 turn pacing off altogether;
 a negative value is refused.
 
 The wait for a turn comes out of the call's own `wait_s` (a second unless it
-says), and the bridge gets what is left. When the turn is further off than
-that, or the call passed `skip_if_busy`, it is answered at once with
-`SESSION_BUSY` and `retry_after_s`, and nothing is sent, so a caller that has
-given up never has its change made later. A call that did wait says how long
+says), and the bridge gets what is left. Calls sent side by side queue and go
+out one after another, however long the call out may run. A call is answered
+at once with `SESSION_BUSY` when the pause and the cap alone would hold it
+past its wait, when it passed `skip_if_busy`, or when the queue is full; one
+whose wait runs out in the queue gets the same answer then. Nothing of it is
+sent, so a caller that has given up never has its change made later. The
+answer carries `retry_after_s`, an estimate from the calls queued ahead and
+how long the session's last few calls took, between the pause and 30
+seconds, and `queued_ahead`, how many calls waited ahead. A call that did wait
+says how long
 in its trace, as `throttled_ms`, and when it was let through, as
 `admitted_at`.
 
@@ -600,9 +606,8 @@ The pace is kept per server process and per session. Two agents sharing one
 server process share its one allowance; two server processes, one per
 client, each have their own, so together they get no more than twice it.
 A call sent again under the operation id of the call that is out goes
-straight through, since the bridge answers it from that call's receipt, and a
-call behind one that named a timeout running past its own wait is refused at
-once. At most 32 calls wait on one session's turn; one more is answered
+straight through, since the bridge answers it from that call's receipt. At
+most 32 calls wait on one session's turn; one more is answered
 `SESSION_BUSY` at once, and a call whose client cancels leaves the queue
 without being sent. Workers are headless and are not paced. A cancel is never
 paced either, since it runs beside the call it stops.

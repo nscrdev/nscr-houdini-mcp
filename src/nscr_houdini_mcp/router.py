@@ -30,9 +30,13 @@ Pacing. A call on its way to a session with a user interface waits here for
 its turn under the pacer's rules, one call out at a time, a minimum pause
 after each and a rate cap, so an agent in a loop cannot keep the artist's main
 thread busy without a break. The wait comes out of the call's `wait_s`, and the
-bridge is given what is left. A call whose turn is further off than that, or
-that asked to be skipped when busy, is refused at once with `SESSION_BUSY` and
-`retry_after_s`, and nothing is sent. The reply says how long the call waited
+bridge is given what is left. A call queues behind the call out however long
+that one may run, a timeout it named being a ceiling and not an estimate. A
+call the pause and the cap alone would hold past its wait, or that asked to be
+skipped when busy, or that finds the queue full, is refused at once with
+`SESSION_BUSY`, an estimated `retry_after_s` and how many calls wait ahead of
+it; so is one whose wait runs out in the queue. Nothing of a refused call is
+sent. The reply says how long the call waited
 in `throttled_ms` and when it was let through in `admitted_at`. A worker is not
 paced, unless the router is told to treat workers as sessions with an
 interface, which is for tests. A cancel is never paced: it runs beside the
@@ -459,14 +463,12 @@ class Router:
                 skip_if_busy=skip_if_busy,
                 cancelled=cancelled.is_set if cancelled is not None else None,
                 operation_id=operation_id,
-                runs_s=BRIDGE_TIMEOUT_S if timeout_s is None else timeout_s,
-                runs_known=timeout_s is not None,
             )
         except NoTurn as refused:
             raise paced_busy(target, refused) from None
         if cancelled is not None and cancelled.is_set():
             # Gone in the moment between the turn and the send: give it back.
-            self.pacer.done(target.session_id)
+            self.pacer.done(target.session_id, ran=False)
             raise paced_busy(
                 target,
                 NoTurn(waited_s=turn.waited_s, retry_after_s=0.0, reason="the caller went away"),
@@ -616,12 +618,13 @@ def paced_busy(target: Target, refused: NoTurn) -> CallError:
         "paced": True,
         "reason": refused.reason,
         "retry_after_s": refused.retry_after_s,
+        "queued_ahead": refused.ahead,
         THROTTLED_KEY: waited,
     }
     return CallError(
         "SESSION_BUSY",
         f"this server paces its calls to {target.record.alias}, which has a user interface,"
-        f" and its next turn is {refused.retry_after_s:g} seconds away; nothing was sent",
+        f" and its next turn is about {refused.retry_after_s:g} seconds away; nothing was sent",
         hint=(
             "call again after retry_after_s, or pass a wait_s longer than that to queue"
             " for the turn"

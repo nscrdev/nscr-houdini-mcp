@@ -46,10 +46,11 @@ class Clock:
         self.now += seconds
 
 
-def pacer(clock: Clock, *, pause_ms: int = 50, per_s: int = 10) -> Pacer:
+def pacer(clock: Clock, *, pause_ms: int = 50, per_s: int = 10, max_queued: int = 32) -> Pacer:
     return Pacer(
         min_pause_s=pause_ms / 1000.0,
         max_per_s=per_s,
+        max_queued=max_queued,
         clock=clock,
         wall=clock,
         wait=clock.wait,
@@ -175,6 +176,112 @@ def test_forgetting_a_session_lets_its_next_call_go_at_once() -> None:
     assert one_call(paced, clock) == 0.0
 
 
+def test_the_cap_alone_can_put_a_queued_turn_past_the_wait() -> None:
+    clock = Clock()
+    paced = pacer(clock, pause_ms=0, per_s=1)
+    one_call(paced, clock)
+    queue = paced._paces["gui"].queue
+    # One call waits ahead: at one start a second, its turn is at 101 and
+    # this call's at 102 at the soonest, however quickly either runs.
+    queue.append(-1)
+    with pytest.raises(NoTurn) as refused:
+        paced.admit("gui", budget_s=1.5)
+    assert refused.value.reason == "the turn is past the wait"
+    assert clock.waits == []
+    assert refused.value.waited_s == 0.0
+    assert refused.value.ahead == 1
+    assert refused.value.retry_after_s == pytest.approx(2.0)
+    # With nobody ahead the same wait is long enough.
+    queue.clear()
+    assert paced.admit("gui", budget_s=1.5).waited_s == pytest.approx(1.0)
+    paced.done("gui")
+    # With the cap's turn inside the wait, the call queues rather than being
+    # refused, and is refused only when the call ahead has not moved by the
+    # end of it.
+    queue.append(-1)
+    with pytest.raises(NoTurn) as refused:
+        paced.admit("gui", budget_s=2.5)
+    assert refused.value.reason == "the wait ran out"
+    assert refused.value.waited_s == pytest.approx(2.5)
+
+
+def test_retry_after_comes_from_recent_durations_not_from_the_timeout() -> None:
+    clock = Clock()
+    paced = pacer(clock)
+    for _ in range(3):
+        one_call(paced, clock, runs_s=0.2)
+    paced.admit("gui", budget_s=30.0)
+    clock.pass_(0.05)
+    with pytest.raises(NoTurn) as refused:
+        paced.admit("gui", budget_s=30.0, skip_if_busy=True)
+    # The rest of a usual call, then the pause.
+    assert refused.value.retry_after_s == pytest.approx(0.2)
+
+
+def test_a_full_queue_says_when_a_place_would_come_from_the_depth() -> None:
+    clock = Clock()
+    paced = pacer(clock, max_queued=4)
+    for _ in range(3):
+        one_call(paced, clock, runs_s=0.1)
+    paced.admit("gui", budget_s=30.0)
+    clock.pass_(0.02)
+    paced._paces["gui"].queue.extend([-1, -2, -3, -4])
+    before = list(clock.waits)
+    with pytest.raises(NoTurn) as refused:
+        paced.admit("gui", budget_s=30.0)
+    assert refused.value.reason == "too many calls are queued"
+    assert refused.value.waited_s == 0.0
+    assert refused.value.ahead == 4
+    assert clock.waits == before
+    # What the call out has left and the pause, then four calls and pauses.
+    assert refused.value.retry_after_s == pytest.approx(0.08 + 0.05 + 4 * 0.15)
+
+
+def test_a_call_out_past_its_estimate_gives_the_pause_as_the_floor() -> None:
+    clock = Clock()
+    paced = pacer(clock)
+    paced.admit("gui", budget_s=1.0)
+    clock.pass_(5.0)
+    with pytest.raises(NoTurn) as refused:
+        paced.admit("gui", budget_s=30.0, skip_if_busy=True)
+    assert refused.value.retry_after_s == pytest.approx(0.05)
+
+
+def test_retry_after_is_capped() -> None:
+    clock = Clock()
+    paced = pacer(clock)
+    for _ in range(3):
+        one_call(paced, clock, runs_s=10.0)
+    paced.admit("gui", budget_s=30.0)
+    paced._paces["gui"].queue.extend(range(-10, 0))
+    with pytest.raises(NoTurn) as refused:
+        paced.admit("gui", budget_s=30.0, skip_if_busy=True)
+    assert refused.value.ahead == 10
+    assert refused.value.retry_after_s == pytest.approx(30.0)
+
+
+def test_durations_are_learned_per_session_and_forgotten_with_it() -> None:
+    clock = Clock()
+    paced = pacer(clock)
+
+    def retry(key: str) -> float:
+        paced.admit(key, budget_s=30.0)
+        try:
+            with pytest.raises(NoTurn) as refused:
+                paced.admit(key, budget_s=30.0, skip_if_busy=True)
+        finally:
+            paced.done(key, ran=False)
+        return refused.value.retry_after_s
+
+    for _ in range(3):
+        one_call(paced, clock, "one", runs_s=1.0)
+    assert retry("one") == pytest.approx(1.05)
+    # Another session has none of its own yet, so it starts from the seed.
+    assert retry("two") == pytest.approx(0.3)
+    paced.forget("one")
+    assert retry("one") == pytest.approx(0.3)
+
+
 def test_a_wait_is_reported_in_whole_milliseconds() -> None:
     assert throttled_ms(0.0) == 0
     assert throttled_ms(0.0004) == 0
@@ -244,7 +351,11 @@ def test_the_queue_for_one_session_is_bounded() -> None:
         paced.admit("gui", budget_s=5.0)
     assert refused.value.reason == "too many calls are queued"
     assert refused.value.waited_s == 0.0
-    assert refused.value.retry_after_s >= 0.05
+    assert refused.value.ahead == 3
+    # Nothing learned yet: the rest of a quarter second for the call out and
+    # the pause, at least the pause however long it has been out, then three
+    # calls of a quarter second and their pauses.
+    assert 0.95 - 1e-9 <= refused.value.retry_after_s <= 1.2 + 1e-9
     paced.done("gui")
     for thread in threads:
         thread.join(10)
@@ -309,15 +420,121 @@ class CountingBridge:
         return client.Answer(200, {"ok": True, "data": {}}, {})
 
 
-def real_router(rows: list, send: Any) -> Router:
+def real_router(rows: list, send: Any, *, max_queued: int = 32) -> Router:
     return Router(
         home=Path("."),
         open_store=lambda path: FakeStore(rows),
         open_session=FakeFiles([row.session_id for row in rows]).open,
         send=send,
         renew_lease=lambda store, session_id: None,
-        pacer=Pacer(min_pause_s=0.05, max_per_s=10),
+        pacer=Pacer(min_pause_s=0.05, max_per_s=10, max_queued=max_queued),
     )
+
+
+def test_forty_parallel_python_calls_mostly_queue_and_run() -> None:
+    bridge = CountingBridge(takes_s=0.05)
+    routed = real_router([record("s-1", "scene", kind="gui")], bridge)
+    target = routed.resolve(None)
+    answers: list[str] = []
+    refusals: list[CallError] = []
+    kept = threading.Lock()
+    go = threading.Barrier(40)
+
+    def caller(index: int) -> None:
+        go.wait()
+        try:
+            routed.call(
+                target, "python.run", wait_s=50.0, timeout_s=10.0, operation_id=f"op-{index}"
+            )
+            answer = "sent"
+        except CallError as error:
+            answer = error.code
+            with kept:
+                refusals.append(error)
+        with kept:
+            answers.append(answer)
+
+    threads = [threading.Thread(target=caller, args=(index,)) for index in range(40)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+    assert len(answers) == 40
+    # One out and 32 queued is the most that can arrive at once; the rest
+    # are told the queue is full, and nothing else is refused.
+    assert answers.count("sent") >= 33
+    assert len(bridge.tools) == answers.count("sent")
+    for error in refusals:
+        assert error.details["reason"] == "too many calls are queued"
+        assert error.details["queued_ahead"] == 32
+        assert 32 * 0.05 <= error.details["retry_after_s"] <= 30.0
+
+
+def test_short_calls_queue_behind_a_call_that_named_a_timeout() -> None:
+    release = threading.Event()
+    bridge = CountingBridge(hold=release, hold_first_only=True)
+    routed = real_router([record("s-1", "scene", kind="gui")], bridge)
+    target = routed.resolve(None)
+    first = threading.Thread(
+        target=lambda: routed.call(
+            target, "python.run", operation_id="op-1", wait_s=50.0, timeout_s=10.0
+        )
+    )
+    first.start()
+    try:
+        while not bridge.tools:
+            time.sleep(0.005)
+        threading.Timer(0.2, release.set).start()
+        started = time.monotonic()
+        second = routed.call(target, "python.run", operation_id="op-2", wait_s=50.0, timeout_s=10.0)
+        assert time.monotonic() - started < 5.0
+        assert second["throttled_ms"] >= 150
+        assert bridge.tools == ["python.run", "python.run"]
+    finally:
+        release.set()
+        first.join(10)
+
+
+def test_a_full_queue_refusal_reports_a_depth_based_retry() -> None:
+    release = threading.Event()
+    bridge = CountingBridge(hold=release)
+    routed = real_router([record("s-1", "scene", kind="gui")], bridge, max_queued=4)
+    target = routed.resolve(None)
+    outcomes: list[str] = []
+    kept = threading.Lock()
+
+    def caller(index: int) -> None:
+        try:
+            routed.call(target, "python.run", wait_s=30.0, operation_id=f"op-{index}")
+            outcome = "sent"
+        except CallError as error:
+            outcome = error.details.get("reason", error.code)
+        with kept:
+            outcomes.append(outcome)
+
+    threads = [threading.Thread(target=caller, args=(index,)) for index in range(5)]
+    for thread in threads:
+        thread.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not (
+            bridge.tools and len(routed.pacer._paces["s-1"].queue) == 4
+        ):
+            time.sleep(0.005)
+        with pytest.raises(CallError) as refused:
+            routed.call(target, "python.run", wait_s=30.0, operation_id="op-late")
+        details = refused.value.details
+        assert details["reason"] == "too many calls are queued"
+        assert details["queued_ahead"] == 4
+        # Nothing learned yet: what is left of a quarter second for the call
+        # out and the pause, then four calls of a quarter second and a pause.
+        assert 1.25 - 1e-9 <= details["retry_after_s"] <= 1.5 + 1e-9
+        assert "about" in refused.value.message
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(10)
+    assert outcomes == ["sent"] * 5
 
 
 def test_forty_callers_with_a_short_wait_are_mostly_busy_and_only_the_admitted_are_sent() -> None:
@@ -633,7 +850,10 @@ def test_a_resend_of_the_call_that_is_out_goes_straight_to_the_bridge() -> None:
         first.join(10)
 
 
-def test_a_call_behind_one_out_past_its_wait_is_refused_at_once_with_when() -> None:
+def test_a_call_behind_one_out_past_its_wait_waits_its_wait_then_says_when() -> None:
+    # A timeout the call out named is a ceiling, not an estimate, so the call
+    # behind it is given its wait; when that runs out it is told when to
+    # come back from what calls usually take.
     release = threading.Event()
     bridge = CountingBridge(hold=release)
     routed = real_router([record("s-1", "scene", kind="gui")], bridge)
@@ -652,13 +872,14 @@ def test_a_call_behind_one_out_past_its_wait_is_refused_at_once_with_when() -> N
             routed.call(target, "bridge.ping", wait_s=1.0)
         took = time.monotonic() - started
         error = refused.value
-        assert took < 0.1
+        # The whole of its wait and no more, with room for a coarse clock.
+        assert 0.9 <= took < 3.0
         assert error.code == "SESSION_BUSY"
-        reason = error.details["reason"]
-        assert reason == "another call holds the session longer than this call will wait"
-        # When to come back: the rest of the three seconds, then the pause.
-        assert 2.5 < error.details["retry_after_s"] <= 3.05
-        assert error.details["throttled_ms"] == 0
+        assert error.details["reason"] == "the wait ran out"
+        assert error.details["queued_ahead"] == 0
+        # Out past what calls usually take, so the pause is all there is to say.
+        assert error.details["retry_after_s"] == pytest.approx(0.05)
+        assert error.details["throttled_ms"] >= 900
         assert bridge.tools == ["python.run"]
     finally:
         release.set()
