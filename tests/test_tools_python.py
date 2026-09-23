@@ -730,7 +730,7 @@ def test_a_retry_from_a_restarted_server_replays_and_names_the_namespace_it_ran_
     assert len(scene.node("/obj").children()) == 1
 
 
-def test_a_retry_queued_behind_timed_out_code_gets_the_stored_answer(
+def test_a_retry_of_timed_out_code_never_meets_a_receipt_that_still_says_running(
     bench: Bench, module: Any, scene: Scene
 ) -> None:
     code = "hou.gate.wait(10)\nhou.node('/obj').createNode('geo')\nresult = 'finished'"
@@ -739,16 +739,17 @@ def test_a_retry_queued_behind_timed_out_code_gets_the_stored_answer(
         python(bench, code=code, timeout_s=0.2, operation_id="op-queued", background=False)
     )
     assert late["code"] == "TIMEOUT"
-    dispatcher = through(bench).dispatcher
-    done: list[Any] = []
-    retry = threading.Thread(
-        target=lambda: done.append(python(bench, code=code, operation_id="op-queued", wait_s=20))
-    )
-    retry.start()
-    support.wait_until(lambda: dispatcher.state()["queued"] == 1, timeout_s=10.0)
+    # While the code runs, a retry is told so at once, with the job.
+    running = ok(python(bench, code=code, operation_id="op-queued", wait_s=20))
+    assert running["state"] == "running"
+    assert running["job_id"] == late["details"]["job_id"]
+    # Sent while the answer is being written, it is still told the code runs,
+    # or given the answer; never an outcome nobody knows.
     module.gate.set()
-    retry.join(20.0)
-    body = ok(done[0])
+    during = ok(python(bench, code=code, operation_id="op-queued", wait_s=20))
+    assert during.get("result") == "finished" or during["state"] == "running"
+    support.wait_until(lambda: not through(bench).dispatcher.state()["busy"], timeout_s=10.0)
+    body = ok(python(bench, code=code, operation_id="op-queued", wait_s=20))
     assert body["result"] == "finished"
     assert len(scene.node("/obj").children()) == 1
 

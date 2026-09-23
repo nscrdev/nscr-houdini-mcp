@@ -180,17 +180,31 @@ def test_a_lost_reply_sent_again_by_another_server_makes_one_node_not_two(
     # goes away with it. The code is still running in the worker.
     assert asyncio.run(_abandon(place, ("hou_python", call), give_up_s=GIVE_UP_S)) is None
     # A second server has a default namespace of its own; the call names none.
-    retried, own = run(
-        place,
-        ("hou_python", {**call, "wait_s": 30}),
-        ("hou_python", {"code": "result = 1"}),
-    )
+    # Sent while the code still runs, it is told so at once, with the job.
+    [retried] = run(place, ("hou_python", {**call, "wait_s": 30}))
     body = ok(retried)
+    assert body["trace"]["operation_id"] == operation_id
+    if "result" not in body:
+        assert body["job_id"] == f"job-{operation_id}"
+        followed(place, body["job_id"])
+        [retried] = run(place, ("hou_python", call))
+        body = ok(retried)
+    [own] = run(place, ("hou_python", {"code": "result = 1"}))
     assert body["result"].startswith("/obj/geo")
     assert body["namespace"].startswith("c_")
     assert body["namespace"] != ok(own)["namespace"]
-    assert body["trace"]["operation_id"] == operation_id
     assert children(place) == before + 1
+
+
+def followed(place: dict[str, Any], job_id: str) -> dict[str, Any]:
+    """Wait on a job with held statuses until it ends."""
+    body: dict[str, Any] = {}
+    for _ in range(6):
+        [held] = run(place, ("hou_jobs", {"job_id": job_id, "wait_s": 10}))
+        body = ok(held)
+        if body["state"] not in ("queued", "running"):
+            break
+    return body
 
 
 async def _abandon(place: dict[str, Any], call: tuple[str, dict], *, give_up_s: float) -> Any:
@@ -231,25 +245,34 @@ def test_an_epoch_from_before_an_open_is_refused_and_outputs_follow_the_scene(
     assert folder.is_dir()
 
 
-def test_code_past_its_timeout_answers_and_a_queued_retry_gets_its_answer(
+def test_code_past_its_timeout_answers_and_a_retry_follows_its_job(
     place: dict[str, Any],
 ) -> None:
     code = "import time\ntime.sleep(5)\nruns = globals().get('runs', 0) + 1\nresult = runs"
     call = {"code": code, "namespace": "slow", "operation_id": client.new_operation_id()}
     operation_id = call["operation_id"]
-    slow, fetched, counted, after = run(
+    slow, again = run(
         place,
         ("hou_python", {**call, "timeout_s": 1, "background": False}),
-        # Sent while the code still runs: it queues behind it and gets the
-        # answer the code came to, never a receipt that still says running.
+        # Sent while the code still runs: it is told so at once, with the job
+        # to follow, rather than queueing behind itself.
         ("hou_python", {**call, "wait_s": 20}),
-        ("hou_python", {"code": "result = runs", "namespace": "slow"}),
-        ("hou_ping", {"wait_s": 0}),
     )
     error = refused(slow)
     assert error["code"] == "TIMEOUT"
     assert error["details"]["still_running"] is True
     assert error["details"]["operation_id"] == operation_id
+    assert ok(again)["job_id"] == error["details"]["job_id"]
+    assert ok(again)["state"] == "running"
+    ended = followed(place, error["details"]["job_id"])
+    assert ended["state"] == "done"
+    assert ended["outputs"]["result"] == 1
+    fetched, counted, after = run(
+        place,
+        ("hou_python", call),
+        ("hou_python", {"code": "result = runs", "namespace": "slow"}),
+        ("hou_ping", {"wait_s": 0}),
+    )
     assert ok(fetched)["result"] == 1
     assert ok(counted)["result"] == 1
     assert ok(after)["call"]["ok"] is True
