@@ -14,16 +14,20 @@ import io
 import json
 import struct
 import sys
+import threading
+import tracemalloc
 import types
+import zlib
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
+from mcp_types import ImageContent
 from PIL import Image, ImageCms
 
-from nscr_houdini_mcp import imaging, references
+from nscr_houdini_mcp import imaging, references, results
 from nscr_houdini_mcp.bridge import images
 from nscr_houdini_mcp.bridge.handlers import default_registry
 from nscr_houdini_mcp.bridge.tools import ToolContext
@@ -50,6 +54,13 @@ class Acting(Sent):
         return super().__call__(session, tool, **rest)
 
 
+@pytest.fixture(autouse=True)
+def no_session_libraries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The libraries a session may have are absent unless a test brings a stand in."""
+    monkeypatch.setitem(sys.modules, "PyOpenColorIO", None)
+    monkeypatch.setitem(sys.modules, "OpenImageIO", None)
+
+
 @pytest.fixture
 def project(tmp_path: Path) -> Path:
     folder = tmp_path / "project"
@@ -67,7 +78,6 @@ def hip(project: Path) -> Path:
 @pytest.fixture
 def bench(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Bench:
     monkeypatch.delenv("HOUDINI_TEMP_DIR", raising=False)
-    monkeypatch.setitem(sys.modules, "PyOpenColorIO", None)
     home = tmp_path / "home"
     home.mkdir()
     made = Bench(home)
@@ -282,7 +292,8 @@ def test_region_cuts_both_sides_before_the_overview(bench: Bench, hip: Path) -> 
     assert data["steps"]["crop_px"] == [480, 270, 960, 540]
     assert Image.open(data["files"]["candidate"]).size == (480, 270)
     assert Image.open(data["files"]["reference"]).size == (480, 270)
-    assert data["steps"]["resized_to"] == [1024, 576]
+    # Smaller than the working size, so it is counted as it is.
+    assert data["steps"]["resized_to"] == [480, 270]
 
 
 def test_an_unknown_crop_name_is_refused_with_the_names_there_are(bench: Bench, hip: Path) -> None:
@@ -482,7 +493,7 @@ def test_set_reference_writes_an_immutable_record_and_a_new_id_on_replace(
 def test_a_reference_is_found_by_name_and_an_unknown_name_says_so(bench: Bench, hip: Path) -> None:
     register(bench, hip, FRONT, name="front")
     data = body(compare(bench, hip, FRONT, "front"))
-    assert data["sources"]["reference_id"].startswith("ref-")
+    assert data["sources"]["reference"]["ref_id"].startswith("ref-")
     assert data["metrics"]["mae"]["overall"] == 0.0
     result = compare(bench, hip, FRONT, "frnt")
     assert code(result) == "REFERENCE_UNKNOWN"
@@ -558,13 +569,380 @@ def test_capture_sources_are_not_yet_available(bench: Bench, source: str) -> Non
     assert bench.sent.calls == []
 
 
+# Section: sizes, depths and memory
+
+
+def png16(path: Path, samples: np.ndarray) -> Path:
+    """A 16 bit RGB or RGBA PNG written by hand, since Pillow will not write one."""
+    height, width, count = samples.shape
+    colour_type = {3: 2, 4: 6}[count]
+    raw = b"".join(b"\0" + samples[row].astype(">u2").tobytes() for row in range(height))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(kind + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", crc)
+
+    header = struct.pack(">IIBBBBB", width, height, 16, colour_type, 0, 0, 0)
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
+    return path
+
+
+def test_a_dark_16_bit_grey_is_read_at_its_own_full_scale(tmp_path: Path) -> None:
+    grey = np.full((8, 8), 1000, dtype=np.uint16)
+    path = tmp_path / "dark16.png"
+    Image.fromarray(grey).save(path)
+    picture = imaging.read_display_file(path)
+    assert picture.colour["source_bits"] == 16
+    assert picture.colour["bits_read"] == 16
+    assert np.allclose(picture.rgb, 1000 / 65535, atol=1e-6)
+
+
+@pytest.mark.parametrize("count", [3, 4])
+def test_a_16_bit_colour_png_is_read_at_16_bits(tmp_path: Path, count: int) -> None:
+    samples = np.random.default_rng(3).integers(0, 65535, (5, 7, count), dtype=np.uint16)
+    picture = imaging.read_display_file(png16(tmp_path / "deep.png", samples))
+    assert picture.colour["source_bits"] == 16
+    assert picture.colour["bits_read"] == 16
+    assert np.allclose(picture.rgb, samples[..., :3] / 65535, atol=1e-6)
+    if count == 4:
+        assert np.allclose(picture.alpha, samples[..., 3] / 65535, atol=1e-6)
+        assert picture.alpha_note["present"] is True
+
+
+def test_an_8_bit_file_says_so() -> None:
+    picture = imaging.read_display_file(FRONT)
+    assert picture.colour["source_bits"] == 8
+    assert picture.colour["bits_read"] == 8
+    assert picture.colour["alpha"] == {"present": False, "premultiplied": False}
+
+
+def test_the_mean_is_counted_in_double_precision() -> None:
+    size = (2000, 2000, 3)
+    candidate = np.full(size, 0.3, dtype=np.float32)
+    reference = np.full(size, 0.2, dtype=np.float32)
+    counted = np.ones(size[:2], dtype=bool)
+    numbers = imaging.metrics(candidate, reference, counted, 0.05)
+    assert numbers["mae"]["r"] == pytest.approx(0.1, abs=1e-6)
+    assert numbers["mae"]["overall"] == pytest.approx(0.1, abs=1e-6)
+
+
+def test_a_small_image_is_counted_at_its_own_size(bench: Bench, hip: Path, tmp_path: Path) -> None:
+    small = save(tmp_path / "small.png", np.full((100, 200, 3), 90))
+    data = body(compare(bench, hip, small, small))
+    assert data["steps"]["resized_to"] == [200, 100]
+    assert imaging.working_size(4000, 2000) == (1024, 512)
+
+
+def test_an_image_over_the_budget_is_shrunk_on_read(
+    bench: Bench, hip: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    picture = imaging.read_display_file(FRONT, budget=960 * 540 // 4)
+    assert picture.resized_on_read == {"from": [960, 540], "to": [480, 270], "factor": 2}
+    assert picture.size == (480, 270)
+    monkeypatch.setattr(imaging, "PIXEL_BUDGET", 960 * 540 // 4)
+    data = body(compare(bench, hip, FRONT, THREE_QUARTER))
+    assert data["steps"]["resized_on_read"]["candidate"]["factor"] == 2
+
+
+def test_an_image_past_the_size_limit_has_its_own_code(
+    bench: Bench, hip: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
+    result = compare(bench, hip, FRONT, THREE_QUARTER)
+    assert code(result) == "IMAGE_TOO_LARGE"
+
+
+def test_a_missing_candidate_is_file_not_found(bench: Bench, hip: Path, tmp_path: Path) -> None:
+    result = compare(bench, hip, tmp_path / "gone.png", FRONT)
+    assert code(result) == "FILE_NOT_FOUND"
+
+
+def reply_bytes(result: Any) -> int:
+    return sum(results.block_size(block) for block in result.content)
+
+
+def test_a_full_sheet_too_large_for_the_reply_is_sent_as_the_thumbnail(
+    bench: Bench, hip: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    noise = np.random.default_rng(11)
+    first = save(tmp_path / "noise_a.png", noise.integers(0, 255, (576, 1024, 3)))
+    second = save(tmp_path / "noise_b.png", noise.integers(0, 255, (576, 1024, 3)))
+    monkeypatch.setattr(results, "REPLY_BUDGET_BYTES", 200_000)
+    result = compare(bench, hip, first, second, return_image="full")
+    data = body(result)
+    assert data["image_downgraded"] is True
+    [picture] = [block for block in result.content if block.type == "image"]
+    sheet = Image.open(io.BytesIO(base64.b64decode(picture.data)))
+    assert sheet.size == Image.open(data["files"]["overview"]).size
+    assert reply_bytes(result) <= 200_000
+    # With room for nothing, nothing is sent, and the result says so.
+    monkeypatch.setattr(results, "REPLY_BUDGET_BYTES", results.TEXT_BLOCK_CAP + 10)
+    bare = compare(bench, hip, first, second)
+    assert body(bare)["image_omitted"] is True
+    assert [block.type for block in bare.content] == ["text"]
+
+
+def test_a_block_over_the_reply_budget_is_never_sent(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(results, "REPLY_BUDGET_BYTES", 10_000)
+    big = ImageContent(type="image", data="A" * 20_000, mime_type="image/jpeg")
+    sent = results.ok_result({"a": 1}, {"session_id": None}, extra=[big])
+    assert [block.type for block in sent.content] == ["text"]
+    assert "left out" in sent.content[0].text
+
+
+# Section: adjust
+
+
+def test_a_large_scale_is_refused_before_anything_is_enlarged(
+    bench: Bench, hip: Path, tmp_path: Path
+) -> None:
+    square = save(tmp_path / "square.png", np.full((400, 400, 3), 90))
+    result = compare(bench, hip, square, square, adjust={"scale": 20})
+    assert code(result) == "BAD_ARGUMENTS"
+    assert result.structured_content["error"]["details"]["argument"] == "adjust.scale"
+
+
+def test_an_enlargement_resizes_only_what_lands_on_the_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    picture = imaging.read_display_file(FRONT)
+    sizes: list[tuple[int, ...]] = []
+    resize = imaging.resize
+
+    def watched(array: np.ndarray, width: int, height: int, box: Any = None) -> np.ndarray:
+        sizes.append((width, height))
+        return resize(array, width, height, box=box)
+
+    monkeypatch.setattr(imaging, "resize", watched)
+    aligned = imaging.align(picture, picture, adjust={"scale": 1.9})
+    assert aligned.valid.all()
+    # The enlargement would be 1824 by 1026; only about the frame's worth is made.
+    assert max(width * height for width, height in sizes) < 1.1 * 960 * 540
+    monkeypatch.setattr(imaging, "resize", resize)
+    whole = resize(picture.rgb, 1824, 1026)
+    left, top = (1824 - 960) // 2, (1026 - 540) // 2
+    expected = whole[top : top + 540, left : left + 960]
+    # The same pixels as enlarging the whole and cutting it, without the whole.
+    assert np.abs(aligned.candidate - np.clip(expected, 0, 1)).max() < 0.002
+
+
+def test_align_none_keeps_a_larger_candidate_at_its_own_pixels(tmp_path: Path) -> None:
+    reference = imaging.read_display_file(save(tmp_path / "ref.png", np.full((50, 100, 3), 90)))
+    candidate = imaging.read_display_file(save(tmp_path / "cand.png", np.full((100, 200, 3), 90)))
+    aligned = imaging.align(candidate, reference, mode="none")
+    steps = aligned.steps
+    assert steps["grid_px"] == [200, 100]
+    assert steps["candidate_scale"] == [1.0, 1.0]
+    assert steps["placed_px"] == {"x": 0, "y": 0, "width": 200, "height": 100}
+    assert steps["letterboxed"] is None
+    assert aligned.valid.all()
+
+
+def test_counting_a_4k_pair_stays_within_a_small_memory_bound() -> None:
+    """The numbers for a 4K crop are counted a block of rows at a time.
+
+    The pair itself is 200 MB. Counting it, and turning one side into a
+    picture, may take no more than 64 MB on top.
+    """
+    shape = (2160, 3840, 3)
+    candidate = np.full(shape, 0.3, dtype=np.float32)
+    reference = np.full(shape, 0.2, dtype=np.float32)
+    counted = np.ones(shape[:2], dtype=bool)
+    tracemalloc.start()
+    try:
+        numbers = imaging.metrics(candidate, reference, counted, 0.05)
+        _, after_numbers = tracemalloc.get_traced_memory()
+        tracemalloc.reset_peak()
+        imaging.to_image(candidate)
+        _, after_picture = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert numbers["mae"]["overall"] == pytest.approx(0.1, abs=1e-6)
+    assert numbers["diff_area_pct"] == 100.0
+    bound = 64 * 1024 * 1024
+    assert after_numbers < bound
+    assert after_picture < bound
+
+
+def test_adjust_moves_stay_within_the_frame(bench: Bench, hip: Path) -> None:
+    result = compare(bench, hip, FRONT, FRONT, adjust={"dx": 1.5})
+    assert code(result) == "BAD_ARGUMENTS"
+    assert result.structured_content["error"]["details"]["argument"] == "adjust.dx"
+
+
+# Section: names and records
+
+
+def test_a_name_with_a_dot_is_a_name_not_a_path(bench: Bench, hip: Path) -> None:
+    result = compare(bench, hip, FRONT, "hero.v2")
+    assert code(result) == "REFERENCE_UNKNOWN"
+
+
+def test_set_reference_refuses_a_name_it_would_have_to_change(bench: Bench, hip: Path) -> None:
+    result = run(bench, info(hip), action="set_reference", reference=str(FRONT), name="hero v2")
+    assert code(result) == "BAD_ARGUMENTS"
+    assert result.structured_content["error"]["details"]["did_you_mean"] == ["hero_v2"]
+
+
+def test_a_record_keeps_its_files_relative_and_survives_a_move(
+    bench: Bench, hip: Path, tmp_path: Path
+) -> None:
+    made = register(bench, hip, FRONT, name="front", mask=str(FRONT_MASK))
+    record = json.loads(Path(made["record"]).read_text(encoding="utf-8"))
+    assert record["image"] == Path(made["image"]).name
+    assert "/" not in record["mask"]["path"] and "\\" not in record["mask"]["path"]
+    assert record["source_note"] == str(FRONT)
+    moved = tmp_path / "moved"
+    hip.parent.rename(moved)
+    data = body(compare(bench, moved / hip.name, FRONT, "front", mask="reference"))
+    assert data["mask"]["source"] == "reference_record"
+    assert data["metrics"]["mae"]["overall"] == 0.0
+
+
+def test_a_failed_registration_leaves_nothing_behind(
+    bench: Bench, hip: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(path: Path, record: Any) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(references, "write_once", refuse)
+    result = run(
+        bench,
+        info(hip),
+        action="set_reference",
+        reference=str(FRONT),
+        name="front",
+        mask=str(FRONT_MASK),
+    )
+    assert code(result) == "OUTPUT_UNWRITABLE"
+    folder = hip.parent / ".agent" / "reference"
+    assert list(folder.iterdir()) == []
+    with bench.store() as store:
+        assert store.list_runs(kind="reference") == []
+
+
+def test_a_reference_folder_that_moves_per_run_is_refused(bench: Bench, hip: Path) -> None:
+    (hip.parent / ".agent").mkdir()
+    (hip.parent / ".agent" / "outputs.toml").write_text(
+        '[outputs.grammar]\nreference = "<output_root>/refs/<date>/<name>_<run_id>.<ext>"\n',
+        encoding="utf-8",
+    )
+    result = run(bench, info(hip), action="list_references")
+    assert code(result) == "OUTPUT_REFUSED"
+    assert "<date>" in result.structured_content["error"]["message"]
+
+
+def test_the_saved_result_holds_no_place_on_this_machine_but_the_scene(
+    bench: Bench, hip: Path, tmp_path: Path
+) -> None:
+    register(bench, hip, FRONT, name="front")
+    data = body(compare(bench, hip, THREE_QUARTER, "front", mask=str(FRONT_MASK)))
+    saved = json.loads(Path(data["files"]["result"]).read_text(encoding="utf-8"))
+    assert saved["files"]["overview"] == "overview.jpg"
+    assert saved["files"]["crops"]["largest_difference"] == "crops/largest_difference.png"
+    assert saved["scene_stamp"]["hip_path"] == str(hip)
+    saved["scene_stamp"].pop("hip_path")
+    text = json.dumps(saved)
+    assert str(tmp_path) not in text
+    assert str(Path.home()) not in text
+    assert "folder" not in saved
+    # The caller still gets places it can open.
+    assert Path(data["files"]["overview"]).is_file()
+    assert Path(data["sources"]["candidate"]["path"]) == THREE_QUARTER
+
+
+def test_each_run_of_a_series_is_a_file_of_its_own(bench: Bench, hip: Path) -> None:
+    register(bench, hip, THREE_QUARTER, name="tq")
+    first = body(compare(bench, hip, EIGHT_KEYS, "tq"))
+    body(compare(bench, hip, EIGHT_KEYS, "tq"))
+    folder = hip.parent / ".agent" / "reference" / "series" / first["series"]["id"]
+    assert len(list(folder.glob("*.json"))) == 2
+    with pytest.raises(FileExistsError):
+        references.log_run(
+            hip.parent / ".agent" / "reference", first["series"]["id"], {"run_id": first["run_id"]}
+        )
+
+
+def test_partial_candidate_alpha_without_a_mask_is_warned_about(
+    bench: Bench, hip: Path, tmp_path: Path
+) -> None:
+    rgb = np.full((50, 80, 3), 100)
+    alpha = np.full((50, 80, 1), 255)
+    alpha[:, :40] = 0
+    candidate = save(tmp_path / "cut.png", np.concatenate([rgb, alpha], axis=2))
+    reference = save(tmp_path / "plain.png", rgb)
+    data = body(compare(bench, hip, candidate, reference))
+    assert data["steps"]["alpha"]["candidate"]["partial"] is True
+    assert data["steps"]["alpha"]["reference"] == {"present": False}
+    assert any("partial alpha" in warning for warning in data["warnings"])
+    white = save(tmp_path / "white.png", np.full((50, 80, 3), 255))
+    masked = body(compare(bench, hip, candidate, reference, mask=str(white)))
+    assert not any("partial alpha" in warning for warning in masked["warnings"] or [])
+
+
 # Section: scene linear files, through a stand in Houdini
 
 
+def exr_file(path: Path, width: int = 6, height: int = 4, channels: str = "ABGR") -> Path:
+    """An EXR header with nothing after it: enough for anything that reads only the header."""
+
+    def attribute(name: str, kind: str, value: bytes) -> bytes:
+        return name.encode() + b"\0" + kind.encode() + b"\0" + struct.pack("<i", len(value)) + value
+
+    chlist = b"".join(letter.encode() + b"\0" + bytes(16) for letter in channels) + b"\0"
+    window = struct.pack("<4i", 0, 0, width - 1, height - 1)
+    path.write_bytes(
+        images_magic()
+        + struct.pack("<I", 2)
+        + attribute("channels", "chlist", chlist)
+        + attribute("dataWindow", "box2i", window)
+        + attribute("displayWindow", "box2i", window)
+        + b"\0"
+    )
+    return path
+
+
+def images_magic() -> bytes:
+    return imaging.EXR_MAGIC
+
+
+class Window:
+    """A window as Houdini hands one back, with a corner at each end."""
+
+    def __init__(self, x0: int, y0: int, x1: int, y1: int) -> None:
+        self.low, self.high = (x0, y0), (x1, y1)
+
+    def min(self) -> tuple[int, int]:
+        return self.low
+
+    def max(self) -> tuple[int, int]:
+        return self.high
+
+
 class Layer:
-    def __init__(self, pixels: np.ndarray, *, half: bool = False) -> None:
+    STORAGE = {
+        np.float32: "imageLayerStorageType.Float32",
+        np.float16: "imageLayerStorageType.Float16",
+        np.uint8: "imageLayerStorageType.Int8",
+    }
+
+    def __init__(
+        self,
+        pixels: np.ndarray,
+        *,
+        kind: Any = np.float32,
+        data: Window | None = None,
+        shown: Window | None = None,
+        fails: bool = False,
+    ) -> None:
         self.pixels = pixels
-        self.half = half
+        self.kind = kind
+        self.data, self.shown, self.fails = data, shown, fails
 
     def bufferResolution(self) -> tuple[int, int]:  # noqa: N802 - Houdini's own name
         return self.pixels.shape[1], self.pixels.shape[0]
@@ -572,9 +950,22 @@ class Layer:
     def channelCount(self) -> int:  # noqa: N802
         return self.pixels.shape[2]
 
+    def storageType(self) -> str:  # noqa: N802
+        return self.STORAGE[self.kind]
+
+    def dataWindow(self) -> Window | None:  # noqa: N802
+        return self.data
+
+    def displayWindow(self) -> Window | None:  # noqa: N802
+        return self.shown
+
     def allBufferElements(self) -> bytes:  # noqa: N802
-        kind = np.float16 if self.half else np.float32
-        return np.ascontiguousarray(self.pixels[::-1], dtype=kind).tobytes()
+        if self.fails:
+            raise RuntimeError("the cook failed")
+        rows = self.pixels[::-1]
+        if self.kind is np.uint8:
+            rows = np.round(rows * 255)
+        return np.ascontiguousarray(rows, dtype=self.kind).tobytes()
 
 
 class Parm:
@@ -665,21 +1056,82 @@ def linear_ramp() -> np.ndarray:
     return pixels
 
 
-def test_the_session_reader_writes_display_values_rows_from_the_top(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setitem(sys.modules, "PyOpenColorIO", None)
-    exr = tmp_path / "beauty.exr"
-    exr.write_bytes(b"stand in")
+def fake_ocio(view: str) -> Any:
+    class Processor:
+        def applyRGB(self, pixels: np.ndarray) -> None:  # noqa: N802
+            pixels *= 0.5
+
+    class Config:
+        @staticmethod
+        def CreateFromFile(path: str) -> Config:  # noqa: N802
+            return Config()
+
+        def getDefaultDisplay(self) -> str:  # noqa: N802
+            return "sRGB - Display"
+
+        def getDefaultView(self, display: str) -> str:  # noqa: N802
+            return view
+
+        def getProcessor(self, transform: Any) -> Any:  # noqa: N802
+            return types.SimpleNamespace(getDefaultCPUProcessor=Processor)
+
+    return types.SimpleNamespace(
+        Config=Config,
+        GetCurrentConfig=Config,
+        DisplayViewTransform=lambda **rest: rest,
+        ROLE_SCENE_LINEAR="scene_linear",
+    )
+
+
+def fake_oiio(pixels: np.ndarray, *, origin: tuple[int, int], full: tuple[int, int]) -> Any:
+    """OpenImageIO as far as the reader uses it: a data window inside a display window."""
+    height, width, count = pixels.shape
+    spec = types.SimpleNamespace(
+        x=origin[0],
+        y=origin[1],
+        width=width,
+        height=height,
+        full_x=0,
+        full_y=0,
+        full_width=full[0],
+        full_height=full[1],
+        nchannels=count,
+        channelnames=("R", "G", "B", "A")[:count],
+        alpha_channel=3 if count == 4 else -1,
+    )
+
+    class Input:
+        closed = False
+
+        def spec(self) -> Any:
+            return spec
+
+        def read_image(self, *arguments: Any) -> np.ndarray:  # noqa: N802
+            return pixels.copy()
+
+        def close(self) -> None:
+            Input.closed = True
+
+    return types.SimpleNamespace(ImageInput=types.SimpleNamespace(open=lambda path: Input()))
+
+
+def test_the_session_reader_writes_display_values_rows_from_the_top(tmp_path: Path) -> None:
+    exr = exr_file(tmp_path / "beauty.exr")
     stand = StandIn([Layer(np.zeros((1, 1, 1))), Layer(linear_ramp())], ["depth", "C"])
     out = tmp_path / "read.f32"
     data = images.read_exr(
         {"path": str(exr), "out_path": str(out)}, ToolContext(hou=stand, kind="hython")
     )
     assert (data["width"], data["height"], data["channels"]) == (6, 4, 4)
-    assert data["colour"]["channel"] == "C"
+    assert data["route"] == "cop_file_node"
+    assert data["scene_marked_changed"] is True
+    assert data["colour"]["channel"] == "C.R,C.G,C.B"
     assert data["colour"]["transform"] == "srgb_curve"
-    assert data["colour"]["alpha"] == "kept apart"
+    assert data["colour"]["alpha"] == {
+        "present": True,
+        "premultiplied": True,
+        "unpremultiplied": True,
+    }
     [reader] = stand.readers
     assert reader.parms == {"filename": str(exr)}
     assert reader.pressed == ["addaovs"]
@@ -689,17 +1141,114 @@ def test_the_session_reader_writes_display_values_rows_from_the_top(
     values = np.fromfile(out, dtype=np.float32).reshape(4, 6, 4)
     assert np.allclose(values[0, :, :3], 1.0)
     assert np.allclose(values[1:, :, :3], 0.5, atol=0.01)
-    # Half floats are read too.
-    half = StandIn([Layer(linear_ramp(), half=True)], ["C"])
-    images.read_exr(
-        {"path": str(exr), "out_path": str(tmp_path / "half.f32")}, ToolContext(hou=half)
+
+
+@pytest.mark.parametrize("kind", [np.float16, np.uint8])
+def test_the_session_reader_decodes_by_storage_type(tmp_path: Path, kind: Any) -> None:
+    exr = exr_file(tmp_path / "beauty.exr")
+    stand = StandIn([Layer(linear_ramp(), kind=kind)], ["C"])
+    out = tmp_path / "read.f32"
+    images.read_exr({"path": str(exr), "out_path": str(out)}, ToolContext(hou=stand))
+    values = np.fromfile(out, dtype=np.float32).reshape(4, 6, 4)
+    assert np.allclose(values[0, :, :3], 1.0, atol=0.01)
+    assert np.allclose(values[1:, :, :3], 0.5, atol=0.02)
+
+
+def test_the_session_reader_places_the_data_window_in_the_display_window(
+    tmp_path: Path,
+) -> None:
+    exr = exr_file(tmp_path / "beauty.exr")
+    small = np.ones((2, 3, 4), dtype=np.float32)
+    # Bottom up, as Houdini counts: two rows starting one row up, three columns from x 2.
+    layer = Layer(small, data=Window(2, 1, 5, 3), shown=Window(0, 0, 6, 4))
+    stand = StandIn([layer], ["C"])
+    out = tmp_path / "read.f32"
+    data = images.read_exr({"path": str(exr), "out_path": str(out)}, ToolContext(hou=stand))
+    assert (data["width"], data["height"]) == (6, 4)
+    values = np.fromfile(out, dtype=np.float32).reshape(4, 6, 4)
+    lit = values[..., 3] > 0.5
+    # From the top, the lit block is rows 1 and 2, columns 2 to 4.
+    expected = np.zeros((4, 6), dtype=bool)
+    expected[1:3, 2:5] = True
+    assert np.array_equal(lit, expected)
+
+
+def test_the_network_is_removed_even_when_the_read_fails(tmp_path: Path) -> None:
+    exr = exr_file(tmp_path / "beauty.exr")
+    stand = StandIn([Layer(linear_ramp(), fails=True)], ["C"])
+    with pytest.raises(RuntimeError):
+        images.read_exr(
+            {"path": str(exr), "out_path": str(tmp_path / "x.f32")}, ToolContext(hou=stand)
+        )
+    [holder] = stand.holders
+    assert holder.destroyed is True
+    assert not (tmp_path / "x.f32").exists()
+
+
+def test_openimageio_reads_without_any_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pixels = np.full((2, 3, 4), 0.2140, dtype=np.float32)
+    pixels[..., 3] = 1.0
+    monkeypatch.setitem(sys.modules, "OpenImageIO", fake_oiio(pixels, origin=(1, 1), full=(6, 4)))
+    exr = exr_file(tmp_path / "beauty.exr")
+    stand = StandIn([], [])
+    out = tmp_path / "read.f32"
+    data = images.read_exr({"path": str(exr), "out_path": str(out)}, ToolContext(hou=stand))
+    assert data["route"] == "OpenImageIO"
+    assert data["scene_marked_changed"] is False
+    assert stand.holders == []
+    values = np.fromfile(out, dtype=np.float32).reshape(4, 6, 4)
+    assert np.allclose(values[1:3, 1:4, :3], 0.5, atol=0.01)
+    assert values[0].max() == 0.0 and values[:, 0].max() == 0.0
+
+
+def test_premultiplied_colour_is_divided_by_alpha_before_the_transform(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pixels = np.zeros((1, 2, 4), dtype=np.float32)
+    pixels[..., :3] = 0.1070  # 0.2140 at half coverage
+    pixels[..., 3] = 0.5
+    monkeypatch.setitem(sys.modules, "OpenImageIO", fake_oiio(pixels, origin=(0, 0), full=(2, 1)))
+    exr = exr_file(tmp_path / "beauty.exr", width=2, height=1)
+    out = tmp_path / "read.f32"
+    data = images.read_exr(
+        {"path": str(exr), "out_path": str(out)}, ToolContext(hou=StandIn([], []))
     )
-    assert np.allclose(np.fromfile(tmp_path / "half.f32", dtype=np.float32)[:3], 1.0)
+    values = np.fromfile(out, dtype=np.float32).reshape(1, 2, 4)
+    assert np.allclose(values[..., :3], 0.5, atol=0.01)
+    assert np.allclose(values[..., 3], 0.5)
+    assert data["alpha"]["partial"] is True
+
+
+def test_a_stopped_read_leaves_no_file(tmp_path: Path) -> None:
+    exr = exr_file(tmp_path / "beauty.exr")
+    stop = threading.Event()
+    stop.set()
+    out = tmp_path / "read.f32"
+    data = images.read_exr(
+        {"path": str(exr), "out_path": str(out)},
+        ToolContext(hou=StandIn([Layer(linear_ramp())], ["C"]), cancel=stop),
+    )
+    assert data == {"cancelled": True, "written": False}
+    assert not out.exists()
+
+
+def test_a_large_read_is_shrunk_in_the_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(images, "PIXEL_BUDGET", 6)
+    exr = exr_file(tmp_path / "beauty.exr")
+    out = tmp_path / "read.f32"
+    data = images.read_exr(
+        {"path": str(exr), "out_path": str(out)},
+        ToolContext(hou=StandIn([Layer(linear_ramp())], ["C"])),
+    )
+    assert data["resized_on_read"] == {"from": [6, 4], "to": [3, 2], "factor": 2}
 
 
 def test_the_session_reader_refuses_what_it_should_not_write(tmp_path: Path) -> None:
-    exr = tmp_path / "beauty.exr"
-    exr.write_bytes(b"stand in")
+    exr = exr_file(tmp_path / "beauty.exr")
     stand = StandIn([Layer(linear_ramp())], ["C"])
     taken = tmp_path / "taken.f32"
     taken.write_bytes(b"")
@@ -721,36 +1270,11 @@ def test_the_session_reader_refuses_what_it_should_not_write(tmp_path: Path) -> 
 def test_the_session_reader_uses_the_opencolorio_view_when_there_is_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class Processor:
-        def applyRGB(self, pixels: np.ndarray) -> None:  # noqa: N802
-            pixels *= 0.5
-
-    class Config:
-        @staticmethod
-        def CreateFromFile(path: str) -> Config:  # noqa: N802
-            made = Config()
-            made.path = path
-            return made
-
-        def getDefaultDisplay(self) -> str:  # noqa: N802
-            return "sRGB - Display"
-
-        def getDefaultView(self, display: str) -> str:  # noqa: N802
-            return "Standard"
-
-        def getProcessor(self, transform: Any) -> Any:  # noqa: N802
-            return types.SimpleNamespace(getDefaultCPUProcessor=Processor)
-
-    fake = types.SimpleNamespace(
-        Config=Config,
-        GetCurrentConfig=Config,
-        DisplayViewTransform=lambda **rest: rest,
-        ROLE_SCENE_LINEAR="scene_linear",
-    )
-    monkeypatch.setitem(sys.modules, "PyOpenColorIO", fake)
-    monkeypatch.setenv("OCIO", str(tmp_path / "config.ocio"))
-    exr = tmp_path / "beauty.exr"
-    exr.write_bytes(b"stand in")
+    monkeypatch.setitem(sys.modules, "PyOpenColorIO", fake_ocio("Standard"))
+    config = tmp_path / "config.ocio"
+    config.write_text("ocio_profile_version: 2\n", encoding="utf-8")
+    monkeypatch.setenv("OCIO", str(config))
+    exr = exr_file(tmp_path / "beauty.exr")
     stand = StandIn([Layer(linear_ramp())], ["C"])
     data = images.read_exr(
         {"path": str(exr), "out_path": str(tmp_path / "v.f32")}, ToolContext(hou=stand)
@@ -759,7 +1283,10 @@ def test_the_session_reader_uses_the_opencolorio_view_when_there_is_one(
     assert colour["transform"] == "ocio_display_view"
     assert colour["display"] == "sRGB - Display"
     assert colour["view"] == "Standard"
-    assert colour["configuration"] == str(tmp_path / "config.ocio")
+    # Named by file name and content, never by where it is.
+    assert colour["configuration"] == "config.ocio"
+    assert colour["configuration_sha256"] == references.file_hash(config)
+    assert str(tmp_path) not in json.dumps(colour)
     assert colour["exposure"] == 0.0
     values = np.fromfile(tmp_path / "v.f32", dtype=np.float32).reshape(4, 6, 4)
     assert np.allclose(values[0, :, :3], 0.5)
@@ -771,32 +1298,72 @@ def test_the_reader_is_registered_on_the_bridge_as_a_read() -> None:
     assert set(tool.required) == {"path", "out_path"}
 
 
-def test_an_exr_candidate_goes_through_the_session_and_is_flagged_against_a_png(
-    bench: Bench, hip: Path, tmp_path: Path
-) -> None:
-    exr = tmp_path / "beauty.exr"
-    exr.write_bytes(b"stand in")
-    grey = save(tmp_path / "grey.png", np.full((4, 6, 3), 128))
+def exr_through_the_session(bench: Bench, hip: Path, tmp_path: Path) -> tuple[Path, Any]:
+    exr = exr_file(tmp_path / "beauty.exr")
     stand = StandIn([Layer(linear_ramp())], ["C"])
 
     def session_reads(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
         assert tool == "compare.read_exr"
         return reply(images.read_exr(arguments, ToolContext(hou=stand)))
 
-    result = run(
-        bench,
-        info(hip),
-        session_reads,
-        candidate={"source": "file", "path": str(exr)},
-        reference=str(grey),
+    return exr, session_reads
+
+
+def test_an_exr_candidate_goes_through_the_session_into_the_compare_folder(
+    bench: Bench, hip: Path, tmp_path: Path
+) -> None:
+    exr, session_reads = exr_through_the_session(bench, hip, tmp_path)
+    grey = save(tmp_path / "grey.png", np.full((4, 6, 3), 128))
+    data = body(
+        run(
+            bench,
+            info(hip),
+            session_reads,
+            candidate={"source": "file", "path": str(exr)},
+            reference=str(grey),
+        )
     )
-    data = body(result)
     assert [call["tool"] for call in bench.sent.calls] == ["scene.info", "compare.read_exr"]
-    sent = bench.sent.calls[1]["arguments"]
-    assert not Path(sent["out_path"]).exists()
+    sent = Path(bench.sent.calls[1]["arguments"]["out_path"])
+    assert sent.parent == Path(data["folder"])
+    assert not sent.exists()
     assert data["colour"]["candidate"]["kind"] == "view_transform"
     assert data["steps"]["view_transform"]["candidate"]["transform"] == "srgb_curve"
     assert data["steps"]["view_transform"]["reference"] is None
+    assert data["steps"]["session_read"]["candidate"]["route"] == "cop_file_node"
+    # A plain sRGB curve against a file made for sRGB is a fair pair.
+    assert data["transfer_mismatch_possible"] == {"flag": False, "why": []}
+
+
+def test_a_tone_mapped_view_against_an_srgb_file_is_flagged(
+    bench: Bench, hip: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(sys.modules, "PyOpenColorIO", fake_ocio("Filmic"))
+    exr, session_reads = exr_through_the_session(bench, hip, tmp_path)
+    grey = save(tmp_path / "grey.png", np.full((4, 6, 3), 128))
+    data = body(
+        run(
+            bench,
+            info(hip),
+            session_reads,
+            candidate={"source": "file", "path": str(exr)},
+            reference=str(grey),
+        )
+    )
     flagged = data["transfer_mismatch_possible"]
     assert flagged["flag"] is True
-    assert "different kinds of transform" in flagged["why"][0]
+    assert "Filmic" in flagged["why"][0]
+
+
+def test_an_exr_reference_is_registered_from_its_header(
+    bench: Bench, hip: Path, tmp_path: Path
+) -> None:
+    exr = exr_file(tmp_path / "plate.exr", width=64, height=48)
+    made = register(bench, hip, exr, name="plate")
+    assert made["size_px"] == [64, 48]
+    assert made["colour"]["format"] == "EXR"
+    assert made["colour"]["channels"] == ["A", "B", "G", "R"]
+    broken = tmp_path / "broken.exr"
+    broken.write_bytes(b"not an exr")
+    result = run(bench, info(hip), action="set_reference", reference=str(broken))
+    assert code(result) == "IMAGE_UNREADABLE"

@@ -159,7 +159,11 @@ def test_an_exr_is_read_by_the_session_through_its_display_transform(
         assert colour["display"] and colour["view"]
     assert colour["channel"]
     assert data["steps"]["grid_px"] == [64, 48]
-    assert data["transfer_mismatch_possible"]["flag"] is True
+    read = data["steps"]["session_read"]["candidate"]
+    assert read["route"] in ("OpenImageIO", "cop_file_node")
+    assert read["scene_marked_changed"] is (read["route"] == "cop_file_node")
+    if colour["transform"] == "srgb_curve":
+        assert data["transfer_mismatch_possible"]["flag"] is False
 
     # Rows come from the top: the light half is on top in the aligned copy.
     candidate = np.asarray(Image.open(data["files"]["candidate"]).convert("L"), dtype=float)

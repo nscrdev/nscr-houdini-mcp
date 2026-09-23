@@ -3,13 +3,14 @@
 Three actions.
 
 - `compare`, the default. The candidate is a file in this build; a viewport
-  capture, a node's own image and a render are named in the schema and answer
-  `NOT_YET_AVAILABLE` until the capture tool arrives. The work follows the
-  order in `imaging`: colour, alignment at native size, crops cut before
+  capture, a node's own image and a render are named in the schema and
+  answer `NOT_YET_AVAILABLE` until the capture tool arrives. The work follows
+  the order in `imaging`: colour, alignment at native size, crops cut before
   anything is shrunk, then the overview. Every step is recorded in the
   result. The files go to a managed `compare` folder: the aligned pair, the
   difference map, the labelled overview sheet, one side by side file per
-  detail crop and `result.json` with everything the call returned.
+  detail crop and `result.json`, which names every file relative to itself
+  and holds no other place on this machine than the scene's own path.
 - `set_reference` registers an image under a name, with an optional camera
   path, named detail regions and a mask. The record is written once and never
   changed; registering the name again makes a new one with a new id.
@@ -22,8 +23,8 @@ that can be read against each other form a series, and a result in a series
 that has earlier runs carries the trend.
 
 A scene linear file (EXR, HDR) is read by the session, which applies its
-display transform; the rest is done here, in the server process, with NumPy
-and Pillow.
+display transform and writes the pixels into this compare's own folder; the
+rest is done here, in the server process, with NumPy and Pillow.
 
 This module never imports `hou`.
 """
@@ -33,7 +34,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import secrets
 import sqlite3
 import time
 from collections.abc import Callable, Mapping
@@ -46,6 +46,7 @@ from mcp_types import Annotations, ImageContent
 
 from nscr_houdini_mcp import outputs as outputs_module
 from nscr_houdini_mcp import references
+from nscr_houdini_mcp import results as results_module
 from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge.errors import did_you_mean
 from nscr_houdini_mcp.results import CallError
@@ -65,15 +66,30 @@ DEFAULT_TOLERANCE = 0.05
 # Files the session reads, through its display transform.
 LINEAR_SUFFIXES = (".exr", ".hdr")
 
+# The file a session writes a scene linear side into, inside the compare folder.
+RAW_NAMES = {"candidate": "_candidate_read.f32", "reference": "_reference_read.f32"}
+
 # How much room the automatic crop leaves around the largest difference.
 AUTO_CROP_MARGIN = 0.1
 AUTO_CROP_NAME = "largest_difference"
 
+# The furthest `adjust` moves the candidate, as a share of the frame.
+MAX_MOVE = 1.0
+
 MASK_NONE = "none"
 MASK_REFERENCE = "reference"
 
+# Views that show scene linear values on an sRGB display with no tone curve,
+# so a file drawn for sRGB is a fair match for them.
+PLAIN_VIEWS = frozenset({"un-tone-mapped", "untonemapped", "standard", "srgb", "plain srgb curve"})
+
 LIKENESS_NOTE = "secondary: lighting, material and framing move these numbers; read the sheet first"
 REGRESSION_NOTE = "primary: the same setup rendered again, so a change in the numbers is a change"
+
+PARTIAL_ALPHA_WARNING = (
+    "the candidate has partial alpha and no mask is set, so its transparent pixels count "
+    "as the colour they store; pass mask to count only the reference's area"
+)
 
 # Where the conventions come from, named the way a person finds them.
 CONVENTION_FILES = (
@@ -238,6 +254,13 @@ def check_adjust(value: Any) -> dict[str, float] | None:
                 "BAD_ARGUMENTS", f"adjust.{key} must be a number", details={"argument": key}
             )
         moved[key] = float(number)
+    for key in ("dx", "dy"):
+        if not -MAX_MOVE <= moved[key] <= MAX_MOVE:
+            raise CallError(
+                "BAD_ARGUMENTS",
+                f"adjust.{key} is a share of the frame, from -1 to 1",
+                details={"argument": f"adjust.{key}"},
+            )
     if not 0.05 <= moved["scale"] <= 20.0:
         raise CallError(
             "BAD_ARGUMENTS",
@@ -292,9 +315,16 @@ def set_reference(call: Call) -> dict[str, Any]:
         mask = a_file(mask_value, "mask")
         readable(lambda: imaging().read_mask(mask), "mask")
     camera = text_or_none(call.arguments.get("camera"), "camera")
+    given = text_or_none(call.arguments.get("name"), "name")
+    if given is not None and outputs_module.sanitize_name(given) != given:
+        raise CallError(
+            "BAD_ARGUMENTS",
+            "a reference name may hold only letters, digits, underscore and dash",
+            details={"argument": "name", "did_you_mean": [outputs_module.sanitize_name(given)]},
+        )
+    name = given or outputs_module.sanitize_name(source.stem)
     colour, size = colour_on_record(source)
     scene = scene_of(call)
-    name = text_or_none(call.arguments.get("name"), "name") or source.stem
 
     def register() -> dict[str, Any]:
         with call.router.store(create=True) as store:
@@ -303,7 +333,7 @@ def set_reference(call: Call) -> dict[str, Any]:
                 home=scene.home,
                 hip_path=scene.hip,
                 session_id=scene.session_id,
-                name=str(name),
+                name=name,
                 source=source,
                 colour=colour,
                 size=size,
@@ -316,9 +346,10 @@ def set_reference(call: Call) -> dict[str, Any]:
     record = guarded("reference", register)
     return {
         "name": record["name"],
+        "name_from_file": given is None,
         "ref_id": record["ref_id"],
         "record": str(scene.place / f"{record['ref_id']}.json"),
-        "image": record["image"],
+        "image": str(references.resolve(scene.place, record["image"])),
         "sha256": record["sha256"],
         "size_px": [record["width"], record["height"]] if record["width"] else None,
         "colour": record["colour"],
@@ -331,14 +362,26 @@ def set_reference(call: Call) -> dict[str, Any]:
 
 
 def colour_on_record(source: Path) -> tuple[dict[str, Any], tuple[int, int] | None]:
-    """What a reference's record says about its colour, read from the file here."""
+    """What a reference's record says about its colour, read from the file here.
+
+    A scene linear file is read only as far as its header: its size and
+    channels are recorded, and the display transform is applied at compare
+    time, by the session.
+    """
+    module = imaging()
     if source.suffix.lower() in LINEAR_SUFFIXES:
+        header = readable(lambda: module.read_linear_header(source), "reference")
         return {
-            "kind": imaging().VIEW_KIND,
+            "kind": module.VIEW_KIND,
             "profile": "scene_linear",
+            "format": header["format"],
+            "channels": header["channels"],
             "note": "brought to display values by the session at compare time",
-        }, None
-    picture = readable(lambda: imaging().read_display_file(source), "reference")
+        }, (header["width"], header["height"])
+    picture = readable(lambda: module.read_display_file(source), "reference")
+    if picture.resized_on_read:
+        width, height = picture.resized_on_read["from"]
+        return picture.colour, (width, height)
     return picture.colour, picture.size
 
 
@@ -400,12 +443,6 @@ def compare(call: Call) -> dict[str, Any]:
     record, reference_path = which_reference(scene, str(arguments["reference"]))
     wanted_crops = crops_wanted(arguments.get("detail_crops", "auto"), record)
     settings["detail_crops"] = sorted(wanted_crops) if wanted_crops is not None else "auto"
-
-    # 1. Colour first: both sides to display values, with a record of how.
-    candidate = load_side(call, candidate_path, "candidate", scene)
-    reference = load_side(call, reference_path, "reference", scene)
-    mask_map, mask_record = mask_for(arguments.get("mask"), record, reference)
-
     name = text_or_none(arguments.get("name"), "name") or (
         record["name"] if record else reference_path.stem
     )
@@ -425,23 +462,39 @@ def compare(call: Call) -> dict[str, Any]:
 
     plan = guarded("compare", allocate)
     folder = Path(plan.directory)
-    report = guarded(
-        "compare",
-        lambda: run(
-            candidate,
-            reference,
-            folder=folder,
-            settings=settings,
-            region=region,
-            crops=wanted_crops,
-            mask_map=mask_map,
-        ),
-    )
+    try:
+        # 1. Colour first: both sides to display values, with a record of how.
+        candidate = load_side(call, candidate_path, "candidate", plan)
+        reference = load_side(call, reference_path, "reference", plan)
+        mask_map, mask_record = mask_for(arguments.get("mask"), record, reference, scene.place)
+    except BaseException:
+        give_back(call, plan)
+        raise
+
+    module = imaging()
+    try:
+        report = guarded(
+            "compare",
+            lambda: run(
+                candidate,
+                reference,
+                folder=folder,
+                settings=settings,
+                region=region,
+                crops=wanted_crops,
+                mask_map=mask_map,
+            ),
+        )
+    except module.AlignRefused as error:
+        give_back(call, plan)
+        raise CallError("BAD_ARGUMENTS", str(error), details={"argument": "adjust.scale"}) from None
 
     reference_hash = references.file_hash(reference_path)
     warnings = list(plan.warnings)
     if record and record.get("sha256") != reference_hash:
         warnings.append("the registered reference image changed on disk since it was registered")
+    if candidate.alpha_note.get("partial") and mask_record is None:
+        warnings.append(PARTIAL_ALPHA_WARNING)
     key = {
         "reference": {"ref_id": record["ref_id"] if record else None, "sha256": reference_hash},
         "camera": record.get("camera") if record else None,
@@ -452,10 +505,9 @@ def compare(call: Call) -> dict[str, Any]:
     }
     series, trend = follow_series(scene.place, key, str(plan.name), report["metrics_numbers"])
 
-    result = {
+    saved = {
         "name": plan.name,
         "run_id": plan.run_id,
-        "folder": str(folder),
         "files": report["files"],
         "metrics": report["metrics"],
         "largest_region": report["largest_region"],
@@ -466,17 +518,23 @@ def compare(call: Call) -> dict[str, Any]:
         "colour": {"candidate": candidate.colour, "reference": reference.colour},
         "mask": mask_record,
         "sources": {
-            "candidate": str(candidate_path),
-            "reference": str(reference_path),
-            "reference_id": record["ref_id"] if record else None,
-            "reference_sha256": reference_hash,
+            "candidate": {
+                "file": candidate_path.name,
+                "sha256": references.file_hash(candidate_path),
+            },
+            "reference": {
+                "file": reference_path.name,
+                "ref_id": record["ref_id"] if record else None,
+                "name": record["name"] if record else None,
+                "sha256": reference_hash,
+            },
         },
         "series": series,
         "trend": trend,
         "scene_stamp": scene.stamp,
         "warnings": warnings or None,
     }
-    write_result(folder / "result.json", result)
+    write_result(folder / "result.json", saved)
     references.log_run(
         scene.place,
         series["id"],
@@ -487,19 +545,56 @@ def compare(call: Call) -> dict[str, Any]:
             "when_iso": datetime.now().isoformat(timespec="seconds"),
             "key": key,
             "metrics": report["metrics_numbers"],
-            "result": str(folder / "result.json"),
+            "result": relative_to(folder / "result.json", scene.place),
         },
     )
-    attach_picture(call, arguments.get("return_image") or "thumb", report)
-    return result
+    sent = attach_picture(call, arguments.get("return_image") or "thumb", report)
+    # What the caller gets is the saved record with places it can open here.
+    return {
+        **saved,
+        **sent,
+        "folder": str(folder),
+        "files": absolute(folder, report["files"]),
+        "sources": {
+            "candidate": {**saved["sources"]["candidate"], "path": str(candidate_path)},
+            "reference": {**saved["sources"]["reference"], "path": str(reference_path)},
+        },
+    }
+
+
+def give_back(call: Call, plan: outputs_module.OutputPlan) -> None:
+    """Hand back a compare place that never got its files."""
+    try:
+        with call.router.store(create=True) as store:
+            outputs_module.release(store, plan)
+    except Exception:  # noqa: BLE001 - the error that brought us here is the one to report
+        pass
+
+
+def relative_to(path: Path, base: Path) -> str | None:
+    """A path written from another folder, or nothing when there is no way between them."""
+    try:
+        return Path(os.path.relpath(path, base)).as_posix()
+    except ValueError:
+        return None
+
+
+def absolute(folder: Path, files: Mapping[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in files.items():
+        if isinstance(value, Mapping):
+            out[key] = absolute(folder, value)
+        else:
+            out[key] = str(folder / value)
+    return out
 
 
 def which_reference(scene: Scene, handle: str) -> tuple[dict[str, Any] | None, Path]:
-    """A registered reference by name or id, or a file given by its path."""
+    """A registered reference by name or id first, then a file by its absolute path."""
     record = references.find(scene.place, handle)
     if record is not None:
-        image = Path(str(record.get("image")))
-        if not image.is_file():
+        image = references.resolve(scene.place, record.get("image"))
+        if image is None or not image.is_file():
             raise CallError(
                 "FILE_NOT_FOUND",
                 f"the image registered as {record.get('name')} is not in the reference folder",
@@ -507,13 +602,13 @@ def which_reference(scene: Scene, handle: str) -> tuple[dict[str, Any] | None, P
                 details={"argument": "reference", "ref_id": record.get("ref_id")},
             )
         return record, image
-    looks_like_path = any(mark in handle for mark in ("/", "\\")) or Path(handle).suffix
-    if looks_like_path:
+    if Path(os.path.expanduser(handle)).is_absolute():
         return None, a_file(handle, "reference")
     known = references.names(scene.place)
     raise CallError(
         "REFERENCE_UNKNOWN",
         f"no reference is registered as {handle}",
+        hint="pass a name from list_references, or an absolute path to an image",
         details={"argument": "reference", "did_you_mean": did_you_mean(handle, known)},
     )
 
@@ -552,17 +647,28 @@ def crops_wanted(value: Any, record: Mapping[str, Any] | None) -> dict[str, list
     return {item: regions[item] for item in value}
 
 
-def load_side(call: Call, path: Path, side: str, scene: Scene) -> Any:
-    """One side in display values. A scene linear file is read by the session."""
+def load_side(call: Call, path: Path, side: str, plan: outputs_module.OutputPlan) -> Any:
+    """One side in display values. A scene linear file is read by the session.
+
+    The session writes its pixels into this compare's own folder, at a path
+    the output conventions check, and the file is removed once read. A
+    session that was asked to stop removes it itself.
+    """
     module = imaging()
     if path.suffix.lower() not in LINEAR_SUFFIXES:
         return readable(lambda: module.read_display_file(path), side)
-    temp = scene.home / "temp"
-    guarded("compare", lambda: temp.mkdir(parents=True, exist_ok=True))
-    raw = temp / f"compare-{secrets.token_hex(6)}.f32"
+    readable(lambda: module.read_linear_header(path), side)
+    raw = Path(guarded("compare", lambda: outputs_module.inside(plan, RAW_NAMES[side])))
     try:
         reply = call.bridge("compare.read_exr", {"path": str(path), "out_path": str(raw)})
         data = dict(reply.get("data") or {})
+        if data.get("cancelled"):
+            raise CallError(
+                "TOOL_FAILED",
+                f"the session stopped reading the {side} before it was done",
+                hint="call again when the session is free",
+                details={"argument": side},
+            )
         picture = readable(
             lambda: module.picture_from_raw(
                 raw,
@@ -576,11 +682,16 @@ def load_side(call: Call, path: Path, side: str, scene: Scene) -> Any:
     finally:
         raw.unlink(missing_ok=True)
     picture.path = str(path)
+    picture.alpha_note = dict(data.get("alpha") or {"present": picture.alpha is not None})
+    picture.resized_on_read = data.get("resized_on_read")
+    picture.read_notes = {
+        key: data[key] for key in ("route", "scene_marked_changed") if key in data
+    }
     return picture
 
 
 def mask_for(
-    value: Any, record: Mapping[str, Any] | None, reference: Any
+    value: Any, record: Mapping[str, Any] | None, reference: Any, place: Path
 ) -> tuple[Any, dict[str, Any] | None]:
     """The area that is counted, from the reference side or a file. Never candidate alpha."""
     if value in (None, MASK_NONE):
@@ -588,16 +699,23 @@ def mask_for(
     if value == MASK_REFERENCE:
         registered = (record or {}).get("mask")
         if registered:
-            path = a_file(registered.get("path"), "mask")
+            path = references.resolve(place, registered.get("path"))
+            if path is None or not path.is_file():
+                raise CallError(
+                    "FILE_NOT_FOUND",
+                    "the mask registered with the reference is not in the reference folder",
+                    hint="register the reference again with set_reference",
+                    details={"argument": "mask"},
+                )
             return readable(lambda: imaging().read_mask(path), "mask"), {
                 "source": "reference_record",
-                "path": str(path),
+                "file": path.name,
                 "sha256": references.file_hash(path),
             }
         if reference.alpha is not None:
             return reference.alpha, {
                 "source": "reference_alpha",
-                "path": reference.path,
+                "file": Path(reference.path).name,
                 "sha256": references.file_hash(reference.path),
             }
         raise CallError(
@@ -609,9 +727,39 @@ def mask_for(
     path = a_file(value, "mask")
     return readable(lambda: imaging().read_mask(path), "mask"), {
         "source": "file",
-        "path": str(path),
+        "file": path.name,
         "sha256": references.file_hash(path),
     }
+
+
+def is_plain(colour: Mapping[str, Any]) -> bool:
+    """Whether a side's values are what a plain sRGB display shows."""
+    if colour.get("kind") != imaging().VIEW_KIND:
+        return True
+    if colour.get("transform") == "srgb_curve":
+        return True
+    display = str(colour.get("display") or "").lower()
+    view = str(colour.get("view") or "").strip().lower()
+    return "srgb" in display and view in PLAIN_VIEWS
+
+
+def transfer_reasons(candidate: Mapping[str, Any], reference: Mapping[str, Any]) -> list[str]:
+    """Why the two sides may not have gone through the same transfer, from their records."""
+    view_kind = imaging().VIEW_KIND
+    both = candidate.get("kind") == view_kind and reference.get("kind") == view_kind
+    if both:
+        views = [(side.get("display"), side.get("view")) for side in (candidate, reference)]
+        if views[0] != views[1]:
+            return ["the two sides went through different display views"]
+        return []
+    reasons = []
+    for side, colour in (("candidate", candidate), ("reference", reference)):
+        if not is_plain(colour):
+            reasons.append(
+                f"the {side} went through the {colour.get('view')} view on "
+                f"{colour.get('display')}, not a plain sRGB display"
+            )
+    return reasons
 
 
 def run(
@@ -624,7 +772,10 @@ def run(
     crops: dict[str, list[float]] | None,
     mask_map: Any,
 ) -> dict[str, Any]:
-    """Align, cut, shrink, count and draw, in that order, writing every file."""
+    """Align, cut, shrink, count and draw, in that order, writing every file.
+
+    File names in the report are relative to `folder`.
+    """
     module = imaging()
     import numpy as np
 
@@ -641,15 +792,16 @@ def run(
     counted = aligned.valid.copy()
     if mask_map is not None:
         counted &= module.resize(mask_map, width, height) >= 0.5
+    sides = (("candidate", candidate), ("reference", reference))
     steps: dict[str, Any] = {
-        "profile": {
-            "candidate": candidate.colour.get("profile"),
-            "reference": reference.colour.get("profile"),
-        },
+        "profile": {side: picture.colour.get("profile") for side, picture in sides},
         "view_transform": {
             side: picture.colour if picture.colour.get("kind") == module.VIEW_KIND else None
-            for side, picture in (("candidate", candidate), ("reference", reference))
+            for side, picture in sides
         },
+        "alpha": {side: picture.alpha_note for side, picture in sides},
+        "resized_on_read": {side: picture.resized_on_read for side, picture in sides},
+        "session_read": {side: getattr(picture, "read_notes", None) for side, picture in sides},
         **aligned.steps,
     }
     files: dict[str, Any] = {}
@@ -680,10 +832,10 @@ def run(
 
     module.to_image(cand).save(folder / "candidate.png")
     module.to_image(ref).save(folder / "reference.png")
-    files["candidate"] = str(folder / "candidate.png")
-    files["reference"] = str(folder / "reference.png")
+    files["candidate"] = "candidate.png"
+    files["reference"] = "reference.png"
 
-    # 4. The overview, at the working size.
+    # 4. The overview, at the working size, never larger than the image.
     native_h, native_w = ref.shape[:2]
     size = module.working_size(native_w, native_h)
     small_cand = np.clip(module.resize(cand, *size), 0.0, 1.0)
@@ -717,22 +869,19 @@ def run(
         except module.MetricsUnavailable as error:
             missing["exposure_matched"] = str(error)
 
-    reasons = []
-    kinds = {candidate.colour.get("kind"), reference.colour.get("kind")}
-    if len(kinds) > 1:
-        reasons.append("the two sides went through different kinds of transform")
+    reasons = transfer_reasons(candidate.colour, reference.colour)
     gap = module.mean_luminance_gap(small_cand, small_ref, small_counted)
     if gap is not None and gap > module.LUMINANCE_MISMATCH:
         reasons.append(f"mean luminance differs by {round(gap * 100)} percent after alignment")
 
     heat = module.heat_map(small_cand, small_ref, small_counted)
     module.to_image(heat).save(folder / "diff.png")
-    files["diff"] = str(folder / "diff.png")
+    files["diff"] = "diff.png"
     labels = ["candidate", "reference", "difference"]
     sheet = module.side_by_side([small_cand, small_ref, heat], labels, edge=module.PANEL_EDGE)
     sheet.save(folder / "overview.jpg", quality=85)
-    files["overview"] = str(folder / "overview.jpg")
-    files["result"] = str(folder / "result.json")
+    files["overview"] = "overview.jpg"
+    files["result"] = "result.json"
 
     metrics = None
     if numbers is not None:
@@ -776,9 +925,9 @@ def detail(
     cand, ref, mask = (module.cut(item, box) for item in (candidate, reference, counted))
     crops = folder / "crops"
     crops.mkdir(exist_ok=True)
-    path = crops / f"{outputs_module.sanitize_name(name)}.png"
-    module.side_by_side([cand, ref], ["candidate", "reference"]).save(path)
-    files.setdefault("crops", {})[name] = str(path)
+    file_name = f"{outputs_module.sanitize_name(name)}.png"
+    module.side_by_side([cand, ref], ["candidate", "reference"]).save(crops / file_name)
+    files.setdefault("crops", {})[name] = f"crops/{file_name}"
     row: dict[str, Any] = {
         "box": [round(value, 4) for value in rect],
         "crop_px": list(box),
@@ -830,25 +979,48 @@ def write_result(path: Path, result: Mapping[str, Any]) -> None:
     path.write_text(text + "\n", encoding="utf-8")
 
 
-def attach_picture(call: Call, how: str, report: Mapping[str, Any]) -> None:
-    """The overview as image content, for the person as much as the agent."""
+def attach_picture(call: Call, how: str, report: Mapping[str, Any]) -> dict[str, Any]:
+    """The overview as image content, for the person as much as the agent.
+
+    The picture has to fit in the reply beside the text. A full sheet that
+    would not is sent as the thumbnail instead, and one that still would not
+    is left out; the result says which.
+    """
     if how == "none":
-        return
+        return {}
     module = imaging()
+    room = results_module.REPLY_BUDGET_BYTES - results_module.TEXT_BLOCK_CAP
+    said: dict[str, Any] = {}
+    encoded = None
     if how == "full":
-        picture = module.side_by_side(
+        full = module.side_by_side(
             list(report["full_panels"]), ["candidate", "reference", "difference"]
         )
-    else:
-        picture = report["sheet"]
+        encoded = base64.b64encode(module.jpeg_bytes(full)).decode("ascii")
+        if len(encoded) > room:
+            said["image_downgraded"] = True
+            said["image_note"] = (
+                f"the full sheet is {len(encoded)} bytes encoded, over the {room} the reply"
+                " has room for, so the thumbnail was sent"
+            )
+            encoded = None
+    if encoded is None:
+        encoded = base64.b64encode(module.jpeg_bytes(report["sheet"])).decode("ascii")
+        if len(encoded) > room:
+            said["image_omitted"] = True
+            said["image_note"] = (
+                "even the thumbnail is over the room the reply has, so none was sent"
+            )
+            return said
     call.attach(
         ImageContent(
             type="image",
-            data=base64.b64encode(module.jpeg_bytes(picture)).decode("ascii"),
+            data=encoded,
             mime_type="image/jpeg",
             annotations=Annotations(audience=["user", "assistant"]),
         )
     )
+    return said
 
 
 def summary(result: Mapping[str, Any]) -> str:

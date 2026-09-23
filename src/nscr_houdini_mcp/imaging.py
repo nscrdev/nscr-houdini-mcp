@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import io
 import math
+import struct
+import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,8 +37,20 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageCms, ImageDraw, ImageFont
 
-# The long edge both sides are resized to for the whole image numbers.
+# The long edge both sides are shrunk to, when longer, for the whole image
+# numbers. A smaller image is counted at its own size.
 WORKING_EDGE = 1024
+
+# The most pixels a side is read at. An image over it is shrunk by a whole
+# factor while it is read, and the result says so.
+PIXEL_BUDGET = 64_000_000
+
+# The most `adjust.scale` may enlarge the candidate to, as a share of the
+# grid's area.
+MAX_PLACED_SHARE = 4.0
+
+# Rows counted at a time, so no whole frame copy is made to count it.
+BLOCK_ROWS = 256
 
 # The long edge of each panel on the overview sheet.
 PANEL_EDGE = 256
@@ -105,6 +119,10 @@ class ImageError(Exception):
         self.details = dict(details or {})
 
 
+class AlignRefused(ValueError):
+    """An alignment that would place the candidate somewhere unreasonable."""
+
+
 class MetricsUnavailable(Exception):
     """Numbers that cannot be counted, and why."""
 
@@ -117,6 +135,10 @@ class Picture:
     alpha: np.ndarray | None
     colour: dict[str, Any]
     path: str
+    alpha_note: dict[str, Any] = field(default_factory=lambda: {"present": False})
+    resized_on_read: dict[str, Any] | None = None
+    # What the session said about how it read a scene linear side.
+    read_notes: dict[str, Any] | None = None
 
     @property
     def size(self) -> tuple[int, int]:
@@ -126,38 +148,166 @@ class Picture:
 # Section: reading
 
 
-def read_display_file(path: str | Path) -> Picture:
+def _open(path: str | Path, what: str) -> Image.Image:
+    """Open an image without decoding it, refusing one past the size limit."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            image = Image.open(path)
+    except FileNotFoundError:
+        raise ImageError("FILE_NOT_FOUND", f"there is no {what} at that path") from None
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning):
+        raise _too_large(what, None) from None
+    except (OSError, SyntaxError, ValueError) as error:
+        raise ImageError(
+            "IMAGE_UNREADABLE",
+            f"the {what} file is not an image this can read",
+            details={"exception": type(error).__name__},
+        ) from None
+    limit = Image.MAX_IMAGE_PIXELS
+    if limit and image.width * image.height > limit:
+        raise _too_large(what, image.size)
+    return image
+
+
+def _too_large(what: str, size: tuple[int, int] | None) -> ImageError:
+    return ImageError(
+        "IMAGE_TOO_LARGE",
+        f"the {what} has more pixels than this reads",
+        details={"size_px": list(size) if size else None, "limit_px": Image.MAX_IMAGE_PIXELS},
+    )
+
+
+def _load(image: Image.Image, what: str) -> None:
+    try:
+        image.load()
+    except (OSError, SyntaxError, ValueError) as error:
+        raise ImageError(
+            "IMAGE_UNREADABLE",
+            f"the {what} file could not be decoded",
+            details={"exception": type(error).__name__},
+        ) from None
+
+
+def reduce_factor(width: int, height: int, budget: int | None = None) -> int:
+    """The whole factor that brings an image within the pixel budget, or 1."""
+    limit = PIXEL_BUDGET if budget is None else budget
+    pixels = width * height
+    if pixels <= limit:
+        return 1
+    return math.ceil(math.sqrt(pixels / limit))
+
+
+def _reduce_array(array: np.ndarray, factor: int) -> np.ndarray:
+    """The block mean over `factor` by `factor` pixels."""
+    if factor <= 1:
+        return array
+    height = array.shape[0] // factor * factor
+    width = array.shape[1] // factor * factor
+    cut = array[:height, :width].astype(np.float32)
+    shape = (height // factor, factor, width // factor, factor) + array.shape[2:]
+    return cut.reshape(shape).mean(axis=(1, 3), dtype=np.float64).astype(np.float32)
+
+
+def _source_bits(image: Image.Image, rawmode: str | None) -> int:
+    """How many bits a sample holds in the file, from the file's own description."""
+    if image.mode == "F":
+        return 32
+    if image.mode == "I":
+        return 16 if image.format == "PNG" else 32
+    if image.mode.startswith("I;16") or (rawmode and ";16" in rawmode):
+        return 16
+    samples = getattr(image, "tag_v2", {}).get(258) if image.format == "TIFF" else None
+    if isinstance(samples, (tuple, list)) and samples:
+        return int(max(samples))
+    if isinstance(samples, int):
+        return samples
+    return 1 if image.mode == "1" else 8
+
+
+def _rawmode(image: Image.Image) -> str | None:
+    tile = getattr(image, "tile", None) or []
+    if tile and isinstance(tile[0].args, str):
+        return tile[0].args
+    return None
+
+
+def _png16(path: str | Path, rawmode: str) -> np.ndarray:
+    """A 16 bit RGB or RGBA PNG at full depth.
+
+    Pillow keeps only the high byte of each sample. The same stream decoded a
+    second time as little endian hands over the low byte in its place, and the
+    two together are the file's values.
+    """
+    planes = []
+    for order in (";16B", ";16L"):
+        with Image.open(path) as image:
+            image.tile = [image.tile[0]._replace(args=rawmode.replace(";16B", order))]
+            image.load()
+            planes.append(np.asarray(image, dtype=np.uint16))
+    return planes[0] * 256 + planes[1]
+
+
+def read_display_file(path: str | Path, *, budget: int | None = None) -> Picture:
     """A PNG, JPEG, TIFF or any file Pillow reads, brought to sRGB.
 
     An embedded ICC profile is converted from; with none, sRGB is assumed and
-    the record says so rather than leaving it to be guessed. Alpha is kept
-    apart and never mixed into the colour.
+    the record says so rather than leaving it to be guessed. The full scale of
+    a sample comes from the file's mode and bit depth, never from its pixels:
+    16 bit greys and 16 bit RGB or RGBA PNGs are read at 16 bits. Alpha is
+    kept apart, unpremultiplied when the file stores it premultiplied, and
+    never mixed into the colour. An image over the pixel budget is shrunk by
+    a whole factor as it is read, and the picture says so.
     """
-    try:
-        image = Image.open(path)
-        image.load()
-    except FileNotFoundError:
-        raise ImageError("FILE_NOT_FOUND", "there is no image at that path") from None
-    except (OSError, SyntaxError, ValueError, Image.DecompressionBombError) as error:
-        raise ImageError(
-            "IMAGE_UNREADABLE",
-            "the file is not an image this can read",
-            details={"exception": type(error).__name__},
-        ) from None
-    colour: dict[str, Any] = {"kind": FILE_KIND, "format": image.format, "mode": image.mode}
+    image = _open(path, "image")
+    rawmode = _rawmode(image)
+    bits = _source_bits(image, rawmode)
+    colour: dict[str, Any] = {
+        "kind": FILE_KIND,
+        "format": image.format,
+        "mode": image.mode,
+        "source_bits": bits,
+        "bits_read": min(bits, 8),
+    }
+    factor = reduce_factor(image.width, image.height, budget)
+    original = image.size
+    _load(image, "image")
     icc = image.info.get("icc_profile")
+    premultiplied = image.mode in ("RGBa", "La")
     alpha = _alpha_of(image)
 
     if image.mode in _HIGH_BIT_GREY:
         grey = np.asarray(image, dtype=np.float32)
-        top = 1.0 if image.mode == "F" else 65535.0 if grey.max(initial=0) > 255 else 255.0
-        grey = np.clip(grey / top, 0.0, 1.0)
+        top = 1.0 if image.mode == "F" else 65535.0 if bits == 16 else 4294967295.0
+        grey = _reduce_array(np.clip(grey / top, 0.0, 1.0), factor)
         rgb = np.repeat(grey[..., None], 3, axis=2)
+        colour["bits_read"] = bits
         colour["profile"] = "embedded_not_applied" if icc else "assumed_srgb"
         if icc:
             colour["reason"] = "a profile is not applied to high bit grey"
-        return Picture(rgb.astype(np.float32), alpha, colour, str(path))
+        return _picture(rgb, alpha, colour, path, premultiplied, factor, original)
 
+    if bits == 16 and image.format == "PNG" and rawmode in ("RGB;16B", "RGBA;16B") and not icc:
+        try:
+            samples = _png16(path, rawmode).astype(np.float32) / 65535.0
+        except (OSError, ValueError, AttributeError) as error:
+            colour["reason"] = f"read at 8 bits: the 16 bit read failed ({type(error).__name__})"
+        else:
+            colour["bits_read"] = 16
+            colour["profile"] = "assumed_srgb"
+            samples = _reduce_array(samples, factor)
+            if samples.shape[2] == 4:
+                alpha = samples[..., 3]
+            return _picture(samples[..., :3], alpha, colour, path, False, factor, original)
+    elif bits > 8:
+        colour["reason"] = (
+            "read at 8 bits: the profile is applied at 8 bits"
+            if icc
+            else f"read at 8 bits: a {bits} bit {image.format} {image.mode} is read at 8"
+        )
+
+    if factor > 1:
+        image = image.reduce(factor)
     base = image
     if image.mode in ("RGBA", "LA", "PA", "RGBa", "La") or (
         image.mode == "P" and "transparency" in image.info
@@ -170,7 +320,7 @@ def read_display_file(path: str | Path) -> Picture:
         converted = _from_profile(base, icc, colour)
         if converted is not None:
             rgb = np.asarray(converted, dtype=np.float32) / 255.0
-            return Picture(rgb, alpha, colour, str(path))
+            return _picture(rgb, alpha, colour, path, premultiplied, factor, original)
     else:
         colour["profile"] = "assumed_srgb"
     try:
@@ -182,7 +332,54 @@ def read_display_file(path: str | Path) -> Picture:
             details={"exception": type(error).__name__, "mode": image.mode},
         ) from None
     rgb = np.asarray(plain, dtype=np.float32) / 255.0
-    return Picture(rgb, alpha, colour, str(path))
+    return _picture(rgb, alpha, colour, path, premultiplied, factor, original)
+
+
+def _picture(
+    rgb: np.ndarray,
+    alpha: np.ndarray | None,
+    colour: dict[str, Any],
+    path: str | Path,
+    premultiplied: bool,
+    factor: int,
+    original: tuple[int, int],
+) -> Picture:
+    """A picture with its alpha record and any shrink on read written down."""
+    if alpha is not None and alpha.shape != rgb.shape[:2]:
+        alpha = _fit_alpha(alpha, rgb.shape[1], rgb.shape[0], factor)
+    colour["alpha"] = {"present": alpha is not None, "premultiplied": premultiplied}
+    picture = Picture(rgb.astype(np.float32), alpha, colour, str(path))
+    picture.alpha_note = alpha_note(
+        alpha, premultiplied=premultiplied, unpremultiplied=premultiplied
+    )
+    if factor > 1:
+        picture.resized_on_read = {
+            "from": list(original),
+            "to": [int(rgb.shape[1]), int(rgb.shape[0])],
+            "factor": factor,
+        }
+    return picture
+
+
+def _fit_alpha(alpha: np.ndarray, width: int, height: int, factor: int) -> np.ndarray:
+    reduced = _reduce_array(alpha, factor)
+    if reduced.shape != (height, width):
+        reduced = resize(reduced, width, height)
+    return reduced
+
+
+def alpha_note(
+    alpha: np.ndarray | None, *, premultiplied: bool, unpremultiplied: bool
+) -> dict[str, Any]:
+    """What a side's alpha is: there or not, partial or not, and how it was stored."""
+    if alpha is None:
+        return {"present": False}
+    return {
+        "present": True,
+        "partial": bool((alpha < 1.0).any()),
+        "premultiplied": premultiplied,
+        "unpremultiplied": unpremultiplied,
+    }
 
 
 def _from_profile(image: Image.Image, icc: bytes, colour: dict[str, Any]) -> Image.Image | None:
@@ -204,8 +401,9 @@ def _from_profile(image: Image.Image, icc: bytes, colour: dict[str, Any]) -> Ima
 
 def _alpha_of(image: Image.Image) -> np.ndarray | None:
     bands = image.getbands()
-    if "A" in bands:
-        return np.asarray(image.getchannel("A"), dtype=np.float32) / 255.0
+    for band in ("A", "a"):
+        if band in bands:
+            return np.asarray(image.getchannel(band), dtype=np.float32) / 255.0
     if image.mode == "P" and "transparency" in image.info:
         return np.asarray(image.convert("RGBA").getchannel("A"), dtype=np.float32) / 255.0
     return None
@@ -228,52 +426,146 @@ def picture_from_raw(
         rgb = pixels[..., :3]
     else:
         rgb = np.repeat(pixels[..., :1], 3, axis=2)
-    alpha = pixels[..., 3] if channels >= 4 else None
+    alpha = pixels[..., 3].copy() if channels >= 4 else None
     rgb = np.clip(np.nan_to_num(rgb, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
     return Picture(rgb.astype(np.float32), alpha, dict(colour), str(path))
 
 
-def read_mask(path: str | Path) -> np.ndarray:
+def read_mask(path: str | Path, *, budget: int | None = None) -> np.ndarray:
     """A mask file as a float map from 0 to 1: its alpha if it has one, else its grey."""
-    try:
-        image = Image.open(path)
-        image.load()
-    except FileNotFoundError:
-        raise ImageError("FILE_NOT_FOUND", "there is no mask file at that path") from None
-    except (OSError, SyntaxError, ValueError, Image.DecompressionBombError) as error:
-        raise ImageError(
-            "IMAGE_UNREADABLE",
-            "the mask file is not an image this can read",
-            details={"exception": type(error).__name__},
-        ) from None
+    image = _open(path, "mask")
+    factor = reduce_factor(image.width, image.height, budget)
+    _load(image, "mask")
+    if factor > 1:
+        image = image.reduce(factor)
     alpha = _alpha_of(image)
     if alpha is not None and alpha.min(initial=1.0) < 1.0:
         return alpha
     return np.asarray(image.convert("L"), dtype=np.float32) / 255.0
 
 
+# Section: scene linear headers
+
+EXR_MAGIC = b"\x76\x2f\x31\x01"
+HEADER_LIMIT = 1 << 20
+
+
+def read_linear_header(path: str | Path) -> dict[str, Any]:
+    """The size and channels an EXR or Radiance HDR file says it has, from its header alone."""
+    try:
+        with open(path, "rb") as stream:
+            head = stream.read(HEADER_LIMIT)
+    except FileNotFoundError:
+        raise ImageError("FILE_NOT_FOUND", "there is no image at that path") from None
+    except OSError as error:
+        raise ImageError(
+            "IMAGE_UNREADABLE",
+            "the file could not be read",
+            details={"exception": type(error).__name__},
+        ) from None
+    try:
+        if head.startswith(EXR_MAGIC):
+            return _exr_header(head)
+        if head.startswith((b"#?RADIANCE", b"#?RGBE")):
+            return _hdr_header(head)
+    except (struct.error, ValueError, IndexError, KeyError, UnicodeDecodeError) as error:
+        raise ImageError(
+            "IMAGE_UNREADABLE",
+            "the file's header could not be read",
+            details={"exception": type(error).__name__},
+        ) from None
+    raise ImageError("IMAGE_UNREADABLE", "the file is not an EXR or HDR image")
+
+
+def _exr_header(head: bytes) -> dict[str, Any]:
+    at = 8
+    found: dict[str, Any] = {"format": "EXR"}
+    while True:
+        end = head.index(b"\0", at)
+        name = head[at:end].decode("ascii")
+        at = end + 1
+        if not name:
+            break
+        end = head.index(b"\0", at)
+        kind = head[at:end].decode("ascii")
+        (size,) = struct.unpack_from("<i", head, end + 1)
+        value = head[end + 5 : end + 5 + size]
+        if size < 0 or len(value) != size:
+            raise ValueError("the header is cut short")
+        at = end + 5 + size
+        if kind == "box2i" and name in ("dataWindow", "displayWindow"):
+            found[name] = list(struct.unpack("<4i", value))
+        elif kind == "chlist" and name == "channels":
+            found["channels"] = _channel_names(value)
+    window = found.get("displayWindow") or found.get("dataWindow")
+    if window is None or not found.get("channels"):
+        raise ValueError("no window or no channels")
+    found["width"] = window[2] - window[0] + 1
+    found["height"] = window[3] - window[1] + 1
+    if found["width"] < 1 or found["height"] < 1:
+        raise ValueError("an empty window")
+    return found
+
+
+def _channel_names(value: bytes) -> list[str]:
+    names, at = [], 0
+    while at < len(value) and value[at] != 0:
+        end = value.index(b"\0", at)
+        names.append(value[at:end].decode("ascii"))
+        at = end + 1 + 16
+    return names
+
+
+def _hdr_header(head: bytes) -> dict[str, Any]:
+    lines = head.split(b"\n")
+    for index, line in enumerate(lines[1:], start=1):
+        if not line.strip():
+            tokens = lines[index + 1].decode("ascii").split()
+            sizes = {tokens[0][1]: int(tokens[1]), tokens[2][1]: int(tokens[3])}
+            return {
+                "format": "HDR",
+                "width": sizes["X"],
+                "height": sizes["Y"],
+                "channels": ["R", "G", "B"],
+            }
+    raise ValueError("no resolution line")
+
+
 # Section: resampling
 
 
-def resize(array: np.ndarray, width: int, height: int) -> np.ndarray:
-    """A float image or map at a new size, channel by channel."""
+def resize(
+    array: np.ndarray,
+    width: int,
+    height: int,
+    box: tuple[float, float, float, float] | None = None,
+) -> np.ndarray:
+    """A float image or map at a new size, channel by channel.
+
+    `box` is the part of the source, in source pixels and fractions of them,
+    that the new size covers: the result is exactly that part of the whole
+    image resized, without the whole image ever being made at the new size.
+    """
     width, height = max(1, int(width)), max(1, int(height))
-    if array.shape[1] == width and array.shape[0] == height:
+    source = (0.0, 0.0, float(array.shape[1]), float(array.shape[0]))
+    area = source if box is None else tuple(float(value) for value in box)
+    if area == source and array.shape[1] == width and array.shape[0] == height:
         return array.astype(np.float32, copy=True)
     flat = array.ndim == 2
     planes = array[..., None] if flat else array
     out = np.empty((height, width, planes.shape[2]), dtype=np.float32)
-    shrinking = width < array.shape[1] or height < array.shape[0]
+    shrinking = width < area[2] - area[0] or height < area[3] - area[1]
     method = Image.Resampling.LANCZOS if shrinking else Image.Resampling.BICUBIC
     for index in range(planes.shape[2]):
         plane = Image.fromarray(np.ascontiguousarray(planes[..., index], dtype=np.float32))
-        out[..., index] = np.asarray(plane.resize((width, height), method), dtype=np.float32)
+        resized = plane.resize((width, height), method, box=area)
+        out[..., index] = np.asarray(resized, dtype=np.float32)
     return out[..., 0] if flat else out
 
 
 def working_size(width: int, height: int, edge: int = WORKING_EDGE) -> tuple[int, int]:
-    """The size with the long edge at `edge`, keeping the aspect."""
-    scale = edge / max(width, height)
+    """The size with the long edge at most `edge`, keeping the aspect. Never larger."""
+    scale = min(1.0, edge / max(width, height))
     return max(1, round(width * scale)), max(1, round(height * scale))
 
 
@@ -325,7 +617,10 @@ def align(
 
     # A candidate with more pixels than the reference keeps them: the grid is
     # scaled up instead, within limits, so a crop sees the candidate's detail.
-    grow = 1.0 if mode == "none" else min(MAX_UPSCALE, 1.0 / min(sx, sy))
+    # With `none` the candidate keeps its own pixels one for one, so the grid
+    # grows by how much larger it is than the reference.
+    ratio = max(cw / rw, ch / rh) if mode == "none" else 1.0 / min(sx, sy)
+    grow = min(MAX_UPSCALE, ratio)
     grow = max(1.0, min(grow, MAX_GRID_EDGE / max(rw, rh)))
     gw, gh = round(rw * grow), round(rh * grow)
     fx, fy = gw / rw, gh / rh
@@ -343,10 +638,15 @@ def align(
         sx, sy = sx * fx, sy * fy
     sx, sy = sx * scale, sy * scale
     nw, nh = max(1, round(cw * sx)), max(1, round(ch * sy))
+    if scale > 1.0 and nw * nh > MAX_PLACED_SHARE * gw * gh:
+        raise AlignRefused(
+            f"adjust.scale {scale:g} would place the candidate at {nw}x{nh}, more than "
+            f"{MAX_PLACED_SHARE:g} times the area of the {gw}x{gh} frame"
+        )
     ox = round((gw - nw) / 2 + dx * gw)
     oy = round((gh - nh) / 2 + dy * gh)
-    placed = resize(candidate.rgb, nw, nh)
-    canvas, valid = _paste(placed, gw, gh, ox, oy)
+    placed, px, py = _visible_part(candidate.rgb, nw, nh, ox, oy, gw, gh)
+    canvas, valid = _paste(placed, gw, gh, px, py)
 
     steps: dict[str, Any] = {
         "align": mode,
@@ -377,6 +677,26 @@ def _bars(ox: int, oy: int, nw: int, nh: int, gw: int, gh: int) -> dict[str, int
         "bottom": max(0, gh - (oy + nh)),
     }
     return bars if any(bars.values()) else None
+
+
+def _visible_part(
+    source: np.ndarray, nw: int, nh: int, ox: int, oy: int, gw: int, gh: int
+) -> tuple[np.ndarray, int, int]:
+    """Only the part of the source that lands on the grid, resized, and where it goes.
+
+    Enlarging the whole candidate and then cutting it down would hold the
+    whole enlargement in memory. Only the frame's worth is made: the visible
+    part of the grid is mapped back to the source, and that box of the source
+    is resized straight to it, at the same place and scale as the whole.
+    """
+    height, width = source.shape[:2]
+    kx, ky = nw / width, nh / height
+    x0, x1 = max(0, ox), min(gw, ox + nw)
+    y0, y1 = max(0, oy), min(gh, oy + nh)
+    if x1 <= x0 or y1 <= y0:
+        return np.zeros((1, 1, source.shape[2]), dtype=np.float32), gw, gh
+    box = ((x0 - ox) / kx, (y0 - oy) / ky, (x1 - ox) / kx, (y1 - oy) / ky)
+    return resize(source, x1 - x0, y1 - y0, box=box), x0, y0
 
 
 def _paste(
@@ -510,19 +830,29 @@ def metrics(
     count = int(evaluated.sum())
     if count == 0:
         raise MetricsUnavailable("the mask and the candidate's coverage leave no pixels to count")
-    delta = candidate[evaluated] - reference[evaluated]
-    absolute = np.abs(delta)
-    squared = delta.astype(np.float64) ** 2
-    mae = absolute.mean(axis=0)
-    rmse = np.sqrt(squared.mean(axis=0))
-    overall_rmse = float(math.sqrt(squared.mean()))
-    over = np.abs(candidate - reference).max(axis=2) > tolerance
-    over &= evaluated
+    # A block of rows at a time: differences and their squares in float32 for
+    # the block only, the running sums in float64.
+    sums = np.zeros(3, dtype=np.float64)
+    squares = np.zeros(3, dtype=np.float64)
+    over = 0
+    for top in range(0, evaluated.shape[0], BLOCK_ROWS):
+        rows = slice(top, top + BLOCK_ROWS)
+        keep = evaluated[rows]
+        if not keep.any():
+            continue
+        delta = candidate[rows][keep] - reference[rows][keep]
+        absolute = np.abs(delta)
+        sums += absolute.sum(axis=0, dtype=np.float64)
+        squares += np.square(delta).sum(axis=0, dtype=np.float64)
+        over += int(np.count_nonzero(absolute.max(axis=1) > tolerance))
+    mae = sums / count
+    rmse = np.sqrt(squares / count)
+    overall_rmse = float(math.sqrt(squares.sum() / (3 * count)))
     return {
-        "mae": _channels(mae, float(absolute.mean())),
+        "mae": _channels(mae, float(sums.sum() / (3 * count))),
         "rmse": _channels(rmse, overall_rmse),
         "psnr_db": _psnr(overall_rmse),
-        "diff_area_pct": round(float(over.sum()) * 100.0 / count, 4),
+        "diff_area_pct": round(over * 100.0 / count, 4),
         "evaluated_pct": round(count * 100.0 / evaluated.size, 4),
         "pixels": count,
     }
@@ -629,8 +959,11 @@ def largest_region(over: np.ndarray) -> dict[str, Any] | None:
 
 
 def to_image(array: np.ndarray) -> Image.Image:
-    """Float display values as an 8 bit RGB picture."""
-    data = (np.clip(array, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    """Float display values as an 8 bit RGB picture, a block of rows at a time."""
+    data = np.empty(array.shape, dtype=np.uint8)
+    for top in range(0, array.shape[0], BLOCK_ROWS):
+        rows = slice(top, top + BLOCK_ROWS)
+        data[rows] = (np.clip(array[rows], 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
     return Image.fromarray(data)
 
 

@@ -10,11 +10,18 @@ named detail regions and a mask. Registering the same name again writes a new
 record under a new id; the name then points at the newest, and every
 comparison made against the new one starts a new series.
 
+The reference folder is fixed per scene: the conventions refuse a reference
+template whose folder part changes with the name, the run, the date, the time,
+the version or the session, so every record of a scene is found in one place.
+A record names its image and mask relative to its own folder, so a project
+that moves, or is opened through another machine's mount, still finds them.
+Where the image came from is kept as a note and never read back.
+
 A series is the run of comparisons that can be read against each other: the
 same reference id and hash, camera, crop, mask, colour records and settings.
-Each series keeps an append only log, one line a run, in `series/` under the
-reference folder, so the trend survives the server and is shared by every
-process working on the scene.
+Each run of a series is one small file in `series/<series_id>/`, created
+exclusively, so two servers writing to the same shared folder never interleave
+and the trend is shared by every process working on the scene.
 
 This module never imports `hou`.
 """
@@ -60,7 +67,11 @@ def folder(
     session_id: str | None,
     scratch_root: str | Path | None = None,
 ) -> Path:
-    """Where this scene's references live. Nothing is made on disk."""
+    """Where this scene's references live. Nothing is made on disk.
+
+    The conventions have already refused a folder that would change from one
+    registration to the next, so any name and run plan the same folder.
+    """
     conventions = outputs_module.load_conventions(home=home, hip_path=hip_path)
     plan = outputs_module.plan_path(
         KIND,
@@ -72,6 +83,13 @@ def folder(
         scratch_root=scratch_root,
     )
     return Path(plan.directory)
+
+
+def resolve(place: Path, stored: str | None) -> Path | None:
+    """A path a record keeps, relative to the record's folder, as a path here."""
+    if not stored:
+        return None
+    return place / Path(*Path(str(stored).replace("\\", "/")).parts)
 
 
 def records(place: Path) -> list[dict[str, Any]]:
@@ -115,7 +133,7 @@ def names(place: Path) -> list[str]:
 
 
 def listing(place: Path) -> list[dict[str, Any]]:
-    """One row a name: the id in force, and how many were registered before it."""
+    """One row a name: the id in force, and the ids registered before it."""
     everything = records(place)
     rows = []
     for name, record in sorted(current(place).items()):
@@ -156,7 +174,9 @@ def register(
 
     The copy goes through the output allocation, so it gets a run id, a run
     record and a readable sidecar like any other output. The record is made
-    with an exclusive create, so an id is written once.
+    with an exclusive create, so an id is written once. A registration that
+    fails part way takes back what it made: the copies first, then the place
+    and the run record.
     """
     source_path = Path(source)
     extension = source_path.suffix.lstrip(".").lower() or "png"
@@ -172,18 +192,22 @@ def register(
         scratch_root=scratch_root,
     )
     place = Path(plan.directory)
-    before = find(place, plan.name)
+    image = Path(plan.path)
+    made: list[Path] = []
     try:
-        shutil.copyfile(source_path, plan.path)
+        before = find(place, plan.name)
+        made.append(image)
+        shutil.copyfile(source_path, image)
         mask_record = None
         if mask is not None:
             mask_path = Path(mask)
             mask_suffix = mask_path.suffix.lstrip(".").lower() or "png"
-            copied = place / f"{Path(plan.path).stem}_mask.{mask_suffix}"
+            copied = place / f"{image.stem}_mask.{mask_suffix}"
+            made.append(copied)
             shutil.copyfile(mask_path, copied)
             mask_record = {
-                "path": str(copied),
-                "source": str(mask_path),
+                "path": copied.name,
+                "source_note": str(mask_path),
                 "sha256": file_hash(copied),
             }
         now = time.time()
@@ -191,11 +215,11 @@ def register(
         record = {
             "ref_id": ref_id,
             "name": plan.name,
-            "image": str(Path(plan.path)),
+            "image": image.name,
             "template": plan.template,
-            "source": str(source_path),
-            "sha256": file_hash(plan.path),
-            "bytes": Path(plan.path).stat().st_size,
+            "source_note": str(source_path),
+            "sha256": file_hash(image),
+            "bytes": image.stat().st_size,
             "width": size[0] if size else None,
             "height": size[1] if size else None,
             "colour": dict(colour),
@@ -203,26 +227,34 @@ def register(
             "regions": {key: list(value) for key, value in (regions or {}).items()},
             "mask": mask_record,
             "hip_family": plan.hip_family,
-            "hip_path": None if hip_path is None else str(hip_path),
             "run_id": plan.run_id,
             "replaces": before["ref_id"] if before else None,
             "created": now,
             "created_iso": datetime.fromtimestamp(now).isoformat(timespec="seconds"),
         }
+        made.append(place / f"{ref_id}.json")
         write_once(place / f"{ref_id}.json", record)
     except BaseException:
+        for leftover in made:
+            try:
+                leftover.unlink(missing_ok=True)
+            except OSError:
+                pass
         outputs_module.release(store, plan)
-        Path(plan.path).unlink(missing_ok=True)
         raise
     return record
 
 
 def write_once(path: Path, record: Mapping[str, Any]) -> None:
-    """Write a record that must never be written again."""
-    text = json.dumps(record, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    """Write a record that must never be written again. A half written one is removed."""
+    text = json.dumps(record, indent=2, sort_keys=True, ensure_ascii=False, default=str) + "\n"
     handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    with os.fdopen(handle, "w", encoding="utf-8") as stream:
-        stream.write(text)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(text)
+    except BaseException:
+        Path(path).unlink(missing_ok=True)
+        raise
 
 
 # Section: series
@@ -233,24 +265,25 @@ def series_id(key: Mapping[str, Any]) -> str:
     return SERIES_PREFIX + hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
 
 
-def series_path(place: Path, identity: str) -> Path:
-    return place / SERIES_DIR / f"{identity}.jsonl"
+def series_folder(place: Path, identity: str) -> Path:
+    return place / SERIES_DIR / identity
 
 
 def series_runs(place: Path, identity: str) -> list[dict[str, Any]]:
     """Every run logged under a series, oldest first."""
-    try:
-        text = series_path(place, identity).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return []
     runs = []
-    for line in text.splitlines():
+    try:
+        entries = list(series_folder(place, identity).glob("*.json"))
+    except OSError:
+        return runs
+    for entry in entries:
         try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
+            run = json.loads(entry.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
-        if isinstance(entry, dict):
-            runs.append(entry)
+        if isinstance(run, dict):
+            runs.append(run)
+    runs.sort(key=lambda run: (float(run.get("when", 0.0)), str(run.get("run_id"))))
     return runs
 
 
@@ -258,27 +291,27 @@ def last_series_for(place: Path, name: str, *, besides: str) -> dict[str, Any] |
     """The newest run logged under the same compare name in another series."""
     newest: dict[str, Any] | None = None
     try:
-        logs = list((place / SERIES_DIR).glob(f"{SERIES_PREFIX}*.jsonl"))
+        logs = [entry for entry in (place / SERIES_DIR).iterdir() if entry.is_dir()]
     except OSError:
         return None
     for log in logs:
-        if log.stem == besides:
+        if log.name == besides or not log.name.startswith(SERIES_PREFIX):
             continue
-        for entry in series_runs(place, log.stem):
+        for entry in series_runs(place, log.name):
             if entry.get("name") != name:
                 continue
             if newest is None or float(entry.get("when", 0)) > float(newest.get("when", 0)):
-                newest = dict(entry, series_id=log.stem)
+                newest = dict(entry, series_id=log.name)
     return newest
 
 
-def log_run(place: Path, identity: str, entry: Mapping[str, Any]) -> None:
-    """Add one run to a series log, in one write."""
-    path = series_path(place, identity)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(entry, sort_keys=True, separators=(",", ":"), default=str) + "\n"
-    with open(path, "a", encoding="utf-8") as stream:
-        stream.write(line)
+def log_run(place: Path, identity: str, entry: Mapping[str, Any]) -> Path:
+    """Add one run to a series, as a file of its own that nothing writes twice."""
+    target = series_folder(place, identity)
+    target.mkdir(parents=True, exist_ok=True)
+    path = target / f"{outputs_module.sanitize_name(str(entry['run_id']))}.json"
+    write_once(path, entry)
+    return path
 
 
 def changed_fields(before: Mapping[str, Any], now: Mapping[str, Any]) -> list[str]:
@@ -288,7 +321,7 @@ def changed_fields(before: Mapping[str, Any], now: Mapping[str, Any]) -> list[st
 
 
 def trend(runs: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """The earlier runs of a series, newest last, and the change since the last one."""
+    """The earlier runs of a series, newest last."""
     earlier = [run for run in runs if isinstance(run.get("metrics"), Mapping)]
     if not earlier:
         return None
@@ -313,10 +346,8 @@ def change_since(last: Mapping[str, Any] | None, now: Mapping[str, Any] | None) 
         return None
     moved: dict[str, float] = {}
     for key in ("mae", "rmse", "diff_area_pct"):
-        before, after = (
-            last.get(key),
-            (_overall(now, key) if key != "diff_area_pct" else now.get(key)),
-        )
+        before = last.get(key)
+        after = _overall(now, key) if key != "diff_area_pct" else now.get(key)
         if isinstance(before, (int, float)) and isinstance(after, (int, float)):
             moved[key] = round(float(after) - float(before), 6)
     return moved or None
