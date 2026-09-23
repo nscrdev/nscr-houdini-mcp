@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -582,3 +583,28 @@ def test_a_flood_refusal_tells_a_change_to_keep_its_id_and_a_read_nothing_more()
     with pytest.raises(CallError) as refused:
         read.bridge("python.run")
     assert refused.value.hint == "wait 30 seconds, then call again"
+
+
+# Section: the log
+
+
+def test_every_refused_call_leaves_one_warning_with_its_code(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The capture listens at the root, where a server's own set up stops lines.
+    monkeypatch.setattr(logging.getLogger("nscr_houdini_mcp"), "propagate", True)
+    with caplog.at_level(logging.WARNING, logger="nscr_houdini_mcp"):
+        stage = Stage([record("s-1", "w1")], replies=(pong(),))
+        _, results = talk(
+            serve(stage),
+            ("hou_ping", {"sesion": "w1"}),
+            ("hou_pnig", {}),
+            ("hou_ping", {}),
+        )
+    assert [result.is_error for result in results] == [True, True, False]
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert [r.getMessage().split(": ")[:2] for r in warnings] == [
+        ["hou_ping refused", "BAD_ARGUMENTS"],
+        ["hou_pnig refused", "UNKNOWN_TOOL"],
+    ]
+    assert {r.name for r in warnings} == {"nscr_houdini_mcp.server"}

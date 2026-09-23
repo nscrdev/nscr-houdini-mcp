@@ -23,6 +23,7 @@ import threading
 from collections.abc import Callable, Mapping, Sequence
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -32,6 +33,8 @@ from mcp.server.mcpserver import MCPServer
 from mcp_types import CallToolResult
 from mcp_types import Tool as MCPTool
 
+from nscr_houdini_mcp import logs
+from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge.errors import did_you_mean
 from nscr_houdini_mcp.config import Config, ConfigError, load_config
 from nscr_houdini_mcp.pacing import Pacer
@@ -118,8 +121,22 @@ class Runtime:
         """Run one tool call to a finished result. Never raises.
 
         `progress` sends a progress note to the client, for a call that holds
-        on purpose; it does nothing when the client asked for none.
+        on purpose; it does nothing when the client asked for none. Every call
+        that ends in an error leaves one warning in the log with its code.
         """
+        result = self._run(name, arguments, progress, cancelled)
+        if result.is_error:
+            code, message = refusal_of(result)
+            log.warning("%s refused: %s: %s", name, code, message)
+        return result
+
+    def _run(
+        self,
+        name: str,
+        arguments: Mapping[str, Any] | None,
+        progress: Callable[[float, float | None, str | None], None] | None = None,
+        cancelled: threading.Event | None = None,
+    ) -> CallToolResult:
         arguments = dict(arguments or {})
         spec = self.tools.get(name)
         if spec is None:
@@ -174,6 +191,20 @@ class Runtime:
                 ),
                 call.trace if call else None,
             )
+
+
+def refusal_of(result: CallToolResult) -> tuple[str, str]:
+    """The code and message of a result that is an error, for the log.
+
+    A coded refusal carries both. A call that ran and reports a failure of its
+    own, such as code that raised inside Houdini, names the exception instead.
+    """
+    body = result.structured_content if isinstance(result.structured_content, Mapping) else {}
+    error = body.get("error")
+    if isinstance(error, Mapping):
+        code = error.get("code") or error.get("type") or "ERROR"
+        return str(code), str(error.get("message") or "")
+    return "ERROR", ""
 
 
 async def in_daemon_thread(
@@ -317,5 +348,14 @@ def run(*, pace_workers: bool = False) -> None:
 
     `pace_workers` is for tests only, as in `build_server`.
     """
+    logs.setup(state_home())
     reap_at_start()
     build_server(pace_workers=pace_workers).run(transport="stdio")
+
+
+def state_home(config_loader: Callable[[], Config] = load_config) -> Path:
+    """The state folder the config names, or the default one when it will not load."""
+    try:
+        return config_loader().state_home
+    except (ConfigError, OSError):
+        return store_module.default_home()
