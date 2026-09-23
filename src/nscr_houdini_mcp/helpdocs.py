@@ -41,9 +41,7 @@ import re
 import shutil
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import zipfile
 import zlib
 from collections import OrderedDict
@@ -64,6 +62,10 @@ PAGE_CACHE_VERSION = 2
 # How long one request to a help server may take, from connecting to the
 # last byte.
 HELP_TIMEOUT_S = 2.0
+
+# How long a connection to a help server may take to be made. On loopback a
+# listening port takes one at once.
+CONNECT_TIMEOUT_S = 0.5
 
 # How long a session whose help server timed out is left alone.
 QUIET_AFTER_TIMEOUT_S = 60.0
@@ -934,30 +936,36 @@ def usable_url(url: Any) -> str | None:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", "", ""))
 
 
-class _NoRedirects(urllib.request.HTTPRedirectHandler):
-    """Every redirect is refused: the answer must come from the address asked."""
-
-    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
-        return None
-
-
 def fetch(base: str, path: str, *, query: dict[str, str] | None = None) -> str:
     """One page from a help server, as text.
 
     Raises `PageMissing` for a 404 and `HelpServerError` for anything else
-    that is not an answer, a redirect included. `HELP_TIMEOUT_S` bounds the
-    whole request: it runs on a thread of its own, which is left behind if it
-    has not finished by then.
+    that is not an answer, a redirect included, since no redirect is followed.
+    `HELP_TIMEOUT_S` bounds the whole request: it runs on a thread of its own,
+    which is left behind if it has not finished by then.
+
+    The two ways it can fail are told apart, because they call for different
+    things. A connection that is refused, reset or not made within
+    `CONNECT_TIMEOUT_S` means nothing is listening there any more
+    (`timed_out` false): the address may have moved. A connection that was
+    made and then not answered in time means the help server is there and
+    busy (`timed_out` true). On loopback a listening port takes a connection
+    at once, even from a process that is busy, so a connect that does not
+    complete quickly is a port nobody listens on, whatever the system does
+    with it.
     """
-    url = base.rstrip("/") + "/" + urllib.parse.quote(path.strip("/"), safe="/_.-+")
+    parsed = urllib.parse.urlsplit(base)
+    target = (
+        (parsed.path.rstrip("/") or "") + "/" + urllib.parse.quote(path.strip("/"), safe="/_.-+")
+    )
     if query:
-        url += "?" + urllib.parse.urlencode(query)
+        target += "?" + urllib.parse.urlencode(query)
     deadline = time.monotonic() + HELP_TIMEOUT_S
-    box: dict[str, Any] = {}
+    box: dict[str, Any] = {"phase": "connect"}
 
     def work() -> None:
         try:
-            box["text"] = _fetch(url, path, deadline)
+            box["text"] = _fetch(parsed, target, path, deadline, box)
         except BaseException as error:  # noqa: BLE001 - handed to the waiting thread
             box["error"] = error
 
@@ -965,6 +973,8 @@ def fetch(base: str, path: str, *, query: dict[str, str] | None = None) -> str:
     worker.start()
     worker.join(max(deadline - time.monotonic(), 0.0))
     if worker.is_alive():
+        if box["phase"] == "connect":
+            raise HelpServerError("the help server did not take a connection")
         raise HelpServerError(
             f"the help server did not answer within {HELP_TIMEOUT_S:g} s", timed_out=True
         )
@@ -973,20 +983,46 @@ def fetch(base: str, path: str, *, query: dict[str, str] | None = None) -> str:
     return box["text"]
 
 
-def _fetch(url: str, path: str, deadline: float) -> str:
-    opener = urllib.request.build_opener(
-        # No proxy: a proxy set for the machine must not carry a loopback request.
-        urllib.request.ProxyHandler({}),
-        _NoRedirects(),
+def _fetch(
+    parsed: urllib.parse.SplitResult, target: str, path: str, deadline: float, box: dict
+) -> str:
+    """The request itself, with no proxy and no redirect, noting its phase in `box`."""
+    try:
+        port = parsed.port or 80
+    except ValueError:
+        raise HelpServerError("the help server address has no usable port") from None
+    connection = http.client.HTTPConnection(
+        parsed.hostname or "127.0.0.1", port, timeout=min(CONNECT_TIMEOUT_S, HELP_TIMEOUT_S)
     )
     try:
-        with opener.open(url, timeout=HELP_TIMEOUT_S) as answer:
+        try:
+            connection.connect()
+        except OSError as error:
+            # Refused, reset, unreachable, or not made in time.
+            raise HelpServerError(
+                f"the help server did not take a connection ({type(error).__name__})"
+            ) from None
+        box["phase"] = "read"
+        if connection.sock is not None:
+            connection.sock.settimeout(max(deadline - time.monotonic(), 0.01))
+        try:
+            connection.request("GET", target, headers={"Accept": "text/html"})
+            answer = connection.getresponse()
+            if answer.status == 404:
+                raise PageMissing(path)
+            if 300 <= answer.status < 400:
+                raise HelpServerError(f"the help server redirected ({answer.status}), refused")
+            if answer.status != 200:
+                raise HelpServerError(f"the help server answered {answer.status}")
             chunks: list[bytes] = []
             size = 0
             while True:
-                if time.monotonic() > deadline:
+                left = deadline - time.monotonic()
+                if left <= 0:
                     raise HelpServerError("the help server answered too slowly", timed_out=True)
-                chunk = answer.read(64 * 1024)
+                if connection.sock is not None:
+                    connection.sock.settimeout(left)
+                chunk = answer.read1(64 * 1024)
                 if not chunk:
                     break
                 size += len(chunk)
@@ -994,23 +1030,21 @@ def _fetch(url: str, path: str, deadline: float) -> str:
                     raise HelpServerError("the help server page is too large")
                 chunks.append(chunk)
             charset = answer.headers.get_content_charset() or "utf-8"
-    except urllib.error.HTTPError as error:
-        if error.code == 404:
-            raise PageMissing(path) from None
-        if 300 <= error.code < 400:
-            raise HelpServerError(f"the help server redirected ({error.code}), refused") from None
-        raise HelpServerError(f"the help server answered {error.code}") from None
-    except TimeoutError as error:
-        raise HelpServerError(
-            f"the help server did not answer: {type(error).__name__}", timed_out=True
-        ) from None
-    except urllib.error.URLError as error:
-        timed_out = isinstance(error.reason, TimeoutError)
-        raise HelpServerError(
-            f"the help server did not answer: {type(error.reason).__name__}", timed_out=timed_out
-        ) from None
-    except (OSError, ValueError, http.client.HTTPException) as error:
-        raise HelpServerError(f"the help server did not answer: {type(error).__name__}") from None
+        except TimeoutError:
+            raise HelpServerError(
+                f"the help server did not answer within {HELP_TIMEOUT_S:g} s", timed_out=True
+            ) from None
+        except (ConnectionError, http.client.RemoteDisconnected) as error:
+            # It hung up: the process behind the port may have gone.
+            raise HelpServerError(
+                f"the help server dropped the connection ({type(error).__name__})"
+            ) from None
+        except (OSError, http.client.HTTPException) as error:
+            raise HelpServerError(
+                f"the help server did not answer ({type(error).__name__})"
+            ) from None
+    finally:
+        connection.close()
     return b"".join(chunks).decode(charset, "replace")
 
 
