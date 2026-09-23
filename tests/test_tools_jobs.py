@@ -837,7 +837,9 @@ def test_a_held_status_tells_a_client_that_asked_that_it_is_still_waiting(
     assert body["changed"] is False
     assert heard, "no progress note arrived"
     assert [note[0] for note in heard] == sorted(note[0] for note in heard)
-    assert heard[0][1] == 1
+    # The total is the time left when the hold began, which a coarse clock
+    # can shave by a tenth.
+    assert heard[0][1] == pytest.approx(1, abs=0.15)
     assert "running" in heard[0][2]
     # Without a callback the same wait answers the same, and nothing depends on it.
     assert job(bench, handle["job_id"], wait_s=0.5)["changed"] is False
