@@ -849,6 +849,24 @@ def test_the_managed_roots_of_a_scene_are_its_output_and_cache_roots(
     assert scratch == ["/tmp/h/nscr-houdini-mcp/s1"]
 
 
+def test_roots_are_read_the_same_way_as_the_path() -> None:
+    # A root as the system hands it back, with its own separators and a
+    # trailing one, still holds the path.
+    assert outputs.inside_roots(["C:\\shots\\"], "C:/shots/render/a.exr")
+    assert outputs.inside_roots(["/shots/./sq010/"], "/shots/sq010/a.exr")
+
+
+def test_more_names_fill_in_whole_variables_and_nothing_is_evaluated() -> None:
+    filled = outputs.expand(
+        "$HIP/render/$HIPNAME.$OS.$F4.exr",
+        hip_dir="/shots",
+        frame=12,
+        names={"HIPNAME": "shot_v002", "OS": "karma1"},
+    )
+    assert filled == "/shots/render/shot_v002.karma1.0012.exr"
+    assert outputs.expand("`npoints()`/$OSX", names={"OS": "a"}) == "`npoints()`/$OSX"
+
+
 def test_a_path_is_inside_the_roots_only_when_it_stays_there() -> None:
     roots = ["/shots"]
     assert outputs.inside_roots(roots, "/shots/render/a.exr")

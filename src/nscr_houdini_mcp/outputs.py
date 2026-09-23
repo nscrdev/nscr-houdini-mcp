@@ -631,6 +631,7 @@ def plan_path(
     when: datetime | None = None,
     scratch_root: str | Path | None = None,
     spill_root: str | Path | None = None,
+    variables: Mapping[str, str | None] | None = None,
 ) -> OutputPlan:
     """Work out the line and the path for one output, without touching disk.
 
@@ -642,6 +643,10 @@ def plan_path(
 
     A spill goes to the server's spill folder, `spill_root`, whatever the
     scene is, so its line holds that folder as it is on this machine.
+
+    `variables` is `$JOB` and `$HOUDINI_TEMP_DIR` as the session has them.
+    Given, they are the only values used, and this process's own environment
+    is never read: the session is where the scene's paths mean something.
     """
     table = conventions or DEFAULT_CONVENTIONS_TABLE
     template = table.template_for(kind)
@@ -701,9 +706,14 @@ def plan_path(
         literal = literal.replace(_SPILL_MARK, spill_folder)
         root_template = spill_folder
 
+    job: str | None = None
+    if variables is not None:
+        job = variables.get("JOB") or ""
+        if variables.get("HOUDINI_TEMP_DIR"):
+            scratch_root = str(variables["HOUDINI_TEMP_DIR"])
     temp_dir = _temp_dir(scratch_root) if unsaved else None
-    root = _normalize(expand(root_template, hip_dir=hip_dir, temp_dir=temp_dir))
-    frozen = _normalize(expand(literal, hip_dir=hip_dir, temp_dir=temp_dir))
+    root = _normalize(expand(root_template, hip_dir=hip_dir, temp_dir=temp_dir, job=job))
+    frozen = _normalize(expand(literal, hip_dir=hip_dir, temp_dir=temp_dir, job=job))
     if not _inside(root, frozen):
         raise ConventionError(f"{frozen} would leave the output root {root}")
 
@@ -747,6 +757,7 @@ def expand(
     temp_dir: str | Path | None = None,
     job: str | Path | None = None,
     frame: int | None = None,
+    names: Mapping[str, str] | None = None,
 ) -> str:
     """Fill in the Houdini variables this server owns, and nothing else.
 
@@ -755,8 +766,13 @@ def expand(
     error, because a folder named after an unexpanded variable is worse than a
     refusal. Separators are settled here and nowhere earlier, so the stored
     template is the same text on every system.
+
+    `names` fills in more whole names, such as `OS` or `HIPNAME` for a
+    reader that knows the node and the scene. Nothing is ever evaluated.
     """
-    values: dict[str, str] = {}
+    values: dict[str, str] = {
+        str(name): str(value) for name, value in (names or {}).items() if value is not None
+    }
     if hip_dir is not None:
         values["HIP"] = _posix(hip_dir)
     if temp_dir is not None:
@@ -964,14 +980,21 @@ def managed_roots(
     hip_path: str | Path | None,
     session_id: str | None = None,
     scratch_root: str | Path | None = None,
+    variables: Mapping[str, str | None] | None = None,
 ) -> list[str]:
     """The folders this server writes one scene's outputs under, expanded.
 
     For a saved scene, the output root and the cache root; for one never
     saved, its scratch folder. A root whose variable has no value here, such
-    as `$JOB` when nothing sets it, is left out.
+    as `$JOB` when nothing sets it, is left out. `variables` is `$JOB` and
+    `$HOUDINI_TEMP_DIR` as the session has them, as for `plan_path`.
     """
     table = conventions or DEFAULT_CONVENTIONS_TABLE
+    job: str | None = None
+    if variables is not None:
+        job = variables.get("JOB") or ""
+        if variables.get("HOUDINI_TEMP_DIR"):
+            scratch_root = str(variables["HOUDINI_TEMP_DIR"])
     if hip_path is None:
         scratch = f"{SCRATCH_ROOT}/{sanitize_name(session_id or 'session')}"
         return [_normalize(expand(scratch, temp_dir=_temp_dir(scratch_root)))]
@@ -981,7 +1004,7 @@ def managed_roots(
         if not template:
             continue
         try:
-            roots.append(_normalize(expand(template, hip_dir=hip_dir)))
+            roots.append(_normalize(expand(template, hip_dir=hip_dir, job=job)))
         except OutputError:
             continue
     return roots
@@ -990,11 +1013,14 @@ def managed_roots(
 def inside_roots(roots: Iterable[str], path: str) -> bool:
     """Whether an expanded path is under one of the roots, read as text."""
     folded = os.name == "nt"
-    target = _normalize(str(path).replace("\\", "/"))
+    target = _normalize(_posix(path))
     if folded:
         target = target.lower()
     for root in roots:
-        if _inside(root.lower() if folded else root, target):
+        # Both sides are read the same way, so a root that came back from the
+        # system with its own separators or case still matches.
+        settled = _normalize(_posix(root))
+        if _inside(settled.lower() if folded else settled, target):
             return True
     return False
 
@@ -1040,6 +1066,7 @@ def allocate(
     when: datetime | None = None,
     scratch_root: str | Path | None = None,
     spill_root: str | Path | None = None,
+    variables: Mapping[str, str | None] | None = None,
     above: int = 0,
 ) -> OutputPlan:
     """Take a version, claim it on disk, record the run and write the sidecar.
@@ -1076,6 +1103,7 @@ def allocate(
         when=when,
         scratch_root=scratch_root,
         spill_root=spill_root,
+        variables=variables,
         above=above,
     )
 
@@ -1149,6 +1177,7 @@ def _claim(
     when: datetime | None,
     scratch_root: str | Path | None,
     spill_root: str | Path | None = None,
+    variables: Mapping[str, str | None] | None = None,
     above: int = 0,
 ) -> OutputPlan:
     """One plan whose place on disk is this run's, and nobody else's."""
@@ -1163,6 +1192,7 @@ def _claim(
         "when": when,
         "scratch_root": scratch_root,
         "spill_root": spill_root,
+        "variables": variables,
     }
     if not table.is_versioned(kind):
         plan = plan_path(kind, version=None, **options)
