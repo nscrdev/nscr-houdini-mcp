@@ -605,6 +605,21 @@ def test_every_refused_call_leaves_one_warning_with_its_code(
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert [r.getMessage().split(": ")[:2] for r in warnings] == [
         ["hou_ping refused", "BAD_ARGUMENTS"],
-        ["hou_pnig refused", "UNKNOWN_TOOL"],
+        ["<unknown> refused", "UNKNOWN_TOOL"],
     ]
     assert {r.name for r in warnings} == {"nscr_houdini_mcp.server"}
+
+
+def test_a_made_up_tool_name_never_reaches_the_log(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    forged = "hou_x\n2026-01-01 00:00:00 WARNING pid=1 token=sk-SECRET"
+    monkeypatch.setattr(logging.getLogger("nscr_houdini_mcp"), "propagate", True)
+    with caplog.at_level(logging.DEBUG, logger="nscr_houdini_mcp"):
+        _, [result] = talk(serve(Stage([])), (forged, {}))
+    assert result.is_error is True
+    warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warned == ["<unknown> refused: UNKNOWN_TOOL"]
+    # At debug the message is written, quoted, so it can never start a line.
+    lines = [record.getMessage() for record in caplog.records]
+    assert not [line for line in lines if "\n" in line]

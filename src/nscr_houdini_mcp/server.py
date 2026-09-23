@@ -67,6 +67,12 @@ UNSERVED_METHODS = (
 
 log = logging.getLogger(__name__)
 
+# How much of a refusal's message the debug line keeps.
+DEBUG_MESSAGE_CHARS = 500
+
+# What the log calls a tool that is not one of ours.
+UNKNOWN_TOOL_NAME = "<unknown>"
+
 # What the log calls a failure a tool reports without one of our codes.
 REPORTED_ERROR = "TOOL_REPORTED_ERROR"
 _CODE = re.compile(r"[A-Z][A-Z_]{1,40}")
@@ -134,8 +140,11 @@ class Runtime:
         result = self._run(name, arguments, progress, cancelled)
         if result.is_error:
             code, message = refusal_of(result)
-            log.warning("%s refused: %s", name, code)
-            log.debug("%s refused: %s: %s", name, code, message)
+            # A name the caller made up is caller text too: only ours is written.
+            shown = name if name in self.tools else UNKNOWN_TOOL_NAME
+            log.warning("%s refused: %s", shown, code)
+            # Quoted and cut short, so it can never start a line of its own.
+            log.debug("%s refused: %s: %r", shown, code, message[:DEBUG_MESSAGE_CHARS])
         return result
 
     def _run(
