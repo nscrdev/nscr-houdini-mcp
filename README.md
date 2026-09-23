@@ -226,8 +226,10 @@ end, and their copies go with them.
 Every file goes under the `capture` kind of the output table below, and the
 answer carries the path, the width and height, the frame, the camera, the
 `route` that made it and `image_stats`: the mean, least and most of each
-channel and `non_empty`, which is false when every channel is one value or
-the alpha is zero everywhere. A capture whose every image is empty is
+channel at the image's own depth, `flat` for an image that is one value in
+every channel, and `non_empty`, which is false for an empty file and, for the
+viewport and a node, for an alpha that is zero everywhere. A flat image is a
+picture, with a note. A capture whose every image is empty is
 `CAPTURE_EMPTY`. A thumbnail of at most 512 pixels on its long edge comes back
 as image content beside the text; `return_image` says `thumb`, `full` or
 `none`.
@@ -238,15 +240,21 @@ flipbooked with settings of its own (no MPlay, the beauty pass only unless
 then put back; and a flipbook render node made for the capture and taken
 away after. A `camera`, `display` or `frame_target` asked for is applied for
 the capture and the view is put back as it was, camera, pivot and width
-included. The render node needs a camera: one named, or one made for the
-capture and fitted to the target's bounds from `persp`, `top`, `front`,
-`right` or an `{orbit, elevation}`. In a session with a user interface that
+included. The render node looks through a camera made for the capture:
+one that follows a named camera and reads its lens by reference, so the named
+camera is never written, or one fitted to the target's bounds from `persp`,
+`top`, `front`, `right` or an `{orbit, elevation}`. A worker is started on
+Qt's offscreen screen plugin, so it draws at one pixel to a point on any
+display. In a session with a user interface that
 route cannot know what the artist's view frames, so it says
 `framing_unverified`; it is the only route a worker has. `node` draws that
 node's object alone with the node carrying the display flag, and puts the
 flag back. Whatever a capture makes for itself is made and taken away with
-undo turned off. The network editor and panes are grabbed from their own
-window, which needs a user interface; a worker answers `UI_UNAVAILABLE`.
+undo turned off. A route that fails part way takes its frames with it; a
+capture stopped on request keeps the frames it wrote and lists them, and the
+run record names each file. The network editor and panes are made the
+current tab and grabbed from their own window, which needs a user interface;
+a worker answers `UI_UNAVAILABLE`.
 
 `views: quad` captures persp, top, front and right, `turntable4` four orbits
 a quarter turn apart, and both add a two by two contact sheet, which is then
