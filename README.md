@@ -63,7 +63,7 @@ Run the server on stdio:
 nscr-houdini-mcp
 ```
 
-Six tools so far. `hou_ping` says which session a call reaches and that it
+Seven tools so far. `hou_ping` says which session a call reaches and that it
 answers. `hou_sessions` lists every session with its state (`live`, `busy`,
 `unresponsive`, `crashed` or `gone`) and starts and stops workers under the
 pool's rules; it never closes a Houdini with a user interface. `hou_scene`
@@ -210,6 +210,27 @@ whether stopped or found gone, is `lost` with the progress and outputs it had
 written, and so is one its session has said nothing about for fifteen
 minutes. A job that ends leaves a readable copy of itself beside the scene,
 in `.agent/jobs/`. Jobs are kept for 7 days.
+
+`hou_node_type` reads a node type from the running Houdini before any node of
+it is made, so installed assets and this build's own versions are the ones
+described. Name a `type` and a `context` (`obj`, `sop`, `lop`, `cop`, `dop`,
+`top`, `chop`, `out`, `mat` or `vop`, or a category name such as `Sop`) for
+its inputs and outputs with their labels and its real parameter names with
+their defaults; `full` adds menus, ranges, folders, hidden parameters and the
+first line of its help. A bare name is the version Houdini would make for it,
+and `resolved_from` says which name was asked for. A multiparm carries its
+instance template under `instances`, and a menu that a script fills in says
+`dynamic` rather than running the script. `query` searches every type by
+keyword: the exact name first, then a name that starts with it, one that
+holds it, the label and the help line. Hidden types come only with `include`
+`hidden`. A name that is not there is `TYPE_NOT_FOUND` with up to five near
+names, or with the contexts that have it. Parameters and search rows page the
+way `hou_inspect` does, and a page after an asset changed says `changed`.
+
+Everything comes from the node type itself: nothing is cooked or made. An
+asset's input labels come from its dialog script, and a type built into
+Houdini takes them from the headings of its help page. Help is the asset's
+own, or the page in the `nodes.zip` Houdini ships.
 
 ### The Houdini side
 
