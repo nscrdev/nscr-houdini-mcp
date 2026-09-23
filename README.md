@@ -229,8 +229,14 @@ way `hou_inspect` does, and a page after an asset changed says `changed`.
 
 Everything comes from the node type itself: nothing is cooked or made. An
 asset's input labels come from its dialog script, and a type built into
-Houdini takes them from the headings of its help page. Help is the asset's
-own, or the page in the `nodes.zip` Houdini ships.
+Houdini takes them from the headings of its help page, which only
+approximate what the node shows; `labels_from` says which it was. A ramp
+says how many points it starts with in `default_points`. Help is the
+asset's own embedded help, or a page from the `nodes.zip` Houdini ships or
+from any `help/nodes` folder on Houdini's search path, which is where
+packages keep theirs. A search with no context leaves out data recipes,
+managers and the networks that only hold other contexts, and equally close
+matches come in context order, SOPs first.
 
 ### The Houdini side
 
