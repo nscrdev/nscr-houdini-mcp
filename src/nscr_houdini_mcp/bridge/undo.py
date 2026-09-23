@@ -31,6 +31,9 @@ class Outcome:
     error: BaseException | None = None
     recorded: bool = False
     rolled_back: bool = False
+    # Whether the undo stack could be read on both sides, so `recorded` is a
+    # finding and not a default.
+    counted: bool = False
 
 
 def run_in_undo_group(function: Callable[[], Any], *, label: str, hou: Any) -> Outcome:
@@ -54,12 +57,16 @@ def run_in_undo_group(function: Callable[[], Any], *, label: str, hou: Any) -> O
             error = raised
 
     after = _entries(hou)
-    # Without a count from both sides there is no way to tell whether this
-    # call put anything on the stack, and an undo on a guess would reverse
-    # somebody else's edit. So it counts as nothing recorded.
-    recorded = before is not None and after is not None and after > before
+    # Without the stack from both sides there is no way to tell whether this
+    # call put anything on it, and an undo on a guess would reverse somebody
+    # else's edit. So it counts as nothing recorded. The stack is compared
+    # whole rather than by length, because a stack at its limit drops its
+    # oldest entry as it takes a new one and keeps the same length. A full
+    # stack whose entries all read the same is the one case this cannot see.
+    counted = before is not None and after is not None
+    recorded = counted and after != before
     if error is None:
-        return Outcome(value=value, recorded=recorded)
+        return Outcome(value=value, recorded=recorded, counted=counted)
 
     rolled_back = False
     if recorded:
@@ -68,12 +75,12 @@ def run_in_undo_group(function: Callable[[], Any], *, label: str, hou: Any) -> O
             rolled_back = True
         except Exception:  # noqa: BLE001 - a failed rollback is reported, not raised
             rolled_back = False
-    return Outcome(error=error, recorded=recorded, rolled_back=rolled_back)
+    return Outcome(error=error, recorded=recorded, rolled_back=rolled_back, counted=counted)
 
 
-def _entries(hou: Any) -> int | None:
-    """How many undo entries there are, or nothing when this build will not say."""
+def _entries(hou: Any) -> tuple[str, ...] | None:
+    """The undo entries there are, or nothing when this build will not say."""
     try:
-        return len(hou.undos.undoLabels())
-    except Exception:  # noqa: BLE001 - without a count there is nothing to compare
+        return tuple(str(label) for label in hou.undos.undoLabels())
+    except Exception:  # noqa: BLE001 - without the stack there is nothing to compare
         return None

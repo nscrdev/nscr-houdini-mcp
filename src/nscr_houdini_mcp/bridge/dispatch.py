@@ -749,6 +749,7 @@ class Dispatcher:
         value: Any = None
         error: BaseException | None = None
         marked = False
+        changed: bool | None = None
         try:
             try:
                 # The last look at the scene, here on the thread that is about
@@ -771,13 +772,14 @@ class Dispatcher:
                     )
                     running.recorded = outcome.recorded
                     running.rolled_back = outcome.rolled_back
+                    changed = outcome.recorded if outcome.counted else None
                     if outcome.error is not None:
                         raise outcome.error
                     value = outcome.value
             except BaseException as raised:  # noqa: BLE001 - becomes the coded answer
                 error = raised
             if marked:
-                self.identity.dirty.ended(tool.name, ok=error is None)
+                self.identity.dirty.ended(tool.name, ok=error is None, changed=changed)
             timing_ms = (time.monotonic() - began) * 1000.0
             reply = self._settle(tool, value, error, running, dict(trace or {}), timing_ms)
             # Written before the session is given back, so a retry queued

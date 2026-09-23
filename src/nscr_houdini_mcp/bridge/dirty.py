@@ -6,7 +6,10 @@ bridge keeps its own mark instead, from what it can see happen:
 
 - `clean` after a save the bridge made, a save any code made while no call
   of ours was running, a load, or a new scene.
-- `dirty` after any call that changes the scene, and after a merge.
+- `dirty` after any call that changes the scene, and after a merge. A call
+  that may change it and left the undo stack as it was, such as Python code
+  that only read, leaves the mark as it was. Code that edits with undo turned
+  off is not seen that way.
 - `unknown` at start, after a call that failed part way, and after code that
   saved or replaced the scene itself: it may have changed things after that
   and nothing here can tell.
@@ -71,8 +74,12 @@ class DirtyMarker:
         with self._lock:
             self._events = []
 
-    def ended(self, tool: str, *, ok: bool) -> None:
-        """A call that may have changed the scene has finished."""
+    def ended(self, tool: str, *, ok: bool, changed: bool | None = None) -> None:
+        """A call that may have changed the scene has finished.
+
+        `changed` is whether the undo stack moved during the call, when that
+        could be read: false leaves the mark alone.
+        """
         with self._lock:
             seen = self._events or []
             self._events = None
@@ -88,6 +95,8 @@ class DirtyMarker:
                 return
             if seen:
                 self._set(UNKNOWN, f"{tool} {seen[-1]} the scene and may have changed it after")
+            elif changed is False:
+                return
             elif ok:
                 self._set(DIRTY, f"changed by {tool}")
             else:

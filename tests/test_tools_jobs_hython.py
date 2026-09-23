@@ -183,13 +183,15 @@ def test_a_worker_reports_unsaved_changes_from_the_bridges_own_mark(
     place: dict[str, Any], tmp_path: Path
 ) -> None:
     hip = tmp_path / "marked.hip"
-    changed, after_change, saved_by_code, after_code, saved, after_save = run(
+    changed, after_change, saved_by_code, after_code, saved, after_save, read, after_read = run(
         place,
         ("hou_python", {"code": "hou.node('/obj').createNode('null')"}),
         ("hou_scene", {}),
         ("hou_python", {"code": f"hou.hipFile.save({str(hip)!r})"}),
         ("hou_scene", {}),
         ("hou_scene", {"action": "save"}),
+        ("hou_scene", {}),
+        ("hou_python", {"code": "result = len(hou.node('/obj').children())"}),
         ("hou_scene", {}),
     )
     ok(changed)
@@ -199,6 +201,9 @@ def test_a_worker_reports_unsaved_changes_from_the_bridges_own_mark(
     assert ok(after_code)["unsaved"] is None
     ok(saved)
     assert (ok(after_save)["unsaved"], ok(after_save)["unsaved_source"]) == (False, "bridge")
+    # Code that only read left the undo stack as it was, and the mark with it.
+    assert ok(read)["result"] >= 1
+    assert ok(after_read)["unsaved"] is False
     assert hip.is_file()
 
 

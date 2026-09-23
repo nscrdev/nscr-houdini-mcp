@@ -139,3 +139,29 @@ def test_a_session_with_a_user_interface_reports_houdinis_own_answer(scene: Scen
     assert scene_info({}, context)["unsaved"] is True
     # Whatever the bridge's own mark says.
     assert mark.unsaved is None
+
+
+def test_code_that_only_reads_leaves_the_mark_as_it_was(scene: Scene) -> None:
+    worker = session(scene)
+    run(worker, "scene.save")
+    assert unsaved(worker) == (False, "bridge")
+    run(worker, "python.run", code="result = len(hou.node('/obj').children())", namespace="n")
+    assert unsaved(worker) == (False, "bridge")
+    run(worker, "python.run", code="hou.node('/obj').createNode('geo')", namespace="n")
+    assert unsaved(worker) == (True, "bridge")
+
+
+def test_a_change_is_seen_when_the_undo_stack_is_at_its_limit(scene: Scene) -> None:
+    worker = session(scene)
+    scene.undos.limit = 3
+    for index in range(3):
+        code = "hou.node('/obj').createNode('null')"
+        run(worker, "python.run", code=code, namespace="n", undo_label=f"step {index}")
+    run(worker, "scene.save")
+    assert unsaved(worker) == (False, "bridge")
+    code = "hou.node('/obj').createNode('geo')"
+    reply = run(worker, "python.run", code=code, namespace="n", undo_label="step 3")
+    # The stack kept its length, and the change was still seen as one.
+    assert len(scene.undos.labels) == 3
+    assert reply["undo"]["recorded"] is True
+    assert unsaved(worker) == (True, "bridge")

@@ -676,6 +676,14 @@ class Undos:
         self.labels: list[tuple[str, list[Any]]] = []
         self._pending: list[Any] | None = None
         self.performed = 0
+        # How many entries the stack keeps, the oldest going first past it,
+        # as Houdini's undo levels do. Nothing means no limit.
+        self.limit: int | None = None
+
+    def _keep(self, entry: tuple[str, list[Any]]) -> None:
+        self.labels.append(entry)
+        if self.limit is not None:
+            del self.labels[: max(0, len(self.labels) - self.limit)]
 
     @contextmanager
     def group(self, label: str):
@@ -686,11 +694,11 @@ class Undos:
         finally:
             done, self._pending = self._pending, outer
             if done:
-                self.labels.append((label, done))
+                self._keep((label, done))
 
     def record(self, undo: Any) -> None:
         if self._pending is None:
-            self.labels.append(("edit", [undo]))
+            self._keep(("edit", [undo]))
         else:
             self._pending.append(undo)
 
