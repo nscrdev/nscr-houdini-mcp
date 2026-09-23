@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from nscr_houdini_mcp.bridge import images, node_types
+from nscr_houdini_mcp.bridge import outputs as output_module
 from nscr_houdini_mcp.bridge import tools as tool_module
 from nscr_houdini_mcp.bridge.tools import ToolContext
 
@@ -350,6 +351,41 @@ def default_registry(
         required=images.ARGUMENTS,
         context=True,
         summary="read a scene linear image through the display transform, for a compare",
+    )
+    registry.add(
+        "outputs.freeze_parm",
+        output_module.freeze_parm,
+        mutating=True,
+        arguments=output_module.FREEZE_ARGUMENTS,
+        required=("node", "parm", "run_id"),
+        context=True,
+        label="freeze output parameter",
+        summary="hold a run's own path on an output parameter while the run goes",
+    )
+    registry.add(
+        "outputs.restore_parm",
+        output_module.restore_parm,
+        mutating=True,
+        arguments=output_module.RESTORE_ARGUMENTS,
+        required=("node", "parm", "token"),
+        context=True,
+        label="restore output parameter",
+        summary="give a frozen output parameter its own value back",
+    )
+    registry.add(
+        "outputs.variables",
+        output_module.variables,
+        arguments=(),
+        context=True,
+        summary="$HIP, $JOB and $HOUDINI_TEMP_DIR as this session has them",
+    )
+    registry.add(
+        "outputs.lint",
+        output_module.lint,
+        arguments=output_module.LINT_ARGUMENTS,
+        context=True,
+        summary="output parameters that break the output conventions, a page at a time",
+        caps=INSPECT_CAPS,
     )
     registry.add_report("namespaces", namespaces.state)
     return registry

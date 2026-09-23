@@ -134,6 +134,8 @@ class ParmTemplate:
         expression: tuple[str, ...] | str | None = None,
         ramp: str = "",
         menu_type: str = "Normal",
+        string_type: str = "Regular",
+        file_type: str = "Any",
     ) -> None:
         self._kind = TemplateType(kind)
         self._label = label
@@ -151,6 +153,8 @@ class ParmTemplate:
         self._expression = expression
         self._ramp = ramp
         self._menu_type = menu_type
+        self._string_type = string_type
+        self._file_type = file_type
 
     def type(self) -> TemplateType:
         return self._kind
@@ -175,6 +179,13 @@ class ParmTemplate:
 
     def itemGeneratorScript(self) -> str:  # noqa: N802 - the name is Houdini's
         return self._script
+
+    def stringType(self) -> str:  # noqa: N802 - the name is Houdini's
+        # Houdini hands back an enum value that prints this way.
+        return f"stringParmType.{self._string_type}"
+
+    def fileType(self) -> str:  # noqa: N802 - the name is Houdini's
+        return f"fileType.{self._file_type}"
 
     def defaultValue(self) -> Any:  # noqa: N802 - the name is Houdini's
         if self._kind.name() in ("Separator", "Label", "Button"):
@@ -263,8 +274,17 @@ class Parm:
         self.default = default
         self.value: Any = default
         self._expression: str | None = None
+        # The value an expression was set over, which Houdini keeps as the
+        # channel's own default and writes into the scene file with it.
+        self.channel_default: Any = None
         self._language = "hscript"
         self.locked = False
+        # Whether a disable rule on the node turns this parameter off, and
+        # the rule, which Houdini only works out again when asked to: a node
+        # just made can report a stale answer until then.
+        self.disabled = False
+        self.disable_rule: Any = None
+        self.hidden = False
         self._instance_of = instance_of
         self._index = index
         self._spare = spare
@@ -300,6 +320,8 @@ class Parm:
             self._node.grow(self)
 
     def setExpression(self, text: str, language: str = "hscript") -> None:  # noqa: N802
+        if self._expression is None:
+            self.channel_default = self.value
         self._expression = text
         self._language = language
         self._node.dirty = True
@@ -351,6 +373,21 @@ class Parm:
         if self._template.type().name() != "String":
             raise OperationFailed("Only string parms have unexpanded strings")
         return str(self.value)
+
+    def isDisabled(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return self.disabled
+
+    def isHidden(self) -> bool:  # noqa: N802 - the name is Houdini's
+        return self.hidden
+
+    def deleteAllKeyframes(self) -> None:  # noqa: N802 - the name is Houdini's
+        # A string parameter whose expression goes is left empty, as it is in
+        # Houdini.
+        if self._expression is not None or self.keys:
+            self.value = ""
+        self.keys = []
+        self._expression = None
+        self.channel_default = None
 
     def isLocked(self) -> bool:  # noqa: N802 - the name is Houdini's
         return self.locked
@@ -430,16 +467,139 @@ TYPE_PARMS: dict[str, tuple[tuple[str, str, tuple[str, ...], Any, dict[str, Any]
         ("bindings", "Toggle", ("bindings",), 0, {}),
         ("go", "Button", ("go",), 0, {}),
     ),
+    "rop_multi": (("outputs", "Folder", ("outputs",), 2, {"folder": "MultiparmBlock"}),),
     "attribcreate": (
         ("group", "String", ("group",), "", {}),
         ("numattr", "Folder", ("numattr",), 1, {"folder": "MultiparmBlock"}),
     ),
-    "file": (("file", "String", ("file",), "default.bgeo", {}),),
+    "file": (
+        (
+            "file",
+            "String",
+            ("file",),
+            "default.bgeo",
+            {"string_type": "FileReference", "tags": {"filechooser_mode": "read_and_write"}},
+        ),
+    ),
+    # Output nodes, with the parameters their types mark as written to, as
+    # read from a real session: a render's picture, a geometry output and a
+    # cache's file. A script run before a render is read, never written, and
+    # a folder for temporary tiles is not an output.
+    "karma": (
+        (
+            "picture",
+            "String",
+            ("picture",),
+            "$HIP/render/$HIPNAME.$OS.$F4.exr",
+            {"string_type": "FileReference", "tags": {"filechooser_mode": "write"}},
+        ),
+        # A deep output, turned off with its toggle off.
+        ("dcm", "Toggle", ("dcm",), 0, {}),
+        (
+            "dcmfilename",
+            "String",
+            ("dcmfilename",),
+            "$HIP/render/$HIPNAME.$OS.dcm.$F4.exr",
+            {"string_type": "FileReference", "tags": {"filechooser_mode": "write"}},
+        ),
+        (
+            "prerender",
+            "String",
+            ("prerender",),
+            "",
+            {"string_type": "FileReference", "tags": {"filechooser_mode": "read"}},
+        ),
+        (
+            "husk_tiletempdir",
+            "String",
+            ("husk_tiletempdir",),
+            "$HOUDINI_TEMP_DIR",
+            {
+                "string_type": "FileReference",
+                "file_type": "Directory",
+                "tags": {"filechooser_mode": "write"},
+            },
+        ),
+    ),
+    "rop_geometry": (
+        (
+            "sopoutput",
+            "String",
+            ("sopoutput",),
+            "$HIP/geo/$HIPNAME.$OS.$F.bgeo.sc",
+            {"string_type": "FileReference", "tags": {"filechooser_mode": "write"}},
+        ),
+    ),
+    # Render nodes whose output the type leaves unmarked, as Alembic and USD
+    # render nodes do, beside a renderer's log and a render it reads back.
+    "alembic": (
+        ("filename", "String", ("filename",), "$HIP/output.abc", {"string_type": "FileReference"}),
+    ),
+    "rop_alembic": (
+        ("filename", "String", ("filename",), "$HIP/output.abc", {"string_type": "FileReference"}),
+        ("execute", "Button", ("execute",), 0, {}),
+    ),
+    "usdrender_rop": (
+        (
+            "outputimage",
+            "String",
+            ("outputimage",),
+            "",
+            {**{"string_type": "FileReference"}, "file_type": "Image"},
+        ),
+        (
+            "lopoutput",
+            "String",
+            ("lopoutput",),
+            "__render__.usd",
+            {"string_type": "FileReference", "tags": {"filechooser_mode": "write"}},
+        ),
+        (
+            "husk_stdout",
+            "String",
+            ("husk_stdout",),
+            "",
+            {"string_type": "FileReference", "tags": {"filechooser_mode": "write"}},
+        ),
+        (
+            "renderexisting",
+            "String",
+            ("renderexisting",),
+            "",
+            {"string_type": "FileReference", "tags": {"filechooser_mode": "write"}},
+        ),
+        (
+            "savetodirectory_directory",
+            "String",
+            ("savetodirectory_directory",),
+            "$HOUDINI_TEMP_DIR/usd_renders/$RENDERID",
+            {"string_type": "FileReference"},
+        ),
+        ("execute", "Button", ("execute",), 0, {}),
+    ),
+    "filecache": (
+        (
+            "file",
+            "String",
+            ("file",),
+            "$HIP/geo/$HIPNAME.$OS.$F.bgeo.sc",
+            {"string_type": "FileReference", "tags": {"filechooser_mode": "write"}},
+        ),
+    ),
 }
 
 # What each instance of a multiparm holds, by the multiparm's name.
 MULTIPARM_INSTANCE = {
     "numattr": (("name#", "String", ""), ("value#", "Float", 0.0)),
+    # A render node that writes as many files as its count says.
+    "outputs": (
+        (
+            "output#",
+            "String",
+            "",
+            {"string_type": "FileReference", "tags": {"filechooser_mode": "write"}},
+        ),
+    ),
 }
 
 # Descriptions for the types whose default name comes from their description.
@@ -665,9 +825,25 @@ class Node:
         # channels, which only a channel operator does.
         self.dependents_now: list[Node] = []
         self.export_flag = False
+        # A number the session gives the node, which a rename leaves alone.
+        scene._next_sid = getattr(scene, "_next_sid", 0) + 1
+        self._sid = scene._next_sid
+        self.parm_state_updates = 0
 
     def name(self) -> str:
         return self._name
+
+    def setName(self, name: str) -> None:  # noqa: N802 - the name is Houdini's
+        self._name = name
+
+    def sessionId(self) -> int:  # noqa: N802 - the name is Houdini's
+        return self._sid
+
+    def updateParmStates(self) -> None:  # noqa: N802 - the name is Houdini's
+        self.parm_state_updates += 1
+        for parm in self.parms():
+            if parm.disable_rule is not None:
+                parm.disabled = bool(parm.disable_rule(self))
 
     def type(self) -> NodeType:
         return self._type
@@ -698,9 +874,9 @@ class Node:
         while len(groups) < wanted:
             index = len(groups) + 1
             group = []
-            for pattern, kind, default in MULTIPARM_INSTANCE.get(counter.name(), ()):
+            for pattern, kind, default, *extra in MULTIPARM_INSTANCE.get(counter.name(), ()):
                 name = pattern.replace("#", str(index))
-                template = ParmTemplate(kind, name, (default,))
+                template = ParmTemplate(kind, name, (default,), **(extra[0] if extra else {}))
                 parm = Parm(self, name, template, default, instance_of=counter, index=index)
                 group.append(ParmTuple(name, [parm]))
             groups.append(group)
@@ -832,6 +1008,10 @@ class Node:
 
     def childTypeCategory(self) -> Any:  # noqa: N802 - the name is Houdini's
         return SimpleNamespace(nodeTypes=lambda: dict.fromkeys(self._scene.types, None))
+
+    def destroy(self) -> None:
+        if self._parent is not None:
+            self._parent._children.remove(self)
 
     def createNode(self, type_name: str, name: str | None = None) -> Node:  # noqa: N802
         if type_name not in self._scene.types:
@@ -1302,8 +1482,10 @@ class HipFile:
         # The text a load warns with, when a test wants one.
         self.load_warning: str | None = None
         self.saved: list[str] = []
-        # Whether a save writes a file, for the checks that look at the disk.
+        # Whether a save writes a file, for the checks that look at the disk,
+        # and whether the file carries the string parameters as they are.
         self.writes_files = False
+        self.writes_values = False
         # What a save raises, when a test wants it to fail part way.
         self.save_error: BaseException | None = None
         self.recent: list[bool] = []
@@ -1373,11 +1555,15 @@ class HipFile:
         if path:
             self._path = str(path)
         self.new = False
+        self._fire(HipFileEventType.BeforeSave)
         self.saved.append(self._path)
         if self.writes_files:
+            content = b"a scene"
+            if self.writes_values:
+                content += "".join(self._scene.values()).encode("utf-8")
             with open(self._path, "wb") as written:
-                written.write(b"a scene")
-        self._fire(HipFileEventType.BeforeSave, HipFileEventType.AfterSave)
+                written.write(content)
+        self._fire(HipFileEventType.AfterSave)
 
     def setName(self, path: str) -> None:  # noqa: N802 - the name is Houdini's
         # A bare untitled name makes the scene untitled again, as it does in
@@ -1448,6 +1634,25 @@ class Scene:
     def everything(self) -> tuple[Node, ...]:
         return self.root.allSubChildren()
 
+    def by_session_id(self, sid: int) -> Node | None:
+        for node in self.everything():
+            if node.sessionId() == sid:
+                return node
+        return None
+
+    def values(self) -> list[str]:
+        """Every string parameter as a saved file holds it, one line each."""
+        lines = []
+        for node in self.everything():
+            for parm in node.parms():
+                if parm.parmTemplate().type().name() == "String":
+                    if parm._expression is not None:
+                        held = f"{parm._expression} {parm.channel_default}"
+                    else:
+                        held = parm.value
+                    lines.append(f"\n{parm.path()} {held}")
+        return lines
+
     def evaluate(self, parm: Parm) -> Any:
         """Evaluate an expression, cooking what it reads the way Houdini does."""
         return self.run(parm.node(), str(parm._expression), parm._language)
@@ -1498,6 +1703,7 @@ class Scene:
         """The scene as something that answers like the `hou` module."""
         return SimpleNamespace(
             node=self.node,
+            nodeBySessionId=self.by_session_id,
             parm=self.parm,
             parmTuple=self.parm_tuple,
             selectedNodes=lambda: tuple(self.selected),

@@ -2449,7 +2449,7 @@ class Namespaces:
             ended=threading.Event(),
             note=context.progress,
             stopped=context.should_stop,
-            allocate=_allocator(context, hou),
+            outputs=_Outputs(context, hou),
         )
         # The two names every snippet can count on are put back each time,
         # and a result from an earlier call never passes for this one's.
@@ -2472,8 +2472,16 @@ class Namespaces:
                     except BaseException as raised:  # noqa: BLE001 - the code's own failure is data
                         error = _raised(raised)
             duration_ms = round((time.monotonic() - began) * 1000.0, 3)
-            return _answer(values.get("result"), capture, error, name, duration_ms)
+            # The run is over, however it ended, so every parameter its code
+            # froze gets its own value back before the answer is made.
+            restored = scope.outputs.restore_all()
+            answer = _answer(values.get("result"), capture, error, name, duration_ms)
+            if restored:
+                answer["restored_parms"] = restored
+            return answer
         finally:
+            # Whatever stopped the call on the way, nothing it froze is left.
+            scope.outputs.restore_all()
             scope.ended.set()
             with self._lock:
                 kept.used_at = self._clock()
@@ -2570,7 +2578,7 @@ class _Scope:
     ended: threading.Event
     note: Any
     stopped: Any
-    allocate: Any
+    outputs: _Outputs
 
 
 class Helper:
@@ -2578,7 +2586,12 @@ class Helper:
 
     `output_path(kind, name, ext)` hands out a managed path for this session
     and scene, from the same table and the same version sequence the server
-    uses: render, flipbook, comp, cache, usd, hip, capture or compare.
+    uses: render, flipbook, comp, cache, usd, hip, capture, compare, reference
+    or check. `freeze_parm(parm, path)` puts a path this call was handed on
+    an output parameter for as long as the call runs; when the call ends,
+    however it ends, the parameter gets back what it held before, and a save
+    in between writes that too, so a saved scene never holds this machine's
+    path.
     `progress(done, total, message)` leaves a note health and the call's job
     show while it runs. `cancelled()` says whether the call should stop, for a
     long loop to look at between pieces of work: it turns true when the job
@@ -2596,13 +2609,20 @@ class Helper:
         self.__scope = scope
 
     def __repr__(self) -> str:
-        return "<mcp: output_path(kind, name, ext), progress(done, total, message), cancelled()>"
+        return (
+            "<mcp: output_path(kind, name, ext), freeze_parm(parm, path), "
+            "progress(done, total, message), cancelled()>"
+        )
 
     def output_path(self, kind: str, name: str | None = None, ext: str | None = None) -> str:
         scope = self.__now()
-        return scope.allocate(
+        return scope.outputs.allocate(
             str(kind), None if name is None else str(name), None if ext is None else str(ext)
         )
+
+    def freeze_parm(self, parm: Any, path: str) -> str:
+        scope = self.__now()
+        return scope.outputs.freeze(parm, str(path))
 
     def progress(self, done: Any, total: Any = None, message: Any = None) -> None:
         scope = self.__now()
@@ -2637,37 +2657,128 @@ def _progress_number(value: Any, label: str) -> int | float:
     return number
 
 
-def _allocator(context: ToolContext, hou: Any) -> Any:
-    """The one way a call's code gets a managed output path.
+class _Outputs:
+    """The managed outputs one call's code may take, and what it froze.
 
-    The state folder and the store stay inside this function, out of reach of
-    the object the code holds.
+    The state folder and the store stay in here, out of reach of the object
+    the code holds. A path is frozen on a parameter only when this call handed
+    it out. While the call runs, a save writes each frozen parameter's own
+    value and puts the run's path back after it; when the call ends every one
+    is given its own value back.
     """
-    home, open_store, session_id = context.home, context.open_store, context.session_id
 
-    def allocate(kind: str, name: str | None, ext: str | None) -> str:
+    def __init__(self, context: ToolContext, hou: Any) -> None:
+        self._home = context.home
+        self._open_store = context.open_store
+        self._session_id = context.session_id
+        self._hou = hou
+        self._handed: dict[str, str] = {}
+        # What this call froze, in order, each with the token it holds it by.
+        self._frozen: dict[tuple[str, str], str] = {}
+        self._guard: Any = None
+
+    def allocate(self, kind: str, name: str | None, ext: str | None) -> str:
         from nscr_houdini_mcp import outputs
+        from nscr_houdini_mcp.bridge import outputs as bridge_outputs
 
-        if home is None or open_store is None:
+        if self._home is None or self._open_store is None:
             raise RuntimeError("this session keeps no state folder, so it has no output paths")
+        if kind in (*outputs.RECORD_KINDS, outputs.SPILL_KIND):
+            raise outputs.UnknownKind(
+                f"{kind} paths are not handed to code; ask for one of "
+                + ", ".join(outputs.CODE_KINDS)
+            )
+        hou = self._hou
         hip = None if _quiet(hou.hipFile.isNewFile) else _quiet(hou.hipFile.path)
         # The same scratch folder the server picks for a scene with no file.
-        scratch = None if os.environ.get("HOUDINI_TEMP_DIR") else Path(home) / "temp"
-        conventions = outputs.load_conventions(home=home, hip_path=hip)
-        with open_store() as store:
+        scratch = None if os.environ.get("HOUDINI_TEMP_DIR") else Path(self._home) / "temp"
+        conventions = outputs.load_conventions(home=self._home, hip_path=hip)
+        with self._open_store() as store:
             plan = outputs.allocate(
                 store,
                 kind,
                 name=name,
                 hip_path=hip,
-                session_id=session_id or None,
+                session_id=self._session_id or None,
                 ext=ext,
                 conventions=conventions,
                 scratch_root=scratch,
+                variables=bridge_outputs.session_variables(hou),
             )
+        self._handed[plan.path] = plan.run_id
         return plan.path
 
-    return allocate
+    def freeze(self, parm: Any, path: str) -> str:
+        from nscr_houdini_mcp.bridge import outputs as bridge_outputs
+
+        run_id = self._handed.get(path)
+        if run_id is None:
+            raise ValueError("freeze_parm takes a path mcp.output_path handed out in this call")
+        if self._open_store is None:
+            raise RuntimeError("this session keeps no state folder, so it keeps no record")
+        node_path, parm_name = _parm_address(parm)
+        frozen = bridge_outputs.freeze(
+            self._hou,
+            self._open_store,
+            session_id=self._session_id,
+            node_path=node_path,
+            parm_name=parm_name,
+            run_id=run_id,
+            token=self._frozen.get((node_path, parm_name)),
+        )
+        address = (frozen["node"], frozen["parm"])
+        self._frozen[address] = frozen["token"]
+        if self._guard is None:
+            self._guard = bridge_outputs.SaveGuard(self._hou, self._open_store, self._session_id)
+        self._guard.watch(*address)
+        return str(frozen["value"])
+
+    def restore_all(self) -> list[dict[str, Any]]:
+        """Give every parameter this call froze its own value back."""
+        from nscr_houdini_mcp.bridge import outputs as bridge_outputs
+
+        if self._guard is not None:
+            self._guard.close()
+            self._guard = None
+        done: list[dict[str, Any]] = []
+        while self._frozen:
+            (node_path, parm_name), token = next(iter(self._frozen.items()))
+            del self._frozen[(node_path, parm_name)]
+            try:
+                done.append(
+                    bridge_outputs.restore(
+                        self._hou,
+                        self._open_store,
+                        session_id=self._session_id,
+                        node_path=node_path,
+                        parm_name=parm_name,
+                        token=token,
+                    )
+                )
+            except Exception as error:  # noqa: BLE001 - one that fails keeps its record for lint
+                done.append(
+                    {
+                        "node": node_path,
+                        "parm": parm_name,
+                        "restored": False,
+                        "reason": type(error).__name__,
+                    }
+                )
+        return done
+
+
+def _parm_address(parm: Any) -> tuple[str, str]:
+    """The node path and parameter name of a parameter, or of its path."""
+    if isinstance(parm, str):
+        node_path, _, name = parm.rstrip("/").rpartition("/")
+        if not node_path or not name:
+            raise ValueError("a parameter path looks like /out/karma1/picture")
+        return node_path, name
+    node = _quiet(parm.node)
+    name = _quiet(parm.name)
+    if node is None or not name:
+        raise TypeError("freeze_parm takes a hou.Parm or a parameter path")
+    return str(node.path()), str(name)
 
 
 class _Capture:

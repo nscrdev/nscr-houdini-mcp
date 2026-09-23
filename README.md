@@ -177,11 +177,17 @@ call. `false` waits up to `timeout_s` (a minute unless you say; anything above
 any of these, and the same operation id fetches its answer once it ends, also
 when sent while the code is still running.
 
-`mcp` in every namespace has three things, made afresh for each call and
+`mcp` in every namespace has four things, made afresh for each call and
 answering only on that call's thread while it runs. `mcp.output_path(kind,
 name, ext)` hands out a managed path for this session and scene from the
 output table below, for `render`, `flipbook`, `comp`, `cache`, `usd`, `hip`,
-`capture` or `compare`. `mcp.progress(done, total, message)` leaves a note,
+`capture`, `compare`, `reference` or `check`; never a `spill` or a `job`,
+which are the server's own. `mcp.freeze_parm(parm, path)` puts a path the call
+was handed on an output parameter, given as a `hou.Parm` or its path, for as
+long as the call runs; when the call ends, however it ends, the parameter
+gets back what it held before, its value or its expression, and the answer
+says so in `restored_parms`.
+`mcp.progress(done, total, message)` leaves a note,
 finite numbers only, that health and `hou_ping` show while the call runs.
 The same note is written to the call's job, at most once a second.
 `mcp.cancelled()` says whether the call should stop, for a long loop to look
@@ -377,6 +383,34 @@ is one file under `reference/series/<series_id>/`, so two servers writing to
 one shared folder never interleave. A result in a series with earlier runs
 carries the trend, and one that starts a new series says which of those
 changed.
+
+`hou_outputs` hands out managed paths and reads back what a scene made.
+`resolve` takes a place for a `kind` and a `name`, with `ext` when the kind's
+own extension is not the one wanted and `node` for the node the output
+belongs to, whose name is used when none is given. It answers with
+`parm_string`, the line with `$HIP` that belongs on the node,
+`expanded_path`, the absolute path for this run, and the `version`, `folder`,
+`run_id` and `sidecar` beside them. A version is taken on every call; with
+`operation_id` the same id sent again answers with the place it took. `$JOB`
+and `$HOUDINI_TEMP_DIR` are read from the session, once, never from the
+server's own environment. `job` and `spill` paths belong to the server and are
+refused. `list` reads the runs this scene has made, newest first, with their
+paths, kinds, versions, sessions, times and whether anything is on disk for
+them; `filter` narrows it by `kind`, a `name` glob and `since`. `lint` reads
+every output parameter under `node` (the whole scene unless named), walking
+the network a node at a time and stopping when its page is full or the call is
+asked to stop. An output is a file parameter a node type marks as written to,
+a multiparm's instances included, or an unmarked one on a render node, as
+Alembic and USD render nodes have; hooks, a renderer's logs, a render it reads
+back and folders are not. One row per problem: `absolute_path`, `outside_hip`
+(outside the folders the output table manages for this scene),
+`unversioned`, `missing_on_disk` (for a sequence, at the current frame and at
+both ends of the frame range, and with `empty` for a node's main output, or
+one a toggle of its own turns on, that names nothing), `frozen_after_run`, `expression` for a value only an evaluation
+could give and `unexpanded` for a variable it cannot fill in. Nothing is
+evaluated and nothing cooks: values are expanded from the table's variables
+and the node's and scene's own names. `list` and `lint` page with `limit` and
+`next_page`, the way reads do.
 
 ### The Houdini side
 
@@ -580,12 +614,21 @@ usd       $HIP/usd/<name>/v<ver>/<name>_v<ver>.usd
 hip       $HIP/<name>_v<ver>.hip
 capture   $HIP/.agent/captures/<date>/<time>_<name>_<run_id>.png
 compare   $HIP/.agent/compare/<date>_<name>/<ver>_<run_id>/
+reference $HIP/.agent/reference/<name>_<run_id>.png
+check     $HIP/.agent/checks/<date>/<time>_<name>_<run_id>.png
 job       $HIP/.agent/jobs/<job_id>.json
 reference $HIP/.agent/reference/<name>_<run_id>.png
+spill     <spill folder>/<YYYY-MM-DD>/<time>-<name>-<run_id>.json
 ```
 
-A `job` path is only ever written by a session or the server, for the record
-of a job that has ended; it is never handed out to code.
+A `reference` is an image an agent keeps to check its work against, and a
+`check` is what it made to compare with one. A `job` path is only ever written
+by a session or the server, for the record of a job that has ended. A `spill`
+goes to the server's own spill folder, where results too large to return go,
+whatever the scene is: its line starts at `<spill_root>` and holds no Houdini
+variable, it is never handed to code and it never goes on a node. The row is
+kept for the server's own use; the spill writer does not read it yet. Neither
+is ever handed out, by `mcp.output_path` or by `hou_outputs resolve`.
 
 Each output comes with two lines. The template keeps its Houdini variables and
 uses `${OS}` for a name that came from the node, so it reads well and a scene
@@ -596,6 +639,23 @@ node for a run it has started is the expanded path, because the run is the
 server's from then on: renaming the node mid render must not send half the
 frames somewhere else, and the record and the scene have to say the same thing.
 A rename still carries through to the next run, which takes its own version.
+
+When the run is over, whether it ended done, failed or cancelled, the node
+gets back what it held before, the `$HIP` line a person set or the expression
+that fed it, so a scene saved afterwards never carries a path from this
+machine. A save while the run is going writes that same value and puts the
+run's path back straight after. Every parameter a run freezes is recorded in
+the coordination store before it is touched, with what it held, and the
+record goes once that is back. Each record carries a token: a parameter held
+by one run is refused to another with `PARM_FROZEN`, naming the run, and only
+the holder gives it back. The call that froze it gives it back when it ends,
+finding a node renamed in the meantime by its session id. A session that dies
+with a parameter frozen cannot, so the next session to load that scene with
+`hou_scene open`, or to save it with `save` or `save_increment`, does; its
+copy may be older than the file, so the record stays while the file on disk
+still holds the path. A record from a scene that was never saved is dropped,
+because no session can open it again. A parameter someone changed in between
+keeps their value. `lint` reports anything left over as `frozen_after_run`.
 
 `$HIP`, `$HOUDINI_TEMP_DIR` and `$JOB` are the variables this fills in, the
 first two from the session and `$JOB` from the environment. A table naming any

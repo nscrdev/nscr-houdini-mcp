@@ -94,6 +94,7 @@ HINTS: dict[str, str] = {
     "SCENE_REPLACED": "read the new scene, then call again with its scene_epoch",
     "SESSION_DEAD": "address the live session named in the details, or start a new one",
     "OPERATION_MISMATCH": "use a new operation_id for different arguments",
+    "PARM_FROZEN": "wait for the run named in the details to end, or use another parameter",
     "OUTCOME_UNKNOWN": "read the scene to see whether the change is there before redoing it",
     "BODY_REFUSED": "send a smaller or less deeply nested request",
     "CAPTURE_EMPTY": "check the camera and the node shown, then capture again",

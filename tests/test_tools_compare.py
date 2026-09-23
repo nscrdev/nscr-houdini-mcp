@@ -137,10 +137,11 @@ def shifted(pixels: np.ndarray, dx: int, dy: int) -> np.ndarray:
 # Section: the tool as listed
 
 
-def test_the_tool_is_listed_last_and_within_its_token_budget(bench: Bench) -> None:
+def test_the_tool_is_listed_after_hou_jobs_and_within_its_token_budget(bench: Bench) -> None:
     listed, _ = talk(bench.serve())
-    assert listed.tools[-1].name == "hou_compare"
-    tool = listed.tools[-1]
+    names = [tool.name for tool in listed.tools]
+    assert names.index("hou_compare") > names.index("hou_jobs")
+    [tool] = [tool for tool in listed.tools if tool.name == "hou_compare"]
     payload = tool.model_dump(mode="json", by_alias=True, exclude_none=True)
     assert len(json.dumps(payload, separators=(",", ":"))) <= 1200
     assert "No pass or fail" in tool.description
