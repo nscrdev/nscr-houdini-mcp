@@ -684,3 +684,39 @@ def test_a_place_whose_run_could_not_be_recorded_is_given_back(
         outputs.allocate(store, "hip", hip_path=scene, when=WHEN, run_id="run-lost")
     assert list(scene.parent.glob("*.claim")) == []
     assert version_rows(Path(store.path)) == [(2, None), (3, None)]
+
+
+# -- records --------------------------------------------------------------
+
+
+def test_a_job_record_goes_beside_the_scene_and_is_never_handed_out(
+    store: Store, tmp_path: Path
+) -> None:
+    folder = tmp_path / "shots"
+    folder.mkdir()
+    made = outputs.record_path(
+        "job", "job-op-1", hip_path=str(folder / "shot.hip"), session_id="s1"
+    )
+    assert made.template == "$HIP/.agent/jobs/job-op-1.json"
+    assert Path(made.path) == folder / ".agent" / "jobs" / "job-op-1.json"
+    assert Path(made.directory).is_dir()
+    with pytest.raises(outputs.UnknownKind):
+        outputs.allocate(store, "job", name="x", hip_path=str(folder / "shot.hip"))
+    with pytest.raises(outputs.UnknownKind):
+        outputs.record_path("capture", "x", hip_path=None, session_id="s1")
+
+
+def test_a_job_record_of_a_scene_whose_folder_is_gone_is_refused(tmp_path: Path) -> None:
+    missing = tmp_path / "moved" / "shot.hip"
+    with pytest.raises(outputs.ConventionError):
+        outputs.record_path("job", "job-1", hip_path=str(missing), session_id="s1")
+    assert not missing.parent.exists()
+
+
+def test_a_job_record_of_an_untitled_scene_goes_to_the_scratch_folder(tmp_path: Path) -> None:
+    made = outputs.record_path(
+        "job", "job-1", hip_path=None, session_id="s1", scratch_root=tmp_path / "temp"
+    )
+    assert made.unsaved_hip is True
+    assert Path(made.path).parent.is_dir()
+    assert Path(made.path).is_relative_to(tmp_path / "temp")

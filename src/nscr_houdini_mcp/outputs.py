@@ -57,7 +57,12 @@ OUTPUT_KINDS = (
     "hip",
     "capture",
     "compare",
+    "job",
 )
+
+# Kinds whose path is only ever for a record the server or a session writes
+# itself, never one handed out to a caller's code.
+RECORD_KINDS = ("job",)
 
 # Every token a template may use. Anything else fails on load, so a typo is a
 # clear message and not a literal `<nmae>` in a file name.
@@ -100,6 +105,7 @@ DEFAULT_GRAMMAR = {
     "hip": "<output_root>/<name>_v<ver>.<ext>",
     "capture": "<output_root>/.agent/captures/<date>/<time>_<name>_<run_id>.<ext>",
     "compare": "<output_root>/.agent/compare/<date>_<name>/<ver>_<run_id>/",
+    "job": "<output_root>/.agent/jobs/<name>.<ext>",
 }
 
 DEFAULT_EXTENSIONS = {
@@ -111,6 +117,7 @@ DEFAULT_EXTENSIONS = {
     "hip": "hip",
     "capture": "png",
     "compare": "",
+    "job": "json",
 }
 
 # Roots are templates too, so a studio can point a kind somewhere else without
@@ -833,6 +840,41 @@ def _temp_dir(scratch_root: str | Path | None) -> str:
     return _posix(store_module.default_home() / "temp")
 
 
+def record_path(
+    kind: str,
+    name: str,
+    *,
+    hip_path: str | Path | None,
+    session_id: str | None,
+    conventions: Conventions | None = None,
+    scratch_root: str | Path | None = None,
+) -> OutputPlan:
+    """Where a readable record of one kind goes, with its folder made.
+
+    Nothing is versioned and no run is recorded: the name is the record's own
+    id, so writing it again writes the same file. A scene with no file goes
+    to the scratch folder, the way every output of an unsaved scene does. A
+    scene whose own root is not there, because the file was moved or its disk
+    is gone, gets no record rather than a folder made for it.
+    """
+    if kind not in RECORD_KINDS:
+        raise UnknownKind(f"{kind} is not a record kind")
+    plan = plan_path(
+        kind,
+        run_id=name,
+        name=name,
+        hip_path=hip_path,
+        session_id=session_id,
+        conventions=conventions,
+        scratch_root=scratch_root,
+    )
+    if hip_path is not None and not Path(plan.root).is_dir():
+        raise ConventionError(f"the output root {plan.root} is not there")
+    _check_real_place(plan)
+    Path(plan.directory).mkdir(parents=True, exist_ok=True)
+    return plan
+
+
 # -- allocation -----------------------------------------------------------
 
 
@@ -866,6 +908,8 @@ def allocate(
     """
     table = conventions or DEFAULT_CONVENTIONS_TABLE
     table.template_for(kind)
+    if kind in RECORD_KINDS:
+        raise UnknownKind(f"{kind} paths are kept for records, not handed out")
     run = run_id or new_run_id()
     node_name = node_path.rstrip("/").rsplit("/", 1)[-1] if node_path else None
     if name is None and node_name is None and kind == "hip":
