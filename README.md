@@ -255,7 +255,13 @@ capture stopped on request keeps the frames it wrote and lists them, and the
 run record names each file. The network editor and panes are made the
 current tab and grabbed from their own window, which needs a user interface;
 a worker answers `UI_UNAVAILABLE`. A render Houdini stops with an error is
-`CAPTURE_FAILED`, with that error in the details.
+`CAPTURE_FAILED`, with that error in the details. Every step that puts the
+scene or the view back is tried, and one that fails makes a capture that
+worked `CLEANUP_FAILED`, naming the step. Crops and the contact sheet are
+made once per operation, so a reply sent again and a job read at the same
+moment do not both write them. A viewport sequence goes a few frames at a
+time, so it can be stopped between them, and its job row names each run and
+the frames written so far.
 
 `views: quad` captures persp, top, front and right, `turntable4` four orbits
 a quarter turn apart, and both add a two by two contact sheet, which is then
