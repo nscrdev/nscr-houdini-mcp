@@ -7,6 +7,8 @@ prints the few lines that start a bridge inside a Houdini that is already
 open. The `worker` commands under it drive the pool of hython workers: start
 one, stop one, list what is there, and take or hand back a warm worker. The
 `config` group writes the server's config file and shows what it resolves to.
+The `skills` group says where the shipped agent skills are and copies them into
+a folder the person names.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from nscr_houdini_mcp import agent_skills as skills_module
 from nscr_houdini_mcp import config as config_module
 from nscr_houdini_mcp import install as install_module
 from nscr_houdini_mcp import pool
@@ -98,7 +101,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     _add_worker_commands(actions)
     _add_config_commands(commands)
+    _add_skills_commands(commands)
     return parser
+
+
+def _add_skills_commands(commands: Any) -> None:
+    """The commands for the agent skills that ship with this package."""
+    skills = commands.add_parser("skills", help="the agent skills that ship with this package")
+    actions = skills.add_subparsers(dest="skills_action", required=True)
+
+    where = actions.add_parser("path", help="print the folder the shipped skills are in")
+    where.set_defaults(handler=_skills_path)
+
+    copy = actions.add_parser("install", help="copy the skills into a folder you name")
+    copy.add_argument("dest", type=Path, help="the folder your client reads skills from")
+    copy.add_argument(
+        "--force",
+        action="store_true",
+        help="write the shipped files over a copy there that differs",
+    )
+    copy.set_defaults(handler=_skills_install)
 
 
 def _add_config_commands(commands: Any) -> None:
@@ -426,6 +448,33 @@ def _config_init(args: argparse.Namespace) -> int:
         return 1
     print(f"wrote {written}")
     return 0
+
+
+# Section: the skills commands
+
+
+def _skills_path(_args: argparse.Namespace) -> int:
+    try:
+        print(skills_module.skills_root())
+    except skills_module.SkillsError as error:
+        print(str(error))
+        return 1
+    return 0
+
+
+def _skills_install(args: argparse.Namespace) -> int:
+    try:
+        results = skills_module.install(args.dest, force=args.force)
+    except (skills_module.SkillsError, OSError) as error:
+        print(str(error))
+        return 1
+    kept = False
+    for item in results:
+        print(f"{item.outcome} {item.name}: {item.path}")
+        if item.note:
+            print(f"  {item.note}")
+        kept = kept or item.outcome == skills_module.KEPT
+    return 1 if kept else 0
 
 
 # Section: what status prints
