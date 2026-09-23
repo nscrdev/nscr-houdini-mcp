@@ -9,22 +9,19 @@ the reply says which route made it and what was tried before.
 The routes for a view, in order, and the first that writes a file wins:
 
 - `viewport_flipbook`: the Scene Viewer that is showing, flipbooked with
-  settings of its own: no MPlay, the beauty pass only and only the objects
-  whose geometry renders unless guides are asked for, the resolution asked
-  for. A camera, a display mode or a target to
-  frame is applied for the capture and put back in a `finally`: the view
-  type, the camera looked through, the default camera with its translation,
-  rotation, pivot and ortho width, and the shading. A torn off copy of a
-  viewport is never made, because it draws nothing and writes no file
-  without saying so.
+  settings of its own: no MPlay, the beauty pass only and the guide
+  objects left out unless guides are asked for, the resolution asked for.
+  A camera, a display mode or a target to frame is applied for the capture
+  and put back in a `finally`: the view type, the camera looked through, the
+  default camera with its translation, rotation, pivot and ortho width, and
+  the shading. A torn off copy of a viewport is never made, because it draws
+  nothing and writes no file without saying so.
 - `viewport_flipbook_tab`: when no Scene Viewer is showing, an existing one
   is made the current tab of its pane, flipbooked the same way, and the tab
   that was current is put back.
 - `flipbook_rop`: a flipbook render node made for the capture, with a camera
   it needs: the one named, or a camera made for the capture and fitted to
-  the target's bounds. Either route frames `all` on the geometry of shown
-  objects, not cameras, lights or nulls, and on the origin, with a warning,
-  when there is none. In a session with a user interface this route cannot
+  the target's bounds. In a session with a user interface this route cannot
   know what the artist's view frames, so its result says
   `framing_unverified`. It is the only route a session without one has.
   `node` isolates the node: its object alone is drawn, the node carries the
@@ -39,6 +36,18 @@ The routes for a view, in order, and the first that writes a file wins:
   asked, read again when the screen's pixel ratio changes, and the made
   camera's window makes up for it. A scale that cannot be read leaves the
   framing marked unverified.
+
+Framing `all` goes around the geometry of the objects shown at the frames
+captured, the first and last of a sequence together, whatever frame the scene
+is on: not cameras, lights, what sits inside them, or an object of a guide
+type (a null, a bone, a rivet) that still draws its stock shape. A
+simulation network draws no geometry node to read, so it is drawn but not
+framed; an instance object is framed around its points grown by what it
+copies. With nothing to frame the view or camera frames the origin and says
+so. Without guides the objects drawn are all of them less those guides, left
+out by name, so Houdini still decides what else is shown at each frame. A
+Scene Viewer inside a geometry network or showing a stage keeps Houdini's own
+frame all and draws every object.
 
 `cop` reads the COP's image layer and writes it as an 8 bit PNG, or saves an
 older COP's image with its own writer. `network` and `pane` grab the pane's
@@ -134,14 +143,26 @@ DEFAULT_ELEVATION = 25.0
 MARGIN = 1.15
 # The size a target with no extent is framed at.
 MIN_EXTENT = 0.5
-# What frames "all" and what a capture without guides draws: the geometry of
-# shown objects. Houdini's own kinds for cameras and lights leave those out,
-# and whatever sits inside them, such as a camera rig's handles. These object
-# types count as geometry to Houdini but draw only a guide shape: a null's
-# cross, a bone, and a rivet's, fetch's and blend's markers.
-NOT_DRAWN_KINDS = ("ObjCamera", "ObjLight")
-GUIDE_OBJECTS = frozenset({"null", "bone", "rivet", "fetch", "blend"})
+# The guides a capture without guides leaves out, and "all" does not frame:
+# cameras and lights, by Houdini's own kinds, with whatever sits inside them
+# such as a camera rig's handles, and the object types Houdini counts as
+# geometry that draw a stock shape, by the type of the shape node they are
+# made with. One of those whose display flag is on anything else draws
+# geometry of its own and counts as geometry.
+GUIDE_KINDS = ("ObjCamera", "ObjLight")
+GUIDE_SHAPES = {
+    "null": "control",
+    "rivet": "control",
+    "sticky": "control",
+    "bone": "bonelink",
+    "fetch": "sphere",
+    "blend": "sphere",
+}
 NOTHING_TO_FRAME = "nothing to frame was found, so the {} frames the origin"
+# How many objects framing "all" reads. Each costs a read of its displayed
+# geometry, a few microseconds once cooked, on the main thread.
+MAX_FRAMED = 10000
+TOO_MANY_TO_FRAME = f"only the first {MAX_FRAMED} shown objects were framed"
 
 DEFAULT_RESOLUTION = (1280, 720)
 MAX_RESOLUTION = 8192
@@ -470,7 +491,7 @@ def _owner(spec: Spec, hou: Any) -> str | None:
     if spec.source not in ("node", "cop") or spec.path is None:
         return None
     node = _quiet(lambda: hou.node(spec.path))
-    return (_quiet(node.path) if node is not None else None) or spec.path
+    return (_quiet(lambda: node.path()) if node is not None else None) or spec.path
 
 
 class JobOutputs:
@@ -587,7 +608,7 @@ def is_gui(hou: Any, context: ToolContext) -> bool:
 
 
 def _current_frame(hou: Any) -> float:
-    frame = _quiet(hou.frame)
+    frame = _quiet(lambda: hou.frame())
     return float(frame) if frame is not None else 1.0
 
 
@@ -722,15 +743,15 @@ def cleanup_failed(
 def routes(hou: Any) -> list[str]:
     """What the capability probe reports: the routes this session has."""
     found: list[str] = []
-    ui = getattr(hou, "ui", None) is not None and bool(_quiet(hou.isUIAvailable))
+    ui = getattr(hou, "ui", None) is not None and bool(_quiet(lambda: hou.isUIAvailable()))
     if ui:
         found += [VIEWPORT, VIEWPORT_TAB]
-    category = _quiet(hou.ropNodeTypeCategory)
+    category = _quiet(lambda: hou.ropNodeTypeCategory())
     if category is not None and _quiet(lambda: hou.nodeType(category, ROP_TYPE)) is not None:
         found.append(FLIPBOOK_ROP)
     if hasattr(hou, "ImageLayer"):
         found.append(COP_LAYER)
-    categories = _quiet(hou.nodeTypeCategories) or {}
+    categories = _quiet(lambda: hou.nodeTypeCategories()) or {}
     if "Cop2" in categories:
         found.append(COP2_SAVE)
     if ui:
@@ -765,7 +786,11 @@ def _reason(error: BaseException) -> str:
 
 def scene_viewers(hou: Any) -> list[Any]:
     kind = hou.paneTabType.SceneViewer
-    return [tab for tab in (_quiet(hou.ui.paneTabs) or ()) if _quiet(tab.type) == kind]
+    return [
+        tab
+        for tab in (_quiet(lambda: hou.ui.paneTabs()) or ())
+        if _quiet(lambda tab=tab: tab.type()) == kind
+    ]
 
 
 def viewport_route(
@@ -779,7 +804,7 @@ def viewport_route(
     attempt: Attempt,
 ) -> dict[str, Any]:
     """The Scene Viewer that is showing."""
-    showing = [tab for tab in scene_viewers(hou) if _quiet(tab.isCurrentTab)]
+    showing = [tab for tab in scene_viewers(hou) if _quiet(lambda tab=tab: tab.isCurrentTab())]
     if not showing:
         raise Unavailable("no Scene Viewer is showing")
     return flipbook_viewer(hou, context, spec, camera, showing[0], path, frames, attempt)
@@ -799,11 +824,11 @@ def viewport_tab_route(
     tabs = scene_viewers(hou)
     if not tabs:
         raise Unavailable("this desktop has no Scene Viewer")
-    if any(_quiet(tab.isCurrentTab) for tab in tabs):
+    if any(_quiet(lambda tab=tab: tab.isCurrentTab()) for tab in tabs):
         raise Unavailable("a Scene Viewer is already showing")
     tab = tabs[0]
-    pane = _quiet(tab.pane)
-    previous = _quiet(pane.currentTab) if pane is not None else None
+    pane = _quiet(lambda: tab.pane())
+    previous = _quiet(lambda: pane.currentTab()) if pane is not None else None
     tab.setIsCurrentTab()
     try:
         return flipbook_viewer(hou, context, spec, camera, tab, path, frames, attempt)
@@ -834,9 +859,10 @@ def flipbook_viewer(
     saved = ViewState.save(hou, viewport)
     done: list[float] = []
     stopped = False
+    objects = shows_objects(viewer)
     try:
-        described, warnings = apply_view(hou, spec, camera, viewport)
-        settings, unset = flipbook_settings(hou, viewer, spec, path, frames)
+        described, warnings = apply_view(hou, spec, camera, viewport, frames, objects)
+        settings, unset = flipbook_settings(hou, viewer, spec, path, frames, objects)
         if unset:
             warnings.append(
                 "these flipbook settings could not be set and keep the artist's: "
@@ -876,16 +902,21 @@ _NO_VALUE = object()
 
 
 def flipbook_settings(
-    hou: Any, viewer: Any, spec: Spec, path: str, frames: Sequence[float]
+    hou: Any,
+    viewer: Any,
+    spec: Spec,
+    path: str,
+    frames: Sequence[float],
+    objects: bool = True,
 ) -> tuple[Any, list[str]]:
     """A copy of the viewer's flipbook settings with every one this capture needs set.
 
     The copy starts from the artist's dialog, so nothing is left to it: an
     object filter, a contact sheet, motion blur, depth of field, a background
     image or a colour transform the artist left on would all come along.
-    Without guides only the objects whose geometry renders are drawn, as the
-    beauty pass alone still draws a null's cross. Returns the settings and
-    the names that could not be set.
+    Without guides, on a viewer showing objects, the guide objects are left
+    out by name, as the beauty pass alone still draws a null's cross. Returns
+    the settings and the names that could not be set.
     """
     settings = viewer.flipbookSettings().stash()
     kinds = getattr(hou, "flipbookObjectType", None)
@@ -898,7 +929,7 @@ def flipbook_settings(
         ("useResolution", True),
         ("resolution", spec.resolution),
         ("beautyPassOnly", not spec.guides),
-        ("visibleObjects", visible_pattern(hou, spec)),
+        ("visibleObjects", guide_mask(hou, spec) if objects else "*"),
         ("visibleTypes", getattr(kinds, "Visible", _NO_VALUE)),
         ("useSheetSize", False),
         ("useMotionBlur", False),
@@ -945,15 +976,15 @@ class ViewState:
     @classmethod
     def save(cls, hou: Any, viewport: Any) -> ViewState:
         shading: dict[str, Any] = {}
-        settings = _quiet(viewport.settings)
+        settings = _quiet(lambda: viewport.settings())
         for name in DISPLAY_SETS:
             kind = getattr(hou.displaySetType, name, None)
             shown = _quiet(lambda kind=kind: settings.displaySet(kind)) if kind else None
             if shown is not None:
-                shading[name] = _quiet(shown.shadedMode)
+                shading[name] = _quiet(lambda shown=shown: shown.shadedMode())
         return cls(
-            kind=_quiet(viewport.type),
-            camera=_quiet(viewport.camera),
+            kind=_quiet(lambda: viewport.type()),
+            camera=_quiet(lambda: viewport.camera()),
             default=viewport.defaultCamera().stash(),
             shading=shading,
         )
@@ -983,8 +1014,25 @@ class ViewState:
             )
 
 
+def shows_objects(viewer: Any) -> bool:
+    """Whether a Scene Viewer is at object level, where "all" and the guide mask apply.
+
+    One inside a geometry network, or showing a stage, keeps Houdini's own
+    frame all and draws every object, as it did before either was ours.
+    """
+    network = _quiet(lambda: viewer.pwd())
+    if network is None:
+        return True
+    return _quiet(lambda: network.childTypeCategory().name()) == "Object"
+
+
 def apply_view(
-    hou: Any, spec: Spec, camera: Any, viewport: Any
+    hou: Any,
+    spec: Spec,
+    camera: Any,
+    viewport: Any,
+    frames: Sequence[float] = (),
+    objects: bool = True,
 ) -> tuple[dict[str, Any], list[str]]:
     """Look through the camera asked for, shade and frame, on a viewport that is put back."""
     warnings: list[str] = []
@@ -995,12 +1043,12 @@ def apply_view(
         viewport.setCamera(through)
         described = {"kind": "node", "path": camera}
     elif isinstance(camera, str):
-        if _quiet(viewport.camera) is not None:
+        if _quiet(lambda: viewport.camera()) is not None:
             viewport.useDefaultCamera()
         viewport.changeType(getattr(hou.geometryViewportType, VIEWPORT_TYPES[camera]))
         described = {"kind": "view", "view": camera}
     elif isinstance(camera, Mapping):
-        if _quiet(viewport.camera) is not None:
+        if _quiet(lambda: viewport.camera()) is not None:
             viewport.useDefaultCamera()
         viewport.changeType(hou.geometryViewportType.Perspective)
         view = viewport.defaultCamera()
@@ -1017,7 +1065,7 @@ def apply_view(
     if target is None and camera is not None and through is None:
         # A view turned for the capture is framed on everything unless told.
         target = "all"
-    if target is not None and camera is None and _quiet(viewport.camera) is not None:
+    if target is not None and camera is None and _quiet(lambda: viewport.camera()) is not None:
         # Framing while looking through a camera node, with the camera locked
         # to the view, would move that camera. The viewport's own camera is
         # framed instead, and the camera node is looked through again after.
@@ -1026,18 +1074,17 @@ def apply_view(
     if target is not None:
         if through is not None:
             warnings.append("a camera node's view is not moved, so frame_target was not applied")
+        elif target == "all" and not objects:
+            viewport.frameAll()
         elif target == "all":
             # Houdini's own frame all counts cameras, lights and nulls, so a
             # shown camera away from the subject pulls the view off it.
-            bounds = world_bounds(hou, None)
-            if bounds is None:
-                warnings.append(NOTHING_TO_FRAME.format("view"))
-                bounds = ((-MIN_EXTENT,) * 3, (MIN_EXTENT,) * 3)
+            bounds = bounds_of_all(hou, frames, warnings, "view")
             viewport.frameBoundingBox(hou.BoundingBox(*bounds[0], *bounds[1]))
         elif target == "selection":
             viewport.frameSelected()
         else:
-            bounds = world_bounds(hou, [hou.node(target)])
+            bounds = world_bounds(hou, [hou.node(target)], frames)
             if bounds is None:
                 warnings.append("the target has no geometry to frame")
             else:
@@ -1061,7 +1108,7 @@ def rop_route(
 ) -> dict[str, Any]:
     """Render through a flipbook render node made for the capture and taken away after."""
     parent = _quiet(lambda: hou.node(ROP_PARENT))
-    category = _quiet(hou.ropNodeTypeCategory)
+    category = _quiet(lambda: hou.ropNodeTypeCategory())
     if parent is None or category is None:
         raise Unavailable(f"this scene has no {ROP_PARENT} network")
     if _quiet(lambda: hou.nodeType(category, ROP_TYPE)) is None:
@@ -1085,8 +1132,10 @@ def rop_route(
                 # session with a user interface, or a hython started some
                 # other way, draws at its screen's ratio.
                 scale = drawing_scale(hou, parent, os.path.dirname(path), attempt)
+            # Read before the capture's own camera is made, so it is not named.
+            mask = guide_mask(hou, spec) if objects is None else None
             camera_path, described, warnings = rop_camera(
-                hou, spec, camera, targets, made, scale or 1.0
+                hou, spec, camera, targets, made, scale or 1.0, frames
             )
             if scale is None:
                 warnings.append("the render node's drawing scale could not be read")
@@ -1103,8 +1152,8 @@ def rop_route(
             if objects is not None:
                 _set(rop, "vobjects", " ".join(objects))
                 _set(rop, "forceobjects", " ".join(objects))
-            else:
-                _set(rop, "vobjects", visible_pattern(hou, spec))
+            if mask is not None:
+                _set(rop, "vobjects", mask)
             for index, frame in enumerate(frames):
                 if context.should_stop():
                     if not done:
@@ -1122,7 +1171,7 @@ def rop_route(
             for label, step in reversed(put_back):
                 attempt.attempt(label, step)
             for node in reversed(made):
-                attempt.attempt(f"take away {_quiet(node.path)}", node.destroy)
+                attempt.attempt(f"take away {_quiet(lambda node=node: node.path())}", node.destroy)
     shot: dict[str, Any] = {
         "files": frame_files(path, done, spec.sequence),
         "frames": done,
@@ -1164,7 +1213,7 @@ def screen_ratio(hou: Any) -> float | None:
     """
     if getattr(hou, "ui", None) is not None:
         window = _quiet(lambda: hou.ui.mainQtWindow())
-        ratio = _quiet(window.devicePixelRatioF) if window is not None else None
+        ratio = _quiet(lambda: window.devicePixelRatioF()) if window is not None else None
         if ratio:
             return float(ratio)
     return primary_screen_ratio()
@@ -1176,9 +1225,15 @@ def primary_screen_ratio() -> float | None:
             gui = __import__(f"{binding}.QtGui", fromlist=["QGuiApplication"])
         except ImportError:
             continue
-        application = _quiet(gui.QGuiApplication.instance)
-        screen = _quiet(application.primaryScreen) if application is not None else None
-        ratio = _quiet(screen.devicePixelRatio) if screen is not None else None
+        application = _quiet(lambda gui=gui: gui.QGuiApplication.instance())
+        screen = (
+            _quiet(lambda application=application: application.primaryScreen())
+            if application is not None
+            else None
+        )
+        ratio = (
+            _quiet(lambda screen=screen: screen.devicePixelRatio()) if screen is not None else None
+        )
         return float(ratio) if ratio else None
     return None
 
@@ -1246,7 +1301,7 @@ def drawing_scale(hou: Any, parent: Any, folder: str, attempt: Attempt) -> float
         scale = None
     finally:
         for node in reversed(made):
-            attempt.attempt(f"take away {_quiet(node.path)}", node.destroy)
+            attempt.attempt(f"take away {_quiet(lambda node=node: node.path())}", node.destroy)
         discard([probe_file])
     if scale is not None:
         _found[:] = [hou, ratio, platform, scale]
@@ -1368,7 +1423,10 @@ def _set(node: Any, name: str, value: Any) -> None:
 
 
 def _free_name(parent: Any, base: str) -> str:
-    taken = {_quiet(child.name) for child in (_quiet(parent.children) or ())}
+    taken = {
+        _quiet(lambda child=child: child.name())
+        for child in (_quiet(lambda: parent.children()) or ())
+    }
     if base not in taken:
         return base
     index = 1
@@ -1387,20 +1445,20 @@ def isolate(node: Any) -> tuple[list[str], list[tuple[str, Callable[[], Any]]]]:
     owner = _object_of(node)
     put_back: list[tuple[str, Callable[[], Any]]] = []
     if owner is not node:
-        previous = _quiet(owner.displayNode)
-        if previous is None or _quiet(previous.path) != _quiet(node.path):
+        previous = _quiet(lambda: owner.displayNode())
+        if previous is None or _quiet(lambda: previous.path()) != _quiet(lambda: node.path()):
             node.setDisplayFlag(True)
             if previous is not None:
                 put_back.append(
                     (
-                        f"give the display flag back to {_quiet(previous.path)}",
+                        f"give the display flag back to {_quiet(lambda: previous.path())}",
                         lambda: previous.setDisplayFlag(True),
                     )
                 )
             else:
                 put_back.append(
                     (
-                        f"take the display flag off {_quiet(node.path)}",
+                        f"take the display flag off {_quiet(lambda: node.path())}",
                         lambda: node.setDisplayFlag(False),
                     )
                 )
@@ -1411,7 +1469,7 @@ def _targets(hou: Any, target: str | None) -> list[Any] | None:
     if target in (None, "all"):
         return None
     if target == "selection":
-        return list(_quiet(hou.selectedNodes) or ())
+        return list(_quiet(lambda: hou.selectedNodes()) or ())
     return [hou.node(target)]
 
 
@@ -1422,6 +1480,7 @@ def rop_camera(
     targets: list[Any] | None,
     made: list[Any],
     scale: float = 1.0,
+    frames: Sequence[float] = (),
 ) -> tuple[str, dict[str, Any], list[str]]:
     """The camera the render node looks through, always one made for the capture.
 
@@ -1445,10 +1504,13 @@ def rop_camera(
     else:
         view = camera or "persp"
         orbit, elevation, ortho = FITTED[view]
-    bounds = world_bounds(hou, targets)
-    if bounds is None:
-        warnings.append(NOTHING_TO_FRAME.format("camera"))
-        bounds = ((-MIN_EXTENT,) * 3, (MIN_EXTENT,) * 3)
+    if targets is None:
+        bounds = bounds_of_all(hou, frames, warnings, "camera")
+    else:
+        found = world_bounds(hou, targets, frames)
+        if found is None:
+            warnings.append(NOTHING_TO_FRAME.format("camera"))
+        bounds = found or ((-MIN_EXTENT,) * 3, (MIN_EXTENT,) * 3)
     parent = hou.node(CAMERA_PARENT)
     fitted = parent.createNode(CAMERA_TYPE, _free_name(parent, CAMERA_NAME))
     made.append(fitted)
@@ -1604,88 +1666,171 @@ def _dot(a: Sequence[float], b: Sequence[float]) -> float:
     return sum(x * y for x, y in zip(a, b, strict=True))
 
 
+def bounds_of_all(
+    hou: Any, frames: Sequence[float], warnings: list[str], what: str
+) -> tuple[Sequence[float], Sequence[float]]:
+    """The box "all" frames, or one at the origin, with a warning, when there is none."""
+    nodes, capped = drawn_objects(hou, frames)
+    if capped:
+        warnings.append(TOO_MANY_TO_FRAME)
+    bounds = world_bounds(hou, nodes, frames)
+    if bounds is None:
+        warnings.append(NOTHING_TO_FRAME.format(what))
+        return (-MIN_EXTENT,) * 3, (MIN_EXTENT,) * 3
+    return bounds
+
+
+def framing_frames(hou: Any, frames: Sequence[float]) -> tuple[float, ...]:
+    """The frames bounds are read at: a sequence is framed on its first and last
+    frames together, so what moves across it stays in, and a single frame on
+    itself, whatever frame the scene is on."""
+    if not frames:
+        return (_current_frame(hou),)
+    if frames[0] == frames[-1]:
+        return (float(frames[0]),)
+    return (float(frames[0]), float(frames[-1]))
+
+
 def world_bounds(
-    hou: Any, nodes: list[Any] | None
+    hou: Any, nodes: Sequence[Any], frames: Sequence[float] = ()
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
-    """The world space box around what the nodes draw, or around all that renders.
+    """The world space box around what the nodes draw at the frames framed.
 
     None when there is no box to go around: no geometry at all, or only
-    empty geometry.
+    empty geometry. A simulation network draws its objects without a
+    geometry node to read, so it is drawn but not framed.
     """
-    if nodes is None:
-        nodes = drawn_objects(hou)
     low = [math.inf] * 3
     high = [-math.inf] * 3
-    for node in nodes:
-        if node is None:
-            continue
-        for point in _node_corners(node):
-            for axis in range(3):
-                low[axis] = min(low[axis], point[axis])
-                high[axis] = max(high[axis], point[axis])
+    for frame in framing_frames(hou, frames):
+        for node in nodes:
+            if node is None:
+                continue
+            for point in _node_corners(hou, node, frame):
+                for axis in range(3):
+                    low[axis] = min(low[axis], point[axis])
+                    high[axis] = max(high[axis], point[axis])
     if not all(math.isfinite(value) for value in (*low, *high)):
         return None
     return (low[0], low[1], low[2]), (high[0], high[1], high[2])
 
 
-def drawn_objects(hou: Any) -> list[Any]:
-    """Every shown object whose geometry renders, inside subnets too.
-
-    A camera, a light, and a null or other object that draws only a guide
-    shape, are left out, and so is a hidden object or one in a hidden subnet.
-    """
+def guide_objects(hou: Any) -> list[Any]:
+    """Every object that draws only a guide: cameras and lights with whatever is
+    inside them, and objects that draw their type's stock shape."""
     root = _quiet(lambda: hou.node("/obj"))
     kinds = getattr(hou, "nodeTypeFilter", None)
     if root is None or kinds is None:
         return []
-    found = _quiet(lambda: root.recursiveGlob("*", kinds.ObjGeometry)) or ()
-    left_out: list[str] = []
-    for name in NOT_DRAWN_KINDS:
+    guides: dict[str, Any] = {}
+    for name in GUIDE_KINDS:
         kind = getattr(kinds, name, None)
-        matched = _quiet(lambda kind=kind: root.recursiveGlob("*", kind)) if kind else None
-        left_out += [node.path() for node in matched or ()]
-    drawn = []
-    for node in found:
+        for node in (
+            _quiet(lambda kind=kind: root.recursiveGlob("*", kind)) if kind else None
+        ) or ():
+            guides[node.path()] = node
+    inside = tuple(path + "/" for path in guides)
+    for node in _quiet(lambda: root.recursiveGlob("*", kinds.ObjGeometry)) or ():
         path = node.path()
-        if any(path == other or path.startswith(other + "/") for other in left_out):
-            continue
-        type_name = _quiet(lambda node=node: node.type().nameComponents()[2])
-        if type_name in GUIDE_OBJECTS or not _shown(node):
-            continue
-        drawn.append(node)
-    return drawn
+        if path not in guides and (path.startswith(inside) or _stock_shape(node)):
+            guides[path] = node
+    return list(guides.values())
 
 
-def visible_pattern(hou: Any, spec: Spec) -> str:
-    """The objects a flipbook draws: every one with guides, else those that render."""
+def _stock_shape(node: Any) -> bool:
+    """Whether an object is of a guide type and still draws the shape it came with."""
+    type_name = _quiet(lambda: node.type().nameComponents()[2])
+    shape = GUIDE_SHAPES.get(type_name)
+    if shape is None:
+        return False
+    shown = _quiet(lambda: node.displayNode())
+    return shown is None or _quiet(lambda: shown.type().name()) == shape
+
+
+def guide_mask(hou: Any, spec: Spec) -> str:
+    """The objects a flipbook draws: all of them, less the guides unless guides are asked for.
+
+    Houdini still decides per frame what is shown, so an object shown only at
+    the frame captured, an instance object or a simulation is drawn as it would
+    be anyway.
+    """
     if spec.guides:
         return "*"
-    drawn = drawn_objects(hou)
-    return " ".join(node.path() for node in drawn) if drawn else "*"
+    return " ".join(["*", *(f"^{node.path()}" for node in guide_objects(hou))])
 
 
-def _shown(node: Any) -> bool:
-    shown = _quiet(node.isObjectDisplayed)
+def drawn_objects(hou: Any, frames: Sequence[float] = ()) -> tuple[list[Any], bool]:
+    """The objects "all" frames, inside subnets too, and whether there were more.
+
+    Every object Houdini counts as geometry that is shown at a frame framed
+    and is not a guide, up to `MAX_FRAMED`.
+    """
+    root = _quiet(lambda: hou.node("/obj"))
+    kinds = getattr(hou, "nodeTypeFilter", None)
+    if root is None or kinds is None:
+        return [], False
+    guides = {node.path() for node in guide_objects(hou)}
+    at = framing_frames(hou, frames)
+    drawn: list[Any] = []
+    for node in _quiet(lambda: root.recursiveGlob("*", kinds.ObjGeometry)) or ():
+        if node.path() in guides or not any(_shown(node, frame) for frame in at):
+            continue
+        if len(drawn) == MAX_FRAMED:
+            return drawn, True
+        drawn.append(node)
+    return drawn, False
+
+
+def _shown(node: Any, frame: float) -> bool:
+    shown = _quiet(lambda: node.isObjectDisplayedAtFrame(frame))
     if shown is None:
-        shown = _quiet(node.isDisplayFlagSet)
-    return bool(shown) and _quiet(node.displayNode) is not None
+        shown = _quiet(lambda: node.isObjectDisplayed())
+    return bool(shown) and _quiet(lambda: node.displayNode()) is not None
 
 
-def _node_corners(node: Any) -> list[tuple[float, float, float]]:
+def _node_corners(hou: Any, node: Any, frame: float) -> list[tuple[float, float, float]]:
     owner = _object_of(node)
     if owner is None:
         return []
-    source = _quiet(owner.displayNode) if owner is node else node
-    geometry = _quiet(source.geometry) if source is not None else None
-    box = _quiet(geometry.boundingBox) if geometry is not None else None
-    if box is None or _quiet(box.isValid) is False:
+    source = _quiet(lambda: owner.displayNode()) if owner is node else node
+    box = _box_at(source, frame)
+    if box is None:
         return []
-    low, high = list(box.minvec()), list(box.maxvec())
-    matrix = _quiet(lambda: owner.worldTransform().asTuple())
+    low, high = box
+    if owner is node:
+        # An instance object draws another object's geometry at each of its
+        # points: the box of the points grown by that geometry's own box.
+        # Each point's own turn and scale are not read.
+        copied = _instanced_box(owner, frame)
+        if copied is not None:
+            low = [a + b for a, b in zip(low, copied[0], strict=True)]
+            high = [a + b for a, b in zip(high, copied[1], strict=True)]
+    matrix = _quiet(lambda: owner.worldTransformAtTime(hou.frameToTime(frame)).asTuple())
     corners = list(_corners(low, high))
     if not matrix or len(matrix) != 16:
         return corners
     return [_apply(matrix, corner) for corner in corners]
+
+
+def _box_at(source: Any, frame: float) -> tuple[list[float], list[float]] | None:
+    """A geometry node's box at a frame, or None for a node with no geometry to read."""
+    if source is None:
+        return None
+    geometry = _quiet(lambda: source.geometryAtFrame(frame))
+    box = _quiet(lambda: geometry.boundingBox()) if geometry is not None else None
+    if box is None or _quiet(lambda: box.isValid()) is False:
+        return None
+    return list(box.minvec()), list(box.maxvec())
+
+
+def _instanced_box(node: Any, frame: float) -> tuple[list[float], list[float]] | None:
+    if _quiet(lambda: node.type().nameComponents()[2]) != "instance":
+        return None
+    copied = _quiet(lambda: node.parm("instancepath").evalAsNodeAtFrame(frame))
+    if copied is None:
+        copied = _quiet(lambda: node.parm("instancepath").evalAsNode())
+    shown = _quiet(lambda: copied.displayNode()) if copied is not None else None
+    return _box_at(shown, frame)
 
 
 def _apply(m: Sequence[float], p: Sequence[float]) -> tuple[float, float, float]:
@@ -1706,7 +1851,7 @@ def _object_of(node: Any) -> Any:
     while current is not None:
         if _category(current) == "Object":
             return current
-        current = _quiet(current.parent)
+        current = _quiet(lambda current=current: current.parent())
     return None
 
 
@@ -1758,7 +1903,7 @@ def cop2_route(
     if _category(node) != "Cop2":
         raise Unavailable("the node is not an older COP")
     node.saveImage(path, (frames[0], frames[0]))
-    native = [_quiet(node.xRes), _quiet(node.yRes)]
+    native = [_quiet(lambda: node.xRes()), _quiet(lambda: node.yRes())]
     return {
         "files": [path],
         "frames": [frames[0]],
@@ -1819,13 +1964,17 @@ def network_route(
 ) -> dict[str, Any]:
     """The network editor's own window, cropped to the editor."""
     kind = hou.paneTabType.NetworkEditor
-    editors = [tab for tab in (_quiet(hou.ui.paneTabs) or ()) if _quiet(tab.type) == kind]
+    editors = [
+        tab
+        for tab in (_quiet(lambda: hou.ui.paneTabs()) or ())
+        if _quiet(lambda tab=tab: tab.type()) == kind
+    ]
     if not editors:
         raise Unavailable("this desktop has no network editor")
-    showing = [tab for tab in editors if _quiet(tab.isCurrentTab)]
+    showing = [tab for tab in editors if _quiet(lambda tab=tab: tab.isCurrentTab())]
     editor = (showing or editors)[0]
     shot: dict[str, Any] = {"files": [path], "frames": [frames[0]], "camera": None}
-    previous = _quiet(editor.pwd) if spec.path else None
+    previous = _quiet(lambda: editor.pwd()) if spec.path else None
     try:
         if spec.path:
             editor.setPwd(hou.node(spec.path))
@@ -1852,7 +2001,10 @@ def pane_route(
     """One pane tab by name, grabbed from its own window."""
     tab = _quiet(lambda: hou.ui.findPaneTab(spec.path))
     if tab is None:
-        names = [_quiet(item.name) for item in (_quiet(hou.ui.paneTabs) or ())]
+        names = [
+            _quiet(lambda item=item: item.name())
+            for item in (_quiet(lambda: hou.ui.paneTabs()) or ())
+        ]
         names = [name for name in names if name]
         raise _bad(
             "path",
@@ -1888,13 +2040,13 @@ def grab_pane(tab: Any, path: str, attempt: Attempt) -> list[int]:
     The tab is made the current one of its pane for the grab, so it is the
     one drawn, and the tab that was current is put back after.
     """
-    pane = _quiet(tab.pane)
-    previous = _quiet(pane.currentTab) if pane is not None else None
-    if not _quiet(tab.isCurrentTab):
+    pane = _quiet(lambda: tab.pane())
+    previous = _quiet(lambda: pane.currentTab()) if pane is not None else None
+    if not _quiet(lambda: tab.isCurrentTab()):
         tab.setIsCurrentTab()
     try:
-        window = _quiet(tab.qtParentWindow)
-        geometry = _quiet(tab.qtScreenGeometry)
+        window = _quiet(lambda: tab.qtParentWindow())
+        geometry = _quiet(lambda: tab.qtScreenGeometry())
         if window is None or geometry is None:
             raise Unavailable("the pane has no window to grab")
         process_events()
@@ -1904,7 +2056,7 @@ def grab_pane(tab: Any, path: str, attempt: Attempt) -> list[int]:
             (geometry.x(), geometry.y(), geometry.width(), geometry.height()),
             (origin.x(), origin.y()),
             (pixmap.width(), pixmap.height()),
-            float(_quiet(pixmap.devicePixelRatio) or 1.0),
+            float(_quiet(lambda: pixmap.devicePixelRatio()) or 1.0),
         )
         if box is None:
             raise Unavailable("the pane is not inside its window on screen")
