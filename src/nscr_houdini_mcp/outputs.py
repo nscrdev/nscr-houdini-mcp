@@ -973,6 +973,18 @@ def allocate(
     return replace(plan, source_node=node_path)
 
 
+def record_files(store: Store, plan: OutputPlan, files: Iterable[str]) -> None:
+    """Name the files a run really wrote, in its record and in the file beside it.
+
+    For an output that turned out to be several files, such as the frames of
+    a capture, so the record lists each one rather than the path it was
+    handed out under.
+    """
+    paths = {**plan.as_record(), "files": [str(item) for item in files]}
+    store.set_run_paths(plan.run_id, paths)
+    write_export(store.run_export(plan.run_id), plan.sidecar)
+
+
 def release(store: Store, plan: OutputPlan, *, drop_run: bool = True) -> None:
     """Give back a place that was claimed and never written.
 
