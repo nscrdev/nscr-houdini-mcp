@@ -222,6 +222,130 @@ def test_a_worker_is_never_said_to_have_drifted(scene: Scene) -> None:
     assert "warnings" not in session.trace()
 
 
+class Namer:
+    """Stands in for the store: hands out the scene's name, or fails."""
+
+    def __init__(self, fails: bool = False) -> None:
+        self.asked: list[str] = []
+        self.fails = fails
+
+    def __call__(self, hip_path: str) -> str:
+        self.asked.append(hip_path)
+        if self.fails:
+            raise RuntimeError("the store is locked")
+        return f"{hip_stem(hip_path)}-1"
+
+
+def untitled(scene: Scene, namer: Namer, **overrides: Any) -> Identity:
+    """A session with a user interface that came up before its scene did."""
+    scene.hipFile.setName("untitled.hip")
+    settings: dict[str, Any] = {
+        "alias": "untitled-1",
+        "hip_path": "untitled.hip",
+        "tracks_hip": True,
+        "on_rename": namer,
+    }
+    settings.update(overrides)
+    session = identity(scene, **settings)
+    session.watch()
+    return session
+
+
+def test_a_session_that_came_up_before_its_scene_takes_the_scene_name_on_load(
+    scene: Scene,
+) -> None:
+    namer = Namer()
+    session = untitled(scene, namer)
+    assert session.provisional is True
+
+    scene.hipFile.load("/scenes/gui_v001.hip")
+
+    assert namer.asked == ["/scenes/gui_v001.hip"]
+    assert session.alias == "gui_v001-1"
+    assert session.drift() is None
+    assert "warnings" not in session.trace()
+    assert session.provisional is False
+    # The epoch still moved: every path from the untitled scene is gone.
+    assert session.scene_epoch == 1
+
+
+def test_a_provisional_name_moves_once(scene: Scene) -> None:
+    namer = Namer()
+    session = untitled(scene, namer)
+    scene.hipFile.load("/scenes/gui_v001.hip")
+
+    scene.hipFile.load("/scenes/shot_020.hip")
+
+    assert namer.asked == ["/scenes/gui_v001.hip"]
+    assert session.alias == "gui_v001-1"
+    assert session.drift()["hip_stem"] == "shot_020"
+
+
+def test_a_provisional_name_follows_the_first_save_too(scene: Scene) -> None:
+    namer = Namer()
+    session = untitled(scene, namer)
+
+    scene.hipFile.save("/scenes/layout_v001.hip")
+
+    assert session.alias == "layout_v001-1"
+    assert session.drift() is None
+    assert session.scene_epoch == 0
+
+
+def test_a_clear_leaves_a_provisional_name_waiting(scene: Scene) -> None:
+    namer = Namer()
+    session = untitled(scene, namer)
+
+    scene.hipFile.clear()
+
+    assert namer.asked == []
+    assert session.provisional is True
+
+
+def test_once_a_call_has_reached_the_session_its_name_stays(scene: Scene) -> None:
+    """A caller may be holding the name from its first call on."""
+    namer = Namer()
+    session = untitled(scene, namer)
+    session.keep_name()
+
+    scene.hipFile.load("/scenes/gui_v001.hip")
+
+    assert namer.asked == []
+    assert session.alias == "untitled-1"
+    assert session.drift()["hip_stem"] == "gui_v001"
+
+
+def test_a_session_that_started_with_a_file_is_never_renamed(scene: Scene) -> None:
+    namer = Namer()
+    session = identity(scene, tracks_hip=True, on_rename=namer)
+    session.watch()
+    assert session.provisional is False
+
+    scene.hipFile.load("/scenes/shot_020.hip")
+
+    assert namer.asked == []
+    assert session.alias == "example-1"
+
+
+def test_a_worker_never_takes_a_provisional_name(scene: Scene) -> None:
+    namer = Namer()
+    session = untitled(scene, namer, kind="hython", alias="w1", tracks_hip=False)
+    scene.hipFile.load("/scenes/gui_v001.hip")
+    assert namer.asked == []
+    assert session.alias == "w1"
+
+
+def test_a_rename_the_store_refuses_leaves_the_old_name_and_says_why(scene: Scene) -> None:
+    said: list[str] = []
+    session = untitled(scene, Namer(fails=True), log=said.append)
+
+    scene.hipFile.load("/scenes/gui_v001.hip")
+
+    assert session.alias == "untitled-1"
+    assert session.drift()["hip_stem"] == "gui_v001"
+    assert any("could not name the session after its scene" in line for line in said)
+
+
 # Section: what a call carrying an old epoch gets
 
 

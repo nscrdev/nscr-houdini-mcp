@@ -10,6 +10,12 @@ Two handles and one counter, and the rules that keep them honest.
   session under a caller that is holding the old name is worse than a name
   that has gone out of date. When the scene file changes so the name no longer
   matches it, every reply says so instead.
+- One exception. A session with a user interface that came up before its scene
+  did, as one started with Houdini does while the file named on the command
+  line is still to load, is named after the untitled scene it found. Its name
+  is provisional: the first time the scene is loaded or saved under a file
+  name, the session takes that name. Only until a call has reached it, since
+  from then on a caller may be holding the name it has.
 - `scene_epoch` counts how many times this process has thrown its scene away.
   Opening a file, starting a new scene and loading the same file again all
   replace the scene, and every node path a caller was holding goes with it. So
@@ -107,6 +113,7 @@ class Identity:
         tracks_hip: bool = False,
         hou: Any | None = None,
         on_change: Callable[[int, str | None], None] | None = None,
+        on_rename: Callable[[str], str] | None = None,
         log: Callable[[str], None] | None = None,
     ) -> None:
         self.session_id = session_id
@@ -126,6 +133,9 @@ class Identity:
         self._counted_at: float | None = None
         self._hou = hou if hou is not None else host.houdini()
         self._on_change = on_change
+        # Takes the scene file a provisional name should follow, and hands
+        # back the name the store gave the session for it.
+        self._on_rename = on_rename
         self._log = log or (lambda text: None)
         self._load_began: float | None = None
         self._counted_the_clear = False
@@ -138,6 +148,9 @@ class Identity:
         # Whether the scene has changes that are not on disk, as far as this
         # session can see. The scene events below move it, and so do the calls.
         self.dirty = dirty_module.DirtyMarker()
+        # Whether the name was taken from a scene with no file yet, and may
+        # still follow the first file the scene gets.
+        self._provisional = on_rename is not None and tracks_hip and self._scene_is_new()
 
     # Section: handles
 
@@ -150,6 +163,59 @@ class Identity:
         """Record the name the store handed out. Called once, at start."""
         with self._lock:
             self._alias = alias
+
+    @property
+    def provisional(self) -> bool:
+        """Whether the name may still move to the scene's, once it has a file."""
+        with self._lock:
+            return self._provisional
+
+    def keep_name(self) -> None:
+        """A call has reached this session, so its name stays what it is."""
+        with self._lock:
+            self._provisional = False
+
+    def _scene_is_new(self) -> bool:
+        """Whether the scene this session starts with has never had a file."""
+        hou = self._hou
+        if hou is None:
+            return False
+        try:
+            return bool(hou.hipFile.isNewFile())
+        except Exception:  # noqa: BLE001 - a fact we cannot read is a fact we do not have
+            return False
+
+    def _follow_the_scene(self) -> None:
+        """Give a provisional name the scene's, now that the scene has a file.
+
+        Runs from the scene event, on the main thread. The name moves once:
+        whatever happens to the scene afterwards, it is settled.
+        """
+        if not self.provisional or self._scene_is_new():
+            return
+        path = self._read_hip_path()
+        with self._lock:
+            if path is not None:
+                self._hip_path = path
+            hip = self._hip_path or ""
+            stem = hip_stem(hip)
+            if not self._provisional or not stem:
+                return
+            self._provisional = False
+            if stem == self._alias_stem:
+                return
+        if self._on_rename is None:
+            return
+        try:
+            alias = self._on_rename(hip)
+        except Exception as error:  # noqa: BLE001 - an old name is not a lost scene
+            self._log(
+                f"could not name the session after its scene: {type(error).__name__}: {error}"
+            )
+            return
+        with self._lock:
+            self._alias = alias
+            self._alias_stem = stem
 
     @property
     def scene_epoch(self) -> int:
@@ -341,8 +407,10 @@ class Identity:
                     else:
                         self.bump(LOADED)
                     self.dirty.event(dirty_module.LOADED)
+                    self._follow_the_scene()
                 elif after_save is not None and event_type == after_save:
                     self.dirty.event(dirty_module.SAVED)
+                    self._follow_the_scene()
                 elif after_merge is not None and event_type == after_merge:
                     self.dirty.event(dirty_module.MERGED)
             except Exception as error:  # noqa: BLE001 - never raise into Houdini's event loop

@@ -1212,6 +1212,33 @@ class Store:
                 db.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
             )
 
+    def rename_session(self, session_id: str, *, alias_template: str) -> SessionRecord:
+        """Give a live session the lowest free name the template makes.
+
+        For a session that came up before its scene did, and takes the scene's
+        name once it arrives. The name it had is free again from here.
+        """
+        now = self._now()
+        with self._txn(write=True) as db:
+            self._reclaim_sessions(db, now)
+            taken = {
+                row["alias"]
+                for row in db.execute(
+                    "SELECT alias FROM sessions WHERE state <> ? AND session_id <> ?",
+                    (SESSION_GONE, session_id),
+                )
+            }
+            name = _first_free_alias(alias_template, taken)
+            written = db.execute(
+                "UPDATE sessions SET alias = ? WHERE session_id = ? AND state <> ?",
+                (name, session_id, SESSION_GONE),
+            )
+            if written.rowcount == 0:
+                raise UnknownRecord(f"no live session {session_id}")
+            return SessionRecord._from_row(
+                db.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+            )
+
     def get_session(self, session_id: str) -> SessionRecord | None:
         """Session by id, gone or not. Ids are never reused."""
         row = self._read_one("SELECT * FROM sessions WHERE session_id = ?", (session_id,))

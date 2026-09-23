@@ -212,6 +212,27 @@ def test_an_alias_template_takes_the_lowest_free_name(store: Store) -> None:
     assert third.alias == "shot-1"
 
 
+def test_a_session_can_take_a_new_name_and_free_the_one_it_had(store: Store) -> None:
+    store.register_session("s1", kind="gui", pid=LIVE_PID, alias_template="untitled-{n}")
+    store.register_session("s2", kind="gui", pid=LIVE_PID, alias="shot-1")
+
+    renamed = store.rename_session("s1", alias_template="shot-{n}")
+
+    assert renamed.alias == "shot-2"
+    assert store.resolve_session("shot-2").session_id == "s1"
+    assert store.resolve_session("untitled-1") is None
+    # Its own name does not count against it.
+    assert store.rename_session("s1", alias_template="shot-{n}").alias == "shot-2"
+
+
+def test_a_session_that_is_gone_or_unknown_cannot_be_renamed(store: Store) -> None:
+    store.register_session("s1", kind="gui", pid=LIVE_PID, alias="shot-1")
+    store.end_session("s1")
+    for session_id in ("s1", "nope"):
+        with pytest.raises(UnknownRecord):
+            store.rename_session(session_id, alias_template="other-{n}")
+
+
 def test_a_name_held_by_a_session_that_crashed_is_free_again(store: Store) -> None:
     """A crash cannot end its own row, so the next start ends it instead."""
     store.register_session("s1", kind="hython", pid=DEAD_PID, alias="w1")
