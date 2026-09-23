@@ -22,8 +22,10 @@ import pytest
 from mcp.client.client import Client
 from mcp.shared.inbound import find_invalid_x_mcp_header
 
+from fake_hou import Scene
 from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge import client as bridge_client
+from nscr_houdini_mcp.bridge import marshal
 from nscr_houdini_mcp.config import Config, ConfigError
 from nscr_houdini_mcp.results import CallError
 from nscr_houdini_mcp.router import Router
@@ -41,6 +43,7 @@ from nscr_houdini_mcp.tools.base import (
     outputs,
 )
 from nscr_houdini_mcp.tools.registry import TOOLS
+from test_bridge_app import make_bridge
 from test_router import FakeFiles, FakeStore, Sent, record
 
 HEALTH = {
@@ -276,13 +279,58 @@ def test_hou_ping_during_a_cook_answers_from_the_main_thread_pulse() -> None:
     assert body["health"]["busy_for_s"] == 3.25
 
 
-def test_hou_ping_reads_a_main_thread_quiet_for_longer_than_a_tick_as_busy() -> None:
-    stage = Stage([record("s-1", "acc-1", kind="gui")])
-    thread = {"installed": True, "pulse_age_s": ping_tool.FREE_PULSE_S + 0.2, "away": False}
+def test_hou_ping_asks_a_main_thread_the_bridge_does_not_call_away() -> None:
+    # An old pulse inside the bridge's own limit, such as a configured limit
+    # of five seconds, is asked rather than skipped.
+    stage = Stage([record("s-1", "acc-1", kind="gui")], replies=(pong(),))
+    thread = {"installed": True, "pulse_age_s": 3.0, "away": False}
     health_saying(stage, kind="gui", busy=False, main_thread=thread)
     _, [result] = talk(serve(stage), ("hou_ping", {}))
+    [sent] = stage.sent.calls
+    assert sent["wait_s"] == ping_tool.PING_WAIT_S
+    assert result.structured_content["call"]["ok"] is True
+    assert "busy_cause" not in result.structured_content["health"]
+
+
+def test_hou_ping_without_a_verdict_judges_the_pulse_by_the_default_limit() -> None:
+    stage = Stage([record("s-1", "acc-1", kind="gui")], replies=(pong(),))
+    health_saying(stage, kind="gui", main_thread={"installed": True, "pulse_age_s": 1.5})
+    _, [asked] = talk(serve(stage), ("hou_ping", {}))
+    assert asked.structured_content["call"]["ok"] is True
+    stage = Stage([record("s-1", "acc-1", kind="gui")])
+    health_saying(stage, kind="gui", main_thread={"installed": True, "pulse_age_s": 2.5})
+    _, [skipped] = talk(serve(stage), ("hou_ping", {}))
     assert stage.sent.calls == []
-    assert result.structured_content["call"]["skipped"] is True
+    assert skipped.structured_content["call"]["skipped"] is True
+
+
+def test_hou_ping_during_playback_goes_through_the_main_thread_path(tmp_path: Path) -> None:
+    """Playback stops the loop callback while posted work still lands.
+
+    The pulse then ages past what an idle loop would show, yet the session is
+    free: a real bridge on a real socket, over the stand in's playback model.
+    """
+    scene = Scene()
+    bridge, _ = make_bridge(tmp_path, driver="stdlib", kind="gui", hou=scene.module())
+    scene.ui.start()
+    bridge.start()
+    try:
+        scene.ui.starve_loop = True
+        began = time.monotonic()
+        while bridge.pulse.age_s() < 0.8 and time.monotonic() - began < 5.0:
+            time.sleep(0.02)
+        assert 0.8 <= bridge.pulse.age_s() < marshal.DEFAULT_STALE_S
+        config = Config(path=tmp_path / "config.toml", state_home=tmp_path)
+        runtime = build_server(config_loader=lambda: config).runtime
+        result = runtime.run("hou_ping", {})
+        assert not result.is_error, result.content
+        body = result.structured_content
+        assert body["call"]["ok"] is True
+        assert "skipped" not in body["call"]
+        assert body["health"]["busy"] is False
+    finally:
+        bridge.stop()
+        scene.ui.stop()
 
 
 def test_hou_ping_of_a_free_session_asks_it_within_a_short_wait() -> None:
