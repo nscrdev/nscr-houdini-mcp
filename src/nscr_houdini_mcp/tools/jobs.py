@@ -44,6 +44,8 @@ import base64
 import binascii
 import hashlib
 import json
+import math
+import re
 import sqlite3
 import time
 from collections.abc import Callable, Mapping
@@ -319,34 +321,64 @@ def make_token(last: JobRecord, query: str) -> str:
     return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
 
 
+TOKEN_KEYS = frozenset({"v", "c", "r", "q"})
+_TOKEN_TEXT = re.compile(r"[A-Za-z0-9_-]+")
+
+
 def read_token(page: Any, query: str) -> tuple[float, int] | None:
+    """The row a list goes on after, from a page token this server wrote.
+
+    Only a token exactly as `make_token` writes it is read: plain base64 in
+    the URL alphabet, JSON with the four keys and no others, a version, a
+    finite creation time, a place above zero and the filters' fingerprint.
+    Anything else, a true for a number included, is `BAD_CURSOR`.
+    """
     if page is None:
         return None
     unreadable = CallError(
         "BAD_CURSOR", "the page token could not be read", details={"argument": "page"}
     )
-    if not isinstance(page, str) or len(page) > MAX_TOKEN_CHARS:
+    if not isinstance(page, str) or len(page) > MAX_TOKEN_CHARS or not _TOKEN_TEXT.fullmatch(page):
         raise unreadable
     try:
         padded = page + "=" * (-len(page) % 4)
-        body = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+        raw = base64.b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
+        if base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=") != page:
+            raise ValueError("not the way this server writes a token")
+        body = json.loads(
+            raw.decode("utf-8"),
+            parse_constant=_no_constant,
+            object_pairs_hook=_no_repeats,
+        )
     except (binascii.Error, UnicodeError, ValueError):
         raise unreadable from None
-    if (
-        not isinstance(body, dict)
-        or body.get("v") != TOKEN_VERSION
-        or not isinstance(body.get("c"), (int, float))
-        or not isinstance(body.get("r"), int)
-        or isinstance(body.get("r"), bool)
-    ):
+    if not isinstance(body, dict) or set(body) != TOKEN_KEYS:
         raise unreadable
-    if body.get("q") != query:
+    version, created, place, fingerprint_ = body["v"], body["c"], body["r"], body["q"]
+    if type(version) is not int or version != TOKEN_VERSION:
+        raise unreadable
+    if type(created) not in (int, float) or not math.isfinite(created):
+        raise unreadable
+    if type(place) is not int or place <= 0 or type(fingerprint_) is not str:
+        raise unreadable
+    if fingerprint_ != query:
         raise CallError(
             "BAD_CURSOR",
             "that page token belongs to a list with other filters; send the same session and state",
             details={"argument": "page"},
         )
-    return float(body["c"]), int(body["r"])
+    return float(created), place
+
+
+def _no_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not a number a token holds")
+
+
+def _no_repeats(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    keys = [key for key, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("a key appears twice")
+    return dict(pairs)
 
 
 # Section: one job as a caller reads it

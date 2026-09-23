@@ -9,6 +9,7 @@ real Houdini does with the same calls is in the integration checks.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import sqlite3
@@ -946,3 +947,48 @@ def test_a_large_answer_spills_once_and_honours_max_chars(bench: Bench) -> None:
     third = job(bench, body["job_id"])
     assert third["outputs"]["spill_path"] == spilled
     assert list(Path(spilled).parent.glob("*.json")) == files
+
+
+def _token(body: Any) -> str:
+    text = json.dumps(body, separators=(",", ":"))
+    return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def test_a_page_token_is_read_only_exactly_as_this_server_writes_it(bench: Bench) -> None:
+    for index in range(3):
+        with bench.store() as store:
+            store.create_job(f"job-{index}", kind="python", session_id="s-1", state="done")
+    first = ok(jobs(bench, action="list", limit=1))
+    good = first["next_page"]
+    body = json.loads(base64.urlsafe_b64decode(good + "=" * (-len(good) % 4)))
+    assert set(body) == {"v", "c", "r", "q"}
+    assert ok(jobs(bench, action="list", limit=1, page=good))["jobs"]
+    bad = [
+        _token({**body, "c": True}),
+        _token({**body, "r": True}),
+        _token({**body, "v": True}),
+        _token({**body, "r": 0}),
+        _token({**body, "r": -3}),
+        _token({**body, "r": 2.0}),
+        _token({**body, "c": "1.0"}),
+        _token({**body, "extra": 1}),
+        _token({key: value for key, value in body.items() if key != "q"}),
+        _token([body]),
+        base64.urlsafe_b64encode(json.dumps(body).replace(str(body["c"]), "Infinity").encode())
+        .decode()
+        .rstrip("="),
+        base64.urlsafe_b64encode(json.dumps(body).replace(str(body["c"]), "1e999").encode())
+        .decode()
+        .rstrip("="),
+        base64.urlsafe_b64encode(('{"v":1,"v":1,' + json.dumps(body)[1:]).encode())
+        .decode()
+        .rstrip("="),
+        good + "=",
+        good + "!",
+        good.replace("-", "+").replace("_", "/") if ("-" in good or "_" in good) else good + "+",
+        base64.urlsafe_b64encode(b"\xff\xfe").decode().rstrip("="),
+        "",
+    ]
+    for token in bad:
+        error = refused(jobs(bench, action="list", limit=1, page=token))
+        assert error["code"] == "BAD_CURSOR", token
