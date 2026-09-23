@@ -377,6 +377,7 @@ def alpha_note(
     return {
         "present": True,
         "partial": bool((alpha < 1.0).any()),
+        "coverage_pct": round(float(alpha.mean(dtype=np.float64)) * 100.0, 2),
         "premultiplied": premultiplied,
         "unpremultiplied": unpremultiplied,
     }
@@ -663,9 +664,45 @@ def align(
         found = estimate_shift(aligned.candidate, aligned.reference, aligned.valid)
         steps["shift_px"] = found
         if found["applied"]:
-            aligned.candidate = translate(aligned.candidate, found["dx"], found["dy"])
-            aligned.valid = translate(aligned.valid, found["dx"], found["dy"])
+            moved_rgb = translate(aligned.candidate, found["dx"], found["dy"])
+            moved_valid = translate(aligned.valid, found["dx"], found["dy"])
+            before = valid_error(aligned.candidate, aligned.reference, aligned.valid)
+            after = valid_error(moved_rgb, aligned.reference, moved_valid)
+            found["mae"] = {
+                "unshifted": None if before is None else round(before, 6),
+                "shifted": None if after is None else round(after, 6),
+            }
+            if before is not None and after is not None and after < before:
+                aligned.candidate, aligned.valid = moved_rgb, moved_valid
+            else:
+                # A weak peak can point the wrong way: the shift is kept only
+                # when it brings the two closer where the candidate covers.
+                found.update(
+                    applied=False,
+                    dx=0,
+                    dy=0,
+                    reason="the shift found did not lower the difference, so it was not applied",
+                )
     return aligned
+
+
+# How many rows a block of `valid_error` reads at a time.
+ERROR_ROWS = 256
+
+
+def valid_error(candidate: np.ndarray, reference: np.ndarray, valid: np.ndarray) -> float | None:
+    """The mean absolute difference where the candidate covers, a block of rows at a time."""
+    total = 0.0
+    count = 0
+    for top in range(0, reference.shape[0], ERROR_ROWS):
+        rows = slice(top, top + ERROR_ROWS)
+        inside = valid[rows]
+        if not inside.any():
+            continue
+        gap = np.abs(candidate[rows][inside] - reference[rows][inside])
+        total += float(gap.sum(dtype=np.float64))
+        count += int(gap.size)
+    return total / count if count else None
 
 
 def _bars(ox: int, oy: int, nw: int, nh: int, gw: int, gh: int) -> dict[str, int] | None:

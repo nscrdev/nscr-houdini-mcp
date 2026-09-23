@@ -141,24 +141,37 @@ def capture(call: Call) -> dict[str, Any]:
     return said
 
 
-def take(call: Call, arguments: Mapping[str, Any]) -> dict[str, Any]:
+def take(
+    call: Call, arguments: Mapping[str, Any], *, operation_id: str | None = None
+) -> dict[str, Any]:
     """One picture made for another tool in this process, finished as `capture` finishes it.
 
     No sequence and no image content: the caller reads the file. The run, its
     receipt and its job are the ones a `hou_capture` call would have made, so
-    `hou_jobs` and `hou_outputs` find it the same way.
+    `hou_jobs` and `hou_outputs` find it the same way. `operation_id` is the
+    id the capture goes under, derived by the caller from its own; without
+    one the call's own is used. `timeout_s` in `arguments` is how long to
+    wait for it before `TIMEOUT` with the job to follow.
     """
     sent = checked(arguments)
     if sent.get("frames") is not None or sent.get("views") not in (None, "single"):
         raise bad("frames", "a capture made for another tool is one picture")
-    job_id = job_rules.job_id_for(call.operation_id())
+    operation_id = operation_id or call.operation_id()
+    job_id = job_rules.job_id_for(operation_id)
+    asked = arguments.get("timeout_s")
     try:
-        reply = call.bridge("capture.image", sent, mutating=True)
+        reply = call.bridge(
+            "capture.image",
+            sent,
+            mutating=True,
+            operation_id=operation_id,
+            timeout_s=None if asked is None else float(asked),
+        )
     except CallError as error:
         if error.code in python_tool.FOLLOWABLE:
             error.details["job_id"] = job_id
         raise
-    said = finalised(call, call.operation_id(), dict(reply.get("data") or {}))
+    said = finalised(call, operation_id, dict(reply.get("data") or {}))
     if said.get("empty") and not said.get("stopped_early"):
         raise empty_error(said)
     said["job_id"] = job_id

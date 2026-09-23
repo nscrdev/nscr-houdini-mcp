@@ -139,6 +139,11 @@ def read_exr(arguments: Mapping[str, Any], context: Any) -> dict[str, Any]:
         "alpha": {
             "present": alpha is not None,
             "partial": bool(alpha is not None and (alpha < 1.0).any()),
+            "coverage_pct": (
+                None
+                if alpha is None
+                else round(float(numpy.clip(alpha, 0.0, 1.0).mean(dtype=numpy.float64)) * 100, 2)
+            ),
             "premultiplied": alpha is not None,
             "unpremultiplied": alpha is not None,
         },
