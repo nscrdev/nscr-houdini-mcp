@@ -233,35 +233,35 @@ def list_outputs(call: Call) -> dict[str, Any]:
     last: tuple[float, int] | None = None
     more = False
     with call.router.store() as store:
-        cursor = before
+        resume_at = before
         scanned = 0
         while store is not None and not more:
             batch = stored(
-                lambda cursor=cursor: store.find_runs(
+                lambda resume_at=resume_at: store.find_runs(
                     hip_family=family,
                     kind=wanted.get("kind"),
                     name_glob=wanted.get("name"),
                     since=wanted.get("since"),
                     session_id=target.session_id if hip is None else None,
-                    before=cursor,
+                    before=resume_at,
                     limit=BATCH,
                 )
             )
             for record in batch:
                 scanned += 1
-                cursor = (record.created_at, int(record.seq or 0))
+                resume_at = (record.created_at, int(record.seq or 0))
                 if hip is not None and not made_here(record, folder):
                     continue
                 if len(rows) >= limit:
                     more = True
                     break
                 rows.append(run_row(record))
-                last = cursor
+                last = resume_at
             if len(batch) < BATCH:
                 break
             if not more and scanned >= MAX_SCANNED:
                 # Long enough for one call: the next page carries on from here.
-                more, last = True, cursor
+                more, last = True, resume_at
     said: dict[str, Any] = {"action": "list", "runs": rows, "scene_family": family}
     if more and last is not None:
         said["next_page"] = make_token(
