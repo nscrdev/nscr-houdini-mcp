@@ -23,12 +23,15 @@ import pytest
 from mcp.client.client import Client
 from mcp.shared.inbound import find_invalid_x_mcp_header
 
+from fake_hou import Scene
 from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge import client as bridge_client
+from nscr_houdini_mcp.bridge import marshal
 from nscr_houdini_mcp.config import Config, ConfigError
 from nscr_houdini_mcp.results import CallError
 from nscr_houdini_mcp.router import Router
 from nscr_houdini_mcp.server import INSTRUCTIONS, SERVER_NAME, build_server
+from nscr_houdini_mcp.tools import ping as ping_tool
 from nscr_houdini_mcp.tools.base import (
     OPERATION_ID,
     SCENE_EPOCH,
@@ -41,6 +44,7 @@ from nscr_houdini_mcp.tools.base import (
     outputs,
 )
 from nscr_houdini_mcp.tools.registry import TOOLS
+from test_bridge_app import make_bridge
 from test_router import FakeFiles, FakeStore, Sent, record
 
 HEALTH = {
@@ -233,6 +237,125 @@ def test_hou_ping_shows_the_progress_the_running_call_reported() -> None:
     health = result.structured_content["health"]
     assert health["current_op"] == "python.run"
     assert health["progress"] == [note]
+
+
+def health_saying(stage: Stage, **said: Any) -> None:
+    data = {**HEALTH["data"], **said}
+    stage.health = lambda session, **rest: bridge_client.Answer(  # type: ignore[method-assign]
+        200, {"ok": True, "data": data}, {}
+    )
+
+
+def test_hou_ping_of_a_session_running_a_call_answers_from_health_alone() -> None:
+    stage = Stage([record("s-1", "w1")])
+    health_saying(stage, busy=True, current_op="python.run", current_op_elapsed_s=12.5)
+    began = time.time()
+    _, [result] = talk(serve(stage), ("hou_ping", {}))
+    assert not result.is_error
+    body = result.structured_content
+    # Nothing is sent to wait behind the running call.
+    assert stage.sent.calls == []
+    assert body["call"]["ok"] is False
+    assert body["call"]["code"] == "SESSION_BUSY"
+    assert body["call"]["skipped"] is True
+    assert "python.run" in body["call"]["message"]
+    health = body["health"]
+    assert health["busy"] is True
+    assert health["current_op"] == "python.run"
+    assert health["busy_cause"] == "running python.run"
+    assert health["busy_for_s"] == 12.5
+    assert began - 12.5 - 1.0 <= health["busy_since"] <= time.time() - 12.5 + 1.0
+
+
+def test_hou_ping_during_a_cook_answers_from_the_main_thread_pulse() -> None:
+    stage = Stage([record("s-1", "acc-1", kind="gui")])
+    thread = {"installed": True, "pulse_age_s": 3.25, "away": True}
+    health_saying(stage, kind="gui", busy=False, main_thread=thread)
+    _, [result] = talk(serve(stage), ("hou_ping", {}))
+    body = result.structured_content
+    assert stage.sent.calls == []
+    assert body["call"]["skipped"] is True
+    assert body["health"]["busy"] is True
+    assert body["health"]["busy_cause"] == "main thread busy"
+    assert body["health"]["busy_for_s"] == 3.25
+
+
+def test_hou_ping_asks_a_main_thread_the_bridge_does_not_call_away() -> None:
+    # An old pulse inside the bridge's own limit, such as a configured limit
+    # of five seconds, is asked rather than skipped.
+    stage = Stage([record("s-1", "acc-1", kind="gui")], replies=(pong(),))
+    thread = {"installed": True, "pulse_age_s": 3.0, "away": False}
+    health_saying(stage, kind="gui", busy=False, main_thread=thread)
+    _, [result] = talk(serve(stage), ("hou_ping", {}))
+    [sent] = stage.sent.calls
+    assert sent["wait_s"] == ping_tool.PING_WAIT_S
+    assert result.structured_content["call"]["ok"] is True
+    assert "busy_cause" not in result.structured_content["health"]
+
+
+def test_hou_ping_without_a_verdict_judges_the_pulse_by_the_default_limit() -> None:
+    stage = Stage([record("s-1", "acc-1", kind="gui")], replies=(pong(),))
+    health_saying(stage, kind="gui", main_thread={"installed": True, "pulse_age_s": 1.5})
+    _, [asked] = talk(serve(stage), ("hou_ping", {}))
+    assert asked.structured_content["call"]["ok"] is True
+    stage = Stage([record("s-1", "acc-1", kind="gui")])
+    health_saying(stage, kind="gui", main_thread={"installed": True, "pulse_age_s": 2.5})
+    _, [skipped] = talk(serve(stage), ("hou_ping", {}))
+    assert stage.sent.calls == []
+    assert skipped.structured_content["call"]["skipped"] is True
+
+
+def test_hou_ping_during_playback_goes_through_the_main_thread_path(tmp_path: Path) -> None:
+    """Playback stops the loop callback while posted work still lands.
+
+    The pulse then ages past what an idle loop would show, yet the session is
+    free: a real bridge on a real socket, over the stand in's playback model.
+    """
+    scene = Scene()
+    bridge, _ = make_bridge(tmp_path, driver="stdlib", kind="gui", hou=scene.module())
+    scene.ui.start()
+    bridge.start()
+    try:
+        scene.ui.starve_loop = True
+        began = time.monotonic()
+        while bridge.pulse.age_s() < 0.8 and time.monotonic() - began < 5.0:
+            time.sleep(0.02)
+        assert 0.8 <= bridge.pulse.age_s() < marshal.DEFAULT_STALE_S
+        config = Config(path=tmp_path / "config.toml", state_home=tmp_path)
+        runtime = build_server(config_loader=lambda: config).runtime
+        result = runtime.run("hou_ping", {})
+        assert not result.is_error, result.content
+        body = result.structured_content
+        assert body["call"]["ok"] is True
+        assert "skipped" not in body["call"]
+        assert body["health"]["busy"] is False
+    finally:
+        bridge.stop()
+        scene.ui.stop()
+
+
+def test_hou_ping_of_a_free_session_asks_it_within_a_short_wait() -> None:
+    stage = Stage([record("s-1", "acc-1", kind="gui")], replies=(pong(),))
+    thread = {"installed": True, "pulse_age_s": 0.2, "away": False}
+    health_saying(stage, kind="gui", busy=False, main_thread=thread)
+    _, [result] = talk(serve(stage), ("hou_ping", {}))
+    body = result.structured_content
+    assert body["call"]["ok"] is True
+    assert "skipped" not in body["call"]
+    assert "busy_since" not in body["health"]
+    [sent] = stage.sent.calls
+    assert sent["wait_s"] == ping_tool.PING_WAIT_S
+
+
+def test_hou_ping_with_a_wait_of_its_own_still_queues_behind_a_busy_session() -> None:
+    stage = Stage([record("s-1", "w1")], replies=(pong(),))
+    health_saying(stage, busy=True, current_op="python.run", current_op_elapsed_s=1.0)
+    _, [result] = talk(serve(stage), ("hou_ping", {"wait_s": 5}))
+    body = result.structured_content
+    assert body["call"]["ok"] is True
+    [sent] = stage.sent.calls
+    assert sent["wait_s"] == 5
+    assert body["health"]["busy_cause"] == "running python.run"
 
 
 def test_an_ambiguous_ping_is_an_error_the_text_alone_can_fix() -> None:
@@ -583,6 +706,35 @@ def test_a_flood_refusal_tells_a_change_to_keep_its_id_and_a_read_nothing_more()
     with pytest.raises(CallError) as refused:
         read.bridge("python.run")
     assert refused.value.hint == "wait 30 seconds, then call again"
+
+
+def test_hou_ping_looks_again_before_it_calls_a_session_busy() -> None:
+    # The first look was taken as the running call ended; the second finds
+    # the session free, so it is asked rather than skipped.
+    stage = Stage([record("s-1", "w1")], replies=(pong(),))
+    looks = iter(
+        [
+            {**HEALTH["data"], "busy": True, "current_op": "python.run"},
+            {**HEALTH["data"], "busy": False},
+        ]
+    )
+    stage.health = lambda session, **rest: bridge_client.Answer(  # type: ignore[method-assign]
+        200, {"ok": True, "data": next(looks)}, {}
+    )
+    _, [result] = talk(serve(stage), ("hou_ping", {}))
+    body = result.structured_content
+    assert body["call"]["ok"] is True
+    assert body["health"]["busy"] is False
+    [sent] = stage.sent.calls
+    assert sent["wait_s"] == ping_tool.PING_WAIT_S
+
+
+def test_hou_ping_says_what_its_wait_does_by_default() -> None:
+    listed, _ = talk(serve(Stage([])))
+    [tool] = [tool for tool in listed.tools if tool.name == "hou_ping"]
+    said = tool.input_schema["properties"]["wait_s"]["description"]
+    assert "Default 1" not in said
+    assert "health" in said
 
 
 # Section: the log

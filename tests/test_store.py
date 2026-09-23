@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import select
+import signal
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -174,6 +179,273 @@ def test_liveness_sees_a_child_exit() -> None:
     child = subprocess.Popen([sys.executable, "-c", "pass"])
     child.wait(timeout=30)
     assert process_is_alive(child.pid) is False
+
+
+needs_exit_watch = pytest.mark.skipif(
+    sys.platform != "darwin", reason="only this system reads start stamps from a program"
+)
+
+
+@needs_exit_watch
+def test_a_start_stamp_is_read_once_while_its_process_runs(monkeypatch) -> None:
+    known = store_module._KnownStarts()
+    reads: list[int] = []
+    real = store_module._ps_start
+
+    def counted(pid: int) -> str | None:
+        reads.append(pid)
+        return real(pid)
+
+    monkeypatch.setattr(store_module, "_ps_start", counted)
+    first = known.stamp(os.getpid())
+    assert first and first == real(os.getpid())
+    assert known.stamp(os.getpid()) == first
+    assert reads == [os.getpid()]
+
+
+@needs_exit_watch
+def test_a_kept_start_stamp_is_dropped_when_its_process_exits(monkeypatch) -> None:
+    known = store_module._KnownStarts()
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        stamp = known.stamp(child.pid)
+        assert stamp
+        # A stamp read while the process ran is not trusted past its exit, even
+        # when the listing would now name some other process under the pid.
+        monkeypatch.setattr(store_module, "_ps_start", lambda pid: "someone else")
+        assert known.stamp(child.pid) == stamp
+    finally:
+        child.kill()
+        child.wait(timeout=30)
+    # The kernel says no process has the pid now, so there is no stamp, and
+    # the listing is not asked.
+    assert known.stamp(child.pid) is None
+    assert child.pid not in known._kept
+
+
+class FakeWatch:
+    """A watch on one process's exit, fired by the test."""
+
+    def __init__(self) -> None:
+        self.exited = False
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_kept_start_stamps_drop_ended_processes_first_then_the_oldest(monkeypatch) -> None:
+    watches: dict[int, FakeWatch] = {}
+
+    def watch(pid: int) -> FakeWatch:
+        watches[pid] = FakeWatch()
+        return watches[pid]
+
+    monkeypatch.setattr(store_module, "_watch_exit", watch)
+    monkeypatch.setattr(store_module, "_has_exited", lambda made: made.exited)
+    monkeypatch.setattr(store_module, "_ps_start", lambda pid: f"stamp {pid}")
+    known = store_module._KnownStarts()
+    known.LIMIT = 4
+    for pid in (1, 2, 3, 4):
+        assert known.stamp(pid) == f"stamp {pid}"
+    # Two of them end. The next new process takes their room, and the live
+    # ones are kept, the oldest included.
+    watches[2].exited = True
+    watches[3].exited = True
+    known.stamp(5)
+    assert list(known._kept) == [1, 4, 5]
+    assert watches[2].closed and watches[3].closed
+    assert not watches[1].closed
+    # Full with live processes: the oldest goes, not the newest.
+    known.stamp(6)
+    known.stamp(7)
+    assert list(known._kept) == [4, 5, 6, 7]
+    assert watches[1].closed
+    # A long run of short lived processes takes one room, not every room:
+    # the first of them pushes out the oldest, and each ended one makes way.
+    for pid in range(100, 200):
+        known.stamp(pid)
+        watches[pid].exited = True
+    assert [pid for pid in known._kept if pid < 100] == [5, 6, 7]
+
+
+def watching(monkeypatch, listing, watches: dict[int, list[FakeWatch]]) -> None:
+    """Stand in watches, kept in `watches`, and a listing the test writes."""
+
+    def watch(pid: int) -> FakeWatch:
+        made = FakeWatch()
+        watches.setdefault(pid, []).append(made)
+        return made
+
+    monkeypatch.setattr(store_module, "_watch_exit", watch)
+    monkeypatch.setattr(store_module, "_has_exited", lambda made: made.exited)
+    monkeypatch.setattr(store_module, "_ps_start", listing)
+
+
+def test_a_process_that_ends_while_it_is_read_gives_no_stamp(monkeypatch) -> None:
+    watches: dict[int, list[FakeWatch]] = {}
+
+    def listing(pid: int) -> str:
+        # The watched process exits while the listing is being read.
+        watches[pid][-1].exited = True
+        return "the old stamp"
+
+    watching(monkeypatch, listing, watches)
+    known = store_module._KnownStarts()
+    assert known.stamp(7) is None
+    assert 7 not in known._kept
+    assert all(made.closed for made in watches[7])
+    assert len(watches[7]) == store_module._KnownStarts.TRIES
+
+
+def test_a_pid_taken_again_while_it_is_read_is_read_under_a_new_watch(monkeypatch) -> None:
+    said = iter(["the old stamp", "the new stamp"])
+    watches: dict[int, list[FakeWatch]] = {}
+
+    def listing(pid: int) -> str:
+        if len(watches[pid]) == 1:
+            watches[pid][-1].exited = True
+        return next(said)
+
+    watching(monkeypatch, listing, watches)
+    known = store_module._KnownStarts()
+    assert known.stamp(7) == "the new stamp"
+    assert known._kept[7][0] == "the new stamp"
+
+
+@needs_exit_watch
+def test_a_pid_with_no_process_gives_no_stamp() -> None:
+    assert store_module._KnownStarts().stamp(DEAD_PID) is None
+
+
+def test_a_pid_the_kernel_will_not_watch_but_is_taken_is_read_from_the_listing(
+    monkeypatch,
+) -> None:
+    # A zombie of some other process now holding the pid: no watch, but the
+    # listing still names the process, so a stale row is told apart.
+    monkeypatch.setattr(store_module, "_watch_exit", lambda pid: store_module._GONE)
+    monkeypatch.setattr(store_module, "_ps_start", lambda pid: "another process")
+    monkeypatch.setattr(store_module, "process_is_alive", lambda pid: True)
+    known = store_module._KnownStarts()
+    assert known.stamp(7) == "another process"
+    assert 7 not in known._kept
+    monkeypatch.setattr(store_module, "process_is_alive", lambda pid: False)
+    assert known.stamp(7) is None
+
+
+def test_a_forked_child_drops_the_kept_stamps_without_closing_them(monkeypatch) -> None:
+    watches: dict[int, list[FakeWatch]] = {}
+    watching(monkeypatch, lambda pid: f"stamp {pid}", watches)
+    known = store_module._KnownStarts()
+    assert known.stamp(7) == "stamp 7"
+    # As a child made without the hook sees it: another pid than the owner.
+    known._owner = -1
+    assert known.stamp(8) == "stamp 8"
+    assert list(known._kept) == [8]
+    assert watches[7][0].closed is False
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="no fork on this system")
+# The runner has threads of its own, which is the case the hook is for.
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_real_fork_starts_the_child_with_no_kept_stamps() -> None:
+    parent = os.getpid()
+    assert store_module.process_start_stamp(parent)
+    read, write = os.pipe()
+    child = os.fork()
+    if child == 0:  # pragma: no cover - runs in the child
+        ok = 1
+        try:
+            os.close(read)
+            known = store_module._known_starts
+            # Something of the child's own takes the lowest free numbers.
+            mine = [os.open(os.devnull, os.O_RDONLY) for _ in range(4)]
+            clean = known._kept == {} and known._owner == os.getpid()
+            answer = store_module.process_start_stamp(parent)
+            still_open = all(os.fstat(fd) is not None for fd in mine)
+            ok = 0 if clean and answer and still_open else 1
+        finally:
+            os.write(write, bytes([ok]))
+            os._exit(0)
+    os.close(write)
+    ready, _, _ = select.select([read], [], [], 30.0)
+    said = os.read(read, 1) if ready else b""
+    os.close(read)
+    if not ready:
+        os.kill(child, signal.SIGKILL)
+    os.waitpid(child, 0)
+    assert said == b"\x00"
+
+
+def test_one_read_per_pid_is_under_way_and_the_rest_wait_for_it(monkeypatch) -> None:
+    reads: list[int] = []
+
+    def listing(pid: int) -> str:
+        reads.append(pid)
+        time.sleep(0.05)
+        return f"stamp {pid}"
+
+    watching(monkeypatch, listing, {})
+    known = store_module._KnownStarts()
+    answers: list[str | None] = []
+    threads = [threading.Thread(target=lambda: answers.append(known.stamp(7))) for _ in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert answers == ["stamp 7"] * 20
+    assert reads == [7]
+
+
+def test_only_a_few_watches_are_open_for_reads_at_once(monkeypatch) -> None:
+    lock = threading.Lock()
+    open_now = [0, 0]  # now, most
+
+    class Counted(FakeWatch):
+        def __init__(self) -> None:
+            super().__init__()
+            with lock:
+                open_now[0] += 1
+                open_now[1] = max(open_now[1], open_now[0])
+
+    def listing(pid: int) -> str:
+        time.sleep(0.05)
+        return f"stamp {pid}"
+
+    monkeypatch.setattr(store_module, "_watch_exit", lambda pid: Counted())
+    monkeypatch.setattr(store_module, "_has_exited", lambda made: made.exited)
+    monkeypatch.setattr(store_module, "_ps_start", listing)
+    known = store_module._KnownStarts()
+    real_keep = known._keep
+
+    def keep(pid: int, stamp: str, watch: Any) -> None:
+        # A kept watch is no longer one in flight.
+        with lock:
+            open_now[0] -= 1
+        real_keep(pid, stamp, watch)
+
+    known._keep = keep  # type: ignore[method-assign]
+    answers: dict[int, str | None] = {}
+    threads = [
+        threading.Thread(target=lambda pid=pid: answers.update({pid: known.stamp(pid)}))
+        for pid in range(40)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    # Every pid has its stamp, whether it was read under a watch or without.
+    assert answers == {pid: f"stamp {pid}" for pid in range(40)}
+    assert open_now[1] <= store_module._KnownStarts.READING
+
+
+def test_same_process_tells_a_reused_pid_apart_after_the_first_look() -> None:
+    stamp = store_module.process_start_stamp()
+    if not stamp:
+        pytest.skip("this system gives no start stamp")
+    assert store_module.same_process(os.getpid(), stamp) is True
+    assert store_module.same_process(os.getpid(), stamp) is True
+    assert store_module.same_process(os.getpid(), "a different stamp") is False
 
 
 # -- sessions -------------------------------------------------------------

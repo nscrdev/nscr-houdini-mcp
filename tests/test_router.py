@@ -488,3 +488,95 @@ def test_neither_the_session_nor_the_target_prints_the_token() -> None:
     for text in (repr(target), str(target), repr(target.session), f"{target.session}"):
         assert "token" not in text
         assert "s-1" in text
+
+
+# Section: one store handle per call
+
+
+class CountedStores:
+    """Opens a fresh stand in store each time and counts opens and closes."""
+
+    def __init__(self, rows: list[SessionRecord]) -> None:
+        self.rows = rows
+        self.opened = 0
+        self.closed = 0
+
+    def __call__(self, path: Any) -> FakeStore:
+        self.opened += 1
+        owner = self
+
+        class Counted(FakeStore):
+            def __exit__(self, *exc: object) -> None:
+                owner.closed += 1
+
+        return Counted(self.rows)
+
+
+def counted_router(stores: CountedStores, *, send: Any = None, health: Any = None) -> Router:
+    return Router(
+        home=Path("."),
+        open_store=stores,
+        open_session=FakeFiles(["s-1"]).open,
+        send=send or Sent(),
+        ask_health=health
+        or (lambda session, **rest: client.Answer(200, {"ok": True, "data": {}}, {})),
+        renew_lease=lambda store, session_id: None,
+    )
+
+
+def test_a_worker_call_shares_a_handle_on_each_side_of_its_wait() -> None:
+    stores = CountedStores([record("s-1", "w1")])
+    held_while_waiting: list[int] = []
+    sent = Sent()
+
+    def send(session: client.Session, tool: str, **rest: Any) -> client.Answer:
+        held_while_waiting.append(stores.opened - stores.closed)
+        return sent(session, tool, **rest)
+
+    def health(session: client.Session, **rest: Any) -> client.Answer:
+        held_while_waiting.append(stores.opened - stores.closed)
+        return client.Answer(200, {"ok": True, "data": {}}, {})
+
+    router = counted_router(stores, send=send, health=health)
+    with router.one_store():
+        target = router.resolve(None)
+        router.health(target)
+        router.call(target, "bridge.ping")
+        with router.store() as store:
+            assert store.list_sessions() == stores.rows
+        assert stores.opened - stores.closed == 1
+    # No handle is open while the session is asked anything.
+    assert held_while_waiting == [0, 0]
+    # Resolve and the renewal before share one open, the renewal after and
+    # the read another: two opens where there were four.
+    assert (stores.opened, stores.closed) == (2, 2)
+
+
+def test_without_one_store_every_read_opens_and_closes_its_own_handle() -> None:
+    stores = CountedStores([record("s-1", "w1")])
+    router = counted_router(stores)
+    target = router.resolve(None)
+    router.call(target, "bridge.ping")
+    assert stores.opened == 3
+    assert stores.closed == 3
+
+
+def test_a_store_that_is_not_there_yet_is_not_kept() -> None:
+    opened: list[Any] = []
+    router = Router(home=Path("."), open_store=lambda path: opened.append(path))
+    with router.one_store():
+        assert router.records() == []
+        assert router.records() == []
+    assert len(opened) == 2
+
+
+def test_a_store_held_across_a_call_is_not_closed_under_its_holder() -> None:
+    stores = CountedStores([record("s-1", "w1")])
+    router = counted_router(stores)
+    with router.one_store():
+        target = router.resolve(None)
+        with router.store() as store:
+            router.call(target, "bridge.ping")
+            assert stores.closed == 0
+            assert store.list_sessions() == stores.rows
+    assert stores.opened == stores.closed

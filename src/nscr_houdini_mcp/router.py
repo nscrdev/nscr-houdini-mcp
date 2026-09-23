@@ -294,6 +294,33 @@ def _open_store(path: Path) -> store_module.Store | None:
     return store_module.Store(path) if path.is_file() else None
 
 
+class _Shared:
+    """A store handle lent inside `Router.one_store`: leaving it does not close it.
+
+    While a caller is inside its `with`, the handle is in use, and a wait on
+    a session does not close it under that caller.
+    """
+
+    __slots__ = ("_held", "_store")
+
+    def __init__(self, store: Any, held: Any) -> None:
+        self._store = store
+        self._held = held
+
+    def __enter__(self) -> Any:
+        self._held.lent += 1
+        return self._store
+
+    def __exit__(self, *exc: object) -> None:
+        self._held.lent -= 1
+
+    def close(self) -> None:
+        return None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
+
+
 class Router:
     """Resolves sessions and sends signed calls to them."""
 
@@ -325,6 +352,8 @@ class Router:
         # Per session id: the signed client and the facts from its session file.
         self._clients: dict[str, tuple[client.Session, dict[str, Any]]] = {}
         self._lock = threading.Lock()
+        # The store handle one call on this thread shares, while it runs.
+        self._held = threading.local()
 
     # Section: resolution
 
@@ -370,7 +399,7 @@ class Router:
         raises.
         """
         try:
-            opened = self._open_store(self.store_path)
+            opened = self._opened_store()
             if opened is None and create:
                 opened = store_module.Store(self.store_path)
         except (store_module.StoreError, sqlite3.Error, OSError) as error:
@@ -384,6 +413,60 @@ class Router:
             return
         with opened:
             yield opened
+
+    @contextmanager
+    def one_store(self) -> Iterator[None]:
+        """Share one store handle among everything a call on this thread reads.
+
+        A call reads the store several times: to resolve its session, to renew
+        a worker's lease before and after, to read its job. Opening the file
+        each time costs more than the reads. Inside this, the first open is
+        kept and handed out again until the call waits on a session, which
+        closes it, and it is closed when the call ends, so no handle is held
+        while Houdini works or outlives the call that opened it. A caller that
+        holds the store across a call of its own keeps it open, as it would a
+        handle of its own. Each read still runs in its own short transaction
+        and sees what other processes have written since.
+        """
+        if getattr(self._held, "active", False):
+            yield
+            return
+        self._held.active = True
+        self._held.store = None
+        self._held.lent = 0
+        try:
+            yield
+        finally:
+            kept = self._held.store
+            self._held.active = False
+            self._held.store = None
+            if kept is not None:
+                kept.__exit__(None, None, None)
+
+    def _let_go_of_store(self) -> None:
+        """Close the handle `one_store` shares, before a wait on a session.
+
+        No handle is held while a call waits on Houdini, which can be for a
+        long time, or after its caller has gone. The next read opens again.
+        """
+        kept = getattr(self._held, "store", None)
+        # A caller that holds the store across its own call keeps it open,
+        # as it would with a handle of its own.
+        if kept is not None and not self._held.lent:
+            self._held.store = None
+            kept.__exit__(None, None, None)
+
+    def _opened_store(self) -> Any:
+        """The store, or nothing when none exists, shared inside `one_store`."""
+        if not getattr(self._held, "active", False):
+            return self._open_store(self.store_path)
+        kept = self._held.store
+        if kept is None:
+            kept = self._open_store(self.store_path)
+            if kept is None:
+                return None
+            self._held.store = kept
+        return _Shared(kept, self._held)
 
     def cached(self) -> list[str]:
         """The session ids a client is kept for."""
@@ -404,7 +487,7 @@ class Router:
 
     def _records(self, *, include_gone: bool = True) -> list[SessionRecord]:
         try:
-            store = self._open_store(self.store_path)
+            store = self._opened_store()
             if store is None:
                 return []
             with store:
@@ -447,7 +530,7 @@ class Router:
     def _renew(self, session_id: str) -> None:
         """Renew a worker's idle lease. A hython started by hand has none."""
         try:
-            store = self._open_store(self.store_path)
+            store = self._opened_store()
             if store is None:
                 return
             with store:
@@ -485,6 +568,7 @@ class Router:
         once rather than a place in the queue, including behind a main thread
         that is away.
         """
+        self._let_go_of_store()
         # The same operation id as the call out is a resend: the bridge
         # answers it from that call's receipt without the main thread, so it
         # never waits for a turn behind the very call it asks about.
@@ -592,6 +676,7 @@ class Router:
 
     def health(self, target: Target) -> dict[str, Any]:
         """What the session says about itself. Answers even while it is busy."""
+        self._let_go_of_store()
         started = time.monotonic()
         try:
             answer = self._ask_health(target.session, timeout_s=HEALTH_TIMEOUT_S)
