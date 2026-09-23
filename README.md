@@ -53,6 +53,14 @@ python scripts/lint_client_names.py   # shipped text must not name any client or
 python scripts/tools_list_cost.py     # token cost of the tools/list payload
 ```
 
+Before a release, check a clean install from a built wheel in a throwaway
+environment, with no checkout in reach. It needs `uv`, writes only inside one
+temporary folder, and prints each check:
+
+```sh
+python scripts/check_install.py
+```
+
 `scripts/tools_list_cost.py` serialises the tool list the way a client receives
 it and counts its tokens, in total and per tool, against a budget of 4,000.
 With the dev extras installed it counts with `tiktoken` and the `o200k_base`
@@ -671,9 +679,11 @@ it, so it is worked out in this order:
 Nothing is remembered between runs, and `bridge status` prints which of those
 decided and every folder it considered.
 
-The file points `HOUDINI_PATH` at this project's `houdini/` folder and
-`PYTHONPATH` at its `src/`, both worked out from where this copy is running,
-so there is nothing to edit by hand. Every file it writes carries a marker: a
+The file points `HOUDINI_PATH` at this copy's `houdini/` folder and
+`PYTHONPATH` at the folder it is imported from: `src/` in a checkout,
+site-packages in an installed copy, where `houdini/` travels inside the
+package. Both are worked out from where this copy is running, so there is
+nothing to edit by hand. Every file it writes carries a marker: a
 package of the same name that this did not write, or a link where the file
 should be, is reported and left exactly as it is, and `uninstall` takes away
 only its own, plus any folder it had to make and nothing else.
