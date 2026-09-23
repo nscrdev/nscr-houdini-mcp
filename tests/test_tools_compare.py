@@ -620,6 +620,51 @@ def test_a_file_candidate_still_lets_other_keys_by(bench: Bench, hip: Path) -> N
     assert body(result)["metrics"]["mae"]["overall"] == 0.0
 
 
+@pytest.mark.parametrize(
+    "form",
+    ["object", "json text", "bare path"],
+)
+def test_a_file_candidate_is_taken_as_an_object_as_its_json_text_or_as_a_path(
+    bench: Bench, hip: Path, form: str
+) -> None:
+    candidate: Any = {
+        "object": {"source": "file", "path": str(FRONT)},
+        "json text": json.dumps({"source": "file", "path": str(FRONT)}),
+        "bare path": str(FRONT),
+    }[form]
+    result = run(
+        bench,
+        info(hip),
+        candidate=candidate,
+        reference=str(FRONT),
+        region=json.dumps([0, 0, 1, 1]),
+    )
+    assert body(result)["metrics"]["mae"]["overall"] == 0.0
+
+
+def test_a_bare_path_that_is_not_there_is_a_missing_file(bench: Bench, tmp_path: Path) -> None:
+    result = run(bench, candidate=str(tmp_path / "absent.png"), reference=str(FRONT))
+    assert code(result) == "FILE_NOT_FOUND"
+    assert result.structured_content["error"]["details"]["argument"] == "candidate.path"
+
+
+@pytest.mark.parametrize(
+    ("candidate", "received"),
+    [("front.png", "str"), (7, "int"), (["/abs/a.png"], "list"), ('{"source": ', "str")],
+)
+def test_a_malformed_candidate_shows_the_shape_wanted_and_what_came(
+    bench: Bench, candidate: Any, received: str
+) -> None:
+    result = run(bench, candidate=candidate, reference=str(FRONT))
+    assert code(result) == "BAD_ARGUMENTS"
+    error = result.structured_content["error"]
+    assert '{"source": "file", "path": "/abs/image.png"}' in error["message"]
+    assert f"got {received}" in error["message"]
+    assert error["details"]["received_type"] == received
+    assert error["details"]["received"] == json.dumps(candidate)[:80]
+    assert bench.sent.calls == []
+
+
 # Section: sizes, depths and memory
 
 

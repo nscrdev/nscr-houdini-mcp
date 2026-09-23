@@ -133,6 +133,7 @@ class Runtime:
                     },
                 )
             )
+        arguments = spec.decode(arguments)
         refused = spec.check(arguments)
         if refused is not None:
             return error_result(refused)

@@ -480,13 +480,7 @@ def readable(read: Callable[[], Any], side: str) -> Any:
 
 def compare(call: Call) -> dict[str, Any]:
     arguments = call.arguments
-    wanted = arguments.get("candidate")
-    if not isinstance(wanted, Mapping):
-        raise CallError(
-            "BAD_ARGUMENTS",
-            'compare needs candidate, such as {"source": "file", "path": "/abs/image.png"}',
-            details={"argument": "candidate"},
-        )
+    wanted = candidate_of(arguments.get("candidate"))
     source = wanted.get("source") or "file"
     check_candidate(wanted, source)
     if not arguments.get("reference"):
@@ -708,6 +702,29 @@ def which_reference(scene: Scene, handle: str) -> tuple[dict[str, Any] | None, P
 
 
 # Section: the candidate, when it is not a file
+
+CANDIDATE_SHAPE = '{"source": "file", "path": "/abs/image.png"}'
+
+
+def candidate_of(value: Any) -> Mapping[str, Any]:
+    """The candidate as an object; an absolute path alone, as for reference, is a file."""
+    if isinstance(value, Mapping):
+        return value
+    if isinstance(value, str) and Path(os.path.expanduser(value.strip())).is_absolute():
+        return {"source": "file", "path": value.strip()}
+    received = "nothing" if value is None else type(value).__name__
+    excerpt = "" if value is None else json.dumps(value, default=str)[:80]
+    raise CallError(
+        "BAD_ARGUMENTS",
+        f"compare needs candidate as an object such as {CANDIDATE_SHAPE}, or an absolute "
+        f"image path; got {received}{' ' + excerpt if excerpt else ''}",
+        details={
+            "argument": "candidate",
+            "expected": CANDIDATE_SHAPE,
+            "received_type": received,
+            "received": excerpt,
+        },
+    )
 
 
 def check_candidate(wanted: Mapping[str, Any], source: str) -> None:

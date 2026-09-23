@@ -10,13 +10,17 @@ tools that start processes or place files.
 
 Arguments are checked against the schema before the handler runs, so a
 misspelled name comes back as `BAD_ARGUMENTS` with the nearest real one and
-the handler never sees it.
+the handler never sees it. Before the check, an argument the schema wants as
+an object or an array that arrived as a string holding that JSON is read into
+it: some clients send nested arguments that way.
 
 This module never imports `hou`.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -33,6 +37,8 @@ from nscr_houdini_mcp.bridge.tools import DETAIL_LEVELS
 from nscr_houdini_mcp.config import Config
 from nscr_houdini_mcp.results import CallError, empty_trace
 from nscr_houdini_mcp.router import Router, Target
+
+log = logging.getLogger(__name__)
 
 # Section: schema pieces every tool shares
 
@@ -129,6 +135,67 @@ def outputs(properties: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+# Section: arguments sent as JSON text
+
+# Keywords that only mean something for one kind of value, for a property
+# schema that leaves out its type.
+_OBJECT_WORDS = ("properties", "additionalProperties", "required", "propertyNames")
+_ARRAY_WORDS = ("items", "prefixItems", "minItems", "maxItems")
+
+
+def structured_kinds(schema: Mapping[str, Any]) -> tuple[type, ...]:
+    """What a string may be read into for this property schema: dict, list, or nothing.
+
+    Nothing when the schema allows a string itself, or names its values, since
+    a string there is meant as it is.
+    """
+    if "enum" in schema or "const" in schema:
+        return ()
+    declared = schema.get("type")
+    if declared is not None:
+        names = [declared] if isinstance(declared, str) else list(declared)
+        if "string" in names:
+            return ()
+    else:
+        names = []
+        if any(word in schema for word in _OBJECT_WORDS):
+            names.append("object")
+        if any(word in schema for word in _ARRAY_WORDS):
+            names.append("array")
+    kinds: list[type] = []
+    if "object" in names:
+        kinds.append(dict)
+    if "array" in names:
+        kinds.append(list)
+    return tuple(kinds)
+
+
+def decoded(
+    arguments: Mapping[str, Any], wanted: Mapping[str, tuple[type, ...]], tool: str = ""
+) -> dict[str, Any]:
+    """The arguments with each JSON string read where the schema wants an object or array.
+
+    A string that does not read as JSON of the wanted kind is left as it is,
+    for the schema check to report.
+    """
+    out = dict(arguments)
+    for name, kinds in wanted.items():
+        value = out.get(name)
+        if not isinstance(value, str):
+            continue
+        text = value.strip()
+        if not text or text[0] not in "{[":
+            continue
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            continue
+        if isinstance(parsed, kinds):
+            out[name] = parsed
+            log.debug("%s: read %s from JSON text", tool, name)
+    return out
+
+
 # Section: the tool
 
 
@@ -154,10 +221,26 @@ class ToolSpec:
     # raised. The client then reads it as an error, with all of it.
     failed: Callable[[Mapping[str, Any]], bool] | None = None
     _validator: Any = field(default=None, init=False, repr=False, compare=False)
+    _structured: Any = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         Draft202012Validator.check_schema(dict(self.input_schema))
         object.__setattr__(self, "_validator", Draft202012Validator(dict(self.input_schema)))
+        structured = {
+            name: kinds
+            for name, schema in self.input_schema.get("properties", {}).items()
+            if isinstance(schema, Mapping) and (kinds := structured_kinds(schema))
+        }
+        object.__setattr__(self, "_structured", structured)
+
+    @property
+    def structured(self) -> dict[str, tuple[type, ...]]:
+        """Each argument that takes an object or an array, with the kinds it takes."""
+        return dict(self._structured)
+
+    def decode(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        """The arguments with objects and arrays sent as JSON text read into them."""
+        return decoded(arguments, self._structured, self.name)
 
     def as_tool(self) -> MCPTool:
         return MCPTool(
