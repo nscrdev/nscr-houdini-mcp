@@ -19,8 +19,10 @@ What it does, all inside one temporary folder:
      eleven tools.
 4. Checks that the installed package, not the checkout, is what Python imports.
 
-Needs `uv` on the path. Nothing outside the temporary folder is written, and
-the folder is removed at the end unless `--keep` is given or a check failed.
+Needs `uv` on the path. This script writes nothing outside the temporary
+folder, but uv keeps its usual cache as it builds and installs, and may
+download a Python to make the environment with. The folder is removed at the
+end unless `--keep` is given or a check failed.
 Exit code is 0 when every check passed and 1 otherwise.
 """
 

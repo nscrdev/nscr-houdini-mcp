@@ -54,8 +54,9 @@ python scripts/tools_list_cost.py     # token cost of the tools/list payload
 ```
 
 Before a release, check a clean install from a built wheel in a throwaway
-environment, with no checkout in reach. It needs `uv`, writes only inside one
-temporary folder, and prints each check:
+environment, with no checkout in reach. It needs `uv`, writes its own files
+only inside one temporary folder (uv keeps its usual cache, and may download
+a Python to make the environment with), and prints each check:
 
 ```sh
 python scripts/check_install.py
@@ -926,11 +927,15 @@ What goes where:
   Every call that ends in an error leaves one warning here with the tool and
   the error code and nothing else, for example `hou_scene refused:
   SESSION_BUSY`. A failure a tool reports without a code of ours, such as
-  code in `hou_python` that raised, is `TOOL_REPORTED_ERROR`. The message,
-  which can hold text from your own code, is written only at `debug`. Each
-  line carries the process id, since several servers can share the file. The
-  file starts again at `server.log.1` when a server starts and finds it over
-  five megabytes.
+  code in `hou_python` that raised, is `TOOL_REPORTED_ERROR`, and a tool name
+  that is not one of the eleven is `<unknown>`. The message, which can hold
+  text from your own code, is written only at `debug`, quoted. The folder is
+  private to you and the file readable by you alone. Each line carries the
+  process id, since several servers can share the file. The file starts
+  again at `server.log.1` when a server starts and finds it over five
+  megabytes. That is best effort while other servers run: only one starting
+  server rolls it over, and where the file cannot be moved, as on Windows
+  while another server has it open, it grows until a later start can.
 - `<session id>.log`: one bridge inside one Houdini. What went wrong in a
   call, with its trace, stays here and never reaches the caller.
 - `worker-<name>.log`: what a worker's hython printed, for a worker started
@@ -942,7 +947,9 @@ What goes where:
 `NSCR_MCP_LOG_LEVEL` sets how much the server writes: `debug`, `info`,
 `warning` (the default) or `error`. Set it in the environment the client
 starts the server with. It does not reach the bridge, worker and autostart
-logs, which have no level and are written whatever it says.
+logs, which have no level and are written whatever it says, nor the MCP
+library's own logging, which it sets up on standard error at `info` apart
+from this setting, so lines of its own can appear there whatever it says.
 
 ## Skills
 
