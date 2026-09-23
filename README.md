@@ -26,6 +26,67 @@ and [CHANGELOG.md](CHANGELOG.md) says what changed.
   every push to main and every pull request. Neither has been run against a
   real Houdini yet, so treat Houdini on either as untried.
 
+## Quick start
+
+You need Houdini 22 and [uv](https://docs.astral.sh/uv/). Nothing is
+published to a package index; everything installs from this repository.
+
+1. Install the server:
+
+   ```sh
+   uv tool install --python 3.11 "git+https://github.com/nscrdev/nscr-houdini-mcp"
+   ```
+
+   This puts `nscr-houdini-mcp` on your path. To update later, run
+   `uv tool upgrade nscr-houdini-mcp`, then repeat step 2.
+
+2. Install the Houdini side, so every Houdini you open starts a bridge:
+
+   ```sh
+   nscr-houdini-mcp bridge install --autostart --dry-run   # shows where it will write
+   nscr-houdini-mcp bridge install --autostart
+   ```
+
+   It writes one package file into the `packages` folder of your Houdini
+   user preferences. Houdini only reads packages from there, so the folder
+   has to be the one your Houdini really uses:
+
+   - The command asks your installed Houdini where its preferences are, so
+     `HOUDINI_USER_PREF_DIR`, `HOUDINI_PACKAGE_DIR` and lines in `houdini.env`
+     are all taken into account. Check the `folder from` line of the dry run.
+   - A variable set only by a launcher or a studio wrapper at the moment it
+     starts Houdini is invisible to this command. Run the command from a shell
+     where that variable is set, or name the folder yourself:
+     `nscr-houdini-mcp bridge install --autostart --packages-dir <your prefs>/packages`.
+   - Without any of those, the defaults are
+     `~/Library/Preferences/houdini/22.0` on macOS, `Documents\houdini22.0`
+     in your profile on Windows (which a synced Documents folder can move),
+     and `~/houdini22.0` on Linux.
+
+   `nscr-houdini-mcp bridge status` later shows which folder holds the
+   package, every folder it considered, and the Houdini sessions running.
+   More detail is in [Installing the Houdini side](#installing-the-houdini-side).
+
+3. Add the server to your MCP client. It speaks MCP over stdio with no
+   arguments. In a client that takes a JSON server list:
+
+   ```json
+   {
+     "mcpServers": {
+       "nscr-houdini": { "command": "nscr-houdini-mcp" }
+     }
+   }
+   ```
+
+   Use the full path from `which nscr-houdini-mcp` (`where` on Windows) if
+   your client does not see your shell's path.
+
+4. Optional: copy the agent skill into the folder your client reads skills
+   from, with `nscr-houdini-mcp skills install <folder>`.
+
+5. Start Houdini, then your client. Ask the agent to run `hou_ping`; it
+   answers with the session it found.
+
 ## Development
 
 Python 3.11 or newer. The server process never imports `hou`.
