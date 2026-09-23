@@ -11,6 +11,9 @@ requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
     "mcp>=2.2,<3",
+    # Reads what a capture wrote: its numbers, a crop, a contact sheet and a
+    # thumbnail. The Houdini side never needs it.
+    "pillow>=10",
 ]
 
 [project.scripts]
