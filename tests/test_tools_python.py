@@ -979,3 +979,17 @@ def test_a_namespace_with_a_trailing_newline_is_refused_at_both_ends(bench: Benc
         Envelope(tool="python.run", arguments={"code": "x = 1", "namespace": "shared\n"})
     )
     assert direct.payload["error"]["code"] == "BAD_ARGUMENTS"
+
+
+def test_what_the_code_raised_stays_out_of_the_log_at_the_default_level(
+    bench: Bench, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "token-5f1e9c-not-for-the-log"
+    # The capture listens at the root, where a server's own set up stops lines.
+    monkeypatch.setattr(logging.getLogger("nscr_houdini_mcp"), "propagate", True)
+    with caplog.at_level(logging.WARNING, logger="nscr_houdini_mcp"):
+        body = raised(python(bench, code=f"raise RuntimeError({secret!r})"))
+    assert secret in json.dumps(body)
+    lines = [record.getMessage() for record in caplog.records]
+    assert "hou_python refused: TOOL_REPORTED_ERROR" in lines
+    assert not [line for line in lines if secret in line]

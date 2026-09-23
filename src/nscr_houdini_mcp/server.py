@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import re
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from importlib.metadata import PackageNotFoundError
@@ -65,6 +66,10 @@ UNSERVED_METHODS = (
 )
 
 log = logging.getLogger(__name__)
+
+# What the log calls a failure a tool reports without one of our codes.
+REPORTED_ERROR = "TOOL_REPORTED_ERROR"
+_CODE = re.compile(r"[A-Z][A-Z_]{1,40}")
 
 
 def package_version() -> str:
@@ -122,12 +127,15 @@ class Runtime:
 
         `progress` sends a progress note to the client, for a call that holds
         on purpose; it does nothing when the client asked for none. Every call
-        that ends in an error leaves one warning in the log with its code.
+        that ends in an error leaves one warning in the log with the tool and
+        its code, and nothing the caller wrote. The message, which can carry
+        text from the caller's own code, is logged at debug level only.
         """
         result = self._run(name, arguments, progress, cancelled)
         if result.is_error:
             code, message = refusal_of(result)
-            log.warning("%s refused: %s: %s", name, code, message)
+            log.warning("%s refused: %s", name, code)
+            log.debug("%s refused: %s: %s", name, code, message)
         return result
 
     def _run(
@@ -182,7 +190,8 @@ class Runtime:
         except CallError as error:
             return error_result(error, call.trace if call else None)
         except Exception as error:  # noqa: BLE001 - a crash becomes a coded answer
-            log.exception("tool %s raised", name)
+            log.error("tool %s raised %s", name, type(error).__name__)
+            log.debug("tool %s raised", name, exc_info=True)
             return error_result(
                 CallError(
                     "TOOL_FAILED",
@@ -196,15 +205,18 @@ class Runtime:
 def refusal_of(result: CallToolResult) -> tuple[str, str]:
     """The code and message of a result that is an error, for the log.
 
-    A coded refusal carries both. A call that ran and reports a failure of its
-    own, such as code that raised inside Houdini, names the exception instead.
+    The code is one of this project's own, or `TOOL_REPORTED_ERROR` for a call
+    that ran and reports a failure of its own, such as code that raised inside
+    Houdini: anything else there could be text the caller chose.
     """
     body = result.structured_content if isinstance(result.structured_content, Mapping) else {}
     error = body.get("error")
-    if isinstance(error, Mapping):
-        code = error.get("code") or error.get("type") or "ERROR"
-        return str(code), str(error.get("message") or "")
-    return "ERROR", ""
+    if not isinstance(error, Mapping):
+        return REPORTED_ERROR, ""
+    code = error.get("code")
+    if not isinstance(code, str) or not _CODE.fullmatch(code):
+        code = REPORTED_ERROR
+    return code, str(error.get("message") or "")
 
 
 async def in_daemon_thread(
