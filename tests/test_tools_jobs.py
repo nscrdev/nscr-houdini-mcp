@@ -823,3 +823,30 @@ def test_a_job_stopped_by_its_session_going_down_is_lost_not_cancelled(bench: Be
     assert ended.error == store_module.SESSION_ENDED_ERROR
     assert ended.cancel_requested is False
     assert ended.outputs["answer"]["result"] < 2000
+
+
+def test_a_retry_of_a_job_still_running_is_answered_at_once_with_the_job(
+    bench: Bench, module: Any
+) -> None:
+    bench.config = replace(bench.config, inline_wait_s=1)
+    code = "hou.gate.wait(20)\nresult = 'once'"
+    handle = ok(python(bench, code=code, operation_id="op-again"))
+    assert handle["state"] == "running"
+    # The same call again, willing to queue for twenty seconds: it is told
+    # at once, and the code does not run twice.
+    began = time.monotonic()
+    again = ok(python(bench, code=code, operation_id="op-again", wait_s=20))
+    assert time.monotonic() - began < 5.0
+    assert through(bench).dispatcher.state()["busy"] is True
+    assert again["job_id"] == handle["job_id"]
+    assert again["state"] == "running"
+    waiting = refused(python(bench, code=code, operation_id="op-again", background=False))
+    assert waiting["code"] == "TIMEOUT"
+    assert waiting["details"]["job_id"] == handle["job_id"]
+    other = refused(python(bench, code="result = 2", operation_id="op-again", wait_s=0))
+    assert other["code"] == "OPERATION_MISMATCH"
+    module.gate.set()
+    idle(bench)
+    replayed = ok(python(bench, code=code, operation_id="op-again"))
+    assert replayed["result"] == "once"
+    assert replayed["state"] == "done"

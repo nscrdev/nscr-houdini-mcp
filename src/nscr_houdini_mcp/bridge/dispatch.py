@@ -138,6 +138,9 @@ class Running:
     ended: threading.Event = field(default_factory=threading.Event)
     # The job this call runs as, for a tool whose calls are jobs.
     job_id: str | None = None
+    # What the call's receipt is bound to, so a retry can be told for the
+    # same call while it still runs.
+    digest: str | None = None
     # Whether the work found out it should stop, because the call was
     # cancelled or because the session is going down, and whether a progress
     # note has come since the job row was last written.
@@ -354,6 +357,16 @@ class Dispatcher:
             early = self._receipt_reply(peeked, tool, trace)
             if early is not None:
                 return early
+            # The same call sent again while it still runs, most often by a
+            # caller following up on a job: it is told so now, with the job,
+            # rather than queueing behind itself until its wait runs out.
+            now_running = self._running
+            if (
+                now_running is not None
+                and now_running.operation_id == wanted
+                and now_running.digest in (None, digest)
+            ):
+                return self._still_running(tool, now_running, 0.0, trace)
 
         # The scene is checked here so a hopeless call is not queued at all,
         # and again on the thread that runs the work, because the scene can be
@@ -420,6 +433,7 @@ class Dispatcher:
             tool=tool.name,
             mutating=tool.mutating,
             label=tool.undo_label(envelope.arguments),
+            digest=digest,
         )
         self._running = running
         context = ToolContext(
@@ -511,26 +525,32 @@ class Dispatcher:
                 running.cancel.set()
             # The work goes on, renewing its receipt, and writes its answer
             # there when it ends, before the session is given back.
-            return Reply(
-                200,
-                {
-                    **error_payload(
-                        "TIMEOUT",
-                        f"{tool.name} is still running after {timeout_s:g} seconds",
-                        hint="the work goes on, ask health for the session before calling again",
-                        details={
-                            "tool": tool.name,
-                            "operation_id": operation_id,
-                            "timeout_s": timeout_s,
-                            "still_running": True,
-                            **({"job_id": running.job_id} if running.job_id else {}),
-                        },
-                    ),
-                    **self._said(trace),
-                },
-            )
+            return self._still_running(tool, running, timeout_s, trace)
 
         return self._finished(tool, work, running, trace, wanted)
+
+    def _still_running(
+        self, tool: Tool, running: Running, timeout_s: float, trace: Mapping[str, Any]
+    ) -> Reply:
+        """`TIMEOUT` with `still_running`: the work goes on, and here is its job."""
+        return Reply(
+            200,
+            {
+                **error_payload(
+                    "TIMEOUT",
+                    f"{tool.name} is still running after {timeout_s:g} seconds",
+                    hint="the work goes on, ask health for the session before calling again",
+                    details={
+                        "tool": tool.name,
+                        "operation_id": running.operation_id,
+                        "timeout_s": timeout_s,
+                        "still_running": True,
+                        **({"job_id": running.job_id} if running.job_id else {}),
+                    },
+                ),
+                **self._said({**trace, "operation_id": running.operation_id}),
+            },
+        )
 
     # Section: answering
 
