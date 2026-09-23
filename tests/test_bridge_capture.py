@@ -1,0 +1,694 @@
+"""`capture.image` on the bridge side, against a stand in for Houdini.
+
+The routes are tried in their order here, the restore after a viewport
+capture is checked value by value, and so is what a render node capture
+leaves behind: nothing. The stand in draws its pictures with Pillow, so every
+file checked is a real PNG. What a real Houdini draws is in the integration
+test; what a real user interface does with the viewport and pane routes is
+checked by hand with a person present, and nothing here stands for that.
+"""
+
+from __future__ import annotations
+
+import math
+import threading
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+from PIL import Image
+
+from fake_hou import (
+    Desktop,
+    NetworkEditorTab,
+    OperationFailed,
+    Pane,
+    Rect,
+    Scene,
+    SceneViewerTab,
+    Tab,
+    Window,
+)
+from nscr_houdini_mcp import outputs
+from nscr_houdini_mcp import store as store_module
+from nscr_houdini_mcp.bridge import capture, receipts, tools
+from nscr_houdini_mcp.bridge.dispatch import Dispatcher
+from nscr_houdini_mcp.bridge.envelope import Envelope
+from nscr_houdini_mcp.bridge.errors import BridgeError
+from nscr_houdini_mcp.bridge.handlers import default_registry
+from nscr_houdini_mcp.bridge.identity import Identity
+
+TYPES = ("geo", "null", "cam", "box", "flipbook", "copnet", "fractalnoise", "img", "file")
+
+
+@pytest.fixture
+def scene(tmp_path: Path) -> Iterator[Scene]:
+    made = Scene(types=TYPES)
+    made.hipFile.setName(str(tmp_path / "shot.hip"))
+    geo = made.node("/obj").createNode("geo", "boxgeo")
+    geo.createNode("box", "box1").setDisplayFlag(True)
+    made.undos.labels.clear()
+    try:
+        yield made
+    finally:
+        made.ui.stop()
+
+
+@pytest.fixture
+def home(tmp_path: Path) -> Path:
+    folder = tmp_path / "home"
+    folder.mkdir()
+    return folder
+
+
+class Run:
+    """One call's context, with its progress notes and its cancel flag."""
+
+    def __init__(self, scene: Scene, home: Path, kind: str) -> None:
+        self.notes: list[dict[str, Any]] = []
+        self.cancel = threading.Event()
+        store_path = home / store_module.STORE_FILE_NAME
+        self.context = tools.ToolContext(
+            hou=scene.module(),
+            kind=kind,
+            session_id="s-1",
+            home=home,
+            open_store=lambda: store_module.Store(store_path),
+            progress=self.notes.append,
+            cancel=self.cancel,
+        )
+
+
+def take(scene: Scene, home: Path, *, kind: str = "hython", **arguments: Any) -> dict[str, Any]:
+    return capture.capture_image(arguments, Run(scene, home, kind).context)
+
+
+def refused(scene: Scene, home: Path, *, kind: str = "hython", **arguments: Any) -> BridgeError:
+    with pytest.raises(BridgeError) as caught:
+        take(scene, home, kind=kind, **arguments)
+    return caught.value
+
+
+def picture(path: str) -> Image.Image:
+    with Image.open(path) as opened:
+        return opened.copy()
+
+
+def names(scene: Scene, network: str) -> list[str]:
+    return [child.name() for child in scene.node(network)._children]
+
+
+def desktop(scene: Scene, *tabs: Any) -> Pane:
+    pane = Pane()
+    for tab in tabs:
+        pane.add(tab)
+    made = Desktop()
+    made.tabs = list(tabs)
+    scene.ui.desktop = made
+    return pane
+
+
+# Section: a session with no user interface
+
+
+def test_the_viewport_in_hython_is_a_fitted_camera_through_the_flipbook_rop(
+    scene: Scene, home: Path, tmp_path: Path
+) -> None:
+    said = take(scene, home, resolution=[640, 360])
+    [shot] = said["views"]
+    assert shot["route"] == capture.FLIPBOOK_ROP
+    assert "framing_unverified" not in shot
+    assert shot["camera"]["kind"] == "fitted"
+    assert shot["camera"]["view"] == "persp"
+    [path] = shot["files"]
+    folder = Path(path).parent
+    assert folder.parent == tmp_path / ".agent" / "captures"
+    assert Path(path).name.endswith(f"_viewport_{shot['run_id']}.png")
+    image = picture(path)
+    assert image.size == (640, 360)
+    assert image.getextrema()[3] == (0, 255)
+    [seen] = scene.capture.seen
+    assert seen["camera"].startswith("/obj/nscr_capture_cam")
+    assert seen["r"] == (-25.0, 45.0, 0.0)
+    assert seen["sopsource"] == "display"
+    assert seen["trange"] == "normal"
+    assert seen["undo_enabled"] is False
+    # Nothing the capture made is left, and none of it is on the undo stack.
+    assert names(scene, "/out") == []
+    assert names(scene, "/obj") == ["boxgeo"]
+    assert scene.undos.undoLabels() == []
+    assert said["sheet"] is None
+    assert said["unsaved_hip"] is False
+
+
+def test_a_named_camera_is_used_as_it_is(scene: Scene, home: Path) -> None:
+    shot_cam = scene.node("/obj").createNode("cam", "shotcam")
+    said = take(scene, home, camera="/obj/shotcam")
+    [seen] = scene.capture.seen
+    assert seen["camera"] == "/obj/shotcam"
+    assert said["views"][0]["camera"] == {"kind": "node", "path": "/obj/shotcam"}
+    assert names(scene, "/obj") == ["boxgeo", "shotcam"]
+    assert shot_cam.parmTuple("t")[0].eval() == 0.0
+
+
+def test_quad_writes_four_views_and_names_a_sheet(scene: Scene, home: Path) -> None:
+    said = take(scene, home, views="quad", resolution=[320, 180])
+    assert [view["view"] for view in said["views"]] == ["persp", "top", "front", "right"]
+    rotations = [seen["r"] for seen in scene.capture.seen]
+    assert rotations == [(-25.0, 45.0, 0.0), (-90.0, 0.0, 0.0), (-0.0, 0.0, 0.0), (-0.0, 90.0, 0.0)]
+    projections = [seen["projection"] for seen in scene.capture.seen]
+    assert projections == ["perspective", "ortho", "ortho", "ortho"]
+    for view in said["views"]:
+        assert Path(view["files"][0]).is_file()
+        assert f"_viewport_{view['view']}_" in Path(view["files"][0]).name
+    assert "_viewport_sheet_" in said["sheet"]["path"]
+    # The sheet is the server's to draw; the session only names it.
+    assert not Path(said["sheet"]["path"]).exists()
+    assert names(scene, "/obj") == ["boxgeo"]
+
+
+def test_turntable_orbits_a_quarter_turn_at_a_time(scene: Scene, home: Path) -> None:
+    said = take(scene, home, views="turntable4", camera={"orbit": 10, "elevation": 40})
+    assert [view["view"] for view in said["views"]] == ["orbit0", "orbit90", "orbit180", "orbit270"]
+    assert [seen["r"] for seen in scene.capture.seen] == [
+        (-40.0, 0.0, 0.0),
+        (-40.0, 90.0, 0.0),
+        (-40.0, 180.0, 0.0),
+        (-40.0, 270.0, 0.0),
+    ]
+
+
+def test_a_node_is_shown_alone_and_the_display_flag_goes_back(scene: Scene, home: Path) -> None:
+    geo = scene.node("/obj/boxgeo")
+    other = geo.createNode("box", "box2")
+    other.bounds = ((10.0, 10.0, 10.0), (12.0, 12.0, 12.0))
+    scene.node("/obj").createNode("geo", "elsewhere").createNode("box").setDisplayFlag(True)
+    scene.undos.labels.clear()
+    said = take(scene, home, source="node", path="/obj/boxgeo/box2")
+    [seen] = scene.capture.seen
+    assert seen["vobjects"] == "/obj/boxgeo"
+    assert seen["forceobjects"] == "/obj/boxgeo"
+    assert seen["displayed"] == {"/obj/boxgeo": "/obj/boxgeo/box2"}
+    # The camera was fitted to the node's own box, far from the origin.
+    assert all(value > 5 for value in seen["t"])
+    assert said["views"][0]["camera"]["target"] == "/obj/boxgeo/box2"
+    assert geo.displayNode().path() == "/obj/boxgeo/box1"
+    assert scene.undos.undoLabels() == []
+    assert names(scene, "/obj") == ["boxgeo", "elsewhere"]
+
+
+def test_a_sequence_writes_a_numbered_file_a_frame_and_reports_progress(
+    scene: Scene, home: Path
+) -> None:
+    run = Run(scene, home, "hython")
+    said = capture.capture_image({"frames": [1, 3, 1]}, run.context)
+    [shot] = said["views"]
+    assert said["sequence"] is True
+    assert shot["frames"] == [1.0, 2.0, 3.0]
+    assert [Path(item).name[-8:] for item in shot["files"]] == [
+        "0001.png",
+        "0002.png",
+        "0003.png",
+    ]
+    assert all(Path(item).is_file() for item in shot["files"])
+    assert [note["done"] for note in run.notes] == [1, 2, 3]
+    assert run.notes[-1]["total"] == 3
+
+
+def test_a_cancelled_sequence_stops_between_frames(scene: Scene, home: Path) -> None:
+    run = Run(scene, home, "hython")
+    context = run.context
+
+    def note(said: dict[str, Any]) -> None:
+        run.notes.append(said)
+        run.cancel.set()
+
+    context = tools.ToolContext(**{**context.__dict__, "progress": note})
+    said = capture.capture_image({"frames": [1, 5, 1]}, context)
+    [shot] = said["views"]
+    assert shot["frames"] == [1.0]
+    assert said["stopped_early"] is True
+    assert names(scene, "/out") == []
+
+
+@pytest.mark.parametrize(("source", "word"), [("network", "hou_inspect"), ("pane", "interface")])
+def test_a_pane_in_hython_is_ui_unavailable(
+    scene: Scene, home: Path, source: str, word: str
+) -> None:
+    error = refused(scene, home, source=source, path="panetab1" if source == "pane" else None)
+    assert error.code == "UI_UNAVAILABLE"
+    assert word in error.hint
+    assert error.details["tried"] == []
+
+
+def test_a_route_that_writes_nothing_is_capture_empty(scene: Scene, home: Path) -> None:
+    scene.capture.writes = False
+    error = refused(scene, home)
+    assert error.code == "CAPTURE_EMPTY"
+    assert error.details["tried"] == [{"route": capture.FLIPBOOK_ROP, "reason": capture.NO_FILE}]
+    assert names(scene, "/out") == []
+
+
+def test_no_flipbook_type_means_no_route(scene: Scene, home: Path) -> None:
+    scene.types = tuple(name for name in TYPES if name != "flipbook")
+    error = refused(scene, home)
+    assert error.code == "UI_UNAVAILABLE"
+    assert error.details["tried"][0]["route"] == capture.FLIPBOOK_ROP
+
+
+def test_an_empty_scene_is_framed_at_the_origin_with_a_warning(scene: Scene, home: Path) -> None:
+    scene.node("/obj/boxgeo").hidden = True
+    said = take(scene, home)
+    assert any("nothing to frame" in item for item in said["warnings"])
+
+
+# Section: the viewport routes, in a session with a user interface
+
+
+def viewer_scene(scene: Scene) -> SceneViewerTab:
+    viewer = SceneViewerTab(scene)
+    desktop(scene, viewer)
+    return viewer
+
+
+def view_state(viewport: Any) -> tuple[Any, ...]:
+    return (
+        viewport.type(),
+        viewport.camera(),
+        viewport._default.state(),
+        viewport.viewTransform().asTuple(),
+        viewport.shading(),
+    )
+
+
+def test_the_showing_viewport_is_flipbooked_with_settings_of_its_own(
+    scene: Scene, home: Path
+) -> None:
+    viewer = viewer_scene(scene)
+    said = take(scene, home, kind="gui", resolution=[800, 450], frame=12)
+    [shot] = said["views"]
+    assert shot["route"] == capture.VIEWPORT
+    assert shot["camera"] == {"kind": "viewport"}
+    [seen] = scene.capture.seen
+    settings = seen["settings"]
+    assert settings["outputToMPlay"] is False
+    assert settings["beautyPassOnly"] is True
+    assert settings["useResolution"] is True
+    assert settings["resolution"] == (800, 450)
+    assert settings["frameRange"] == (12.0, 12.0)
+    assert settings["output"] == shot["files"][0]
+    # The viewer's own settings are not the ones changed.
+    assert viewer.settings.values["outputToMPlay"] is True
+    assert picture(shot["files"][0]).size == (800, 450)
+    # Nothing was framed: the view is what the artist sees.
+    assert viewer.viewport.framed == []
+
+
+def test_guides_leave_the_beauty_pass_off(scene: Scene, home: Path) -> None:
+    viewer_scene(scene)
+    take(scene, home, kind="gui", guides=True)
+    assert scene.capture.seen[0]["settings"]["beautyPassOnly"] is False
+
+
+def test_a_view_applied_for_the_capture_is_put_back_exactly(scene: Scene, home: Path) -> None:
+    viewer = viewer_scene(scene)
+    viewport = viewer.viewport
+    viewport._default.setTranslation((1.5, 2.5, 3.5))
+    viewport._default.setOrthoWidth(3.25)
+    before = view_state(viewport)
+    take(scene, home, kind="gui", camera="top", display="wire")
+    [seen] = scene.capture.seen
+    assert seen["type"] == "Top"
+    assert seen["shading"] == {"SceneObject": "Wire", "DisplayModel": "Wire"}
+    assert viewport.framed == ["all"]
+    after = view_state(viewport)
+    assert after == before
+    translation, rotation, pivot, ortho_width = viewport._default.state()
+    assert translation == (1.5, 2.5, 3.5)
+    assert ortho_width == 3.25
+    assert pivot == (0.0, 0.0, 0.0)
+    assert rotation == (0.0, 0.0, 0.0)
+
+
+def test_a_camera_node_is_looked_through_and_let_go_after(scene: Scene, home: Path) -> None:
+    viewer = viewer_scene(scene)
+    scene.node("/obj").createNode("cam", "shotcam")
+    before = view_state(viewer.viewport)
+    said = take(scene, home, kind="gui", camera="/obj/shotcam", frame_target="all")
+    [seen] = scene.capture.seen
+    assert seen["camera"] == "/obj/shotcam"
+    assert viewer.viewport.framed == []
+    assert any("frame_target was not applied" in item for item in said["warnings"])
+    assert view_state(viewer.viewport) == before
+
+
+def test_an_orbit_turns_the_view_and_frames_the_target(scene: Scene, home: Path) -> None:
+    viewer = viewer_scene(scene)
+    before = view_state(viewer.viewport)
+    take(
+        scene,
+        home,
+        kind="gui",
+        camera={"orbit": 90, "elevation": 30},
+        frame_target="/obj/boxgeo",
+    )
+    [seen] = scene.capture.seen
+    assert seen["view"][1] == (-30.0, 90.0, 0.0)
+    assert viewer.viewport.framed == [((-0.5, -0.5, -0.5), (0.5, 0.5, 0.5))]
+    assert view_state(viewer.viewport) == before
+
+
+def test_a_failed_flipbook_puts_the_view_back_and_moves_on(scene: Scene, home: Path) -> None:
+    viewer = viewer_scene(scene)
+    before = view_state(viewer.viewport)
+    scene.capture.flipbook_error = OperationFailed("the flipbook failed")
+    said = take(scene, home, kind="gui", camera="front", display="matcap")
+    [shot] = said["views"]
+    assert view_state(viewer.viewport) == before
+    assert shot["route"] == capture.FLIPBOOK_ROP
+    assert shot["framing_unverified"] is True
+    assert shot["tried"][0]["route"] == capture.VIEWPORT
+    assert shot["tried"][0]["reason"].startswith("OperationFailed")
+    # The route that ran is the render node, with the view asked for fitted.
+    [seen] = scene.capture.seen
+    assert seen["route"] == "rop"
+    assert seen["shadingmode"] == "matcap"
+
+
+def test_a_hidden_viewer_is_shown_for_the_capture_and_hidden_again(
+    scene: Scene, home: Path
+) -> None:
+    viewer = SceneViewerTab(scene, "viewer")
+    other = Tab(scene, "Parm", "parms")
+    pane = desktop(scene, other, viewer)
+    assert pane.currentTab() is other
+    said = take(scene, home, kind="gui")
+    [shot] = said["views"]
+    assert shot["route"] == capture.VIEWPORT_TAB
+    assert shot["tried"] == [{"route": capture.VIEWPORT, "reason": "no Scene Viewer is showing"}]
+    assert scene.capture.seen[0]["current"] is True
+    assert pane.currentTab() is other
+
+
+def test_no_viewer_at_all_falls_to_the_render_node_with_framing_unverified(
+    scene: Scene, home: Path
+) -> None:
+    desktop(scene)
+    said = take(scene, home, kind="gui")
+    [shot] = said["views"]
+    assert shot["route"] == capture.FLIPBOOK_ROP
+    assert shot["framing_unverified"] is True
+    assert [item["route"] for item in shot["tried"]] == [capture.VIEWPORT, capture.VIEWPORT_TAB]
+
+
+# Section: the network editor and panes, grabbed through Qt
+
+
+def editor_scene(scene: Scene, ratio: float = 2.0) -> NetworkEditorTab:
+    editor = NetworkEditorTab(scene)
+    window = Window(100, 50, 800, 600, ratio)
+    editor.window = window
+    editor.geometry = Rect(300, 250, 400, 200)
+    window.painted.append((editor.geometry, (255, 0, 0, 255)))
+    desktop(scene, editor)
+    return editor
+
+
+def test_the_network_editor_is_its_own_window_cropped_to_the_pane(scene: Scene, home: Path) -> None:
+    editor = editor_scene(scene)
+    said = take(scene, home, kind="gui", source="network")
+    [shot] = said["views"]
+    assert shot["route"] == capture.NETWORK_GRAB
+    assert shot["native"] == [800, 400]
+    image = picture(shot["files"][0])
+    assert image.size == (800, 400)
+    assert image.convert("RGB").getextrema() == ((255, 255), (0, 0), (0, 0))
+    assert editor.window.grabs == 1
+
+
+def test_a_network_asked_for_is_shown_then_the_editor_goes_back(scene: Scene, home: Path) -> None:
+    editor = editor_scene(scene, ratio=1.0)
+    said = take(scene, home, kind="gui", source="network", path="/obj/boxgeo")
+    [shot] = said["views"]
+    assert shot["framing_unverified"] is True
+    assert editor.pwd().path() == "/obj"
+
+
+def test_a_pane_is_found_by_name(scene: Scene, home: Path) -> None:
+    editor_scene(scene, ratio=1.0)
+    said = take(scene, home, kind="gui", source="pane", path="panetab2")
+    assert said["views"][0]["route"] == capture.PANE_GRAB
+    error = refused(scene, home, kind="gui", source="pane", path="panetab9")
+    assert error.code == "BAD_ARGUMENTS"
+    assert "panetab2" in error.details["did_you_mean"]
+
+
+@pytest.mark.parametrize(
+    ("pane", "origin", "size", "ratio", "box"),
+    [
+        ((300, 250, 400, 200), (100, 50), (1600, 1200), 2.0, (400, 400, 1200, 800)),
+        ((100, 50, 800, 600), (100, 50), (800, 600), 1.0, (0, 0, 800, 600)),
+        # A pane that runs off the window is cut at the window's edge.
+        ((50, 40, 200, 100), (100, 50), (800, 600), 1.0, (0, 0, 150, 90)),
+        ((10, 10, 101, 51), (0, 0), (300, 200), 1.5, (15, 15, 167, 92)),
+    ],
+)
+def test_crop_maths(
+    pane: tuple[int, ...], origin: tuple[int, int], size: tuple[int, int], ratio: float, box: Any
+) -> None:
+    assert capture.crop_box(pane, origin, size, ratio) == box
+
+
+def test_a_pane_off_its_window_has_no_crop() -> None:
+    assert capture.crop_box((900, 700, 50, 50), (0, 0), (800, 600), 1.0) is None
+
+
+# Section: COP images
+
+
+def test_a_copernicus_layer_is_written_the_right_way_up(scene: Scene, home: Path) -> None:
+    net = scene.node("/obj").createNode("copnet", "cops")
+    net.createNode("fractalnoise", "noise")
+    said = take(scene, home, source="cop", path="/obj/cops/noise", frame=24)
+    [shot] = said["views"]
+    assert shot["route"] == capture.COP_LAYER
+    assert shot["native"] == [64, 32]
+    image = picture(shot["files"][0])
+    assert image.size == (64, 32)
+    assert image.getpixel((0, 0)) == (255, 255, 255, 255)
+    assert image.getpixel((0, 31)) == (0, 0, 0, 255)
+    assert scene.capture.cop_frames == [24.0]
+
+
+def test_an_older_cop_saves_its_own_image(scene: Scene, home: Path) -> None:
+    img = scene.root.createNode("img", "img")
+    img.createNode("file", "plate")
+    said = take(scene, home, source="cop", path="/img/plate")
+    [shot] = said["views"]
+    assert shot["route"] == capture.COP2_SAVE
+    assert shot["tried"] == [
+        {"route": capture.COP_LAYER, "reason": "the node is not a Copernicus COP"}
+    ]
+    assert Path(shot["files"][0]).is_file()
+
+
+# Section: what is refused before anything is made
+
+
+@pytest.mark.parametrize(
+    ("arguments", "code", "argument"),
+    [
+        ({"camera": "/obj/boxgeo"}, "BAD_ARGUMENTS", "camera"),
+        ({"camera": "/obj/nothing"}, "NODE_NOT_FOUND", "camera"),
+        ({"camera": "side"}, "BAD_ARGUMENTS", "camera"),
+        ({"camera": {"orbit": 1, "tilt": 2}}, "BAD_ARGUMENTS", "camera"),
+        ({"frame_target": "/obj/gone"}, "NODE_NOT_FOUND", "frame_target"),
+        ({"frames": [1, 4, 1], "views": "quad"}, "BAD_ARGUMENTS", "views"),
+        ({"frames": [1, 4, 1], "frame": 2}, "BAD_ARGUMENTS", "frames"),
+        ({"frames": [1.5, 4, 1]}, "BAD_ARGUMENTS", "frames"),
+        ({"source": "cop", "path": "/obj/boxgeo"}, "BAD_ARGUMENTS", "path"),
+        ({"source": "cop", "path": "/obj/cops", "camera": "top"}, "BAD_ARGUMENTS", "camera"),
+        ({"source": "node"}, "BAD_ARGUMENTS", "path"),
+        ({"source": "node", "path": "/out"}, "BAD_ARGUMENTS", "path"),
+        ({"resolution": [0, 10]}, "BAD_ARGUMENTS", "resolution"),
+    ],
+)
+def test_what_is_refused(
+    scene: Scene, home: Path, arguments: dict[str, Any], code: str, argument: str
+) -> None:
+    error = refused(scene, home, **arguments)
+    assert error.code == code
+    assert error.details["argument"] == argument
+    assert scene.capture.seen == []
+
+
+# Section: the numbers and the file
+
+
+def project(fit: dict[str, Any], point: tuple[float, ...], aspect: float) -> tuple[float, float]:
+    """Where a point lands on a fitted camera's frame, from -1 to 1 across and up."""
+    rx, ry, _ = (math.radians(value) for value in fit["r"])
+    offset = [p - t for p, t in zip(point, fit["t"], strict=True)]
+    # Undo the orbit about Y, then the tilt about X.
+    x = offset[0] * math.cos(-ry) + offset[2] * math.sin(-ry)
+    z = -offset[0] * math.sin(-ry) + offset[2] * math.cos(-ry)
+    y = offset[1]
+    y, z = y * math.cos(-rx) - z * math.sin(-rx), y * math.sin(-rx) + z * math.cos(-rx)
+    assert z < 0, "the point is behind the camera"
+    if fit["orthowidth"]:
+        return x / (fit["orthowidth"] / 2.0), y / (fit["orthowidth"] / 2.0 / aspect)
+    tan_across = (41.4214 / 2.0) / 50.0
+    return x / (-z * tan_across), y / (-z * tan_across / aspect)
+
+
+@pytest.mark.parametrize("view", ["persp", "top", "front", "right"])
+def test_a_fitted_camera_sees_every_corner(view: str) -> None:
+    bounds = ((-1.0, 0.0, -3.0), (5.0, 2.0, 1.0))
+    orbit, elevation, ortho = capture.FITTED[view]
+    fit = capture.fit_camera(
+        bounds,
+        orbit=orbit,
+        elevation=elevation,
+        ortho=ortho,
+        aspect=16 / 9,
+        focal=50.0,
+        aperture=41.4214,
+    )
+    reach = 0.0
+    for corner in capture._corners(*bounds):
+        x, y = project(fit, corner, 16 / 9)
+        assert abs(x) <= 1.0 and abs(y) <= 1.0, (view, corner, x, y)
+        reach = max(reach, abs(x), abs(y))
+    # And it is not so far back that the box is a speck.
+    assert reach > 0.5
+
+
+def test_write_png_turns_a_bottom_up_image_the_right_way_up(tmp_path: Path) -> None:
+    rows = [bytes((value, value, value, 255)) * 3 for value in (10, 20)]
+    path = tmp_path / "out.png"
+    capture.write_png(str(path), 3, 2, b"".join(rows), bottom_up=True)
+    image = picture(str(path))
+    assert image.getpixel((0, 0)) == (20, 20, 20, 255)
+    assert image.getpixel((2, 1)) == (10, 10, 10, 255)
+    assert not (tmp_path / "out.png.part").exists()
+
+
+def test_a_sequence_path_puts_the_frame_before_the_extension() -> None:
+    assert outputs.sequence_path("/a/b/c_run-1.png") == "/a/b/c_run-1.$F4.png"
+    assert outputs.sequence_path("c.png", "$F") == "c.$F.png"
+    assert outputs.sequence_path("/a/noext") == "/a/noext.$F4"
+
+
+def test_the_capability_probe_names_the_routes(scene: Scene) -> None:
+    module = scene.module()
+    assert capture.routes(module) == [
+        capture.VIEWPORT,
+        capture.VIEWPORT_TAB,
+        capture.FLIPBOOK_ROP,
+        capture.COP_LAYER,
+        capture.COP2_SAVE,
+        capture.NETWORK_GRAB,
+        capture.PANE_GRAB,
+    ]
+    del module.ui
+    assert capture.routes(module) == [capture.FLIPBOOK_ROP, capture.COP_LAYER, capture.COP2_SAVE]
+
+
+# Section: through the dispatcher
+
+
+def test_through_the_dispatcher_nothing_lands_on_undo_and_a_retry_is_the_receipt(
+    scene: Scene, home: Path
+) -> None:
+    store_path = home / store_module.STORE_FILE_NAME
+    module = scene.module()
+    identity = Identity(session_id="s-1", kind="hython", alias="w1", hou=module)
+    dispatcher = Dispatcher(
+        default_registry(),
+        lock=threading.Lock(),
+        kind="hython",
+        session_id="s-1",
+        identity=identity,
+        receipts=receipts.Receipts(lambda: store_module.Store(store_path), session_id="s-1"),
+        hou=module,
+        wait_s=5.0,
+        timeout_s=10.0,
+        home=home,
+        open_store=lambda: store_module.Store(store_path),
+    )
+    mark = identity.dirty.state_name
+    envelope = Envelope(
+        tool="capture.image",
+        arguments={"resolution": [100, 50]},
+        operation_id="cap-1",
+    )
+    first = dispatcher.dispatch(envelope).payload
+    assert first["ok"] is True, first
+    assert first["undo"]["recorded"] is False
+    assert first["job_id"] == "job-cap-1"
+    assert scene.undos.undoLabels() == []
+    assert identity.dirty.state_name == mark
+    again = dispatcher.dispatch(envelope).payload
+    assert again["replayed"] is True
+    assert again["data"]["views"][0]["files"] == first["data"]["views"][0]["files"]
+    assert len(scene.capture.seen) == 1
+    with store_module.Store(store_path) as store:
+        job = store.get_job("job-cap-1")
+    assert job.kind == "capture"
+    assert job.state == "done"
+    assert job.spec == {"source": "viewport", "views": "single", "frames": None}
+
+
+# Section: a render node that draws larger than asked
+
+
+def test_a_dense_display_is_worked_out_and_the_camera_window_makes_up_for_it(
+    scene: Scene, home: Path
+) -> None:
+    scene.capture.backing = 2.0
+    said = take(scene, home, resolution=[320, 160])
+    [shot] = said["views"]
+    assert shot["camera"]["window_scaled"] == 2.0
+    assert "framing_unverified" not in shot
+    [seen] = scene.capture.seen
+    assert seen["window"] == (0.5, 0.5, 2.0, 2.0)
+    # The box sits in the middle of the frame, where it would with no scale.
+    assert picture(shot["files"][0]).getchannel("A").getbbox() == (80, 40, 240, 120)
+    assert len(scene.capture.probes) == 1
+    assert not list(Path(shot["files"][0]).parent.glob("*.probe.png"))
+    assert names(scene, "/obj") == ["boxgeo"]
+    assert names(scene, "/out") == []
+
+
+def test_a_named_camera_gets_its_own_window_back(scene: Scene, home: Path) -> None:
+    scene.capture.backing = 2.0
+    shot_cam = scene.node("/obj").createNode("cam", "shotcam")
+    shot_cam.parmTuple("win").set((0.1, 0.0))
+    take(scene, home, camera="/obj/shotcam")
+    [seen] = scene.capture.seen
+    assert seen["window"] == pytest.approx((0.6, 0.5, 2.0, 2.0))
+    assert tuple(parm.eval() for parm in shot_cam.parmTuple("win")) == (0.1, 0.0)
+    assert tuple(parm.eval() for parm in shot_cam.parmTuple("winsize")) == (1.0, 1.0)
+
+
+def test_a_scale_that_cannot_be_read_leaves_the_framing_unverified(
+    scene: Scene, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(capture, "alpha_box", lambda path: None)
+    said = take(scene, home)
+    [shot] = said["views"]
+    assert shot["framing_unverified"] is True
+    assert any("drawing scale" in item for item in said["warnings"])
+
+
+def test_alpha_box_reads_what_a_render_node_writes(tmp_path: Path) -> None:
+    image = Image.new("RGBA", (20, 10), (0, 0, 0, 0))
+    image.paste((9, 9, 9, 200), (3, 2, 7, 9))
+    image.save(tmp_path / "rgba.png")
+    assert capture.alpha_box(str(tmp_path / "rgba.png")) == (3, 2, 7, 9)
+    Image.new("RGBA", (4, 4), (0, 0, 0, 0)).save(tmp_path / "clear.png")
+    assert capture.alpha_box(str(tmp_path / "clear.png")) is None
+    Image.new("RGB", (4, 4), (1, 2, 3)).save(tmp_path / "rgb.png")
+    with pytest.raises(ValueError):
+        capture.alpha_box(str(tmp_path / "rgb.png"))
