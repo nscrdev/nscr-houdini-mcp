@@ -294,6 +294,27 @@ def _open_store(path: Path) -> store_module.Store | None:
     return store_module.Store(path) if path.is_file() else None
 
 
+class _Shared:
+    """A store handle lent inside `Router.one_store`: leaving it does not close it."""
+
+    __slots__ = ("_store",)
+
+    def __init__(self, store: Any) -> None:
+        self._store = store
+
+    def __enter__(self) -> Any:
+        return self._store
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
+
+
 class Router:
     """Resolves sessions and sends signed calls to them."""
 
@@ -325,6 +346,8 @@ class Router:
         # Per session id: the signed client and the facts from its session file.
         self._clients: dict[str, tuple[client.Session, dict[str, Any]]] = {}
         self._lock = threading.Lock()
+        # The store handle one call on this thread shares, while it runs.
+        self._held = threading.local()
 
     # Section: resolution
 
@@ -370,7 +393,7 @@ class Router:
         raises.
         """
         try:
-            opened = self._open_store(self.store_path)
+            opened = self._opened_store()
             if opened is None and create:
                 opened = store_module.Store(self.store_path)
         except (store_module.StoreError, sqlite3.Error, OSError) as error:
@@ -384,6 +407,43 @@ class Router:
             return
         with opened:
             yield opened
+
+    @contextmanager
+    def one_store(self) -> Iterator[None]:
+        """Share one store handle among everything a call on this thread reads.
+
+        A call reads the store several times: to resolve its session, to renew
+        a worker's lease before and after, to read its job. Opening the file
+        each time costs more than the reads. Inside this, the first open is
+        kept and handed out again, and closed when the call ends, so no handle
+        outlives the call that opened it. Each read still runs in its own
+        short transaction and sees what other processes have written since.
+        """
+        if getattr(self._held, "active", False):
+            yield
+            return
+        self._held.active = True
+        self._held.store = None
+        try:
+            yield
+        finally:
+            kept = self._held.store
+            self._held.active = False
+            self._held.store = None
+            if kept is not None:
+                kept.__exit__(None, None, None)
+
+    def _opened_store(self) -> Any:
+        """The store, or nothing when none exists, shared inside `one_store`."""
+        if not getattr(self._held, "active", False):
+            return self._open_store(self.store_path)
+        kept = self._held.store
+        if kept is None:
+            kept = self._open_store(self.store_path)
+            if kept is None:
+                return None
+            self._held.store = kept
+        return _Shared(kept)
 
     def cached(self) -> list[str]:
         """The session ids a client is kept for."""
@@ -404,7 +464,7 @@ class Router:
 
     def _records(self, *, include_gone: bool = True) -> list[SessionRecord]:
         try:
-            store = self._open_store(self.store_path)
+            store = self._opened_store()
             if store is None:
                 return []
             with store:
@@ -447,7 +507,7 @@ class Router:
     def _renew(self, session_id: str) -> None:
         """Renew a worker's idle lease. A hython started by hand has none."""
         try:
-            store = self._open_store(self.store_path)
+            store = self._opened_store()
             if store is None:
                 return
             with store:

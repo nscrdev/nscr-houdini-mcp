@@ -488,3 +488,66 @@ def test_neither_the_session_nor_the_target_prints_the_token() -> None:
     for text in (repr(target), str(target), repr(target.session), f"{target.session}"):
         assert "token" not in text
         assert "s-1" in text
+
+
+# Section: one store handle per call
+
+
+class CountedStores:
+    """Opens a fresh stand in store each time and counts opens and closes."""
+
+    def __init__(self, rows: list[SessionRecord]) -> None:
+        self.rows = rows
+        self.opened = 0
+        self.closed = 0
+
+    def __call__(self, path: Any) -> FakeStore:
+        self.opened += 1
+        owner = self
+
+        class Counted(FakeStore):
+            def __exit__(self, *exc: object) -> None:
+                owner.closed += 1
+
+        return Counted(self.rows)
+
+
+def counted_router(stores: CountedStores) -> Router:
+    return Router(
+        home=Path("."),
+        open_store=stores,
+        open_session=FakeFiles(["s-1"]).open,
+        send=Sent(),
+        renew_lease=lambda store, session_id: None,
+    )
+
+
+def test_a_worker_call_opens_the_store_once_inside_one_store() -> None:
+    stores = CountedStores([record("s-1", "w1")])
+    router = counted_router(stores)
+    with router.one_store():
+        target = router.resolve(None)
+        router.call(target, "bridge.ping")
+        with router.store() as store:
+            assert store.list_sessions() == stores.rows
+        assert stores.closed == 0
+    # Resolve, the renewal before, the renewal after and the read: one open.
+    assert (stores.opened, stores.closed) == (1, 1)
+
+
+def test_without_one_store_every_read_opens_and_closes_its_own_handle() -> None:
+    stores = CountedStores([record("s-1", "w1")])
+    router = counted_router(stores)
+    target = router.resolve(None)
+    router.call(target, "bridge.ping")
+    assert stores.opened == 3
+    assert stores.closed == 3
+
+
+def test_a_store_that_is_not_there_yet_is_not_kept() -> None:
+    opened: list[Any] = []
+    router = Router(home=Path("."), open_store=lambda path: opened.append(path))
+    with router.one_store():
+        assert router.records() == []
+        assert router.records() == []
+    assert len(opened) == 2

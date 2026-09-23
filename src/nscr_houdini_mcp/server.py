@@ -149,7 +149,8 @@ class Runtime:
                 progress=progress,
                 cancelled=cancelled,
             )
-            data = spec.handler(call)
+            with router.one_store():
+                data = spec.handler(call)
             summary = spec.summary(data) if spec.summary else None
             spill = Spill(config.spill_folder, config.spill_over_bytes)
             failed = bool(spec.failed(data)) if spec.failed else False
