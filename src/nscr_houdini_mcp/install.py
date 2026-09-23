@@ -41,6 +41,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -121,14 +122,37 @@ def payload_root() -> Path:
 # this tool's environment (numpy built for another Python, say) is loaded in
 # place of the one Houdini ships. A checkout's `src` holds only this package
 # and is named as it is, so an edit there reaches the next Houdini. Any other
-# source folder is copied: into a folder owned by one package file for
-# `bridge install`, refreshed on every install and removed on uninstall, or
-# into one owned by the source folder for the sessions this tool starts
-# itself, refreshed whenever the source has changed. A copy rather than a
-# link, because a link on Windows needs rights an artist may not have.
+# source folder is copied, and a copy rather than a link, because a link on
+# Windows needs rights an artist may not have.
+#
+# A copy is named after what it holds and never changes once it is there: a
+# new version goes into a folder of its own beside the old one. So a Houdini
+# importing from a copy never finds it half written or gone for a moment, and
+# two servers making the same copy at once end up with one. Copies nobody has
+# used for a week are taken away when the next one is made.
 
 COPIES_DIR_NAME = "houdini-python"
 STAMP_FILE_NAME = ".nscr-houdini-mcp.json"
+
+# Touched whenever a copy is handed out, so an unused one can be told apart.
+USED_FILE_NAME = ".used"
+# Written into a package file's old copy when a new install replaces it. A
+# Houdini started before the new install may still import from the old one.
+SUPERSEDED_FILE_NAME = ".superseded"
+
+# How long a copy may go unused, or stay replaced, before it is taken away.
+UNUSED_AFTER_S = 7 * 24 * 3600.0
+# How old a half built copy has to be before it counts as left behind by a
+# process that died. Building one takes well under a second.
+LEFTOVER_AFTER_S = 600.0
+
+PACKAGE_COPY = "package"
+RUN_COPY = "run"
+
+# How often, and how far apart, a rename into place is tried again when
+# Windows refuses it because a scanner or indexer has the folder open.
+RENAME_TRIES = 5
+RENAME_PAUSE_S = 0.1
 
 # File endings Python imports a module from, on any system, and `.pth`, which
 # a site folder reads to add yet more paths.
@@ -136,6 +160,10 @@ _MODULE_SUFFIXES = (".py", ".pyc", ".pyw", ".pyd", ".so", ".pth")
 
 # Never imported as a module: it only caches the files next to it.
 _NOT_A_MODULE = ("__pycache__",)
+
+# What a folder being built, or being taken away, is called for a while.
+_BUILDING = ".part-"
+_LEAVING = ".old-"
 
 
 def package_root() -> Path:
@@ -166,17 +194,17 @@ def strays(folder: Path) -> list[str]:
 
 
 def fingerprint(package: Path) -> str:
-    """What the package's files are right now, as one short text.
+    """What the package's files hold, as one short text.
 
-    Names, sizes and change times, so a copy made from an older version, or
-    before an edit, is told apart from a current one without reading a file.
+    Read from the files themselves, so two copies of one version agree
+    wherever they sit, and any edit or upgrade gives another answer.
     """
     package = Path(package)
-    digest = hashlib.sha256(str(package).encode("utf-8"))
+    digest = hashlib.sha256()
     for path in sorted(_package_files(package)):
-        stat = path.stat()
         relative = path.relative_to(package).as_posix()
-        digest.update(f"\0{relative}\0{stat.st_size}\0{stat.st_mtime_ns}".encode())
+        digest.update(f"\0{relative}\0".encode())
+        digest.update(path.read_bytes())
     return digest.hexdigest()[:32]
 
 
@@ -193,63 +221,64 @@ def copies_dir(home: Path) -> Path:
     return Path(home) / COPIES_DIR_NAME
 
 
-def copy_for_package_file(package_file: Path, home: Path) -> Path:
-    """The folder holding the copy one package file points Houdini at.
+def copy_for_package_file(package_file: Path, home: Path, stamp: str) -> Path:
+    """The copy one package file points Houdini at, for one version.
 
-    Named after the package file, so two package files never share a copy and
-    taking one away can never pull the ground from under another.
+    Named after the package file, so taking one away can never pull the
+    ground from under another, and after what it holds.
     """
-    return copies_dir(home) / ("package-" + _short_hash(str(package_file)))
+    return copies_dir(home) / _copy_name(PACKAGE_COPY, str(package_file), stamp)
 
 
-def copy_for_source(package: Path, home: Path) -> Path:
-    """The folder holding the copy that sessions this tool starts import."""
-    return copies_dir(home) / ("run-" + _short_hash(str(package)))
+def copy_for_source(package: Path, home: Path, stamp: str) -> Path:
+    """The copy that sessions this tool starts import, for one version."""
+    return copies_dir(home) / _copy_name(RUN_COPY, str(package), stamp)
 
 
-def _short_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+def _copy_name(kind: str, owner: str, stamp: str) -> str:
+    return f"{_owner_prefix(kind, owner)}{stamp[:16]}"
+
+
+def _owner_prefix(kind: str, owner: str) -> str:
+    """The start every copy of one owner's shares, whatever its version."""
+    return f"{kind}-{hashlib.sha256(owner.encode('utf-8')).hexdigest()[:16]}-"
 
 
 def python_path_for_run(home: Path | None = None) -> Path:
     """The folder to put on the path of a Houdini this tool starts itself.
 
-    The source folder when it holds only this package, otherwise a copy that
-    is refreshed here whenever the source has changed. Several servers may
-    start sessions at once, so a current copy another one has just finished is
-    taken as it is rather than fought over.
+    The source folder when it holds only this package, otherwise a copy of
+    the version running now. Old copies nobody has used for a week, and
+    anything a process that died left half built, are taken away here.
     """
     source = source_root()
     if not strays(source):
         return source
     home = Path(home) if home is not None else store_module.default_home()
     package = package_root()
-    folder = copy_for_source(package, home)
     stamp = fingerprint(package)
-    if copy_stamp(folder) == stamp:
-        return folder
-    try:
-        refresh_copy(folder, package, stamp)
-    except OSError:
-        if copy_stamp(folder) != stamp:
-            raise
+    folder = ensure_copy(copy_for_source(package, home, stamp), package, stamp)
+    sweep(copies_dir(home), keep=(folder,))
     return folder
 
 
-def refresh_copy(folder: Path, package: Path | None = None, stamp: str | None = None) -> Path:
-    """Make `folder` hold a fresh copy of the package and nothing else.
+def ensure_copy(folder: Path, package: Path | None = None, stamp: str | None = None) -> Path:
+    """Make sure `folder` holds a whole copy of the package, and mark it used.
 
-    The copy is built beside the folder and moved into place in one step, so
-    a Houdini starting meanwhile sees the old copy or the new one, never half
-    of either. A folder there that this tool did not make is left alone.
+    The copy is built beside the folder and renamed into place in one step, so
+    it is either all there or not there. When another process got there first
+    its copy is as good as this one, since the name says what it holds.
     """
     package = Path(package) if package is not None else package_root()
     stamp = stamp or fingerprint(package)
     folder = Path(folder)
-    if (folder.exists() or folder.is_symlink()) and not is_our_copy(folder):
+    if copy_stamp(folder) == stamp:
+        _touch(folder / USED_FILE_NAME)
+        return folder
+    if folder.exists() or folder.is_symlink():
         raise InstallError(f"{folder} was not made by this tool, so it is left alone")
     folder.parent.mkdir(parents=True, exist_ok=True)
-    building = Path(tempfile.mkdtemp(dir=str(folder.parent), prefix=folder.name + ".part-"))
+    building = Path(tempfile.mkdtemp(dir=str(folder.parent), prefix=folder.name + _BUILDING))
     try:
         shutil.copytree(
             package,
@@ -260,29 +289,96 @@ def refresh_copy(folder: Path, package: Path | None = None, stamp: str | None = 
             {MARKER_KEY: MARKER_VALUE, "source": str(package), "fingerprint": stamp}
         )
         (building / STAMP_FILE_NAME).write_text(stamp_text + "\n", encoding="utf-8")
-        _swap_in(building, folder)
-    except BaseException:
-        shutil.rmtree(building, ignore_errors=True)
-        raise
+        _touch(building / USED_FILE_NAME)
+        _rename_into_place(building, folder)
+    finally:
+        if building.exists():
+            shutil.rmtree(building, ignore_errors=True)
+    if copy_stamp(folder) != stamp:
+        raise InstallError(f"{folder} could not be made")
     return folder
 
 
-def _swap_in(new: Path, folder: Path) -> None:
-    """Put `new` where `folder` is, and take the old one away."""
-    old = None
-    if folder.exists():
-        old = folder.with_name(f"{folder.name}.old-{secrets.token_hex(4)}")
-        os.replace(folder, old)
+def _rename_into_place(building: Path, folder: Path) -> None:
+    """Rename a finished copy to its name, unless one is there already."""
+    for attempt in range(RENAME_TRIES):
+        if folder.exists():
+            return
+        try:
+            os.rename(building, folder)
+            return
+        except PermissionError:
+            if attempt == RENAME_TRIES - 1:
+                raise
+            time.sleep(RENAME_PAUSE_S)
+        except OSError:
+            # Somebody else's copy landed first: theirs holds the same files.
+            if folder.exists():
+                return
+            raise
+
+
+def _touch(path: Path) -> None:
     try:
-        os.replace(new, folder)
+        path.touch()
+        os.utime(path, None)
     except OSError:
-        if old is not None and not folder.exists():
-            os.replace(old, folder)
-            old = None
-        raise
-    finally:
-        if old is not None:
-            shutil.rmtree(old, ignore_errors=True)
+        pass
+
+
+def sweep(folder: Path, *, keep: tuple[Path, ...] = (), now: float | None = None) -> list[Path]:
+    """Take away what is no longer used in the folder of copies.
+
+    Half built copies a process left behind, copies a session started by this
+    tool has not asked for in a week, and a package file's old copies a week
+    after a new install replaced them. A package file's own copy is never
+    taken here, whatever its age: only uninstall does that.
+    """
+    folder = Path(folder)
+    if not folder.is_dir():
+        return []
+    now = time.time() if now is None else now
+    kept = {Path(path) for path in keep}
+    removed = []
+    for child in sorted(folder.iterdir()):
+        if child in kept or child.is_symlink() or not child.is_dir():
+            continue
+        name = child.name
+        if _BUILDING in name or _LEAVING in name:
+            if _older(child, LEFTOVER_AFTER_S, now):
+                removed.append(child)
+                shutil.rmtree(child, ignore_errors=True)
+            continue
+        if not is_our_copy(child):
+            continue
+        if name.startswith(RUN_COPY + "-"):
+            stale = _older(child / USED_FILE_NAME, UNUSED_AFTER_S, now)
+        elif name.startswith(PACKAGE_COPY + "-"):
+            marker = child / SUPERSEDED_FILE_NAME
+            stale = marker.exists() and _older(marker, UNUSED_AFTER_S, now)
+        else:
+            stale = False
+        if stale and _take_away(child):
+            removed.append(child)
+    return removed
+
+
+def _older(path: Path, age_s: float, now: float) -> bool:
+    try:
+        return now - path.stat().st_mtime > age_s
+    except OSError:
+        return True
+
+
+def _take_away(folder: Path) -> bool:
+    """Rename a copy aside first, so nobody finds it half deleted, then delete it."""
+    leaving = folder.with_name(f"{folder.name}{_LEAVING}{secrets.token_hex(4)}")
+    try:
+        os.rename(folder, leaving)
+    except OSError:
+        return False
+    shutil.rmtree(leaving, ignore_errors=True)
+    return True
 
 
 def read_stamp(folder: Path) -> dict[str, Any] | None:
@@ -302,38 +398,62 @@ def is_our_copy(folder: Path) -> bool:
 
 
 def copy_stamp(folder: Path) -> str | None:
-    """The fingerprint of the source a copy was made from."""
+    """The fingerprint of the package a copy holds."""
     loaded = read_stamp(folder)
     value = loaded.get("fingerprint") if loaded else None
     return value if isinstance(value, str) else None
 
 
-def copy_is_current(folder: Path) -> bool | None:
-    """Whether a copy still matches the source it was made from.
+def copy_is_current(folder: Path, package: Path | None = None) -> bool:
+    """Whether a copy holds the same package as the one running this code.
 
-    Nothing when that source is gone, since then there is nothing to match.
+    Not the one it was copied from: that may be an old environment still on
+    disk while the server runs from a new one, and Houdini would then run a
+    bridge of another version than the server it talks to.
     """
-    loaded = read_stamp(folder)
-    if not loaded:
+    stamp = copy_stamp(folder)
+    if stamp is None:
         return False
-    named = loaded.get("source")
-    if not isinstance(named, str) or not named or not Path(named).is_dir():
-        return None
-    return fingerprint(Path(named)) == loaded.get("fingerprint")
+    return stamp == fingerprint(Path(package) if package is not None else package_root())
 
 
-def remove_copy(folder: Path) -> bool:
-    """Take away a copy this tool made, and the folder of copies once empty."""
+def remove_copies(folder: Path) -> list[Path]:
+    """Take away a copy this tool made and every other version of its owner's.
+
+    The folder of copies goes too once it is empty.
+    """
     folder = Path(folder)
-    if not is_our_copy(folder):
-        return False
-    shutil.rmtree(folder)
+    parent = folder.parent
+    prefix = folder.name.rsplit("-", 1)[0] + "-"
+    removed = []
+    if parent.is_dir():
+        for child in sorted(parent.iterdir()):
+            if child.name.startswith(prefix) and is_our_copy(child) and _take_away(child):
+                removed.append(child)
+    _remove_if_empty(parent)
+    return removed
+
+
+def remove_run_copies(home: Path, package: Path | None = None) -> list[Path]:
+    """Take away every copy made for sessions started from this package."""
+    package = Path(package) if package is not None else package_root()
+    folder = copies_dir(home)
+    prefix = _owner_prefix(RUN_COPY, str(package))
+    removed = []
+    if folder.is_dir():
+        for child in sorted(folder.iterdir()):
+            if child.name.startswith(prefix) and is_our_copy(child) and _take_away(child):
+                removed.append(child)
+    _remove_if_empty(folder)
+    return removed
+
+
+def _remove_if_empty(folder: Path) -> None:
     try:
-        if not any(folder.parent.iterdir()):
-            folder.parent.rmdir()
+        if folder.is_dir() and not any(folder.iterdir()):
+            folder.rmdir()
     except OSError:
         pass
-    return True
 
 
 def user_pref_dir(version: str = DEFAULT_HOUDINI_VERSION) -> Path:
@@ -828,8 +948,11 @@ def install(
 
     When the source folder holds anything besides this package, the package
     is copied into a folder of its own under `home` (the state folder when
-    none is given) and that copy is what the file names. It is made again on
-    every install, so running this after an upgrade brings Houdini up to date.
+    none is given) and that copy is what the file names, for the Python path
+    and for Houdini's path alike, so the startup files and the bridge they
+    start are always one version. Running this after an upgrade makes a copy
+    of the new version and points the file at it; the old copy stays a week
+    for a Houdini that is still running from it.
     """
     found = lookup or resolve(version, override=packages)
     path = found.path / PACKAGE_FILE_NAME
@@ -847,12 +970,19 @@ def install(
     source = source_root()
     copied_from = None
     copy = None
+    stamp = ""
     if strays(source):
         copied_from = package_root()
         home = Path(home) if home is not None else store_module.default_home()
-        copy = copy_for_package_file(path, home)
+        stamp = fingerprint(copied_from)
+        copy = copy_for_package_file(path, home, stamp)
         source = copy
+        # An installed copy carries its startup files inside the package, so
+        # the copy has them too, and Houdini's path takes them from there.
+        if payload.is_relative_to(copied_from):
+            payload = copy / PACKAGE_NAME / payload.relative_to(copied_from)
     check_writable(source, "source")
+    check_writable(payload, "payload")
 
     would_make = _missing_folders(path.parent)
     body = document(
@@ -860,11 +990,15 @@ def install(
     )
     if not dry_run:
         if copy is not None:
-            refresh_copy(copy, copied_from)
+            ensure_copy(copy, copied_from, stamp)
+            _unmark_superseded(copy)
         path.parent.mkdir(parents=True, exist_ok=True)
         _write_atomically(path, json.dumps(body, indent=4, ensure_ascii=False) + "\n")
-        if earlier_copy is not None and earlier_copy != copy:
-            remove_copy(earlier_copy)
+        if earlier_copy is not None and earlier_copy != copy and is_our_copy(earlier_copy):
+            # A Houdini started before this install may still import from it.
+            _touch(earlier_copy / SUPERSEDED_FILE_NAME)
+        if copy is not None:
+            sweep(copy.parent, keep=(copy,))
     lines = [
         f"package       {path}",
         f"folder from   {found.source}",
@@ -888,6 +1022,14 @@ def install(
         lines=lines,
         copied_from=copied_from,
     )
+
+
+def _unmark_superseded(copy: Path) -> None:
+    """A copy named by a package file again is not an old one any more."""
+    try:
+        (copy / SUPERSEDED_FILE_NAME).unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _missing_folders(folder: Path) -> list[Path]:
@@ -934,12 +1076,17 @@ def uninstall(
     *,
     packages: Path | str | None = None,
     lookup: Lookup | None = None,
+    home: Path | str | None = None,
 ) -> list[RemovedPackage]:
     """Take away the package files this tool wrote.
 
     Every folder this machine could be reading packages from is looked at, so
     a file left in the old place is found after the folder has moved. A file
     of the same name that this tool did not write is reported and kept.
+
+    With each file go the copies of the package made for it, every version.
+    The copies made for sessions this tool starts from this package, under
+    `home` (the state folder when none is given), go too.
     """
     targets = _targets(version, packages=packages, lookup=lookup)
     seen: list[Path] = []
@@ -965,8 +1112,15 @@ def uninstall(
         path.unlink()
         results.append(RemovedPackage(path, found_version, True, "removed"))
         _remove_empty(made)
-        if copy is not None and remove_copy(copy):
-            results.append(RemovedPackage(copy, found_version, True, "removed its copy"))
+        if copy is not None:
+            for removed in remove_copies(copy):
+                results.append(RemovedPackage(removed, found_version, True, "removed its copy"))
+    if not strays(source_root()):
+        # Sessions started from a folder holding only this package get no copy.
+        return results
+    home = Path(home) if home is not None else store_module.default_home()
+    for removed in remove_run_copies(home):
+        results.append(RemovedPackage(removed, "", True, "removed a copy for started sessions"))
     return results
 
 
@@ -1021,9 +1175,13 @@ class InstalledPackage:
     ours: bool
     autostart: bool | None
     # The copy of the package Houdini imports, when the install made one, and
-    # whether it still matches its source (nothing when the source is gone).
+    # whether it holds the same package as the one running this code.
     copy: Path | None = None
     copy_current: bool | None = None
+    # What the file puts on Houdini's Python path, and anything importable in
+    # it besides this package: a whole site-packages, from before the copy.
+    source: Path | None = None
+    source_strays: tuple[str, ...] = ()
 
 
 def installed(
@@ -1040,6 +1198,7 @@ def installed(
         loaded = read_document(path) if path.exists() else None
         ours = bool(loaded) and loaded.get(MARKER_KEY) == MARKER_VALUE
         copy = copy_of(loaded) if ours else None
+        source = _source_of(loaded) if ours else None
         states.append(
             InstalledPackage(
                 version=found_version,
@@ -1049,9 +1208,27 @@ def installed(
                 autostart=_autostart_of(loaded) if ours else None,
                 copy=copy,
                 copy_current=copy_is_current(copy) if copy is not None else None,
+                source=source,
+                source_strays=_strays_of(source),
             )
         )
     return states
+
+
+def _source_of(loaded: dict[str, Any] | None) -> Path | None:
+    for item in (loaded or {}).get("env") or []:
+        if isinstance(item, dict) and isinstance(item.get(SOURCE_ENV_VAR), str):
+            return Path(item[SOURCE_ENV_VAR])
+    return None
+
+
+def _strays_of(source: Path | None) -> tuple[str, ...]:
+    if source is None:
+        return ()
+    try:
+        return tuple(strays(source))
+    except OSError:
+        return ()
 
 
 def _autostart_of(loaded: dict[str, Any] | None) -> bool | None:

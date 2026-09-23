@@ -268,7 +268,10 @@ def _install(args: argparse.Namespace) -> int:
 
 
 def _uninstall(args: argparse.Namespace) -> int:
-    results = install_module.uninstall(args.houdini_version, packages=args.packages_dir)
+    home, problem = _state_home()
+    if problem:
+        print(problem)
+    results = install_module.uninstall(args.houdini_version, packages=args.packages_dir, home=home)
     if not results:
         print("nothing to remove")
         return 0
@@ -655,13 +658,19 @@ def _print_packages(lookup: install_module.Lookup) -> None:
         if state.copy is not None:
             if not install_module.is_our_copy(state.copy):
                 how = "missing, run bridge install again"
-            elif state.copy_current is None:
-                how = "the folder it was copied from is gone"
             elif state.copy_current:
-                how = "up to date"
+                how = "the same version as this server"
             else:
-                how = "older than its source, run bridge install again"
+                how = "another version than this server, run bridge install again"
             print(f"    python copy {state.copy} ({how})")
+        if state.source_strays:
+            shown = ", ".join(state.source_strays[:5])
+            more = ", ..." if len(state.source_strays) > 5 else ""
+            print(
+                f"    {install_module.SOURCE_ENV_VAR} {state.source} holds other libraries"
+                f" too ({shown}{more}), which load in place of Houdini's own:"
+                " run bridge install again"
+            )
 
     installs = install_module.find_installs()
     if not installs:

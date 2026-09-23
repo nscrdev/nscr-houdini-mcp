@@ -10,10 +10,11 @@ What it does, all inside one temporary folder:
    packages folder all pointed inside it:
    - `bridge install --dry-run --packages-dir <tmp>`, then a real install
      into the same temporary folder, whose package file must point
-     `NSCR_MCP_PAYLOAD` at the `houdini` folder inside the installed package
-     and `NSCR_MCP_SRC` at a folder that holds this package and nothing else
-     of the environment (no numpy, no PIL, no mcp), never at site-packages,
-     since whatever else is there would load in place of Houdini's own;
+     `NSCR_MCP_SRC` at a folder that holds this package and nothing else of
+     the environment (no numpy, no PIL, no mcp), never at site-packages,
+     since whatever else is there would load in place of Houdini's own, and
+     `NSCR_MCP_PAYLOAD` at the `houdini` folder inside that same copy, so
+     the startup files and the bridge they start are one version;
    - that folder imported by a Python that is not the environment's, with no
      site-packages at all, which must load the bridge and nothing from
      outside the folder and that Python's own library (and, with `--hython`,
@@ -378,8 +379,10 @@ def _check(tmp: Path, python: str, checks: Checks, hython: Path | None) -> None:
         str(pythonpath),
     )
     checks.check(
-        houdini_path is not None and inside(houdini_path, package_dir),
-        "the dry run points the houdini path inside the installed package",
+        houdini_path is not None
+        and pythonpath is not None
+        and Path(houdini_path) == Path(pythonpath) / PACKAGE / "houdini",
+        "the dry run points the houdini path inside the same copy",
         str(houdini_path),
     )
     checks.check(not packages.exists() or not any(packages.iterdir()), "the dry run wrote nothing")
@@ -451,13 +454,20 @@ def _check(tmp: Path, python: str, checks: Checks, hython: Path | None) -> None:
         )
     payload = variables.get("NSCR_MCP_PAYLOAD")
     checks.check(
-        payload is not None and Path(payload).resolve() == (package_dir / "houdini").resolve(),
-        "the package file points NSCR_MCP_PAYLOAD at the installed houdini folder",
+        payload is not None
+        and Path(payload).resolve() == (source_dir / PACKAGE / "houdini").resolve()
+        and (Path(payload) / "python3.13libs" / "nscr_mcp_autostart.py").is_file(),
+        "the package file points NSCR_MCP_PAYLOAD at the houdini folder in that copy",
         str(payload),
     )
 
     status = run([entry, "bridge", "status", "--packages-dir", packages], env=env, cwd=work)
     checks.check(status.returncode == 0, "bridge status runs")
+    checks.check(
+        "(the same version as this server)" in status.stdout
+        and "holds other libraries" not in status.stdout,
+        "bridge status calls the copy the same version as this server",
+    )
 
     removed = run([entry, "bridge", "uninstall", "--packages-dir", packages], env=env, cwd=work)
     checks.check(
