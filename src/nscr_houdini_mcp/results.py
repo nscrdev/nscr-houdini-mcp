@@ -70,6 +70,8 @@ SERVER_CODES: dict[str, str] = {
     "IMAGE_UNREADABLE": "the file is not an image this can read",
     "IMAGE_TOO_LARGE": "the image has more pixels than this reads",
     "REFERENCE_UNKNOWN": "no reference is registered under that name",
+    "JOB_RUNNING": "the job has not ended, so its output is not final",
+    "NO_OUTPUT": "no image written by that job or node is on disk",
 }
 
 CODES: dict[str, str] = {**BRIDGE_CODES, **SERVER_CODES}
@@ -141,6 +143,8 @@ HINTS: dict[str, str] = {
     "IMAGE_UNREADABLE": "export the image as PNG, JPEG, TIFF or EXR and pass that file",
     "IMAGE_TOO_LARGE": "pass a smaller copy of the image, or crop it to the part that matters",
     "REFERENCE_UNKNOWN": "pass a registered name from list_references, or a file path",
+    "JOB_RUNNING": "wait for the job with hou_jobs and wait_s, then call again",
+    "NO_OUTPUT": "make the image first, or pass it as a file",
 }
 
 # The largest result whose text block repeats the whole JSON. Larger ones get a

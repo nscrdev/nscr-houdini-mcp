@@ -143,7 +143,8 @@ def test_the_tool_is_listed_after_hou_jobs_and_within_its_token_budget(bench: Be
     assert names.index("hou_compare") > names.index("hou_jobs")
     [tool] = [tool for tool in listed.tools if tool.name == "hou_compare"]
     payload = tool.model_dump(mode="json", by_alias=True, exclude_none=True)
-    assert len(json.dumps(payload, separators=(",", ":"))) <= 1200
+    # Under 320 tokens by the estimate of four bytes to a token.
+    assert len(json.dumps(payload, separators=(",", ":"))) <= 4 * 319
     assert "No pass or fail" in tool.description
     assert tool.input_schema["additionalProperties"] is False
 
@@ -557,16 +558,28 @@ def test_a_replaced_reference_starts_a_new_series(bench: Bench, hip: Path) -> No
     assert again["series"]["id"] != first["series"]["id"]
 
 
-# Section: sources this build does not have yet
+# Section: what each candidate source takes
 
 
-@pytest.mark.parametrize("source", ["viewport", "node", "render"])
-def test_capture_sources_are_not_yet_available(bench: Bench, source: str) -> None:
-    result = run(bench, candidate={"source": source}, reference="front")
-    assert code(result) == "NOT_YET_AVAILABLE"
-    error = result.structured_content["error"]
-    assert error["details"]["tool"] == "hou_capture"
-    assert "hou_capture" in error["hint"]
+@pytest.mark.parametrize(
+    ("candidate", "argument"),
+    [
+        ({"source": "file", "path": "/a.png", "job_id": "job-1"}, "candidate.job_id"),
+        ({"source": "node"}, "candidate.path"),
+        ({"source": "node", "path": "/obj/geo1", "resolution": [10]}, "candidate.resolution"),
+        ({"source": "viewport", "region": [0.5, 0, 0.4, 1]}, "candidate.region"),
+        ({"source": "viewport", "frames": [1, 3, 1]}, "candidate.frames"),
+        ({"source": "render"}, "candidate"),
+        ({"source": "render", "job_id": "job-1", "path": "/obj/geo1"}, "candidate"),
+        ({"source": "render", "job_id": "job-1", "camera": "/obj/cam1"}, "candidate.camera"),
+    ],
+)
+def test_what_a_candidate_source_does_not_take_is_refused_before_the_session(
+    bench: Bench, candidate: dict[str, Any], argument: str
+) -> None:
+    result = run(bench, candidate=candidate, reference="front")
+    assert code(result) == "BAD_ARGUMENTS"
+    assert result.structured_content["error"]["details"]["argument"] == argument
     assert bench.sent.calls == []
 
 

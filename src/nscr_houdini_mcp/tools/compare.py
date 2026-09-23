@@ -2,9 +2,16 @@
 
 Three actions.
 
-- `compare`, the default. The candidate is a file in this build; a viewport
-  capture, a node's own image and a render are named in the schema and
-  answer `NOT_YET_AVAILABLE` until the capture tool arrives. The work follows
+- `compare`, the default. The candidate is a file; a `viewport` or `node`
+  picture captured now, through the capture code in this process with the
+  capture arguments the candidate carries; or a `render`, the newest file on
+  disk that a finished job or a node wrote, from the run records. A
+  registered reference that names a camera frames a capture, at the
+  reference's aspect, unless the candidate names its own camera or size, and
+  the result says which camera framed it. The capture's run id and path, or
+  the render's run and job, are the candidate's source in the result and in
+  `result.json`. A job not yet ended is `JOB_RUNNING`; a job or node with no
+  image on disk is `NO_OUTPUT`. The work follows
   the order in `imaging`: colour, alignment at native size, crops cut before
   anything is shrunk, then the overview. Every step is recorded in the
   result. The files go to a managed `compare` folder: the aligned pair, the
@@ -50,6 +57,9 @@ from nscr_houdini_mcp import results as results_module
 from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge.errors import did_you_mean
 from nscr_houdini_mcp.results import CallError
+from nscr_houdini_mcp.tools import capture as capture_tool
+from nscr_houdini_mcp.tools import jobs as jobs_tool
+from nscr_houdini_mcp.tools import outputs as outputs_tool
 from nscr_houdini_mcp.tools.base import SESSION, Call, ToolSpec, inputs, outputs
 
 ACTIONS = ("compare", "set_reference", "list_references")
@@ -58,8 +68,23 @@ ALIGN = ("fit", "fill", "stretch", "none")
 MODES = ("likeness", "regression")
 RETURN_IMAGE = ("thumb", "none", "full")
 
-# The tool that will produce a candidate from the session itself.
-CAPTURE_TOOL = "hou_capture"
+# The sources the session draws for the compare, through the capture code.
+CAPTURED = ("viewport", "node")
+
+# What each source's candidate takes besides `source`.
+CAPTURE_KEYS = ("path", "camera", "frame_target", "display", "resolution", "frame", "region")
+CANDIDATE_KEYS = {
+    "file": ("path",),
+    "viewport": CAPTURE_KEYS,
+    "node": CAPTURE_KEYS,
+    "render": ("job_id", "path"),
+}
+
+# The longest edge of a capture made at a reference's aspect.
+REFERENCE_EDGE = 2048
+
+# How many runs of one node are looked through for its newest file.
+NODE_RUNS = 50
 
 DEFAULT_TOLERANCE = 0.05
 
@@ -424,20 +449,14 @@ def compare(call: Call) -> dict[str, Any]:
             details={"argument": "candidate"},
         )
     source = wanted.get("source") or "file"
-    if source != "file":
-        raise CallError(
-            "NOT_YET_AVAILABLE",
-            f"a {source} candidate comes with the capture tool, which this build does not have",
-            hint=f"capture with {CAPTURE_TOOL} when it arrives; for now pass the image as a file",
-            details={"source": source, "tool": CAPTURE_TOOL, "available": ["file"]},
-        )
+    check_candidate(wanted, source)
     if not arguments.get("reference"):
         raise CallError(
             "BAD_ARGUMENTS",
             "compare needs reference: a registered name or an image path",
             details={"argument": "reference"},
         )
-    candidate_path = a_file(wanted.get("path"), "candidate.path")
+    candidate_path = a_file(wanted.get("path"), "candidate.path") if source == "file" else None
     region = check_region(arguments.get("region"))
     adjust = check_adjust(arguments.get("adjust"))
     settings = {
@@ -448,6 +467,9 @@ def compare(call: Call) -> dict[str, Any]:
         "match_exposure": bool(arguments.get("match_exposure")),
         "tolerance": check_tolerance(arguments.get("tolerance")),
     }
+    if source == "render":
+        # Before the session is asked: one busy with the job would hold the call.
+        render_ready(call, wanted)
 
     scene = scene_of(call)
     record, reference_path = which_reference(scene, str(arguments["reference"]))
@@ -456,6 +478,15 @@ def compare(call: Call) -> dict[str, Any]:
     name = text_or_none(arguments.get("name"), "name") or (
         record["name"] if record else reference_path.stem
     )
+    # What the candidate's own run says about it: from the capture made now,
+    # or from the run that wrote the render.
+    made: dict[str, Any] = {}
+    if source in CAPTURED:
+        candidate_path, made = captured(call, wanted, source, record, str(name))
+    elif source == "render":
+        candidate_path, made = rendered(call, wanted, scene)
+    if candidate_path is None:
+        raise CallError("NO_OUTPUT", "the candidate has no image", details={"source": source})
 
     def allocate() -> outputs_module.OutputPlan:
         conventions = outputs_module.load_conventions(home=scene.home, hip_path=scene.hip)
@@ -507,7 +538,7 @@ def compare(call: Call) -> dict[str, Any]:
         warnings.append(PARTIAL_ALPHA_WARNING)
     key = {
         "reference": {"ref_id": record["ref_id"] if record else None, "sha256": reference_hash},
-        "camera": record.get("camera") if record else None,
+        "camera": made["camera"] if "camera" in made else (record or {}).get("camera"),
         "crop": region,
         "mask": mask_record and {"source": mask_record["source"], "sha256": mask_record["sha256"]},
         "colour": {"candidate": candidate.colour, "reference": reference.colour},
@@ -528,10 +559,7 @@ def compare(call: Call) -> dict[str, Any]:
         "colour": {"candidate": candidate.colour, "reference": reference.colour},
         "mask": mask_record,
         "sources": {
-            "candidate": {
-                "file": candidate_path.name,
-                "sha256": references.file_hash(candidate_path),
-            },
+            "candidate": candidate_record(source, made, candidate_path, folder),
             "reference": {
                 "file": reference_path.name,
                 "ref_id": record["ref_id"] if record else None,
@@ -622,6 +650,258 @@ def which_reference(scene: Scene, handle: str) -> tuple[dict[str, Any] | None, P
         hint="pass a name from list_references, or an absolute path to an image",
         details={"argument": "reference", "did_you_mean": did_you_mean(handle, known)},
     )
+
+
+# Section: the candidate, when it is not a file
+
+
+def check_candidate(wanted: Mapping[str, Any], source: str) -> None:
+    """Refuse what the candidate's source does not take, before the session is asked."""
+    known = CANDIDATE_KEYS[source]
+    for key in wanted:
+        if key != "source" and key not in known:
+            raise CallError(
+                "BAD_ARGUMENTS",
+                f"a {source} candidate takes no {key}",
+                details={
+                    "argument": f"candidate.{key}",
+                    "did_you_mean": did_you_mean(str(key), list(known)),
+                    "arguments": ["source", *known],
+                },
+            )
+    if source in CAPTURED:
+        if source == "node" and not wanted.get("path"):
+            raise CallError(
+                "BAD_ARGUMENTS",
+                "a node candidate needs path: the node to capture",
+                details={"argument": "candidate.path"},
+            )
+        as_candidate(lambda: capture_tool.checked({**wanted, "source": source}))
+    if source == "render" and bool(wanted.get("job_id")) == bool(wanted.get("path")):
+        raise CallError(
+            "BAD_ARGUMENTS",
+            "a render candidate takes job_id, or path: the node whose output to use",
+            details={"argument": "candidate"},
+        )
+
+
+def as_candidate(work: Callable[[], Any]) -> Any:
+    """Run capture code, naming a refused argument as part of the candidate."""
+    try:
+        return work()
+    except CallError as error:
+        where = error.details.get("argument")
+        if error.code == "BAD_ARGUMENTS" and where and not str(where).startswith("candidate"):
+            error.details["argument"] = f"candidate.{where}"
+        raise
+
+
+def captured(
+    call: Call,
+    wanted: Mapping[str, Any],
+    source: str,
+    record: Mapping[str, Any] | None,
+    name: str,
+) -> tuple[Path, dict[str, Any]]:
+    """Capture the candidate now, through the capture code in this process.
+
+    A registered reference that names a camera frames the capture, at the
+    reference's aspect, unless the candidate names its own camera or size.
+    """
+    arguments = {key: wanted[key] for key in CAPTURE_KEYS if wanted.get(key) is not None}
+    arguments["source"] = source
+    arguments["name"] = outputs_module.sanitize_name(f"{name}_candidate")[: capture_tool.MAX_NAME]
+    framed_by = "candidate" if "camera" in arguments else "capture"
+    if record and record.get("camera") and "camera" not in arguments:
+        arguments["camera"] = record["camera"]
+        framed_by = "reference"
+        if "resolution" not in arguments and record.get("width") and record.get("height"):
+            arguments["resolution"] = reference_size(int(record["width"]), int(record["height"]))
+    said = as_candidate(lambda: capture_tool.take(call, arguments))
+    if not said.get("path"):
+        raise CallError(
+            "NO_OUTPUT",
+            "the capture stopped before it wrote an image",
+            details={"source": source, "job_id": said.get("job_id")},
+        )
+    made = {
+        "run_id": said.get("run_id"),
+        "job_id": said.get("job_id"),
+        "route": said.get("route"),
+        "camera": said.get("camera"),
+        "framed_by": framed_by,
+        "size_px": [said.get("width"), said.get("height")],
+    }
+    if said.get("framing_unverified"):
+        made["framing_unverified"] = True
+    return Path(str(said["path"])), made
+
+
+def reference_size(width: int, height: int) -> list[int]:
+    """The reference's own size, or its aspect at `REFERENCE_EDGE` when it is larger."""
+    scale = min(1.0, REFERENCE_EDGE / max(width, height))
+    return [max(1, round(width * scale)), max(1, round(height * scale))]
+
+
+def rendered(call: Call, wanted: Mapping[str, Any], scene: Scene) -> tuple[Path, dict[str, Any]]:
+    """The newest image a finished job, or a node, wrote, as its run records say."""
+    job_id = text_or_none(wanted.get("job_id"), "candidate.job_id")
+    if job_id is not None:
+        return from_job(call, job_id)
+    node = str(wanted["path"]).rstrip("/") or "/"
+    return from_node(call, node, scene)
+
+
+def render_ready(call: Call, wanted: Mapping[str, Any]) -> None:
+    """`JOB_RUNNING` for a job, or this session's newest run of a node, not yet ended."""
+    job_id = text_or_none(wanted.get("job_id"), "candidate.job_id")
+    if job_id is not None:
+        if not call.router.store_path.is_file():
+            raise jobs_tool.unknown(job_id)
+        ended_job(call, job_id)
+        return
+    session_id = call.target().session_id
+    node = str(wanted["path"]).rstrip("/") or "/"
+    for run in runs_of(call, source_node=node):
+        if run.session_id == session_id and run.job_id:
+            if job_kept(call, run.job_id):
+                ended_job(call, run.job_id)
+            return
+
+
+def from_job(call: Call, job_id: str) -> tuple[Path, dict[str, Any]]:
+    job = ended_job(call, job_id)
+    details: dict[str, Any] = {"job_id": job_id, "state": job.state, "kind": job.kind}
+    files: list[str] = []
+    run_id = None
+    runs = runs_of(call, job_id=job_id)
+    if job.kind == "capture":
+        # The answer `hou_jobs` gives, finished once, so a crop is made once
+        # and a capture that came back empty is not taken for a picture.
+        answer, why_not = capture_answer(call, job)
+        if why_not is None:
+            files = [str(item) for item in (answer.get("paths") or [answer.get("path")]) if item]
+            run_id = answer.get("run_id")
+        else:
+            details["error"] = why_not
+    else:
+        for run in runs:
+            files = run_files(run)
+            if files:
+                run_id = run.run_id
+                break
+    chosen = newest(files)
+    if chosen is None:
+        raise no_output(details)
+    node = next((run.source_node for run in runs if run.run_id == run_id), None)
+    return chosen, {"run_id": run_id, "job_id": job_id, "job_kind": job.kind, "node": node}
+
+
+def from_node(call: Call, node: str, scene: Scene) -> tuple[Path, dict[str, Any]]:
+    family = outputs_module.hip_family(scene.hip)
+    folder = outputs_tool.scene_folder(scene.hip)
+    for run in runs_of(call, source_node=node):
+        if run.hip_family != family:
+            continue
+        if scene.hip is None and run.session_id != scene.session_id:
+            continue
+        if scene.hip is not None and not outputs_tool.made_here(run, folder):
+            continue
+        job = ended_job(call, run.job_id) if run.job_id and job_kept(call, run.job_id) else None
+        if job is not None and job.kind == "capture":
+            # Finished once before it is read; an empty capture is no picture.
+            if capture_answer(call, job)[1] is not None:
+                continue
+        chosen = newest(run_files(run))
+        if chosen is not None:
+            return chosen, {"run_id": run.run_id, "job_id": run.job_id, "node": node}
+    raise no_output({"node": node})
+
+
+def capture_answer(call: Call, job: Any) -> tuple[dict[str, Any], str | None]:
+    """A capture job's answer, finished once, and the code saying why it is no picture."""
+    answer = capture_tool.job_answer(call, job) or {}
+    if isinstance(answer.get("error"), Mapping):
+        return answer, str(answer["error"].get("code"))
+    if answer.get("empty"):
+        return answer, "CAPTURE_EMPTY"
+    return answer, None
+
+
+def ended_job(call: Call, job_id: str) -> Any:
+    """A job's row brought up to date, or `JOB_RUNNING` while it has not ended."""
+    with jobs_tool.capped(call, jobs_tool.BUSY_S) as store:
+        job = jobs_tool.found(store, job_id)
+    job = jobs_tool.settle_one(call, job, busy_s=jobs_tool.BUSY_S)
+    if job.state not in jobs_tool.FINAL:
+        raise CallError(
+            "JOB_RUNNING",
+            f"job {job_id} is {job.state}, so its output is not final",
+            hint=f"wait with hou_jobs (job_id {job_id}, wait_s), then compare again",
+            details={"job_id": job_id, "state": job.state, "kind": job.kind},
+        )
+    return job
+
+
+def job_kept(call: Call, job_id: str) -> bool:
+    try:
+        with call.router.store() as store:
+            return store is not None and store.get_job(job_id) is not None
+    except (store_module.StoreError, sqlite3.Error):
+        return False
+
+
+def runs_of(call: Call, **which: str) -> list[store_module.RunRecord]:
+    def read() -> list[store_module.RunRecord]:
+        with call.router.store() as store:
+            return [] if store is None else store.runs_made_by(**which, limit=NODE_RUNS)
+
+    return guarded("render", read)
+
+
+def run_files(run: store_module.RunRecord) -> list[str]:
+    """The files a run wrote that are there and hold something."""
+    paths = run.paths if isinstance(run.paths, Mapping) else {}
+    if paths.get("is_directory"):
+        return []
+    listed = paths.get("files")
+    if isinstance(listed, list) and listed:
+        return [str(item) for item in listed if outputs_module.files_on_disk(str(item))]
+    return outputs_module.files_on_disk(str(paths.get("path") or ""))
+
+
+def newest(files: list[str]) -> Path | None:
+    """The file written last, and the later one in the list when two share a time."""
+    there = [Path(item) for item in files if item and Path(item).is_file()]
+    there = [path for path in there if path.stat().st_size > 0]
+    if not there:
+        return None
+    return max(enumerate(there), key=lambda pair: (pair[1].stat().st_mtime, pair[0]))[1]
+
+
+def no_output(details: dict[str, Any]) -> CallError:
+    return CallError(
+        "NO_OUTPUT",
+        "no image written by that job or node is on disk",
+        hint="capture it with a node candidate, or name the image as a file",
+        details=details,
+    )
+
+
+def candidate_record(
+    source: str, made: Mapping[str, Any], path: Path, folder: Path
+) -> dict[str, Any]:
+    """The candidate as `result.json` keeps it: its file, and the run that made it."""
+    said: dict[str, Any] = {
+        "source": source,
+        "file": path.name,
+        "sha256": references.file_hash(path),
+    }
+    if made:
+        said.update(made)
+        # Relative to the result, so the record names no other place on this machine.
+        said["path"] = relative_to(path, folder)
+    return said
 
 
 def crops_wanted(value: Any, record: Mapping[str, Any] | None) -> dict[str, list[float]] | None:
@@ -1074,7 +1354,7 @@ _STRING = {"type": "string"}
 HOU_COMPARE = ToolSpec(
     name="hou_compare",
     description=(
-        "Compare a candidate image (file, viewport, node or render) with a reference: "
+        "Compare a candidate image with a reference: "
         "aligned side by side sheet, difference map, numbers. No pass or fail; read both. "
         "Boxes are [x0,y0,x1,y1] in 0..1."
     ),
@@ -1083,7 +1363,12 @@ HOU_COMPARE = ToolSpec(
             "action": {"enum": list(ACTIONS)},
             "session": SESSION,
             "reference": _STRING,
-            "candidate": {"properties": {"source": {"enum": list(SOURCES)}, "path": {}}},
+            "candidate": {
+                "properties": {
+                    "source": {"enum": list(SOURCES)},
+                    **{key: {} for key in (*CAPTURE_KEYS, "job_id")},
+                }
+            },
             "align": {"enum": list(ALIGN)},
             "adjust": {"properties": {"dx": {}, "dy": {}, "scale": {}}},
             "auto_shift": {"type": "boolean"},

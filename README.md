@@ -296,12 +296,30 @@ least recently going first, and a build whose install has gone is removed.
 
 `hou_compare` puts a candidate image beside a reference and says how far
 apart they are, as pictures and as numbers. It never says pass or fail: there
-is no match flag and no built in threshold. The candidate is a file in this
-build, given by its absolute path; a path with nothing there is
-`FILE_NOT_FOUND`. A viewport capture, a node's own image and a render are
-named in the schema and answer `NOT_YET_AVAILABLE`, naming the capture tool
-to use when it arrives. The work runs in the server with NumPy and Pillow, in
-a fixed order, and the result records every step:
+is no match flag and no built in threshold. The `candidate` is one of four
+sources:
+
+- `file`: an image given by its absolute path; a path with nothing there is
+  `FILE_NOT_FOUND`.
+- `viewport` or `node`: a picture captured for the compare, through the same
+  code as `hou_capture` and with the capture arguments the candidate carries
+  (`path`, `camera`, `frame_target`, `display`, `resolution`, `frame`,
+  `region`). It is a capture like any other: a run in the `capture` folder
+  and a job `hou_jobs` can read. When the reference was registered with a
+  camera, that camera frames the capture, at the reference's aspect (its own
+  size, or 2048 pixels on the long edge when larger), unless the candidate
+  names its own `camera` or `resolution`.
+- `render`: the newest image on disk that a finished job wrote (`job_id`),
+  or that runs of a node wrote (`path`, the node), read from the run records.
+  A job not yet ended is `JOB_RUNNING`, with a hint to wait on it with
+  `hou_jobs`; a job or node with no image on disk is `NO_OUTPUT`.
+
+The result's `sources.candidate` says which: for a capture its `run_id`,
+`job_id`, `path`, `route`, the `camera` that framed it and `framed_by`
+(`reference`, `candidate` or `capture`); for a render the run, the job and
+the node. `result.json` keeps the same, with the path written relative to
+itself. The work runs in the server with NumPy and Pillow, in a fixed order,
+and the result records every step:
 
 1. Colour. A PNG, JPEG or TIFF is converted to sRGB through its embedded ICC
    profile; with none, sRGB is assumed and the result says `assumed_srgb`.
@@ -443,7 +461,9 @@ node's object alone with the node carrying the display flag, and puts the
 flag back. Whatever a capture makes for itself is made and taken away with
 undo turned off. A route that fails part way takes its frames with it; a
 capture stopped on request keeps the frames it wrote and lists them, and the
-run record names each file. The network editor and panes are made the
+run record names each file, the capture's job and, for a `node` or `cop`
+capture, the node, which is how `hou_compare` finds a node's newest picture.
+The network editor and panes are made the
 current tab and grabbed from their own window, which needs a user interface;
 a worker answers `UI_UNAVAILABLE`. A render Houdini stops with an error is
 `CAPTURE_FAILED`, with that error in the details. Every step that puts the
