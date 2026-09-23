@@ -10,7 +10,9 @@ Four actions.
 - `open` loads a scene file. The path is checked here before anything is
   sent, so a mistyped path is refused without the session touching its own
   scene. What the load could not resolve comes back as data. The scene is
-  replaced, so the trace carries the new scene epoch.
+  replaced, so the trace carries the new scene epoch. An output parameter a
+  session that has gone left frozen in this scene gets its template back,
+  and `restored_parms` says which.
 - `save` writes the scene over its own file. A scene with no file yet is
   refused, because saving it means picking a name, which is what
   `save_increment` is for.
@@ -58,6 +60,7 @@ from nscr_houdini_mcp.tools.base import (
     inputs,
     outputs,
 )
+from nscr_houdini_mcp.tools.outputs import restore_left_over
 
 ACTIONS = ("info", "open", "save", "save_increment")
 
@@ -152,6 +155,12 @@ def open_scene(call: Call) -> dict[str, Any]:
     data = dict(reply.get("data") or {})
     data["version"] = version_of(data.get("hip_name"))
     data["scene_epoch"] = call.trace.get("scene_epoch")
+    # A session that died while a run held one of this scene's output
+    # parameters left it frozen; the session that opens the scene gives it
+    # its template back.
+    restored = restore_left_over(call, data.get("hip_path"))
+    if restored:
+        data["restored_parms"] = restored
     return data
 
 
