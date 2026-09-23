@@ -1,6 +1,6 @@
 {
     "//": "Template. `nscr-houdini-mcp bridge install` writes this for you, with the paths filled in.",
-    "//src": "__SOURCE_ROOT__ is the src folder of this project, the one holding nscr_houdini_mcp.",
+    "//src": "__SOURCE_ROOT__ is a folder holding nscr_houdini_mcp and nothing else, such as the src folder of this project. Never a site-packages folder: whatever else is in it would load in place of Houdini's own libraries.",
     "//payload": "__PAYLOAD_ROOT__ is the houdini folder of this project.",
     "//autostart": "NSCR_MCP_AUTOSTART is 0 by default. Set it to 1 to start a bridge with the interface.",
     "enable": true,

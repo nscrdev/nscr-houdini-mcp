@@ -288,8 +288,9 @@ def worker_env(
     them rather than whatever happened to be inherited.
     """
     environment = dict(os.environ if base is None else base)
-    # The package has to be importable inside Houdini's own interpreter.
-    source_root = str(Path(__file__).resolve().parents[1])
+    # The package has to be importable inside Houdini's own interpreter, and
+    # nothing else of this environment may be, or it would shadow Houdini's own.
+    source_root = str(install_module.python_path_for_run(config.home))
     existing = environment.get("PYTHONPATH")
     environment["PYTHONPATH"] = (
         source_root if not existing else os.pathsep.join([source_root, existing])

@@ -60,7 +60,12 @@ a Python to make the environment with), and prints each check:
 
 ```sh
 python scripts/check_install.py
+python scripts/check_install.py --hython /path/to/hython   # also import it in Houdini
 ```
+
+Among its checks: the folder the package file puts on Houdini's path holds
+this package and nothing else of the environment, and a Python with no
+site-packages imports the bridge from it alone.
 
 `scripts/tools_list_cost.py` serialises the tool list the way a client receives
 it and counts its tokens, in total and per tool, against a budget of 4,000.
@@ -680,14 +685,25 @@ it, so it is worked out in this order:
 Nothing is remembered between runs, and `bridge status` prints which of those
 decided and every folder it considered.
 
-The file points `HOUDINI_PATH` at this copy's `houdini/` folder and
-`PYTHONPATH` at the folder it is imported from: `src/` in a checkout,
-site-packages in an installed copy, where `houdini/` travels inside the
-package. Both are worked out from where this copy is running, so there is
-nothing to edit by hand. Every file it writes carries a marker: a
-package of the same name that this did not write, or a link where the file
-should be, is reported and left exactly as it is, and `uninstall` takes away
-only its own, plus any folder it had to make and nothing else.
+The file points `HOUDINI_PATH` at this copy's `houdini/` folder (inside the
+package in an installed copy) and puts a folder that holds `nscr_houdini_mcp`
+and nothing else in front of Houdini's `PYTHONPATH`. In a checkout that is
+`src/`, as it stands, so an edit there reaches the next Houdini. An installed
+copy never names its site-packages folder: every other library of the
+environment is there too, and numpy, Pillow or anything else in it would load
+in place of Houdini's own and break Houdini's own tools. Instead the install
+copies the package alone into `houdini-python/` under the state folder and
+names that copy. It is made again on every `bridge install`, so run the
+install again after upgrading, and `bridge status` says when a copy is older
+than the package it came from. Inside Houdini the bridge needs only the
+standard library, `hou` and, for reading images, the numpy, OpenImageIO and
+OpenColorIO Houdini ships.
+
+Every path is worked out from where this copy is running, so there is nothing
+to edit by hand. Every file it writes carries a marker: a package of the same
+name that this did not write, or a link where the file should be, is reported
+and left exactly as it is, and `uninstall` takes away only its own, plus any
+folder and copy it made and nothing else.
 
 Installing opens no port. Auto start is off unless you ask for it with
 `--autostart`, which sets `NSCR_MCP_AUTOSTART` to `1` in the package. The
@@ -702,7 +718,8 @@ is installed.
 
 To start a bridge inside a Houdini that is already open, paste what `bridge
 snippet` prints into its Python shell. It works out the source path as it
-prints, so the lines run as they stand.
+prints, a copy of the package alone for an installed copy as above, so the
+lines run as they stand.
 
 `houdini/packages/nscr_houdini_mcp.json` is the same file as a template, for
 anyone who would rather place it themselves.

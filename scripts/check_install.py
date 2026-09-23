@@ -10,9 +10,16 @@ What it does, all inside one temporary folder:
    packages folder all pointed inside it:
    - `bridge install --dry-run --packages-dir <tmp>`, then a real install
      into the same temporary folder, whose package file must point
-     `NSCR_MCP_SRC` at the environment's site-packages and `NSCR_MCP_PAYLOAD`
-     at the `houdini` folder inside the installed package;
-   - `bridge status`;
+     `NSCR_MCP_PAYLOAD` at the `houdini` folder inside the installed package
+     and `NSCR_MCP_SRC` at a folder that holds this package and nothing else
+     of the environment (no numpy, no PIL, no mcp), never at site-packages,
+     since whatever else is there would load in place of Houdini's own;
+   - that folder imported by a Python that is not the environment's, with no
+     site-packages at all, which must load the bridge and nothing from
+     outside the folder and that Python's own library (and, with `--hython`,
+     the same in a real Houdini, whose numpy must be its own);
+   - `bridge status`, then `bridge uninstall`, which must take the folder
+     away with the package file;
    - `skills path`, which must name a folder inside the installed package;
    - `config init`, which must write the config file into the temporary home;
    - an MCP `initialize` and `tools/list` over stdio, which must list the
@@ -60,6 +67,65 @@ TOOLS = (
 PROTOCOL_VERSION = "2025-06-18"
 STEP_TIMEOUT_S = 180.0
 REPLY_TIMEOUT_S = 30.0
+
+# Libraries of the environment that must never reach Houdini's path.
+NEVER_BESIDE = ("numpy", "PIL", "mcp", "pydantic", "anyio")
+
+# What the bridge side imports inside Houdini: the autostart, the bridge and
+# the hython worker's own entry point.
+BRIDGE_MODULES = (
+    "nscr_houdini_mcp",
+    "nscr_houdini_mcp.bridge",
+    "nscr_houdini_mcp.bridge.app",
+    "nscr_houdini_mcp.bridge.net",
+    "nscr_houdini_mcp.bridge.main",
+)
+
+IMPORT_PROBE = f"""
+import json
+import os
+import sys
+import sysconfig
+
+import importlib
+
+for name in {BRIDGE_MODULES!r}:
+    importlib.import_module(name)
+
+folder = os.path.realpath(sys.argv[1])
+allowed = [folder] + [
+    os.path.realpath(sysconfig.get_paths()[key]) for key in ("stdlib", "platstdlib")
+] + ([os.path.realpath(os.environ["HFS"])] if os.environ.get("HFS") else [])
+outside = sorted(
+    name
+    for name, module in list(sys.modules.items())
+    if name != "__main__"
+    and getattr(module, "__file__", None)
+    and not any(
+        os.path.realpath(module.__file__).startswith(root + os.sep) for root in allowed
+    )
+)
+numpy_file = None
+try:
+    import numpy
+
+    numpy_file = numpy.__file__
+except ImportError:
+    pass
+print(
+    "probe "
+    + json.dumps(
+        {{
+            "package": sys.modules["nscr_houdini_mcp"].__file__,
+            "outside": outside,
+            "numpy": numpy_file,
+            "hfs": os.environ.get("HFS"),
+            "prefix": sys.prefix,
+            "python": sys.version.split()[0],
+        }}
+    )
+)
+"""
 
 
 class Checks:
@@ -198,10 +264,28 @@ def talk_stdio(entry: Path, *, env: dict[str, str], cwd: Path) -> list[dict[str,
                 print(f"    server: {line}")
 
 
+def probe(
+    python: Sequence[str | Path], folder: Path, *, env: dict[str, str], cwd: Path
+) -> dict[str, Any]:
+    """What a Python loads when `folder` is all it has besides its own library."""
+    probe_env = dict(env)
+    probe_env["PYTHONPATH"] = str(folder)
+    script = cwd / "import_probe.py"
+    script.write_text(IMPORT_PROBE, encoding="utf-8")
+    done = run([*python, script, folder], env=probe_env, cwd=cwd)
+    for line in done.stdout.splitlines():
+        if line.startswith("probe "):
+            return json.loads(line[len("probe ") :])
+    return {}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--python", default="3.11", help="the Python the environment is made with")
     parser.add_argument("--keep", action="store_true", help="leave the temporary folder behind")
+    parser.add_argument(
+        "--hython", type=Path, default=None, help="also import the folder in this Houdini"
+    )
     args = parser.parse_args(argv)
 
     if shutil.which("uv") is None:
@@ -212,7 +296,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"working in {tmp}")
     checks = Checks()
     try:
-        _check(tmp, args.python, checks)
+        _check(tmp, args.python, checks, args.hython)
     except Exception as error:  # noqa: BLE001 - reported as the failure it is
         checks.check(False, "the check ran to the end", f"{type(error).__name__}: {error}")
     if checks.failed:
@@ -226,7 +310,7 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _check(tmp: Path, python: str, checks: Checks) -> None:
+def _check(tmp: Path, python: str, checks: Checks, hython: Path | None) -> None:
     env = clean_env(tmp)
     work = tmp / "work"
     work.mkdir()
@@ -268,6 +352,10 @@ def _check(tmp: Path, python: str, checks: Checks) -> None:
         (package_dir / "houdini" / "packages").is_dir(), "the wheel carries the houdini folder"
     )
     checks.check(
+        all((site / name).is_dir() for name in NEVER_BESIDE),
+        "site-packages holds the libraries Houdini must never see",
+    )
+    checks.check(
         any((package_dir / "skills").glob("*/SKILL.md")), "the wheel carries the skills folder"
     )
 
@@ -280,9 +368,13 @@ def _check(tmp: Path, python: str, checks: Checks) -> None:
     pythonpath = field(dry.stdout, "pythonpath")
     houdini_path = field(dry.stdout, "houdini path")
     checks.check(dry.returncode == 0, "bridge install --dry-run runs")
+    copies = tmp / "home" / "houdini-python"
     checks.check(
-        pythonpath is not None and inside(pythonpath, site) and not inside(pythonpath, REPO),
-        "the dry run points the python path at site-packages",
+        pythonpath is not None
+        and inside(pythonpath, copies)
+        and not inside(pythonpath, site)
+        and not inside(pythonpath, REPO),
+        "the dry run points the python path at a folder of its own, not site-packages",
         str(pythonpath),
     )
     checks.check(
@@ -302,11 +394,61 @@ def _check(tmp: Path, python: str, checks: Checks) -> None:
     source = variables.get("NSCR_MCP_SRC")
     checks.check(
         source is not None
-        and Path(source).resolve() == site.resolve()
+        and Path(source).resolve() != site.resolve()
+        and inside(source, copies)
         and not inside(source, REPO),
-        "the package file points NSCR_MCP_SRC at site-packages",
+        "the package file points NSCR_MCP_SRC at a folder of its own, not site-packages",
         str(source),
     )
+    source_dir = Path(source) if source else tmp / "missing"
+    held = sorted(child.name for child in source_dir.iterdir()) if source_dir.is_dir() else []
+    importable = [name for name in held if not name.startswith(".")]
+    checks.check(
+        importable == [PACKAGE],
+        "that folder holds this package and nothing else",
+        ", ".join(held),
+    )
+    checks.check(
+        all((site / name).is_dir() for name in NEVER_BESIDE)
+        and not any((source_dir / name).exists() for name in NEVER_BESIDE),
+        "the environment's numpy, PIL, mcp, pydantic and anyio stay out of it",
+    )
+    checks.check(
+        (source_dir / PACKAGE / "bridge" / "app.py").is_file(),
+        "the copy there holds the bridge",
+    )
+
+    # A Python that is not the environment's, with no site-packages of any
+    # kind, stands in for Houdini's: the bridge has to import from the folder
+    # alone and bring nothing in from anywhere but it and the standard library.
+    found_probe = probe([sys.executable, "-S", "-s"], source_dir, env=env, cwd=work)
+    checks.check(
+        bool(found_probe)
+        and inside(found_probe.get("package", ""), source_dir)
+        and not found_probe.get("outside"),
+        f"the bridge imports under Python {found_probe.get('python')} from that folder alone",
+        f"outside: {found_probe.get('outside')}" if found_probe else "no answer",
+    )
+    checks.check(
+        bool(found_probe) and found_probe.get("numpy") is None,
+        "no numpy is reachable through that folder",
+        str(found_probe.get("numpy")),
+    )
+    if hython is not None:
+        in_houdini = probe([hython], source_dir, env=env, cwd=work)
+        # Houdini's own libraries live under $HFS, or under the Python it ships
+        # with, which on macOS sits beside $HFS inside the same install.
+        own = [Path(root) for root in (in_houdini.get("hfs"), in_houdini.get("prefix")) if root]
+        checks.check(
+            bool(in_houdini) and inside(in_houdini.get("package", ""), source_dir),
+            "hython imports the bridge from that folder",
+            str(in_houdini.get("package")),
+        )
+        checks.check(
+            any(inside(in_houdini.get("numpy") or "", root) for root in own),
+            "hython's numpy is Houdini's own",
+            str(in_houdini.get("numpy")),
+        )
     payload = variables.get("NSCR_MCP_PAYLOAD")
     checks.check(
         payload is not None and Path(payload).resolve() == (package_dir / "houdini").resolve(),
@@ -321,6 +463,7 @@ def _check(tmp: Path, python: str, checks: Checks) -> None:
     checks.check(
         removed.returncode == 0 and not package_file.exists(), "bridge uninstall takes it away"
     )
+    checks.check(not source_dir.exists(), "bridge uninstall takes the folder away too")
 
     skills = run([entry, "skills", "path"], env=env, cwd=work)
     skills_dir = skills.stdout.strip().splitlines()[-1] if skills.stdout.strip() else ""

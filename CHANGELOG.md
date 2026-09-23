@@ -54,6 +54,16 @@ inside Houdini, and one agent skill.
 - `skills path` and `skills install` find and copy the shipped skills.
 - `config show` and `config init` read and write the server's config file.
 
+### Fixed before release
+
+- `bridge install` from an installed wheel put the environment's whole
+  site-packages folder in front of Houdini's `PYTHONPATH`, so numpy built for
+  another Python, and every other library there, loaded in place of Houdini's
+  own and broke Houdini's own tools on start. Houdini is now given a folder
+  holding this package alone: `src/` in a checkout, and otherwise a copy made
+  under the state folder, refreshed on every install and removed on uninstall.
+  Workers the pool starts, and `bridge snippet`, get the same.
+
 ### The skill
 
 - `houdini-artist`: how an agent plans, builds, checks its work against a

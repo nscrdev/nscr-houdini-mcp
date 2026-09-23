@@ -243,14 +243,18 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _install(args: argparse.Namespace) -> int:
+    home, problem = _state_home()
+    if problem:
+        print(problem)
     try:
         result = install_module.install(
             args.houdini_version,
             autostart=args.autostart,
             dry_run=args.dry_run,
             packages=args.packages_dir,
+            home=home,
         )
-    except install_module.InstallError as error:
+    except (install_module.InstallError, OSError) as error:
         print(str(error))
         return 1
     print("would write" if result.dry_run else ("replaced" if result.replaced else "wrote"))
@@ -279,12 +283,9 @@ def _status(args: argparse.Namespace) -> int:
     if args.home:
         home = Path(args.home)
     else:
-        try:
-            home = config_module.load_config().state_home
-        except config_module.ConfigError as error:
-            # Status still reports, from the usual folder, and says why.
-            print(f"config invalid: {error.message}")
-            home = store_module.default_home()
+        home, problem = _state_home()
+        if problem:
+            print(problem)
     print(f"home {home}")
     _print_sessions(home)
     _print_packages(install_module.resolve(override=args.packages_dir))
@@ -292,8 +293,23 @@ def _status(args: argparse.Namespace) -> int:
 
 
 def _snippet(_args: argparse.Namespace) -> int:
-    print(install_module.snippet())
+    home, problem = _state_home()
+    if problem:
+        print(f"# {problem}")
+    print(install_module.snippet(home=home))
     return 0
+
+
+def _state_home() -> tuple[Path, str]:
+    """The state folder from config, or the usual one and why, when it is broken.
+
+    These commands still do their work from the usual folder rather than
+    refusing, and say so.
+    """
+    try:
+        return config_module.load_config().state_home, ""
+    except config_module.ConfigError as error:
+        return store_module.default_home(), f"config invalid: {error.message}"
 
 
 # Section: the worker commands
@@ -636,6 +652,16 @@ def _print_packages(lookup: install_module.Lookup) -> None:
             word = f"installed, autostart {'on' if state.autostart else 'off'}"
         print(f"  {word}")
         print(f"    {state.path}")
+        if state.copy is not None:
+            if not install_module.is_our_copy(state.copy):
+                how = "missing, run bridge install again"
+            elif state.copy_current is None:
+                how = "the folder it was copied from is gone"
+            elif state.copy_current:
+                how = "up to date"
+            else:
+                how = "older than its source, run bridge install again"
+            print(f"    python copy {state.copy} ({how})")
 
     installs = install_module.find_installs()
     if not installs:

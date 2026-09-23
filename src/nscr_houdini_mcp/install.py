@@ -13,6 +13,12 @@ Two rules stand behind everything here:
 - Paths are read from this module's own location rather than written down, so
   a package file names the source folder this copy is actually running from,
   whether that is a checkout or an installed one.
+- Houdini's Python is given this package and nothing else. An installed copy
+  lives in a site-packages folder next to every other library of its
+  environment, and putting that folder in front of Houdini's own would load
+  those libraries in place of Houdini's. So a source folder that holds anything
+  importable besides this package is never named: the package is copied into a
+  folder of its own under the state folder, and that copy is what Houdini gets.
 
 Finding the packages folder is its own job, because a preference folder is
 often moved by something this command cannot see: a line in `houdini.env`, a
@@ -26,9 +32,12 @@ Every command reports which of those decided, and status lists them all.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,6 +45,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from nscr_houdini_mcp import store as store_module
+
+PACKAGE_NAME = "nscr_houdini_mcp"
 PACKAGE_FILE_NAME = "nscr_houdini_mcp.json"
 PACKAGES_DIR_NAME = "packages"
 
@@ -47,6 +59,10 @@ MARKER_VALUE = "written by nscr-houdini-mcp"
 # The folders an install had to make, written into the file it made them for,
 # so an uninstall can take away its own leftovers and nothing else.
 CREATED_KEY = "//folders-this-made"
+
+# The copy of the package this install made for Houdini to import, written
+# into the package file so an uninstall takes it away with the file.
+COPY_KEY = "//python-copy-this-made"
 
 DEFAULT_HOUDINI_VERSION = "22.0"
 
@@ -96,6 +112,228 @@ def payload_root() -> Path:
     raise PayloadMissing(
         "no houdini payload folder next to this package, so there is nothing to point Houdini at"
     )
+
+
+# Section: the folder Houdini's Python imports this package from
+#
+# Whatever folder goes on Houdini's `PYTHONPATH` is searched before Houdini's
+# own libraries. It must hold this package and nothing else, or a library of
+# this tool's environment (numpy built for another Python, say) is loaded in
+# place of the one Houdini ships. A checkout's `src` holds only this package
+# and is named as it is, so an edit there reaches the next Houdini. Any other
+# source folder is copied: into a folder owned by one package file for
+# `bridge install`, refreshed on every install and removed on uninstall, or
+# into one owned by the source folder for the sessions this tool starts
+# itself, refreshed whenever the source has changed. A copy rather than a
+# link, because a link on Windows needs rights an artist may not have.
+
+COPIES_DIR_NAME = "houdini-python"
+STAMP_FILE_NAME = ".nscr-houdini-mcp.json"
+
+# File endings Python imports a module from, on any system, and `.pth`, which
+# a site folder reads to add yet more paths.
+_MODULE_SUFFIXES = (".py", ".pyc", ".pyw", ".pyd", ".so", ".pth")
+
+# Never imported as a module: it only caches the files next to it.
+_NOT_A_MODULE = ("__pycache__",)
+
+
+def package_root() -> Path:
+    """The folder of this package itself."""
+    return Path(__file__).resolve().parent
+
+
+def strays(folder: Path) -> list[str]:
+    """Everything a Python could import from this folder besides this package.
+
+    A folder is importable when its name is a Python name, with or without an
+    `__init__.py`, because a folder without one is still a namespace package.
+    A file is when its name starts with a Python name and ends like a module.
+    """
+    found = []
+    for child in sorted(Path(folder).iterdir(), key=lambda item: item.name):
+        name = child.name
+        if name == PACKAGE_NAME or name in _NOT_A_MODULE:
+            continue
+        if child.is_dir():
+            if name.isidentifier():
+                found.append(name)
+        elif name.endswith(".pth"):
+            found.append(name)
+        elif name.split(".", 1)[0].isidentifier() and name.endswith(_MODULE_SUFFIXES):
+            found.append(name)
+    return found
+
+
+def fingerprint(package: Path) -> str:
+    """What the package's files are right now, as one short text.
+
+    Names, sizes and change times, so a copy made from an older version, or
+    before an edit, is told apart from a current one without reading a file.
+    """
+    package = Path(package)
+    digest = hashlib.sha256(str(package).encode("utf-8"))
+    for path in sorted(_package_files(package)):
+        stat = path.stat()
+        relative = path.relative_to(package).as_posix()
+        digest.update(f"\0{relative}\0{stat.st_size}\0{stat.st_mtime_ns}".encode())
+    return digest.hexdigest()[:32]
+
+
+def _package_files(package: Path) -> list[Path]:
+    found = []
+    for folder, children, files in os.walk(package):
+        children[:] = [name for name in children if name not in _NOT_A_MODULE]
+        found.extend(Path(folder) / name for name in files if not name.endswith(".pyc"))
+    return found
+
+
+def copies_dir(home: Path) -> Path:
+    """The folder every copy of the package is made in."""
+    return Path(home) / COPIES_DIR_NAME
+
+
+def copy_for_package_file(package_file: Path, home: Path) -> Path:
+    """The folder holding the copy one package file points Houdini at.
+
+    Named after the package file, so two package files never share a copy and
+    taking one away can never pull the ground from under another.
+    """
+    return copies_dir(home) / ("package-" + _short_hash(str(package_file)))
+
+
+def copy_for_source(package: Path, home: Path) -> Path:
+    """The folder holding the copy that sessions this tool starts import."""
+    return copies_dir(home) / ("run-" + _short_hash(str(package)))
+
+
+def _short_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def python_path_for_run(home: Path | None = None) -> Path:
+    """The folder to put on the path of a Houdini this tool starts itself.
+
+    The source folder when it holds only this package, otherwise a copy that
+    is refreshed here whenever the source has changed. Several servers may
+    start sessions at once, so a current copy another one has just finished is
+    taken as it is rather than fought over.
+    """
+    source = source_root()
+    if not strays(source):
+        return source
+    home = Path(home) if home is not None else store_module.default_home()
+    package = package_root()
+    folder = copy_for_source(package, home)
+    stamp = fingerprint(package)
+    if copy_stamp(folder) == stamp:
+        return folder
+    try:
+        refresh_copy(folder, package, stamp)
+    except OSError:
+        if copy_stamp(folder) != stamp:
+            raise
+    return folder
+
+
+def refresh_copy(folder: Path, package: Path | None = None, stamp: str | None = None) -> Path:
+    """Make `folder` hold a fresh copy of the package and nothing else.
+
+    The copy is built beside the folder and moved into place in one step, so
+    a Houdini starting meanwhile sees the old copy or the new one, never half
+    of either. A folder there that this tool did not make is left alone.
+    """
+    package = Path(package) if package is not None else package_root()
+    stamp = stamp or fingerprint(package)
+    folder = Path(folder)
+    if (folder.exists() or folder.is_symlink()) and not is_our_copy(folder):
+        raise InstallError(f"{folder} was not made by this tool, so it is left alone")
+    folder.parent.mkdir(parents=True, exist_ok=True)
+    building = Path(tempfile.mkdtemp(dir=str(folder.parent), prefix=folder.name + ".part-"))
+    try:
+        shutil.copytree(
+            package,
+            building / PACKAGE_NAME,
+            ignore=shutil.ignore_patterns(*_NOT_A_MODULE, "*.pyc"),
+        )
+        stamp_text = json.dumps(
+            {MARKER_KEY: MARKER_VALUE, "source": str(package), "fingerprint": stamp}
+        )
+        (building / STAMP_FILE_NAME).write_text(stamp_text + "\n", encoding="utf-8")
+        _swap_in(building, folder)
+    except BaseException:
+        shutil.rmtree(building, ignore_errors=True)
+        raise
+    return folder
+
+
+def _swap_in(new: Path, folder: Path) -> None:
+    """Put `new` where `folder` is, and take the old one away."""
+    old = None
+    if folder.exists():
+        old = folder.with_name(f"{folder.name}.old-{secrets.token_hex(4)}")
+        os.replace(folder, old)
+    try:
+        os.replace(new, folder)
+    except OSError:
+        if old is not None and not folder.exists():
+            os.replace(old, folder)
+            old = None
+        raise
+    finally:
+        if old is not None:
+            shutil.rmtree(old, ignore_errors=True)
+
+
+def read_stamp(folder: Path) -> dict[str, Any] | None:
+    """What a copy says about itself, or nothing when it is not a copy of ours."""
+    folder = Path(folder)
+    if folder.is_symlink() or not folder.is_dir():
+        return None
+    loaded = read_document(folder / STAMP_FILE_NAME)
+    if not loaded or loaded.get(MARKER_KEY) != MARKER_VALUE:
+        return None
+    return loaded
+
+
+def is_our_copy(folder: Path) -> bool:
+    """Whether this tool made the copy in that folder."""
+    return read_stamp(folder) is not None
+
+
+def copy_stamp(folder: Path) -> str | None:
+    """The fingerprint of the source a copy was made from."""
+    loaded = read_stamp(folder)
+    value = loaded.get("fingerprint") if loaded else None
+    return value if isinstance(value, str) else None
+
+
+def copy_is_current(folder: Path) -> bool | None:
+    """Whether a copy still matches the source it was made from.
+
+    Nothing when that source is gone, since then there is nothing to match.
+    """
+    loaded = read_stamp(folder)
+    if not loaded:
+        return False
+    named = loaded.get("source")
+    if not isinstance(named, str) or not named or not Path(named).is_dir():
+        return None
+    return fingerprint(Path(named)) == loaded.get("fingerprint")
+
+
+def remove_copy(folder: Path) -> bool:
+    """Take away a copy this tool made, and the folder of copies once empty."""
+    folder = Path(folder)
+    if not is_our_copy(folder):
+        return False
+    shutil.rmtree(folder)
+    try:
+        if not any(folder.parent.iterdir()):
+            folder.parent.rmdir()
+    except OSError:
+        pass
+    return True
 
 
 def user_pref_dir(version: str = DEFAULT_HOUDINI_VERSION) -> Path:
@@ -477,16 +715,19 @@ def document(
     source: Path | None = None,
     payload: Path | None = None,
     created: list[Path] | None = None,
+    copy: Path | None = None,
 ) -> dict[str, Any]:
     """The package Houdini reads, as data.
 
     `HOUDINI_PATH` gets the payload folder through `hpath`, so Houdini runs
-    the startup files in it. `PYTHONPATH` gets the source folder, so the
-    bridge is importable in Houdini's own interpreter. Nothing opens a port
-    unless the auto start variable is on.
+    the startup files in it. `PYTHONPATH` gets the source folder, which holds
+    this package and nothing else, so the bridge is importable in Houdini's
+    own interpreter and nothing of this tool's environment is. Nothing opens
+    a port unless the auto start variable is on.
 
-    The folders this install had to make are written down, so an uninstall can
-    take away what it made and nothing else.
+    The folders this install had to make, and the copy of the package it made
+    when there was one, are written down, so an uninstall can take away what
+    it made and nothing else.
     """
     source = Path(source) if source is not None else source_root()
     payload = Path(payload) if payload is not None else payload_root()
@@ -506,6 +747,8 @@ def document(
     }
     if created:
         body[CREATED_KEY] = [str(folder) for folder in created]
+    if copy is not None:
+        body[COPY_KEY] = str(copy)
     return body
 
 
@@ -543,6 +786,12 @@ def created_folders(loaded: dict[str, Any] | None) -> list[Path]:
     return [Path(str(item)) for item in listed]
 
 
+def copy_of(loaded: dict[str, Any] | None) -> Path | None:
+    """The copy of the package the install that wrote this file made."""
+    named = (loaded or {}).get(COPY_KEY)
+    return Path(named) if isinstance(named, str) and named else None
+
+
 @dataclass(frozen=True)
 class InstallResult:
     """What one install did, or would have done."""
@@ -557,6 +806,8 @@ class InstallResult:
     dry_run: bool
     lookup: Lookup | None = None
     lines: list[str] = field(default_factory=list)
+    # The package folder the copy on `source` was made from, when there is one.
+    copied_from: Path | None = None
 
 
 def install(
@@ -566,6 +817,7 @@ def install(
     dry_run: bool = False,
     packages: Path | str | None = None,
     lookup: Lookup | None = None,
+    home: Path | str | None = None,
 ) -> InstallResult:
     """Write the package file for one Houdini version.
 
@@ -573,9 +825,12 @@ def install(
     ours raises, and nothing on disk is touched. `packages` names the folder
     outright; without it the folder is worked out, and a caller that has
     already worked it out passes that `lookup` rather than asking again.
+
+    When the source folder holds anything besides this package, the package
+    is copied into a folder of its own under `home` (the state folder when
+    none is given) and that copy is what the file names. It is made again on
+    every install, so running this after an upgrade brings Houdini up to date.
     """
-    source = source_root()
-    payload = payload_root()
     found = lookup or resolve(version, override=packages)
     path = found.path / PACKAGE_FILE_NAME
     # A link is never written through. Following one would write the package
@@ -586,11 +841,40 @@ def install(
     exists = path.exists()
     if exists and not is_ours(path):
         raise NotOurs(f"{path} was not written by this tool, so it is left alone")
+    earlier_copy = copy_of(read_document(path)) if exists else None
+
+    payload = payload_root()
+    source = source_root()
+    copied_from = None
+    copy = None
+    if strays(source):
+        copied_from = package_root()
+        home = Path(home) if home is not None else store_module.default_home()
+        copy = copy_for_package_file(path, home)
+        source = copy
+    check_writable(source, "source")
+
     would_make = _missing_folders(path.parent)
-    body = document(autostart=autostart, source=source, payload=payload, created=would_make)
+    body = document(
+        autostart=autostart, source=source, payload=payload, created=would_make, copy=copy
+    )
     if not dry_run:
+        if copy is not None:
+            refresh_copy(copy, copied_from)
         path.parent.mkdir(parents=True, exist_ok=True)
         _write_atomically(path, json.dumps(body, indent=4, ensure_ascii=False) + "\n")
+        if earlier_copy is not None and earlier_copy != copy:
+            remove_copy(earlier_copy)
+    lines = [
+        f"package       {path}",
+        f"folder from   {found.source}",
+        f"houdini        {version}",
+        f"houdini path   {payload}",
+        f"pythonpath     {source}",
+    ]
+    if copied_from is not None:
+        lines.append(f"copied from    {copied_from}")
+    lines.append(f"{AUTOSTART_ENV_VAR}   {'1' if autostart else '0'}")
     return InstallResult(
         path=path,
         version=version,
@@ -601,14 +885,8 @@ def install(
         replaced=exists,
         dry_run=dry_run,
         lookup=found,
-        lines=[
-            f"package       {path}",
-            f"folder from   {found.source}",
-            f"houdini        {version}",
-            f"houdini path   {payload}",
-            f"pythonpath     {source}",
-            f"{AUTOSTART_ENV_VAR}   {'1' if autostart else '0'}",
-        ],
+        lines=lines,
+        copied_from=copied_from,
     )
 
 
@@ -681,10 +959,14 @@ def uninstall(
                 RemovedPackage(path, found_version, False, "not written by this tool, kept")
             )
             continue
-        made = created_folders(read_document(path))
+        loaded = read_document(path)
+        made = created_folders(loaded)
+        copy = copy_of(loaded)
         path.unlink()
         results.append(RemovedPackage(path, found_version, True, "removed"))
         _remove_empty(made)
+        if copy is not None and remove_copy(copy):
+            results.append(RemovedPackage(copy, found_version, True, "removed its copy"))
     return results
 
 
@@ -738,6 +1020,10 @@ class InstalledPackage:
     present: bool
     ours: bool
     autostart: bool | None
+    # The copy of the package Houdini imports, when the install made one, and
+    # whether it still matches its source (nothing when the source is gone).
+    copy: Path | None = None
+    copy_current: bool | None = None
 
 
 def installed(
@@ -753,6 +1039,7 @@ def installed(
         path = folder / PACKAGE_FILE_NAME
         loaded = read_document(path) if path.exists() else None
         ours = bool(loaded) and loaded.get(MARKER_KEY) == MARKER_VALUE
+        copy = copy_of(loaded) if ours else None
         states.append(
             InstalledPackage(
                 version=found_version,
@@ -760,6 +1047,8 @@ def installed(
                 present=path.exists(),
                 ours=ours,
                 autostart=_autostart_of(loaded) if ours else None,
+                copy=copy,
+                copy_current=copy_is_current(copy) if copy is not None else None,
             )
         )
     return states
@@ -852,13 +1141,14 @@ def _sort_key(version: str) -> tuple[int, ...]:
 # Section: starting a bridge by hand
 
 
-def snippet(source: Path | None = None) -> str:
+def snippet(source: Path | None = None, *, home: Path | None = None) -> str:
     """Python to paste into the shell of a Houdini that is already open.
 
     The path is worked out when this prints, so the snippet names the source
-    folder of the copy the artist is running.
+    folder of the copy the artist is running, or, when that folder holds
+    other libraries too, a copy of the package alone made under `home`.
     """
-    root = Path(source) if source is not None else source_root()
+    root = Path(source) if source is not None else python_path_for_run(home)
     return "\n".join(
         [
             "import sys",

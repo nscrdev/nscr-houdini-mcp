@@ -18,6 +18,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from nscr_houdini_mcp import install as install_module
 from nscr_houdini_mcp.bridge import app, client, registry
 from nscr_houdini_mcp.bridge.main import STOP_WORD
 from nscr_houdini_mcp.bridge.net import DEFAULT_PORT_RANGE
@@ -242,8 +243,9 @@ class HythonBridge:
 
     def _child_env(self) -> dict[str, str]:
         environment = dict(os.environ if self.env is None else self.env)
-        # The package has to be importable inside Houdini's own interpreter.
-        source_root = str(Path(__file__).resolve().parents[2])
+        # The package has to be importable inside Houdini's own interpreter, and
+        # nothing else of this environment may be, or it would shadow Houdini's.
+        source_root = str(install_module.python_path_for_run(self.home))
         existing = environment.get("PYTHONPATH")
         environment["PYTHONPATH"] = (
             source_root if not existing else os.pathsep.join([source_root, existing])
