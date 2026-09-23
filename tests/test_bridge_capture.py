@@ -492,6 +492,27 @@ def test_a_pane_is_found_by_name(scene: Scene, home: Path) -> None:
     assert "panetab2" in error.details["did_you_mean"]
 
 
+def test_a_pane_with_no_name_is_the_scene_viewer(scene: Scene, home: Path) -> None:
+    viewer = SceneViewerTab(scene)
+    viewer.window = Window(0, 0, 400, 300, 1.0)
+    viewer.geometry = Rect(0, 0, 400, 300)
+    viewer.window.painted.append((Rect(10, 10, 20, 20), (0, 0, 255, 255)))
+    editor = NetworkEditorTab(scene)
+    desktop(scene, editor, viewer)
+    said = take(scene, home, kind="gui", source="pane")
+    [shot] = said["views"]
+    assert shot["route"] == capture.PANE_GRAB
+    assert viewer.window.grabs == 1
+    assert editor.isCurrentTab()
+
+
+def test_a_pane_with_no_name_and_no_scene_viewer_is_refused(scene: Scene, home: Path) -> None:
+    editor_scene(scene)
+    error = refused(scene, home, kind="gui", source="pane")
+    assert error.code == "UI_UNAVAILABLE"
+    assert "no Scene Viewer" in error.details["tried"][0]["reason"]
+
+
 @pytest.mark.parametrize(
     ("pane", "origin", "size", "ratio", "box"),
     [

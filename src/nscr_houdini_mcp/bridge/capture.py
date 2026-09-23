@@ -297,9 +297,8 @@ def _fits_source(spec: Spec, hou: Any) -> None:
             raise _bad("views", "views is for the viewport and node sources")
     if spec.sequence and spec.views != "single":
         raise _bad("views", "a sequence is captured from one view")
-    if spec.source in ("node", "cop", "pane") and not spec.path:
-        what = "the pane tab's name" if spec.source == "pane" else "the node's path"
-        raise _bad("path", f"source {spec.source} needs path: {what}")
+    if spec.source in ("node", "cop") and not spec.path:
+        raise _bad("path", f"source {spec.source} needs path: the node's path")
     if spec.source == "node":
         node = _node_at(hou, spec.path, "path")
         if _object_of(node) is None:
@@ -2086,7 +2085,14 @@ def pane_route(
     gui: bool,
     attempt: Attempt,
 ) -> dict[str, Any]:
-    """One pane tab by name, grabbed from its own window."""
+    """One pane tab by name, or with no name the Scene Viewer, grabbed from its own window."""
+    if not spec.path:
+        viewers = scene_viewers(hou)
+        if not viewers:
+            raise Unavailable("this desktop has no Scene Viewer")
+        showing = [tab for tab in viewers if _quiet(lambda tab=tab: tab.isCurrentTab())]
+        native = grab_pane((showing or viewers)[0], path, attempt)
+        return {"files": [path], "frames": [frames[0]], "camera": None, "native": native}
     tab = _quiet(lambda: hou.ui.findPaneTab(spec.path))
     if tab is None:
         names = [
