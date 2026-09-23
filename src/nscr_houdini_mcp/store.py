@@ -45,7 +45,7 @@ APP_DIR_NAME = "nscr-houdini-mcp"
 HOME_ENV_VAR = "NSCR_MCP_HOME"
 STORE_FILE_NAME = "coord.sqlite"
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 SESSION_KINDS = frozenset({"gui", "hython"})
 SESSION_STATES = frozenset({"live", "busy", "unresponsive", "crashed", "gone"})
@@ -656,6 +656,9 @@ class RunRecord:
     paths: Any
     scene: Any
     created_at: float
+    # Where the row sits in the table, for a read that pages through runs made
+    # in the same instant. Nothing when the read did not ask for it.
+    seq: int | None = None
 
     @classmethod
     def _from_row(cls, row: sqlite3.Row) -> RunRecord:
@@ -670,6 +673,40 @@ class RunRecord:
             job_id=row["job_id"],
             paths=_load(row["paths"]),
             scene=_load(row["scene"]),
+            created_at=row["created_at"],
+            seq=row["seq"] if "seq" in row.keys() else None,
+        )
+
+
+@dataclass(frozen=True)
+class FrozenParm:
+    """An output parameter a run set to its own path, owed its template back.
+
+    `frozen` is the path the run wrote on the node and `template` the line
+    with its Houdini variables that goes back when the run is over. `hip_key`
+    is the scene the parameter was frozen in, for the session that opens the
+    scene next when the one that froze it has gone.
+    """
+
+    session_id: str
+    node_path: str
+    parm_name: str
+    template: str
+    frozen: str
+    run_id: str | None
+    hip_key: str | None
+    created_at: float
+
+    @classmethod
+    def _from_row(cls, row: sqlite3.Row) -> FrozenParm:
+        return cls(
+            session_id=row["session_id"],
+            node_path=row["node_path"],
+            parm_name=row["parm_name"],
+            template=row["template"],
+            frozen=row["frozen"],
+            run_id=row["run_id"],
+            hip_key=row["hip_key"],
             created_at=row["created_at"],
         )
 
@@ -841,6 +878,26 @@ _SCHEMA_9 = (
     """,
 )
 
+# Output parameters a run has set to its own path, each owed its template back
+# when the run is over, and the index a scene's list of its runs reads by.
+_SCHEMA_10 = (
+    """
+    CREATE TABLE frozen_parms (
+        session_id TEXT NOT NULL,
+        node_path  TEXT NOT NULL,
+        parm_name  TEXT NOT NULL,
+        template   TEXT NOT NULL,
+        frozen     TEXT NOT NULL,
+        run_id     TEXT,
+        hip_key    TEXT,
+        created_at REAL NOT NULL,
+        PRIMARY KEY (session_id, node_path, parm_name)
+    )
+    """,
+    "CREATE INDEX frozen_parms_by_scene ON frozen_parms(hip_key)",
+    "CREATE INDEX runs_by_family ON runs(hip_family, created_at)",
+)
+
 MIGRATIONS = (
     _SCHEMA_1,
     _SCHEMA_2,
@@ -851,6 +908,7 @@ MIGRATIONS = (
     _SCHEMA_7,
     _SCHEMA_8,
     _SCHEMA_9,
+    _SCHEMA_10,
 )
 
 
@@ -2332,6 +2390,169 @@ class Store:
         args.append(limit)
         return [RunRecord._from_row(row) for row in self._read_all(sql, args)]
 
+    def find_runs(
+        self,
+        *,
+        hip_family: str,
+        kind: str | None = None,
+        name_glob: str | None = None,
+        since: float | None = None,
+        session_id: str | None = None,
+        before: tuple[float, int] | None = None,
+        limit: int = 50,
+    ) -> list[RunRecord]:
+        """One scene family's runs, newest first, a batch at a time.
+
+        `before` is the `created_at` and `seq` of the last run of the batch
+        before, so the next batch starts after it whatever was added since,
+        and two runs made in the same instant keep the order they were made
+        in. `name_glob` matches the way a shell does, and case counts.
+        """
+        clauses = ["hip_family = ?"]
+        args: list[Any] = [hip_family]
+        if kind is not None:
+            clauses.append("kind = ?")
+            args.append(kind)
+        if name_glob is not None:
+            clauses.append("name GLOB ?")
+            args.append(name_glob)
+        if since is not None:
+            clauses.append("created_at >= ?")
+            args.append(since)
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            args.append(session_id)
+        if before is not None:
+            clauses.append("(created_at < ? OR (created_at = ? AND rowid < ?))")
+            args.extend([before[0], before[0], before[1]])
+        sql = (
+            f"SELECT rowid AS seq, * FROM runs WHERE {' AND '.join(clauses)}"
+            " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        )
+        args.append(limit)
+        return [RunRecord._from_row(row) for row in self._read_all(sql, args)]
+
+    # -- frozen output parameters ------------------------------------------
+
+    def freeze_parm(
+        self,
+        *,
+        session_id: str,
+        node_path: str,
+        parm_name: str,
+        template: str,
+        frozen: str,
+        run_id: str | None = None,
+        hip_key: str | None = None,
+    ) -> FrozenParm:
+        """Record that a run set a parameter to its own path.
+
+        Written before the parameter is set, so a process that dies between
+        the two leaves a record rather than a machine path nobody knows of. A
+        second run freezing the same parameter takes the record over: the
+        template it owes back is the newer run's.
+        """
+        with self._txn(write=True) as db:
+            db.execute(
+                "INSERT OR REPLACE INTO frozen_parms (session_id, node_path, parm_name,"
+                " template, frozen, run_id, hip_key, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    node_path,
+                    parm_name,
+                    template,
+                    frozen,
+                    run_id,
+                    hip_key,
+                    self._now(),
+                ),
+            )
+            return FrozenParm._from_row(
+                db.execute(
+                    "SELECT * FROM frozen_parms WHERE session_id = ? AND node_path = ?"
+                    " AND parm_name = ?",
+                    (session_id, node_path, parm_name),
+                ).fetchone()
+            )
+
+    def get_frozen_parm(self, session_id: str, node_path: str, parm_name: str) -> FrozenParm | None:
+        """One frozen parameter, by the session that froze it."""
+        row = self._read_one(
+            "SELECT * FROM frozen_parms WHERE session_id = ? AND node_path = ? AND parm_name = ?",
+            (session_id, node_path, parm_name),
+        )
+        return None if row is None else FrozenParm._from_row(row)
+
+    def list_frozen_parms(
+        self, *, session_id: str | None = None, hip_key: str | None = None
+    ) -> list[FrozenParm]:
+        """Frozen parameters, by node path, for a session, a scene or both."""
+        clauses: list[str] = []
+        args: list[Any] = []
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            args.append(session_id)
+        if hip_key is not None:
+            clauses.append("hip_key = ?")
+            args.append(hip_key)
+        sql = "SELECT * FROM frozen_parms"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY node_path, parm_name, session_id"
+        return [FrozenParm._from_row(row) for row in self._read_all(sql, args)]
+
+    def thaw_parm(self, session_id: str, node_path: str, parm_name: str) -> bool:
+        """Take off the record of a parameter that has had its template back."""
+        with self._txn(write=True) as db:
+            return (
+                db.execute(
+                    "DELETE FROM frozen_parms WHERE session_id = ? AND node_path = ?"
+                    " AND parm_name = ?",
+                    (session_id, node_path, parm_name),
+                ).rowcount
+                > 0
+            )
+
+    def session_is_over(self, session_id: str) -> bool:
+        """Whether a session has ended, or its process is shown to be gone.
+
+        A process this system will not name is taken to be running, so a
+        record is never taken from a session on a guess.
+        """
+        record = self.get_session(session_id)
+        if record is None or record.state == SESSION_GONE:
+            return True
+        return same_process(record.pid, record.pid_start) is False
+
+    def orphan_frozen_parms(self, *, hip_key: str | None = None) -> list[FrozenParm]:
+        """Frozen parameters whose session is over, so nobody is left to restore them.
+
+        With `hip_key`, only those frozen in that scene: the next session to
+        open it restores them.
+        """
+        rows = self.list_frozen_parms(hip_key=hip_key)
+        over: dict[str, bool] = {}
+        orphans = []
+        for row in rows:
+            if row.session_id not in over:
+                over[row.session_id] = self.session_is_over(row.session_id)
+            if over[row.session_id]:
+                orphans.append(row)
+        return orphans
+
+    def forget_unrestorable_frozen_parms(self) -> int:
+        """Drop the records of an ended session's parameters in a scene never saved.
+
+        No session can open that scene again, so nothing will ever be owed
+        back. Returns the count.
+        """
+        dropped = 0
+        for row in self.orphan_frozen_parms():
+            if row.hip_key is None and self.thaw_parm(row.session_id, row.node_path, row.parm_name):
+                dropped += 1
+        return dropped
+
     # -- readable exports -------------------------------------------------
 
     def run_export(self, run_id: str) -> dict[str, Any]:
@@ -2339,7 +2560,10 @@ class Store:
         record = self.get_run(run_id)
         if record is None:
             raise UnknownRecord(f"no run {run_id}")
-        return _export_dict(record, {"created_at": "created"})
+        exported = _export_dict(record, {"created_at": "created"})
+        # Where the row sat in the table says nothing to a reader of the file.
+        exported.pop("seq", None)
+        return exported
 
     def job_export(self, job_id: str) -> dict[str, Any]:
         """Job record as plain data, for the readable copy of a finished job."""

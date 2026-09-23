@@ -1155,3 +1155,128 @@ def test_exporting_a_record_that_is_not_there_is_refused(store: Store) -> None:
         store.run_export("r1")
     with pytest.raises(UnknownRecord):
         store.job_export("j1")
+
+
+# -- runs a scene has made ------------------------------------------------
+
+
+def _run(store: Store, run_id: str, *, family: str = "shot", **rest) -> None:
+    store.create_run(run_id, kind=rest.pop("kind", "render"), hip_family=family, paths={}, **rest)
+
+
+def test_a_scene_familys_runs_come_newest_first_a_batch_at_a_time(
+    timed_store: Store, clock: FakeClock
+) -> None:
+    for index in range(5):
+        _run(timed_store, f"r{index}", name="beauty" if index % 2 else "sim")
+        clock.step(1)
+    _run(timed_store, "other", family="elsewhere")
+    first = timed_store.find_runs(hip_family="shot", limit=2)
+    assert [record.run_id for record in first] == ["r4", "r3"]
+    last = first[-1]
+    rest = timed_store.find_runs(hip_family="shot", before=(last.created_at, last.seq), limit=10)
+    assert [record.run_id for record in rest] == ["r2", "r1", "r0"]
+
+
+def test_runs_made_in_the_same_instant_keep_the_order_they_were_made_in(
+    timed_store: Store,
+) -> None:
+    for run_id in ("b", "c", "a"):
+        _run(timed_store, run_id)
+    assert [record.run_id for record in timed_store.find_runs(hip_family="shot")] == [
+        "a",
+        "c",
+        "b",
+    ]
+    [newest] = timed_store.find_runs(hip_family="shot", limit=1)
+    after = timed_store.find_runs(hip_family="shot", before=(newest.created_at, newest.seq))
+    assert [record.run_id for record in after] == ["c", "b"]
+    assert "seq" not in timed_store.run_export("a")
+
+
+def test_runs_found_by_kind_name_glob_time_and_session(
+    timed_store: Store, clock: FakeClock
+) -> None:
+    _run(timed_store, "a", kind="cache", name="sim_fluid", session_id="s1")
+    clock.step(10)
+    _run(timed_store, "b", kind="render", name="beauty", session_id="s2")
+    later = clock.now
+    clock.step(10)
+    _run(timed_store, "c", kind="render", name="sim_smoke", session_id="s1")
+    found = timed_store.find_runs
+    assert [r.run_id for r in found(hip_family="shot", kind="render")] == ["c", "b"]
+    assert [r.run_id for r in found(hip_family="shot", name_glob="sim_*")] == ["c", "a"]
+    assert [r.run_id for r in found(hip_family="shot", since=later)] == ["c", "b"]
+    assert [r.run_id for r in found(hip_family="shot", session_id="s1")] == ["c", "a"]
+
+
+# -- frozen output parameters ---------------------------------------------
+
+
+def _freeze(store: Store, session_id: str = "s1", **rest):
+    options = {
+        "node_path": "/out/karma1",
+        "parm_name": "picture",
+        "template": "$HIP/renders/20260921_beauty/v001/beauty_v001.$F4.exr",
+        "frozen": "/shots/renders/20260921_beauty/v001/beauty_v001.$F4.exr",
+        "run_id": "run-1",
+        "hip_key": "/shots/shot.hip",
+    }
+    options.update(rest)
+    return store.freeze_parm(session_id=session_id, **options)
+
+
+def test_a_frozen_parm_is_recorded_until_it_is_thawed(timed_store: Store, clock: FakeClock) -> None:
+    made = _freeze(timed_store)
+    assert made.template.startswith("$HIP/")
+    assert made.created_at == clock.now
+    assert timed_store.get_frozen_parm("s1", "/out/karma1", "picture") == made
+    assert timed_store.list_frozen_parms(session_id="s1") == [made]
+    assert timed_store.list_frozen_parms(hip_key="/shots/shot.hip") == [made]
+    assert timed_store.list_frozen_parms(hip_key="/elsewhere.hip") == []
+    assert timed_store.thaw_parm("s1", "/out/karma1", "picture") is True
+    assert timed_store.thaw_parm("s1", "/out/karma1", "picture") is False
+    assert timed_store.get_frozen_parm("s1", "/out/karma1", "picture") is None
+
+
+def test_freezing_the_same_parm_again_owes_the_newer_runs_template(store: Store) -> None:
+    _freeze(store)
+    again = _freeze(store, run_id="run-2", template="$HIP/renders/x/v002/x_v002.$F4.exr")
+    assert again.run_id == "run-2"
+    assert [row.run_id for row in store.list_frozen_parms()] == ["run-2"]
+
+
+def test_only_a_session_that_is_over_leaves_orphans(store: Store) -> None:
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        stamp = store_module.process_start_stamp(child.pid)
+        store.register_session("s-live", kind="hython", pid=LIVE_PID, alias="w1")
+        store.register_session(
+            "s-killed", kind="hython", pid=child.pid, alias="w2", pid_start=stamp
+        )
+        store.register_session("s-ended", kind="hython", pid=LIVE_PID, alias="w3")
+        store.end_session("s-ended")
+        _freeze(store, "s-live")
+        _freeze(store, "s-killed", node_path="/out/karma2")
+        _freeze(store, "s-ended", node_path="/out/karma3", hip_key=None)
+        _freeze(store, "s-never", node_path="/out/karma4")
+        assert store.session_is_over("s-live") is False
+        assert store.session_is_over("s-killed") is False
+        child.kill()
+        child.wait(timeout=30)
+        assert store.session_is_over("s-killed") is True
+        orphans = {row.node_path for row in store.orphan_frozen_parms()}
+        assert orphans == {"/out/karma2", "/out/karma3", "/out/karma4"}
+        in_scene = store.orphan_frozen_parms(hip_key="/shots/shot.hip")
+        assert {row.node_path for row in in_scene} == {"/out/karma2", "/out/karma4"}
+        # The one from a scene never saved can never be given back.
+        assert store.forget_unrestorable_frozen_parms() == 1
+        assert {row.node_path for row in store.list_frozen_parms()} == {
+            "/out/karma1",
+            "/out/karma2",
+            "/out/karma4",
+        }
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=30)
