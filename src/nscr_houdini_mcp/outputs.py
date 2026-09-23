@@ -36,6 +36,7 @@ import json
 import os
 import re
 import secrets
+import tempfile
 import tomllib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
@@ -705,6 +706,21 @@ def sequence_path(path: str, frame_token: str = str(DEFAULT_OUTPUTS["frame_token
         stem, extension = leaf, ""
     numbered = f"{stem}.{frame_token}" + (f".{extension}" if extension else "")
     return f"{folder}/{numbered}" if folder else numbered
+
+
+def temporary_beside(path: str) -> str:
+    """A new, empty file beside an output, for one writer to fill and then move over it.
+
+    It is made exclusively with a random part in its name, so two writers
+    finishing the same output never share one, and the move over the output
+    is on the same disk. The writer takes it away if it does not move it.
+    """
+    folder = os.path.dirname(path) or "."
+    handle, name = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.", suffix=".partial", dir=folder
+    )
+    os.close(handle)
+    return name
 
 
 def expand(
