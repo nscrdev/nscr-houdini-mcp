@@ -214,29 +214,47 @@ in `.agent/jobs/`. Jobs are kept for 7 days.
 `hou_compare` puts a candidate image beside a reference and says how far
 apart they are, as pictures and as numbers. It never says pass or fail: there
 is no match flag and no built in threshold. The candidate is a file in this
-build; a viewport capture, a node's own image and a render are named in the
-schema and answer `NOT_YET_AVAILABLE`, naming the capture tool to use when it
-arrives. The work runs in the server with NumPy and Pillow, in a fixed order,
-and the result records every step:
+build, given by its absolute path; a path with nothing there is
+`FILE_NOT_FOUND`. A viewport capture, a node's own image and a render are
+named in the schema and answer `NOT_YET_AVAILABLE`, naming the capture tool
+to use when it arrives. The work runs in the server with NumPy and Pillow, in
+a fixed order, and the result records every step:
 
 1. Colour. A PNG, JPEG or TIFF is converted to sRGB through its embedded ICC
-   profile; with none, sRGB is assumed and the result says `assumed_srgb`. An
-   EXR or HDR file is read by the session, through a COP `file` node made and
-   removed for the purpose, and brought to display values with the session's
-   OpenColorIO display and view. The result names the configuration, display,
-   view, exposure, channel and what was done with alpha, and says
-   `transfer_mismatch_possible` when the two sides went through different
-   kinds of transform or their mean luminance is more than 25 percent apart.
+   profile; with none, sRGB is assumed and the result says `assumed_srgb`.
+   The full scale of a sample comes from the file's bit depth, never from its
+   pixels: 16 bit greys and 16 bit RGB or RGBA PNGs are read at 16 bits, and
+   the colour record says how many bits the file had and how many were read.
+   An EXR or HDR file is read by the session, with OpenImageIO when the
+   session has it and otherwise through a COP `file` node made and removed
+   for the purpose (which a session with a user interface counts as a change
+   to the scene, and the result says so). Its colour is divided by alpha and
+   brought to display values with the session's OpenColorIO display and
+   view. The result names the configuration by file name and content hash,
+   the display, view, exposure, channels and what was done with alpha.
+   `transfer_mismatch_possible` is set when a scene linear side went through
+   a view that is not a plain sRGB display, when two scene linear sides went
+   through different views, or when the mean luminance of the two sides is
+   more than 25 percent apart after alignment.
 2. Alignment at native size: `align` (`fit` letterboxes to the reference's
-   aspect, `fill` crops to cover it, `stretch`, `none`), then `adjust` (`dx`,
-   `dy` and `scale` in shares of the frame), then `auto_shift`, a translation
-   found by phase correlation. A candidate with more pixels than the reference
-   keeps them: the grid grows instead, up to four times.
+   aspect, `fill` crops to cover it, `stretch`, `none` keeps the candidate's
+   pixels one for one), then `adjust` (`dx` and `dy` from -1 to 1 and `scale`
+   from 0.05 to 20, in shares of the frame), then `auto_shift`, a translation
+   found by phase correlation. A candidate with more pixels than the
+   reference keeps them: the grid grows instead, up to four times. Only the
+   part of an enlarged candidate that lands on the frame is ever made, and a
+   `scale` that would place it over four times the frame's area is refused.
 3. Crops before any shrinking. Named regions and `region`, each
    `[x0, y0, x1, y1]` in shares of the frame, are cut from the aligned native
-   images, and a detail crop's numbers are counted at that size.
-4. The overview: both sides resized to a long edge of 1024 for the whole
-   image numbers, the difference map and the sheet.
+   images, and a detail crop's numbers are counted at that size, a block of
+   rows at a time.
+4. The overview: both sides shrunk to a long edge of 1024, or kept as they
+   are when smaller, for the whole image numbers, the difference map and the
+   sheet.
+
+An image over 64 million pixels is shrunk by a whole factor as it is read, and
+the result says `resized_on_read`. One past Pillow's own size limit is
+`IMAGE_TOO_LARGE`.
 
 The numbers are mean absolute error and RMSE per channel and overall, PSNR,
 the share of the counted area whose difference is over `tolerance` (0.05
@@ -245,26 +263,40 @@ unless you say), and a rough box around the largest area of difference.
 luminance. In `likeness` mode, the default, they are labelled secondary,
 because lighting and framing move them; in `regression` mode they are
 primary. `mask` limits the counted area to the reference's registered mask or
-alpha, or to a mask file; the candidate's alpha never decides it. Numbers that
-cannot be counted are named in `missing` with the reason, and the aligned pair
-and the sheet are written all the same.
+alpha, or to a mask file; the candidate's alpha never decides it, and a
+candidate with partial alpha and no mask gets a warning, because its
+transparent pixels count as the colour they store. Numbers that cannot be
+counted are named in `missing` with the reason, and the aligned pair and the
+sheet are written all the same.
 
 Every compare writes `candidate.png` and `reference.png` (the aligned pair),
 `diff.png`, `overview.jpg` (candidate, reference and difference, labelled),
-`crops/<region>.png` and `result.json` to a `compare` folder, and returns
-the overview as an image for the person as well as the agent (`return_image`
-`thumb`, `full` or `none`).
+`crops/<region>.png` and `result.json` to a `compare` folder. `result.json`
+names every file relative to itself and holds no place on the machine other
+than the scene's own path. The call returns the overview as an image for the
+person as well as the agent (`return_image` `thumb`, `full` or `none`). The
+text and the image of a reply stay within one megabyte together: a full
+sheet that would not fit is sent as the thumbnail, with `image_downgraded`.
 
 `set_reference` copies an image into `$HIP/.agent/reference/` and writes one
 record beside it, `<ref_id>.json`, that is never written again: the content
-hash, the colour profile or the assumption made, and optionally the camera it
-was framed for, named `regions` and a mask. Registering a name again makes a
-new record and id. `list_references` lists the names, and `hou_scene` `info`
-at `full` detail lists them too, so a fresh context finds the goal. Compares
-with the same reference id and hash, camera, crop, mask, colour records and
-settings form a series, logged under `reference/series/`; a result in a
-series with earlier runs carries the trend, and one that starts a new series
-says which of those changed.
+hash, the colour profile or the assumption made (an EXR or HDR is read as far
+as its header), and optionally the camera it was framed for, named `regions`
+and a mask. The record names its image and mask relative to its own folder,
+so a project that moves still finds them. A name may hold letters, digits,
+underscore and dash; any other name is refused rather than changed.
+Registering a name again makes a new record and id. `list_references` lists
+the names, and `hou_scene` `info` at `full` detail lists them too, so a fresh
+context finds the goal. A name is looked up before a path, and only an
+absolute path is read as a file. The reference folder is fixed per scene: a
+`reference` template whose folder part uses `<name>`, `<run_id>`, `<date>`,
+`<date_iso>`, `<time>`, `<ver>` or `<session>` is refused when the
+conventions are read. Compares with the same reference id and hash, camera,
+crop, mask, colour records and settings form a series; each run of a series
+is one file under `reference/series/<series_id>/`, so two servers writing to
+one shared folder never interleave. A result in a series with earlier runs
+carries the trend, and one that starts a new series says which of those
+changed.
 
 ### The Houdini side
 
