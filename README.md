@@ -63,7 +63,7 @@ Run the server on stdio:
 nscr-houdini-mcp
 ```
 
-Six tools so far. `hou_ping` says which session a call reaches and that it
+Seven tools so far. `hou_ping` says which session a call reaches and that it
 answers. `hou_sessions` lists every session with its state (`live`, `busy`,
 `unresponsive`, `crashed` or `gone`) and starts and stops workers under the
 pool's rules; it never closes a Houdini with a user interface. `hou_scene`
@@ -220,6 +220,40 @@ job to follow, rather than its answer, leaves a readable copy of itself
 beside the scene file when it ends, in `.agent/jobs/`, and nothing is made
 beside a scene file that is not there. Jobs are kept for 7 days after they
 end, and their copies go with them.
+
+`hou_capture` saves a picture of what a session shows: the `viewport`, one
+`node` on its own, the `network` editor, a `cop` output or a `pane` by name.
+Every file goes under the `capture` kind of the output table below, and the
+answer carries the path, the width and height, the frame, the camera, the
+`route` that made it and `image_stats`: the mean, least and most of each
+channel and `non_empty`, which is false when every channel is one value or
+the alpha is zero everywhere. A capture whose every image is empty is
+`CAPTURE_EMPTY`. A thumbnail of at most 512 pixels on its long edge comes back
+as image content beside the text; `return_image` says `thumb`, `full` or
+`none`.
+
+The routes for the viewport, in order: the Scene Viewer that is showing,
+flipbooked with settings of its own (no MPlay, the beauty pass only unless
+`guides`); an existing Scene Viewer made the current tab for the capture and
+then put back; and a flipbook render node made for the capture and taken
+away after. A `camera`, `display` or `frame_target` asked for is applied for
+the capture and the view is put back as it was, camera, pivot and width
+included. The render node needs a camera: one named, or one made for the
+capture and fitted to the target's bounds from `persp`, `top`, `front`,
+`right` or an `{orbit, elevation}`. In a session with a user interface that
+route cannot know what the artist's view frames, so it says
+`framing_unverified`; it is the only route a worker has. `node` draws that
+node's object alone with the node carrying the display flag, and puts the
+flag back. Whatever a capture makes for itself is made and taken away with
+undo turned off. The network editor and panes are grabbed from their own
+window, which needs a user interface; a worker answers `UI_UNAVAILABLE`.
+
+`views: quad` captures persp, top, front and right, `turntable4` four orbits
+a quarter turn apart, and both add a two by two contact sheet, which is then
+`path`. `region` crops each saved image to `[x0, y0, x1, y1]`, fractions from
+the top left. `frames: [start, end, step]` captures a sequence, which is a
+job: it answers inline when it is done within `inline_wait_s`, and with the
+job to follow in `hou_jobs` when it is not.
 
 ### The Houdini side
 
