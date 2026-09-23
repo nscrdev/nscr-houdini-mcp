@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+import support
 from nscr_houdini_mcp import cli
 from nscr_houdini_mcp import install as install_module
 from nscr_houdini_mcp import store as store_module
@@ -28,7 +29,7 @@ from nscr_houdini_mcp.bridge.launcher import find_hython, hython_available
 PREF_TEMPLATE = f"prefs{install_module.VERSION_TOKEN}"
 
 # Its own range, away from anything a person on this machine may be running.
-PORT_RANGE = (18400, 18449)
+PORT_RANGE = support.INSTALL_PORTS
 
 START_TIMEOUT_S = 180.0
 STOP_TIMEOUT_S = 60.0

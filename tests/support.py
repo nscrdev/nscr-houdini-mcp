@@ -46,6 +46,7 @@ __all__ = [
     "APP_PORTS",
     "BRIDGE_PORTS",
     "FAILURE_PORTS",
+    "INSTALL_PORTS",
     "POOL_PORTS",
     "call_and_die",
     "client_that_dies_mid_call",
@@ -79,6 +80,7 @@ APP_PORTS = _ports((18200, 18249), 0, 15)
 BRIDGE_PORTS = _ports((18300, 18349), 15, 15)
 POOL_PORTS = _ports((18360, 18399), 30, 10)
 FAILURE_PORTS = _ports((18410, 18429), 40, 10)
+INSTALL_PORTS = _ports((18430, 18449), 45, 5)
 
 BARRIER_TIMEOUT_S = 60.0
 RESULT_TIMEOUT_S = 300.0
