@@ -176,6 +176,55 @@ def test_liveness_sees_a_child_exit() -> None:
     assert process_is_alive(child.pid) is False
 
 
+needs_exit_watch = pytest.mark.skipif(
+    sys.platform != "darwin", reason="only this system reads start stamps from a program"
+)
+
+
+@needs_exit_watch
+def test_a_start_stamp_is_read_once_while_its_process_runs(monkeypatch) -> None:
+    known = store_module._KnownStarts()
+    reads: list[int] = []
+    real = store_module._ps_start
+
+    def counted(pid: int) -> str | None:
+        reads.append(pid)
+        return real(pid)
+
+    monkeypatch.setattr(store_module, "_ps_start", counted)
+    first = known.stamp(os.getpid())
+    assert first and first == real(os.getpid())
+    assert known.stamp(os.getpid()) == first
+    assert reads == [os.getpid()]
+
+
+@needs_exit_watch
+def test_a_kept_start_stamp_is_dropped_when_its_process_exits(monkeypatch) -> None:
+    known = store_module._KnownStarts()
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        stamp = known.stamp(child.pid)
+        assert stamp
+        # A stamp read while the process ran is not trusted past its exit, even
+        # when the listing would now name some other process under the pid.
+        monkeypatch.setattr(store_module, "_ps_start", lambda pid: "someone else")
+        assert known.stamp(child.pid) == stamp
+    finally:
+        child.kill()
+        child.wait(timeout=30)
+    assert known.stamp(child.pid) == "someone else"
+    assert child.pid not in known._kept
+
+
+def test_same_process_tells_a_reused_pid_apart_after_the_first_look() -> None:
+    stamp = store_module.process_start_stamp()
+    if not stamp:
+        pytest.skip("this system gives no start stamp")
+    assert store_module.same_process(os.getpid(), stamp) is True
+    assert store_module.same_process(os.getpid(), stamp) is True
+    assert store_module.same_process(os.getpid(), "a different stamp") is False
+
+
 # -- sessions -------------------------------------------------------------
 
 

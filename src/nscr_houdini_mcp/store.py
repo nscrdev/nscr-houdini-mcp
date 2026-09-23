@@ -30,9 +30,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import select
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -294,7 +296,7 @@ def process_start_stamp(pid: int | None = None) -> str | None:
     if sys.platform == "linux":
         return _linux_start(number)
     if sys.platform == "darwin":
-        return _ps_start(number)
+        return _known_starts.stamp(number)
     return None
 
 
@@ -350,6 +352,88 @@ def _ps_start(pid: int) -> str | None:
         return None
     stamp = finished.stdout.strip()
     return stamp or None
+
+
+class _KnownStarts:
+    """Start stamps already read from the process listing, kept while their
+    process runs.
+
+    Asking the listing starts a program, which costs milliseconds, and every
+    read of the session list asks once for each live session. A stamp is kept
+    together with a kernel watch on its process's exit, set before the listing
+    is read, so a kept stamp is handed out only while that very process has not
+    ended. A pid that has been given to a new process is read afresh. Where the
+    kernel offers no such watch, or refuses one, nothing is kept and every
+    question goes to the listing as before.
+    """
+
+    # Each kept stamp holds one open watch, so the number is bounded.
+    LIMIT = 64
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._kept: dict[int, tuple[str, Any]] = {}
+
+    def stamp(self, pid: int) -> str | None:
+        with self._lock:
+            kept = self._kept.get(pid)
+            if kept is not None:
+                if not _has_exited(kept[1]):
+                    return kept[0]
+                del self._kept[pid]
+                kept[1].close()
+        watch = _watch_exit(pid)
+        stamp = _ps_start(pid)
+        if watch is None:
+            return stamp
+        if stamp is None or _has_exited(watch):
+            # The listing may have read a different process under this pid.
+            watch.close()
+            return stamp
+        with self._lock:
+            while len(self._kept) >= self.LIMIT:
+                _, (_, oldest) = self._kept.popitem()
+                oldest.close()
+            replaced = self._kept.pop(pid, None)
+            if replaced is not None:
+                replaced[1].close()
+            self._kept[pid] = (stamp, watch)
+        return stamp
+
+
+def _watch_exit(pid: int) -> Any:
+    """A kernel queue that will hold an event once `pid` exits, or nothing."""
+    make = getattr(select, "kqueue", None)
+    if make is None:
+        return None
+    try:
+        queue = make()
+    except OSError:
+        return None
+    try:
+        event = select.kevent(
+            pid,
+            filter=select.KQ_FILTER_PROC,
+            flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+            fflags=select.KQ_NOTE_EXIT,
+        )
+        queue.control([event], 0, 0)
+    except (OSError, ValueError, OverflowError):
+        queue.close()
+        return None
+    return queue
+
+
+def _has_exited(queue: Any) -> bool:
+    """Whether the process a queue watches has exited. Never waits."""
+    try:
+        return bool(queue.control(None, 1, 0))
+    except (OSError, ValueError):
+        # A watch that cannot be read proves nothing: read the listing again.
+        return True
+
+
+_known_starts = _KnownStarts()
 
 
 def _windows_start(pid: int) -> str | None:
