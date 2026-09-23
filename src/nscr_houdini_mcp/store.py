@@ -45,7 +45,7 @@ APP_DIR_NAME = "nscr-houdini-mcp"
 HOME_ENV_VAR = "NSCR_MCP_HOME"
 STORE_FILE_NAME = "coord.sqlite"
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 SESSION_KINDS = frozenset({"gui", "hython"})
 SESSION_STATES = frozenset({"live", "busy", "unresponsive", "crashed", "gone"})
@@ -959,6 +959,12 @@ _SCHEMA_10 = (
     "CREATE INDEX runs_by_family ON runs(hip_family, created_at)",
 )
 
+# What a node or a job wrote, found without reading every run.
+_SCHEMA_11 = (
+    "CREATE INDEX runs_by_node ON runs(source_node, created_at)",
+    "CREATE INDEX runs_by_job ON runs(job_id)",
+)
+
 MIGRATIONS = (
     _SCHEMA_1,
     _SCHEMA_2,
@@ -970,6 +976,7 @@ MIGRATIONS = (
     _SCHEMA_8,
     _SCHEMA_9,
     _SCHEMA_10,
+    _SCHEMA_11,
 )
 
 
@@ -2487,6 +2494,32 @@ class Store:
         sql += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
         args.append(limit)
         return [RunRecord._from_row(row) for row in self._read_all(sql, args)]
+
+    def runs_made_by(
+        self,
+        *,
+        job_id: str | None = None,
+        source_node: str | None = None,
+        hip_family: str | None = None,
+        limit: int = 50,
+    ) -> list[RunRecord]:
+        """The runs of one job, or of one node, newest first.
+
+        `hip_family` narrows them to one scene family before the limit, since
+        the same node path is in every scene.
+        """
+        if (job_id is None) == (source_node is None):
+            raise ValueError("name a job or a node, not both")
+        column, value = ("job_id", job_id) if job_id is not None else ("source_node", source_node)
+        clauses, args = [f"{column} = ?"], [value]
+        if hip_family is not None:
+            clauses.append("hip_family = ?")
+            args.append(hip_family)
+        sql = (
+            f"SELECT * FROM runs WHERE {' AND '.join(clauses)}"
+            " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        )
+        return [RunRecord._from_row(row) for row in self._read_all(sql, [*args, limit])]
 
     def find_runs(
         self,

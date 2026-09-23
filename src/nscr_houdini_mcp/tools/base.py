@@ -279,6 +279,7 @@ class Call:
         wait_s: float | None = None,
         timeout_s: float | None = None,
         skip_if_busy: bool = False,
+        operation_id: str | None = None,
     ) -> dict[str, Any]:
         """Send one bridge call and hand back the whole reply.
 
@@ -291,10 +292,14 @@ class Call:
         `wait_s` and `timeout_s` are for a tool that sets its own budgets for
         a call it makes on the side; otherwise the caller's are passed on.
         `skip_if_busy` is for a call that is only worth making if the session
-        can take it now.
+        can take it now. `operation_id` is for a change a tool derives an id
+        for itself, from the call's own, such as a capture made for a compare.
         """
         target = self.target()
-        operation_id = self._next_operation_id() if mutating else None
+        if mutating and operation_id is None:
+            operation_id = self._next_operation_id()
+        elif not mutating:
+            operation_id = None
         try:
             reply = self.router.call(
                 target,

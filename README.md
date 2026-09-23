@@ -188,7 +188,9 @@ answering only on that call's thread while it runs. `mcp.output_path(kind,
 name, ext)` hands out a managed path for this session and scene from the
 output table below, for `render`, `flipbook`, `comp`, `cache`, `usd`, `hip`,
 `capture`, `compare`, `reference` or `check`; never a `spill` or a `job`,
-which are the server's own. `mcp.freeze_parm(parm, path)` puts a path the call
+which are the server's own. The run it records names the call's job, so
+`hou_compare` can find an image the job wrote by its `job_id`.
+`mcp.freeze_parm(parm, path)` puts a path the call
 was handed on an output parameter, given as a `hou.Parm` or its path, for as
 long as the call runs; when the call ends, however it ends, the parameter
 gets back what it held before, its value or its expression, and the answer
@@ -302,12 +304,43 @@ least recently going first, and a build whose install has gone is removed.
 
 `hou_compare` puts a candidate image beside a reference and says how far
 apart they are, as pictures and as numbers. It never says pass or fail: there
-is no match flag and no built in threshold. The candidate is a file in this
-build, given by its absolute path; a path with nothing there is
-`FILE_NOT_FOUND`. A viewport capture, a node's own image and a render are
-named in the schema and answer `NOT_YET_AVAILABLE`, naming the capture tool
-to use when it arrives. The work runs in the server with NumPy and Pillow, in
-a fixed order, and the result records every step:
+is no match flag and no built in threshold. The `candidate` is one of four
+sources:
+
+- `file`: an image given by its absolute path; a path with nothing there is
+  `FILE_NOT_FOUND`.
+- `viewport` or `node`: a picture captured for the compare, through the same
+  code as `hou_capture` and with the capture arguments the candidate carries
+  (`path`, `camera`, `frame_target`, `display`, `resolution`, `frame`,
+  `region`, and `timeout_s` for how long to wait for it). It is a capture
+  like any other, under an operation id made from the compare's own with
+  `:capture` added: a run in the `capture` folder and a job `hou_jobs` can
+  read. The reference and any `mask` are read first, so one that will not do
+  costs no capture. When the reference was registered with a camera, that
+  camera frames the capture unless the candidate names its own camera, and
+  the capture is made at the reference's aspect (its own size, or 2048
+  pixels on the long edge when larger) unless the candidate names its own
+  size, which then sets the size alone. A camera the reference names that is
+  gone or is not a camera is the reference's error (`argument: reference`,
+  with the camera in the details). A capture whose aspect is off the
+  reference's by more than a pixel says so in `warnings`, beside the
+  capture's own warnings. A capture that runs past its time answers
+  `TIMEOUT` with its `job_id`: wait for it with `hou_jobs`, then compare
+  with a `render` candidate of that job.
+- `render`: the newest image on disk that a finished job wrote (`job_id`),
+  or that runs of a node wrote (`path`, the node), read from the run records.
+  A capture job's image is the one its answer names; any other job's is the
+  newest image among the runs it took, such as a path a `hou_python` job took
+  with `mcp.output_path`. A job not yet ended is `JOB_RUNNING`, with a hint
+  to wait on it with `hou_jobs`; a job or node with no image on disk is
+  `NO_OUTPUT`.
+
+The result's `sources.candidate` says which: for a capture its `run_id`,
+`job_id`, `path`, `route`, `frame`, the `camera` that framed it and
+`framed_by` (`reference`, `candidate` or `capture`), and `unsaved_hip` when
+the scene had no file; for a render the run, the job and the node.
+`result.json` keeps the same, with the path written relative to itself. The work runs in the server with NumPy and Pillow, in a fixed order,
+and the result records every step:
 
 1. Colour. A PNG, JPEG or TIFF is converted to sRGB through its embedded ICC
    profile; with none, sRGB is assumed and the result says `assumed_srgb`.
@@ -329,7 +362,9 @@ a fixed order, and the result records every step:
    aspect, `fill` crops to cover it, `stretch`, `none` keeps the candidate's
    pixels one for one), then `adjust` (`dx` and `dy` from -1 to 1, in shares
    of the frame, and `scale` from 0.05), then `auto_shift`, a translation
-   found by phase correlation. A candidate with more pixels than the
+   found by phase correlation and applied only when it lowers the mean
+   difference where the candidate covers; otherwise `shift_px` says
+   `applied: false` with the reason, the estimate and both errors. A candidate with more pixels than the
    reference keeps them: the grid grows instead, up to four times. Only the
    part of an enlarged candidate that lands on the frame is ever made. There
    is no fixed largest `scale`: one that would place the candidate over four
@@ -355,8 +390,9 @@ luminance. In `likeness` mode, the default, they are labelled secondary,
 because lighting and framing move them; in `regression` mode they are
 primary. `mask` limits the counted area to the reference's registered mask or
 alpha, or to a mask file; the candidate's alpha never decides it, and a
-candidate with partial alpha and no mask gets a warning, because its
-transparent pixels count as the colour they store. Numbers that cannot be
+candidate whose alpha covers between 5 and 95 percent of it, with no mask,
+gets a warning, because its transparent pixels count as the colour they
+store. Numbers that cannot be
 counted are named in `missing` with the reason, and the aligned pair and the
 sheet are written all the same.
 
@@ -384,7 +420,8 @@ absolute path is read as a file. The reference folder is fixed per scene: a
 `reference` template whose folder part uses `<name>`, `<run_id>`, `<date>`,
 `<date_iso>`, `<time>`, `<ver>` or `<session>` is refused when the
 conventions are read. Compares with the same reference id and hash, camera,
-crop, mask, colour records and settings form a series; each run of a series
+crop, mask, colour records and settings form a series, and for a captured
+candidate the same size, display, frame and region too; each run of a series
 is one file under `reference/series/<series_id>/`, so two servers writing to
 one shared folder never interleave. A result in a series with earlier runs
 carries the trend, and one that starts a new series says which of those
@@ -449,7 +486,9 @@ node's object alone with the node carrying the display flag, and puts the
 flag back. Whatever a capture makes for itself is made and taken away with
 undo turned off. A route that fails part way takes its frames with it; a
 capture stopped on request keeps the frames it wrote and lists them, and the
-run record names each file. The network editor and panes are made the
+run record names each file, the capture's job and, for a `node` or `cop`
+capture, the node, which is how `hou_compare` finds a node's newest picture.
+The network editor and panes are made the
 current tab and grabbed from their own window, which needs a user interface;
 a worker answers `UI_UNAVAILABLE`. A render Houdini stops with an error is
 `CAPTURE_FAILED`, with that error in the details. Every step that puts the

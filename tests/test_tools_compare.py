@@ -143,7 +143,8 @@ def test_the_tool_is_listed_after_hou_jobs_and_within_its_token_budget(bench: Be
     assert names.index("hou_compare") > names.index("hou_jobs")
     [tool] = [tool for tool in listed.tools if tool.name == "hou_compare"]
     payload = tool.model_dump(mode="json", by_alias=True, exclude_none=True)
-    assert len(json.dumps(payload, separators=(",", ":"))) <= 1200
+    # Under 320 tokens by the estimate of four bytes to a token.
+    assert len(json.dumps(payload, separators=(",", ":"))) <= 4 * 319
     assert "No pass or fail" in tool.description
     assert tool.input_schema["additionalProperties"] is False
 
@@ -205,6 +206,34 @@ def test_a_known_shift_is_found_within_a_pixel(bench: Bench, hip: Path, tmp_path
     assert (shift["dx"], shift["dy"]) == (-5, -3)
     assert before["steps"]["shift_px"] is None
     assert after["metrics"]["mae"]["overall"] < before["metrics"]["mae"]["overall"] / 5
+
+
+def test_a_shift_that_makes_the_numbers_worse_is_not_applied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pixels = load(FRONT).astype(np.float32) / 255.0
+    picture = imaging.Picture(rgb=pixels, alpha=None, colour={}, path="front.png")
+    wrong = {"dx": 7, "dy": -4, "estimate": [7.2, -3.9], "peak": 0.09, "applied": True}
+    monkeypatch.setattr(imaging, "estimate_shift", lambda *_: dict(wrong))
+    aligned = imaging.align(picture, picture, auto_shift=True)
+    shift = aligned.steps["shift_px"]
+    assert shift["applied"] is False
+    assert (shift["dx"], shift["dy"]) == (0, 0)
+    assert shift["estimate"] == [7.2, -3.9]
+    assert "did not lower the difference" in shift["reason"]
+    assert shift["mae"]["unshifted"] == 0.0 < shift["mae"]["shifted"]
+    assert np.array_equal(aligned.candidate, np.clip(pixels, 0.0, 1.0))
+    assert aligned.valid.all()
+
+
+def test_a_shift_that_lowers_the_numbers_is_applied_with_both_errors(tmp_path: Path) -> None:
+    pixels = load(FRONT).astype(np.float32) / 255.0
+    moved = shifted(load(FRONT), 5, 3).astype(np.float32) / 255.0
+    reference = imaging.Picture(rgb=pixels, alpha=None, colour={}, path="front.png")
+    candidate = imaging.Picture(rgb=moved, alpha=None, colour={}, path="moved.png")
+    shift = imaging.align(candidate, reference, auto_shift=True).steps["shift_px"]
+    assert shift["applied"] is True
+    assert shift["mae"]["shifted"] < shift["mae"]["unshifted"]
 
 
 def test_a_different_image_is_counted_and_boxed(bench: Bench, hip: Path) -> None:
@@ -557,17 +586,38 @@ def test_a_replaced_reference_starts_a_new_series(bench: Bench, hip: Path) -> No
     assert again["series"]["id"] != first["series"]["id"]
 
 
-# Section: sources this build does not have yet
+# Section: what each candidate source takes
 
 
-@pytest.mark.parametrize("source", ["viewport", "node", "render"])
-def test_capture_sources_are_not_yet_available(bench: Bench, source: str) -> None:
-    result = run(bench, candidate={"source": source}, reference="front")
-    assert code(result) == "NOT_YET_AVAILABLE"
-    error = result.structured_content["error"]
-    assert error["details"]["tool"] == "hou_capture"
-    assert "hou_capture" in error["hint"]
+@pytest.mark.parametrize(
+    ("candidate", "argument"),
+    [
+        ({"source": "node"}, "candidate.path"),
+        ({"source": "node", "path": "/obj/geo1", "resolution": [10]}, "candidate.resolution"),
+        ({"source": "viewport", "region": [0.5, 0, 0.4, 1]}, "candidate.region"),
+        ({"source": "viewport", "frames": [1, 3, 1]}, "candidate.frames"),
+        ({"source": "render"}, "candidate"),
+        ({"source": "render", "job_id": "job-1", "path": "/obj/geo1"}, "candidate"),
+        ({"source": "render", "job_id": "job-1", "camera": "/obj/cam1"}, "candidate.camera"),
+    ],
+)
+def test_what_a_candidate_source_does_not_take_is_refused_before_the_session(
+    bench: Bench, candidate: dict[str, Any], argument: str
+) -> None:
+    result = run(bench, candidate=candidate, reference="front")
+    assert code(result) == "BAD_ARGUMENTS"
+    assert result.structured_content["error"]["details"]["argument"] == argument
     assert bench.sent.calls == []
+
+
+def test_a_file_candidate_still_lets_other_keys_by(bench: Bench, hip: Path) -> None:
+    result = run(
+        bench,
+        info(hip),
+        candidate={"source": "file", "path": str(FRONT), "note": "kept as before"},
+        reference=str(FRONT),
+    )
+    assert body(result)["metrics"]["mae"]["overall"] == 0.0
 
 
 # Section: sizes, depths and memory
