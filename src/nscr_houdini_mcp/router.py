@@ -26,6 +26,14 @@ again when its answer comes back, as the pool expects of any server that
 routes to one. Reads count: a worker somebody is reading from is in use, so it
 is kept warm on purpose.
 
+Pacing. A call on its way to a session with a user interface waits here for
+its turn under the pacer's two rules, a minimum pause and a rate cap, so an
+agent in a loop cannot keep the artist's main thread busy without a break. The
+reply says how long the call waited in `throttled_ms`. A worker is not paced,
+unless the router is told to treat workers as sessions with an interface,
+which is for tests. A cancel is never paced: it runs beside the call it stops
+and never reaches the main thread.
+
 The socket wait. When a call names no `timeout_s`, the bridge gives running
 work its own default of a minute, so this end waits on the socket for the
 queueing time plus that minute plus a margin. Waiting less would read a slow
@@ -51,6 +59,7 @@ from nscr_houdini_mcp.bridge import client, registry
 from nscr_houdini_mcp.bridge.dispatch import DEFAULT_TIMEOUT_S as BRIDGE_TIMEOUT_S
 from nscr_houdini_mcp.bridge.dispatch import DEFAULT_WAIT_S as BRIDGE_WAIT_S
 from nscr_houdini_mcp.bridge.errors import did_you_mean
+from nscr_houdini_mcp.pacing import Pacer, throttled_ms
 from nscr_houdini_mcp.results import CallError
 from nscr_houdini_mcp.store import SessionRecord
 
@@ -66,6 +75,12 @@ SOCKET_MARGIN_S = client.SOCKET_MARGIN_S
 
 # Codes in a reply that mean the kept client no longer fits the session.
 STALE_CLIENT_CODES = frozenset({"SESSION_DEAD", "UNKNOWN_SESSION", "UNAUTHORIZED"})
+
+# Bridge tools that never reach the main thread, so are never paced.
+UNPACED_TOOLS = frozenset({"bridge.cancel"})
+
+# Where a reply says how long pacing held it.
+THROTTLED_KEY = "throttled_ms"
 
 
 @dataclass(frozen=True)
@@ -240,8 +255,13 @@ class Router:
         send: Callable[..., client.Answer] = client.call,
         ask_health: Callable[..., client.Answer] = client.health,
         renew_lease: Callable[[Any, str], Any] = pool.touch,
+        pacer: Pacer | None = None,
+        pace_workers: bool = False,
     ) -> None:
         self.home = Path(home)
+        # No pacer means no pacing, which is what a router built by hand gets.
+        self.pacer = pacer if pacer is not None else Pacer(min_pause_s=0, max_per_s=0)
+        self.pace_workers = pace_workers
         self.default_session = default_session
         self.store_path = store_path or self.home / store_module.STORE_FILE_NAME
         self._open_store = open_store
@@ -322,6 +342,7 @@ class Router:
         with self._lock:
             for session_id in [key for key in self._clients if key not in live]:
                 del self._clients[session_id]
+                self.pacer.forget(session_id)
 
     def _records(self, *, include_gone: bool = True) -> list[SessionRecord]:
         try:
@@ -402,6 +423,50 @@ class Router:
         once rather than a place in the queue, including behind a main thread
         that is away.
         """
+        paced = self.paces(target, tool)
+        waited = throttled_ms(self.pacer.admit(target.session_id)) if paced else 0
+        try:
+            reply = self._call(
+                target,
+                tool,
+                arguments,
+                operation_id=operation_id,
+                scene_epoch=scene_epoch,
+                wait_s=wait_s,
+                timeout_s=timeout_s,
+                socket_s=socket_s,
+                skip_if_busy=skip_if_busy,
+            )
+        except CallError as error:
+            if waited:
+                error.trace[THROTTLED_KEY] = waited
+            raise
+        finally:
+            if paced:
+                self.pacer.done(target.session_id)
+        if waited:
+            reply = {**reply, THROTTLED_KEY: waited}
+        return reply
+
+    def paces(self, target: Target, tool: str) -> bool:
+        """Whether a call of this tool to this session waits its turn first."""
+        if tool in UNPACED_TOOLS or not self.pacer.active:
+            return False
+        return target.record.kind == "gui" or (self.pace_workers and target.record.kind == "hython")
+
+    def _call(
+        self,
+        target: Target,
+        tool: str,
+        arguments: Mapping[str, Any] | None,
+        *,
+        operation_id: str | None,
+        scene_epoch: int | None,
+        wait_s: float | None,
+        timeout_s: float | None,
+        socket_s: float | None,
+        skip_if_busy: bool,
+    ) -> dict[str, Any]:
         extra: dict[str, Any] = {"skip_if_busy": True} if skip_if_busy else {}
         try:
             answer = self._send(

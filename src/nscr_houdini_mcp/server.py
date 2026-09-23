@@ -33,6 +33,7 @@ from mcp_types import Tool as MCPTool
 
 from nscr_houdini_mcp.bridge.errors import did_you_mean
 from nscr_houdini_mcp.config import Config, ConfigError, load_config
+from nscr_houdini_mcp.pacing import Pacer
 from nscr_houdini_mcp.results import CallError, Spill, error_result, ok_result, reap_spill
 from nscr_houdini_mcp.router import Router
 from nscr_houdini_mcp.tools.base import Call, ToolSpec
@@ -206,7 +207,16 @@ async def in_daemon_thread(work: Callable[..., Any], *args: Any) -> Any:
 
 
 def _router_for(config: Config) -> Router:
-    return Router(config.state_home, default_session=config.default_session)
+    pacer = Pacer(
+        min_pause_s=config.gui_min_pause_ms / 1000.0,
+        max_per_s=config.gui_max_calls_per_s,
+    )
+    return Router(
+        config.state_home,
+        default_session=config.default_session,
+        pacer=pacer,
+        pace_workers=config.treat_workers_as_gui,
+    )
 
 
 class HoudiniServer(MCPServer):

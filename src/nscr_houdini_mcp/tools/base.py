@@ -341,6 +341,10 @@ class Call:
         warnings = said.get("warnings")
         if warnings:
             self.trace["warnings"] = warnings
+        # Pacing waits add up over the bridge calls one tool call makes.
+        waited = said.get("throttled_ms")
+        if isinstance(waited, int) and not isinstance(waited, bool) and waited > 0:
+            self.trace["throttled_ms"] = int(self.trace.get("throttled_ms") or 0) + waited
         # A caller that guards on the epoch is guarding on the scene, so a
         # later step of the same call follows a scene this call replaced.
         if self._epoch is not None and isinstance(said.get("scene_epoch"), int):

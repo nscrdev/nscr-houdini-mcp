@@ -19,6 +19,13 @@ install by version, `22.0` for the newest 22.0 build or `22.0.368` for that
 one. With neither, `NSCR_MCP_HYTHON` is read, then the newest install this
 machine has is used.
 
+Pacing. `gui_min_pause_ms` and `gui_max_calls_per_s` limit how hard this
+server drives a Houdini with a user interface: the least time between one
+call ending and the next starting, and how many calls may start in any one
+second. Zero turns either off. `treat_workers_as_gui` paces workers the same
+way; it exists so the pacing can be tried against a headless Houdini, and is
+left out of the template on purpose.
+
 The same file may hold `[outputs]` and `[conventions]` tables. Those belong to
 the output paths, which check them when they read them, so they are passed
 over here.
@@ -38,7 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from nscr_houdini_mcp import install as install_module
-from nscr_houdini_mcp import pool
+from nscr_houdini_mcp import pacing, pool
 from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge.security import InsecureLocation, check_home
 
@@ -77,6 +84,11 @@ DEFAULT_INLINE_WAIT_S = 10
 # Within what a client commonly waits for one answer before it gives up.
 MAX_INLINE_WAIT_S = 50
 
+# The longest pause between calls to a session with a user interface, and the
+# most calls a second it may be asked to take.
+MAX_GUI_MIN_PAUSE_MS = 10_000
+MAX_GUI_CALLS_PER_S = 1000
+
 _BUILD = re.compile(r"^\d+\.\d+(\.\d+)*$")
 
 # Every key the file may hold, in the order `config show` prints them.
@@ -92,6 +104,9 @@ KEYS = (
     "spill_keep_days",
     "python_timeout_cap_s",
     "inline_wait_s",
+    "gui_min_pause_ms",
+    "gui_max_calls_per_s",
+    "treat_workers_as_gui",
     "transport",
 )
 
@@ -138,6 +153,15 @@ python_timeout_cap_s = {DEFAULT_PYTHON_TIMEOUT_CAP_S}
 # Seconds hou_python waits for its code before it answers with a job id to
 # follow with hou_jobs. The code carries on either way. From 1 to {MAX_INLINE_WAIT_S}.
 inline_wait_s = {DEFAULT_INLINE_WAIT_S}
+
+# Pacing for a Houdini with a user interface, so agents cannot keep its main
+# thread busy without a break. The least milliseconds between one call from
+# this server ending and the next starting, and the most calls from this
+# server that may start in any one second. A call past either waits its turn
+# and says how long in throttled_ms; it never fails for it. Workers are not
+# paced. 0 turns a rule off.
+gui_min_pause_ms = {pacing.DEFAULT_MIN_PAUSE_MS}
+gui_max_calls_per_s = {pacing.DEFAULT_MAX_CALLS_PER_S}
 
 # How clients reach the server. Only "stdio" is served by this build.
 transport = "stdio"
@@ -187,6 +211,9 @@ class Config:
     spill_keep_days: int = DEFAULT_SPILL_KEEP_DAYS
     python_timeout_cap_s: int = DEFAULT_PYTHON_TIMEOUT_CAP_S
     inline_wait_s: int = DEFAULT_INLINE_WAIT_S
+    gui_min_pause_ms: int = pacing.DEFAULT_MIN_PAUSE_MS
+    gui_max_calls_per_s: int = pacing.DEFAULT_MAX_CALLS_PER_S
+    treat_workers_as_gui: bool = False
     transport: str = TRANSPORTS[0]
     # Which keys the file set. The rest are defaults.
     from_file: frozenset[str] = frozenset()
@@ -213,6 +240,9 @@ class Config:
             "spill_keep_days": self.spill_keep_days,
             "python_timeout_cap_s": self.python_timeout_cap_s,
             "inline_wait_s": self.inline_wait_s,
+            "gui_min_pause_ms": self.gui_min_pause_ms,
+            "gui_max_calls_per_s": self.gui_max_calls_per_s,
+            "treat_workers_as_gui": self.treat_workers_as_gui,
             "transport": self.transport,
         }
         return {key: values[key] for key in KEYS}
@@ -379,6 +409,20 @@ def _inline_wait(value: Any, key: str, path: Path) -> int:
     return _whole(value, key, path, 1, MAX_INLINE_WAIT_S)
 
 
+def _pause_ms(value: Any, key: str, path: Path) -> int:
+    return _whole(value, key, path, 0, MAX_GUI_MIN_PAUSE_MS)
+
+
+def _calls_per_s(value: Any, key: str, path: Path) -> int:
+    return _whole(value, key, path, 0, MAX_GUI_CALLS_PER_S)
+
+
+def _switch(value: Any, key: str, path: Path) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"{key} must be true or false, got {_kind(value)}", path=path, key=key)
+    return value
+
+
 def _transport(value: Any, key: str, path: Path) -> str | None:
     text = _text(value, key, path)
     if text is not None and text not in TRANSPORTS:
@@ -406,6 +450,9 @@ _CHECKS = {
     "spill_keep_days": _keep_days,
     "python_timeout_cap_s": _python_timeout_cap,
     "inline_wait_s": _inline_wait,
+    "gui_min_pause_ms": _pause_ms,
+    "gui_max_calls_per_s": _calls_per_s,
+    "treat_workers_as_gui": _switch,
     "transport": _transport,
 }
 

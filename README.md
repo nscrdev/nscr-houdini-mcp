@@ -478,6 +478,29 @@ hython -m nscr_houdini_mcp.bridge.main --home <state folder>
 
 It stops when its input closes, or on the word `stop`.
 
+### Pacing a Houdini with a user interface
+
+In a session with a user interface every call runs on Houdini's main thread,
+the one that draws the interface. Calls sent back to back leave it no room,
+and an agent in a loop can send a great many, so the server paces the calls it
+sends to such a session. Two keys in `config.toml` set the pace:
+
+```toml
+gui_min_pause_ms = 50     # least time from one call ending to the next starting
+gui_max_calls_per_s = 10  # most calls that may start in any one second
+```
+
+A call past either waits its turn and is never refused for it; its reply says
+how long it waited in the trace, as `throttled_ms`. Zero turns a rule off. The
+pace is kept per server process, which is one client, and per session, so two
+agents on one session each get their own allowance and together no more than
+twice it. Workers are headless and are not paced. A cancel is never paced
+either, since it runs beside the call it stops.
+
+The bridge has a limit of its own, whoever sends: it remembers the signed
+requests of the last two minutes, 20,000 at most, and refuses one more with
+`FLOOD_GUARD`, naming the limit and how many seconds to wait.
+
 ### Installing the Houdini side
 
 One command writes the Houdini package that puts this on a session's path:
