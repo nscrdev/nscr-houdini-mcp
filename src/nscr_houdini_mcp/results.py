@@ -64,6 +64,8 @@ SERVER_CODES: dict[str, str] = {
     "OUTPUT_UNWRITABLE": "the folder for an output could not be made",
     "BAD_CURSOR": "the page token is not one this read handed out",
     "JOB_UNKNOWN": "no job is kept under that id",
+    "HELP_UNAVAILABLE": "no help server and no help folder for this Houdini",
+    "DOC_NOT_FOUND": "the help has no page at that path",
 }
 
 CODES: dict[str, str] = {**BRIDGE_CODES, **SERVER_CODES}
@@ -121,6 +123,11 @@ HINTS: dict[str, str] = {
     "SCENE_UNTITLED": "use save_increment, which picks a versioned file for the scene",
     "JOB_UNKNOWN": "list the jobs to see the ids that are kept; a job is kept for 7 days",
     "JOB_ID_TAKEN": "use a new operation_id; the job under this one is kept for 7 days",
+    "HELP_UNAVAILABLE": (
+        "start a session or a worker, or set houdini_build or hython in config to an install"
+        " that has its houdini/help folder"
+    ),
+    "DOC_NOT_FOUND": "use one of the paths in did_you_mean, or find the page with mode search",
 }
 
 # The largest result whose text block repeats the whole JSON. Larger ones get a
