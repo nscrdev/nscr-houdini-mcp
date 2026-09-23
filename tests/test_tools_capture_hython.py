@@ -295,3 +295,51 @@ def test_quad_and_a_two_frame_sequence(place: dict[str, Any]) -> None:
     assert all(is_png(item) for item in frames["paths"])
     plausible(frames["image_stats"])
     assert look(place) == before
+
+
+# A shown camera, light and null away from the box, with the null's cross in
+# front of the box where a capture would draw it.
+AROUND = """
+obj = hou.node('/obj')
+cam = obj.createNode('cam', 'sidecam')
+cam.parmTuple('t').set((6, 3, 0))
+light = obj.createNode('hlight::2.0', 'sidelight')
+light.parmTuple('t').set((-5, 4, 2))
+marker = obj.createNode('null', 'marker')
+marker.parmTuple('t').set((0.3, 0.3, 0.9))
+result = [cam.path(), light.path(), marker.path()]
+"""
+
+
+def green(path: str) -> int:
+    """How many drawn pixels are the green a null's cross is drawn in."""
+    with Image.open(path) as image:
+        data = image.convert("RGBA").tobytes()
+    pixels = (data[index : index + 4] for index in range(0, len(data), 4))
+    return sum(1 for r, g, b, a in pixels if a and g > r + 40 and g > b + 40)
+
+
+def test_framing_all_leaves_out_cameras_lights_and_nulls(place: dict[str, Any]) -> None:
+    before = look(place)
+    [made] = run(place, ("hou_python", {"code": AROUND}))
+    extras = ok(made)["result"]
+    try:
+        plain, guided = run(
+            place,
+            ("hou_capture", {"frame_target": "all", "resolution": [320, 180]}),
+            ("hou_capture", {"frame_target": "all", "guides": True, "resolution": [320, 180]}),
+        )
+    finally:
+        gone = "\n".join(f"hou.node({path!r}).destroy()" for path in extras)
+        run(place, ("hou_python", {"code": gone}))
+    body = ok(plain)
+    assert body["camera"]["target"] == "all"
+    assert not any("nothing to frame" in item for item in body.get("warnings", []))
+    framed(body["path"])
+    assert green(body["path"]) == 0
+    # With guides the null's cross is drawn, and the framing is the same.
+    framed(ok(guided)["path"])
+    assert green(ok(guided)["path"]) > 20
+    after = look(place)
+    assert after["obj"] == before["obj"]
+    assert after["out"] == []

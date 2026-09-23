@@ -9,8 +9,9 @@ the reply says which route made it and what was tried before.
 The routes for a view, in order, and the first that writes a file wins:
 
 - `viewport_flipbook`: the Scene Viewer that is showing, flipbooked with
-  settings of its own: no MPlay, the beauty pass only unless guides are asked
-  for, the resolution asked for. A camera, a display mode or a target to
+  settings of its own: no MPlay, the beauty pass only and only the objects
+  whose geometry renders unless guides are asked for, the resolution asked
+  for. A camera, a display mode or a target to
   frame is applied for the capture and put back in a `finally`: the view
   type, the camera looked through, the default camera with its translation,
   rotation, pivot and ortho width, and the shading. A torn off copy of a
@@ -21,7 +22,9 @@ The routes for a view, in order, and the first that writes a file wins:
   that was current is put back.
 - `flipbook_rop`: a flipbook render node made for the capture, with a camera
   it needs: the one named, or a camera made for the capture and fitted to
-  the target's bounds. In a session with a user interface this route cannot
+  the target's bounds. Either route frames `all` on the geometry of shown
+  objects, not cameras, lights or nulls, and on the origin, with a warning,
+  when there is none. In a session with a user interface this route cannot
   know what the artist's view frames, so its result says
   `framing_unverified`. It is the only route a session without one has.
   `node` isolates the node: its object alone is drawn, the node carries the
@@ -131,6 +134,14 @@ DEFAULT_ELEVATION = 25.0
 MARGIN = 1.15
 # The size a target with no extent is framed at.
 MIN_EXTENT = 0.5
+# What frames "all" and what a capture without guides draws: the geometry of
+# shown objects. Houdini's own kinds for cameras and lights leave those out,
+# and whatever sits inside them, such as a camera rig's handles. These object
+# types count as geometry to Houdini but draw only a guide shape: a null's
+# cross, a bone, and a rivet's, fetch's and blend's markers.
+NOT_DRAWN_KINDS = ("ObjCamera", "ObjLight")
+GUIDE_OBJECTS = frozenset({"null", "bone", "rivet", "fetch", "blend"})
+NOTHING_TO_FRAME = "nothing to frame was found, so the {} frames the origin"
 
 DEFAULT_RESOLUTION = (1280, 720)
 MAX_RESOLUTION = 8192
@@ -872,7 +883,9 @@ def flipbook_settings(
     The copy starts from the artist's dialog, so nothing is left to it: an
     object filter, a contact sheet, motion blur, depth of field, a background
     image or a colour transform the artist left on would all come along.
-    Returns the settings and the names that could not be set.
+    Without guides only the objects whose geometry renders are drawn, as the
+    beauty pass alone still draws a null's cross. Returns the settings and
+    the names that could not be set.
     """
     settings = viewer.flipbookSettings().stash()
     kinds = getattr(hou, "flipbookObjectType", None)
@@ -885,7 +898,7 @@ def flipbook_settings(
         ("useResolution", True),
         ("resolution", spec.resolution),
         ("beautyPassOnly", not spec.guides),
-        ("visibleObjects", "*"),
+        ("visibleObjects", visible_pattern(hou, spec)),
         ("visibleTypes", getattr(kinds, "Visible", _NO_VALUE)),
         ("useSheetSize", False),
         ("useMotionBlur", False),
@@ -1014,7 +1027,13 @@ def apply_view(
         if through is not None:
             warnings.append("a camera node's view is not moved, so frame_target was not applied")
         elif target == "all":
-            viewport.frameAll()
+            # Houdini's own frame all counts cameras, lights and nulls, so a
+            # shown camera away from the subject pulls the view off it.
+            bounds = world_bounds(hou, None)
+            if bounds is None:
+                warnings.append(NOTHING_TO_FRAME.format("view"))
+                bounds = ((-MIN_EXTENT,) * 3, (MIN_EXTENT,) * 3)
+            viewport.frameBoundingBox(hou.BoundingBox(*bounds[0], *bounds[1]))
         elif target == "selection":
             viewport.frameSelected()
         else:
@@ -1084,6 +1103,8 @@ def rop_route(
             if objects is not None:
                 _set(rop, "vobjects", " ".join(objects))
                 _set(rop, "forceobjects", " ".join(objects))
+            else:
+                _set(rop, "vobjects", visible_pattern(hou, spec))
             for index, frame in enumerate(frames):
                 if context.should_stop():
                     if not done:
@@ -1426,7 +1447,7 @@ def rop_camera(
         orbit, elevation, ortho = FITTED[view]
     bounds = world_bounds(hou, targets)
     if bounds is None:
-        warnings.append("nothing to frame was found, so the camera frames the origin")
+        warnings.append(NOTHING_TO_FRAME.format("camera"))
         bounds = ((-MIN_EXTENT,) * 3, (MIN_EXTENT,) * 3)
     parent = hou.node(CAMERA_PARENT)
     fitted = parent.createNode(CAMERA_TYPE, _free_name(parent, CAMERA_NAME))
@@ -1586,10 +1607,13 @@ def _dot(a: Sequence[float], b: Sequence[float]) -> float:
 def world_bounds(
     hou: Any, nodes: list[Any] | None
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
-    """The world space box around what the nodes draw, or around every shown object."""
+    """The world space box around what the nodes draw, or around all that renders.
+
+    None when there is no box to go around: no geometry at all, or only
+    empty geometry.
+    """
     if nodes is None:
-        scene = _quiet(lambda: hou.node("/obj").children()) or ()
-        nodes = [node for node in scene if _shown(node)]
+        nodes = drawn_objects(hou)
     low = [math.inf] * 3
     high = [-math.inf] * 3
     for node in nodes:
@@ -1602,6 +1626,42 @@ def world_bounds(
     if not all(math.isfinite(value) for value in (*low, *high)):
         return None
     return (low[0], low[1], low[2]), (high[0], high[1], high[2])
+
+
+def drawn_objects(hou: Any) -> list[Any]:
+    """Every shown object whose geometry renders, inside subnets too.
+
+    A camera, a light, and a null or other object that draws only a guide
+    shape, are left out, and so is a hidden object or one in a hidden subnet.
+    """
+    root = _quiet(lambda: hou.node("/obj"))
+    kinds = getattr(hou, "nodeTypeFilter", None)
+    if root is None or kinds is None:
+        return []
+    found = _quiet(lambda: root.recursiveGlob("*", kinds.ObjGeometry)) or ()
+    left_out: list[str] = []
+    for name in NOT_DRAWN_KINDS:
+        kind = getattr(kinds, name, None)
+        matched = _quiet(lambda kind=kind: root.recursiveGlob("*", kind)) if kind else None
+        left_out += [node.path() for node in matched or ()]
+    drawn = []
+    for node in found:
+        path = node.path()
+        if any(path == other or path.startswith(other + "/") for other in left_out):
+            continue
+        type_name = _quiet(lambda node=node: node.type().nameComponents()[2])
+        if type_name in GUIDE_OBJECTS or not _shown(node):
+            continue
+        drawn.append(node)
+    return drawn
+
+
+def visible_pattern(hou: Any, spec: Spec) -> str:
+    """The objects a flipbook draws: every one with guides, else those that render."""
+    if spec.guides:
+        return "*"
+    drawn = drawn_objects(hou)
+    return " ".join(node.path() for node in drawn) if drawn else "*"
 
 
 def _shown(node: Any) -> bool:

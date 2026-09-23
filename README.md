@@ -474,7 +474,11 @@ flipbooked with settings of its own (no MPlay, the beauty pass only unless
 then put back; and a flipbook render node made for the capture and taken
 away after. A `camera`, `display` or `frame_target` asked for is applied for
 the capture and the view is put back as it was, camera, pivot and width
-included. The render node looks through a camera made for the capture:
+included. `frame_target: "all"` (the default for a view turned or fitted for
+the capture) frames the geometry of shown objects, never a camera, light or
+null, and frames the origin with a warning when there is no geometry. Without
+`guides` both routes draw only the objects whose geometry renders, so a
+null's cross stays out of the picture. The render node looks through a camera made for the capture:
 one that follows a named camera and reads its lens by reference, so the named
 camera is never written, or one fitted to the target's bounds from `persp`,
 `top`, `front`, `right` or an `{orbit, elevation}`. A worker is started on

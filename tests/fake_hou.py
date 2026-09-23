@@ -1108,7 +1108,16 @@ class Node:
         return next((child for child in self._children if "Display" in child.flags), None)
 
     def isObjectDisplayed(self) -> bool:  # noqa: N802 - the name is Houdini's
+        # An object in a hidden subnet is hidden with it.
+        if self._parent is not None and self._parent._type.name() == "subnet":
+            return not self.hidden and self._parent.isObjectDisplayed()
         return not self.hidden
+
+    def recursiveGlob(self, pattern: str, filter: str) -> tuple[Node, ...]:  # noqa: A002, N802
+        """Every node below of the kind asked for, as `nodeTypeFilter` names it."""
+        assert pattern == "*", pattern
+        wanted = OBJECT_KINDS[filter]
+        return tuple(node for node in self.allSubChildren() if node._type.name() in wanted)
 
     def worldTransform(self) -> Matrix4:  # noqa: N802 - the name is Houdini's
         t = self.parmTuple("t")
@@ -1153,6 +1162,15 @@ class Node:
         return node
 
 
+# Houdini's kinds of object, by the types `nodeTypeFilter` matches, as a real
+# 22.0 sorts them: a null, a bone and a subnet count as geometry too.
+OBJECT_KINDS = {
+    "ObjGeometry": ("geo", "null", "subnet", "bone", "rivet", "fetch", "blend"),
+    "ObjCamera": ("cam",),
+    "ObjLight": ("hlight::2.0", "envlight", "ambient"),
+}
+
+
 def _category(parent: Node | None) -> str:
     """Which network a node lives in, which is what decides its category."""
     if parent is None:
@@ -1164,6 +1182,8 @@ def _category(parent: Node | None) -> str:
         return "Cop"
     if kind in ("img", "cop2net"):
         return "Cop2"
+    if kind == "subnet" and parent._type.category().name() == "Object":
+        return "Object"
     return {"/obj": "Object", "/out": "Driver", "/stage": "Lop"}.get(parent.path(), "Sop")
 
 
@@ -1908,6 +1928,7 @@ class Scene:
             imageLayerStorageType=SimpleNamespace(Fixed8="Fixed8", Float32="Float32"),
             ImageLayer=ImageLayer,
             BoundingBox=BoundingBox,
+            nodeTypeFilter=SimpleNamespace(**{kind: kind for kind in OBJECT_KINDS}),
             hmath=SimpleNamespace(buildRotate=build_rotate),
             Vector3=Vector3,
             Matrix4=Matrix4,
@@ -2540,7 +2561,7 @@ class CaptureStandIn:
         )
         if not self.writes:
             return
-        shown = self.anything_shown(self.shown_objects())
+        shown = self.anything_shown(self.shown_objects(str(values["visibleObjects"])))
         frame = float(start)
         while frame <= float(end):
             path = str(values["output"]).replace("$F4", f"{int(frame):04d}")
