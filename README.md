@@ -238,12 +238,14 @@ a fixed order, and the result records every step:
    more than 25 percent apart after alignment.
 2. Alignment at native size: `align` (`fit` letterboxes to the reference's
    aspect, `fill` crops to cover it, `stretch`, `none` keeps the candidate's
-   pixels one for one), then `adjust` (`dx` and `dy` from -1 to 1 and `scale`
-   from 0.05 to 20, in shares of the frame), then `auto_shift`, a translation
+   pixels one for one), then `adjust` (`dx` and `dy` from -1 to 1, in shares
+   of the frame, and `scale` from 0.05), then `auto_shift`, a translation
    found by phase correlation. A candidate with more pixels than the
    reference keeps them: the grid grows instead, up to four times. Only the
-   part of an enlarged candidate that lands on the frame is ever made, and a
-   `scale` that would place it over four times the frame's area is refused.
+   part of an enlarged candidate that lands on the frame is ever made. There
+   is no fixed largest `scale`: one that would place the candidate over four
+   times the frame's area is refused, which for a candidate that already
+   fills the frame is a little over 2.
 3. Crops before any shrinking. Named regions and `region`, each
    `[x0, y0, x1, y1]` in shares of the frame, are cut from the aligned native
    images, and a detail crop's numbers are counted at that size, a block of
@@ -275,8 +277,9 @@ Every compare writes `candidate.png` and `reference.png` (the aligned pair),
 names every file relative to itself and holds no place on the machine other
 than the scene's own path. The call returns the overview as an image for the
 person as well as the agent (`return_image` `thumb`, `full` or `none`). The
-text and the image of a reply stay within one megabyte together: a full
-sheet that would not fit is sent as the thumbnail, with `image_downgraded`.
+structured result, the text and the image of a reply stay within one
+megabyte together: a full sheet that would not fit is sent as the thumbnail,
+with `image_downgraded`.
 
 `set_reference` copies an image into `$HIP/.agent/reference/` and writes one
 record beside it, `<ref_id>.json`, that is never written again: the content

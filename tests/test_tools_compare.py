@@ -687,6 +687,18 @@ def test_a_full_sheet_too_large_for_the_reply_is_sent_as_the_thumbnail(
     assert [block.type for block in bare.content] == ["text"]
 
 
+def test_the_structured_result_counts_against_the_reply_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(results, "REPLY_BUDGET_BYTES", 12_000)
+    picture = ImageContent(type="image", data="A" * 3_000, mime_type="image/jpeg")
+    small = results.ok_result({"a": 1}, {"session_id": None}, extra=[picture])
+    assert [block.type for block in small.content] == ["text", "image"]
+    large = results.ok_result({"a": "x" * 9_000}, {"session_id": None}, extra=[picture])
+    assert [block.type for block in large.content] == ["text"]
+    assert "left out" in large.content[0].text
+
+
 def test_a_block_over_the_reply_budget_is_never_sent(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(results, "REPLY_BUDGET_BYTES", 10_000)
     big = ImageContent(type="image", data="A" * 20_000, mime_type="image/jpeg")
@@ -767,6 +779,18 @@ def test_counting_a_4k_pair_stays_within_a_small_memory_bound() -> None:
     bound = 64 * 1024 * 1024
     assert after_numbers < bound
     assert after_picture < bound
+
+
+def test_scale_is_limited_by_the_placed_area_not_a_fixed_number(
+    bench: Bench, hip: Path, tmp_path: Path
+) -> None:
+    tiny = save(tmp_path / "tiny.png", np.full((10, 10, 3), 90))
+    frame = save(tmp_path / "frame.png", np.full((400, 400, 3), 90))
+    kept = body(compare(bench, hip, tiny, frame, align="none", adjust={"scale": 30}))
+    assert kept["steps"]["placed_px"]["width"] == 300
+    small = compare(bench, hip, tiny, frame, adjust={"scale": 0.01})
+    assert code(small) == "BAD_ARGUMENTS"
+    assert "four times" in small.structured_content["error"]["message"]
 
 
 def test_adjust_moves_stay_within_the_frame(bench: Bench, hip: Path) -> None:
@@ -1083,7 +1107,14 @@ def fake_ocio(view: str) -> Any:
     )
 
 
-def fake_oiio(pixels: np.ndarray, *, origin: tuple[int, int], full: tuple[int, int]) -> Any:
+def fake_oiio(
+    pixels: np.ndarray,
+    *,
+    origin: tuple[int, int],
+    full: tuple[int, int],
+    names: list[str] | None = None,
+    alpha: int | None = None,
+) -> Any:
     """OpenImageIO as far as the reader uses it: a data window inside a display window."""
     height, width, count = pixels.shape
     spec = types.SimpleNamespace(
@@ -1096,8 +1127,8 @@ def fake_oiio(pixels: np.ndarray, *, origin: tuple[int, int], full: tuple[int, i
         full_width=full[0],
         full_height=full[1],
         nchannels=count,
-        channelnames=("R", "G", "B", "A")[:count],
-        alpha_channel=3 if count == 4 else -1,
+        channelnames=tuple(names) if names else ("R", "G", "B", "A")[:count],
+        alpha_channel=alpha if alpha is not None else (3 if count == 4 else -1),
     )
 
     class Input:
@@ -1219,6 +1250,73 @@ def test_premultiplied_colour_is_divided_by_alpha_before_the_transform(
     assert np.allclose(values[..., :3], 0.5, atol=0.01)
     assert np.allclose(values[..., 3], 0.5)
     assert data["alpha"]["partial"] is True
+
+
+LAYERED = ["R", "G", "B", "A", "diffuse.R", "diffuse.G", "diffuse.B"]
+
+
+@pytest.mark.parametrize(
+    ("names", "alpha", "expected"),
+    [
+        (LAYERED, 3, ([0, 1, 2], 3)),
+        (["diffuse.R", "diffuse.G", "diffuse.B", "R", "G", "B"], None, ([3, 4, 5], None)),
+        (["depth.Z", "C.R", "C.G", "C.B", "C.A"], None, ([1, 2, 3], 4)),
+        (
+            ["spec.R", "spec.G", "spec.B", "beauty.R", "beauty.G", "beauty.B"],
+            None,
+            ([3, 4, 5], None),
+        ),
+        (["diffuse.R", "diffuse.G", "diffuse.B", "A"], 3, ([0, 1, 2], None)),
+        (["Y", "U", "V"], None, ([0, 1, 2], None)),
+    ],
+)
+def test_colour_comes_from_one_layer_and_the_first_match(
+    names: list[str], alpha: int | None, expected: tuple[list[int], int | None]
+) -> None:
+    assert images._colour_channels(names, len(names), alpha) == expected
+
+
+def test_the_beauty_is_read_when_the_file_also_has_a_diffuse_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pixels = np.zeros((1, 2, 7), dtype=np.float32)
+    pixels[..., 0:3] = 0.2140
+    pixels[..., 3] = 1.0
+    pixels[..., 4:7] = 1.0
+    fake = fake_oiio(pixels, origin=(0, 0), full=(2, 1), names=LAYERED, alpha=3)
+    monkeypatch.setitem(sys.modules, "OpenImageIO", fake)
+    exr = exr_file(tmp_path / "layers.exr", width=2, height=1)
+    out = tmp_path / "read.f32"
+    data = images.read_exr(
+        {"path": str(exr), "out_path": str(out)}, ToolContext(hou=StandIn([], []))
+    )
+    assert data["colour"]["channel"] == "R,G,B"
+    values = np.fromfile(out, dtype=np.float32).reshape(1, 2, 4)
+    assert np.allclose(values[..., :3], 0.5, atol=0.01)
+
+
+def test_an_opencolorio_failure_is_a_coded_error_with_the_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = fake_ocio("Standard")
+
+    def refuse(**rest: Any) -> Any:
+        raise RuntimeError("Cannot find source color space named 'scene_linear'.")
+
+    fake.DisplayViewTransform = refuse
+    monkeypatch.setitem(sys.modules, "PyOpenColorIO", fake)
+    monkeypatch.delenv("OCIO", raising=False)
+    exr = exr_file(tmp_path / "beauty.exr")
+    out = tmp_path / "read.f32"
+    with pytest.raises(images.BridgeError) as raised:
+        images.read_exr(
+            {"path": str(exr), "out_path": str(out)},
+            ToolContext(hou=StandIn([Layer(linear_ramp())], ["C"])),
+        )
+    assert raised.value.code == "TOOL_FAILED"
+    assert "scene_linear" in raised.value.details["reason"]
+    assert "scene_linear" in raised.value.hint
+    assert not out.exists()
 
 
 def test_a_stopped_read_leaves_no_file(tmp_path: Path) -> None:

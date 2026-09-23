@@ -56,6 +56,10 @@ PIXEL_BUDGET = 64_000_000
 # Output names read first, in this order, when the file has several.
 COLOUR_OUTPUTS = ("C", "rgba", "RGBA", "rgb", "RGB", "Cd", "beauty")
 
+# Channel layers read first, in this order: the unprefixed `R`, `G`, `B`,
+# then the usual names of the beauty layer.
+COLOUR_LAYERS = ("", "C", "rgba", "RGBA", "beauty")
+
 HOLDER_NAME = "nscr_compare_read"
 HOLDER_TYPE = "copnet"
 FILE_TYPE = "file"
@@ -89,9 +93,9 @@ def read_exr(arguments: Mapping[str, Any], context: Any) -> dict[str, Any]:
     if read is None:
         read = _read_cop(hou, path, numpy)
         marked = True
-    pixels, names, alpha_index, route = read
+    pixels, names, file_alpha, route = read
     height, width = pixels.shape[:2]
-    rgb_index = _colour_channels(names, pixels.shape[2], alpha_index)
+    rgb_index, alpha_index = _colour_channels(names, pixels.shape[2], file_alpha)
     factor = _factor(width, height)
     if factor > 1:
         pixels = _shrink(pixels, factor, numpy)
@@ -305,15 +309,32 @@ def _colour_output(names: list[str]) -> int:
     return 0
 
 
-def _colour_channels(names: list[str], count: int, alpha: int | None) -> list[int]:
-    """Which channels are red, green and blue: by name when they have names."""
-    plain = {name.rsplit(".", 1)[-1].upper(): index for index, name in enumerate(names)}
-    if all(letter in plain for letter in "RGB"):
-        return [plain["R"], plain["G"], plain["B"]]
+def _colour_channels(
+    names: list[str], count: int, alpha: int | None
+) -> tuple[list[int], int | None]:
+    """Which channels are red, green, blue and alpha, all from one layer.
+
+    Channels are keyed by layer and letter, and the first channel under a key
+    is kept, so `diffuse.R` never stands in for `R`. The unprefixed layer is
+    tried first, then the usual names of the beauty layer, then any layer
+    that has all three colours, in the order the file lists them. Alpha comes
+    from the same layer or not at all. A file whose channels have no such
+    names gives its first three channels that are not its alpha.
+    """
+    layers: dict[str, dict[str, int]] = {}
+    for index, name in enumerate(names):
+        layer, _, letter = name.rpartition(".")
+        layers.setdefault(layer, {}).setdefault(letter.upper(), index)
+    order = [layer for layer in COLOUR_LAYERS if layer in layers]
+    order += [layer for layer in layers if layer not in order]
+    for layer in order:
+        found = layers[layer]
+        if all(letter in found for letter in "RGB"):
+            return [found["R"], found["G"], found["B"]], found.get("A")
     colour = [index for index in range(count) if index != alpha]
     if len(colour) >= 3:
-        return colour[:3]
-    return [colour[0]] * 3 if colour else [0, 0, 0]
+        return colour[:3], alpha
+    return ([colour[0]] * 3 if colour else [0, 0, 0]), alpha
 
 
 def _factor(width: int, height: int) -> int:
@@ -347,15 +368,35 @@ def display(hou: Any, rgb: Any, numpy: Any) -> tuple[Any, dict[str, Any]]:
             "reason": "OpenColorIO is not importable in this session",
         }
     config_path = _quiet(lambda: hou.Color.ocio_configPath()) or os.environ.get("OCIO")
-    config = ocio.Config.CreateFromFile(config_path) if config_path else ocio.GetCurrentConfig()
-    display_name = _quiet(lambda: hou.Color.ocio_defaultDisplay()) or config.getDefaultDisplay()
-    view_name = _quiet(lambda: hou.Color.ocio_defaultView()) or config.getDefaultView(display_name)
-    transform = ocio.DisplayViewTransform(
-        src=ocio.ROLE_SCENE_LINEAR, display=display_name, view=view_name
-    )
-    processor = config.getProcessor(transform).getDefaultCPUProcessor()
-    shown = numpy.ascontiguousarray(rgb, dtype=numpy.float32).copy()
-    processor.applyRGB(shown)
+    try:
+        if config_path:
+            config = ocio.Config.CreateFromFile(config_path)
+        else:
+            config = ocio.GetCurrentConfig()
+        display_name = _quiet(lambda: hou.Color.ocio_defaultDisplay()) or config.getDefaultDisplay()
+        view_name = _quiet(lambda: hou.Color.ocio_defaultView()) or config.getDefaultView(
+            display_name
+        )
+        transform = ocio.DisplayViewTransform(
+            src=ocio.ROLE_SCENE_LINEAR, display=display_name, view=view_name
+        )
+        processor = config.getProcessor(transform).getDefaultCPUProcessor()
+        shown = numpy.ascontiguousarray(rgb, dtype=numpy.float32).copy()
+        processor.applyRGB(shown)
+    except Exception as error:  # noqa: BLE001 - OpenColorIO raises its own kinds
+        raise BridgeError(
+            "TOOL_FAILED",
+            "the session's OpenColorIO configuration could not bring the image to display values",
+            {
+                "exception": type(error).__name__,
+                "reason": str(error)[:300],
+                "configuration": Path(config_path).name if config_path else "the current one",
+            },
+            hint=(
+                "point OCIO at a configuration with a scene_linear role and a default display"
+                " and view, or compare a PNG or TIFF exported from the image"
+            ),
+        ) from None
     return shown, {
         "kind": "view_transform",
         "transform": "ocio_display_view",

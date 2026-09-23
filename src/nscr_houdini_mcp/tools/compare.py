@@ -76,6 +76,11 @@ AUTO_CROP_NAME = "largest_difference"
 # The furthest `adjust` moves the candidate, as a share of the frame.
 MAX_MOVE = 1.0
 
+# The smallest `adjust.scale`. There is no fixed largest: the candidate it
+# places may cover at most four times the frame's area, which `imaging`
+# refuses before anything is enlarged.
+MIN_SCALE = 0.05
+
 MASK_NONE = "none"
 MASK_REFERENCE = "reference"
 
@@ -85,6 +90,10 @@ PLAIN_VIEWS = frozenset({"un-tone-mapped", "untonemapped", "standard", "srgb", "
 
 LIKENESS_NOTE = "secondary: lighting, material and framing move these numbers; read the sheet first"
 REGRESSION_NOTE = "primary: the same setup rendered again, so a change in the numbers is a change"
+
+# Room kept for what is added to a result after its size is taken: the
+# trace and the note about the picture.
+RESULT_MARGIN = 2048
 
 PARTIAL_ALPHA_WARNING = (
     "the candidate has partial alpha and no mask is set, so its transparent pixels count "
@@ -261,10 +270,11 @@ def check_adjust(value: Any) -> dict[str, float] | None:
                 f"adjust.{key} is a share of the frame, from -1 to 1",
                 details={"argument": f"adjust.{key}"},
             )
-    if not 0.05 <= moved["scale"] <= 20.0:
+    if moved["scale"] < MIN_SCALE:
         raise CallError(
             "BAD_ARGUMENTS",
-            "adjust.scale must be from 0.05 to 20",
+            f"adjust.scale must be at least {MIN_SCALE:g}; above 1 it is limited by area, "
+            "since the candidate it places may cover at most four times the frame",
             details={"argument": "adjust.scale"},
         )
     return moved
@@ -548,11 +558,9 @@ def compare(call: Call) -> dict[str, Any]:
             "result": relative_to(folder / "result.json", scene.place),
         },
     )
-    sent = attach_picture(call, arguments.get("return_image") or "thumb", report)
     # What the caller gets is the saved record with places it can open here.
-    return {
+    returned = {
         **saved,
-        **sent,
         "folder": str(folder),
         "files": absolute(folder, report["files"]),
         "sources": {
@@ -560,6 +568,9 @@ def compare(call: Call) -> dict[str, Any]:
             "reference": {**saved["sources"]["reference"], "path": str(reference_path)},
         },
     }
+    how = arguments.get("return_image") or "thumb"
+    returned.update(attach_picture(call, how, report, beside=returned))
+    return returned
 
 
 def give_back(call: Call, plan: outputs_module.OutputPlan) -> None:
@@ -979,17 +990,24 @@ def write_result(path: Path, result: Mapping[str, Any]) -> None:
     path.write_text(text + "\n", encoding="utf-8")
 
 
-def attach_picture(call: Call, how: str, report: Mapping[str, Any]) -> dict[str, Any]:
+def attach_picture(
+    call: Call, how: str, report: Mapping[str, Any], *, beside: Mapping[str, Any]
+) -> dict[str, Any]:
     """The overview as image content, for the person as much as the agent.
 
-    The picture has to fit in the reply beside the text. A full sheet that
-    would not is sent as the thumbnail instead, and one that still would not
-    is left out; the result says which.
+    The picture has to fit in the reply beside the structured result and the
+    text. A full sheet that would not is sent as the thumbnail instead, and
+    one that still would not is left out; the result says which.
     """
     if how == "none":
         return {}
     module = imaging()
-    room = results_module.REPLY_BUDGET_BYTES - results_module.TEXT_BLOCK_CAP
+    room = (
+        results_module.REPLY_BUDGET_BYTES
+        - results_module.TEXT_BLOCK_CAP
+        - results_module.structured_size(beside)
+        - RESULT_MARGIN
+    )
     said: dict[str, Any] = {}
     encoded = None
     if how == "full":

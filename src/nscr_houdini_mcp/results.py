@@ -141,9 +141,9 @@ DETAILS_CHARS = 1500
 # How much of a spilled result comes back as a preview.
 PREVIEW_CHARS = 2000
 
-# The most the text block and any other blocks, such as a picture, may add up
-# to in one reply. A block that would go over it is left out, and the text
-# says so. A tool that sends a picture sizes it to fit first.
+# The most one reply may add up to: the structured result, the text block and
+# any other blocks, such as a picture. A block that would go over it is left
+# out, and the text says so. A tool that sends a picture sizes it to fit first.
 REPLY_BUDGET_BYTES = 1024 * 1024
 
 # More than the text block of a result can be: the mirrored result, or the
@@ -344,7 +344,7 @@ def ok_result(
             f" {spill.over_bytes}, so it was written to {spilled['path']}."
             f" Read that file for all of it. First part:\n{text[:PREVIEW_CHARS]}"
         )
-        line, kept = within_budget(line, blocks)
+        line, kept = within_budget(line, blocks, structured=body)
         return CallToolResult(
             content=[TextContent(type="text", text=line), *kept],
             structured_content=body,
@@ -353,7 +353,7 @@ def ok_result(
     if len(text) > MIRROR_CHARS:
         line = summary or f"{tool}: {len(text)} characters, keys {', '.join(sorted(data))}"
         text = f"{line}\ntrace: {compact(dict(trace))}\nThe full result is in structuredContent."
-    text, kept = within_budget(text, blocks)
+    text, kept = within_budget(text, blocks, structured=body)
     return CallToolResult(
         content=[TextContent(type="text", text=text), *kept],
         structured_content=body,
@@ -370,9 +370,22 @@ def block_size(block: Any) -> int:
     return 0
 
 
-def within_budget(text: str, blocks: Sequence[Any]) -> tuple[str, list[Any]]:
-    """The blocks that fit beside the text in one reply, and a text that says what did not."""
+def structured_size(body: Mapping[str, Any]) -> int:
+    """The bytes a structured result adds to a reply."""
+    text = json.dumps(body, separators=(",", ":"), ensure_ascii=False, default=str)
+    return len(text.encode("utf-8"))
+
+
+def within_budget(
+    text: str, blocks: Sequence[Any], *, structured: Mapping[str, Any] | None = None
+) -> tuple[str, list[Any]]:
+    """The blocks that fit beside the text and the structured result in one reply.
+
+    The text says what did not fit.
+    """
     used = len(text.encode("utf-8"))
+    if structured is not None:
+        used += structured_size(structured)
     kept: list[Any] = []
     dropped = 0
     for block in blocks:
