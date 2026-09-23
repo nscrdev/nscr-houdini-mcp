@@ -684,7 +684,10 @@ def test_a_pool_worker_is_never_given_the_whole_environment(from_site: Path, hom
 def test_a_launched_hython_is_never_given_the_whole_environment(
     from_site: Path, home: Path
 ) -> None:
-    given = HythonBridge(home=home, env={})._child_env()
+    # Any file stands in for hython: only the environment it would get is read.
+    stand_in = home / "hython"
+    stand_in.write_text("")
+    given = HythonBridge(home=home, env={}, hython=stand_in)._child_env()
     assert given["PYTHONPATH"] == str(
         install_module.copy_for_source(
             from_site / install_module.PACKAGE_NAME, home, stamp_of(from_site)
