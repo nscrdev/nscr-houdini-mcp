@@ -29,7 +29,7 @@ PARTS = [
 ]
 
 # Tools the skill may name before they are in the registry.
-ARRIVING = {"hou_capture", "hou_compare", "hou_outputs", "hou_docs", "hou_node_type"}
+ARRIVING = {"hou_capture"}
 
 
 def load_lint() -> Any:
