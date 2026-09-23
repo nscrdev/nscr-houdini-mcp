@@ -18,7 +18,8 @@ from typing import Any
 
 import pytest
 
-from nscr_houdini_mcp.tools.base import ToolSpec, structured_kinds
+from nscr_houdini_mcp.tools import base
+from nscr_houdini_mcp.tools.base import ToolSpec, inputs, structured_kinds
 from nscr_houdini_mcp.tools.registry import TOOLS
 from test_server import Stage, serve, talk
 
@@ -36,7 +37,22 @@ SAMPLES: dict[tuple[str, str], Any] = {
     ("hou_capture", "frames"): [1, 12],
     ("hou_capture", "region"): [0, 0, 1, 1],
     ("hou_capture", "camera"): {"position": [0, 1, 5], "look_at": [0, 0, 0]},
+    ("hou_compare", "detail_crops"): ["keys", "face"],
 }
+
+
+def takes_structure(schema: Any) -> bool:
+    """Whether a property schema takes an object or an array, read here on its own terms."""
+    if not isinstance(schema, dict):
+        return False
+    declared = schema.get("type") or []
+    kinds = {declared} if isinstance(declared, str) else set(declared)
+    if "properties" in schema:
+        kinds.add("object")
+    if "items" in schema:
+        kinds.add("array")
+    branches = [*schema.get("anyOf", []), *schema.get("oneOf", [])]
+    return bool(kinds & {"object", "array"}) or any(takes_structure(b) for b in branches)
 
 
 def echoing(spec: ToolSpec) -> ToolSpec:
@@ -57,8 +73,80 @@ def given(result: Any) -> dict[str, Any]:
 
 def test_every_object_or_array_argument_is_known() -> None:
     """A new object or array argument is added to the samples, and so to the tests."""
+    expected = {
+        (spec.name, name)
+        for spec in TOOLS
+        for name, schema in spec.input_schema["properties"].items()
+        if takes_structure(schema)
+    }
     found = {(spec.name, name) for spec in TOOLS for name in spec.structured}
-    assert found == set(SAMPLES)
+    assert expected == set(SAMPLES)
+    assert found == expected
+
+
+def test_an_any_of_or_one_of_argument_is_read_too() -> None:
+    spec = ToolSpec(
+        name="test_branches",
+        description="test only",
+        input_schema=inputs(
+            {
+                "either": {"anyOf": [{"type": "string"}, {"type": "object"}]},
+                "one": {"oneOf": [{"type": "array", "items": {"type": "number"}}, {"enum": [1]}]},
+            }
+        ),
+        handler=lambda call: {"given": call.arguments},
+    )
+    assert spec.structured == {"either": (dict,), "one": (list,)}
+    _, [result] = talk(
+        serve(Stage([]), tools=(spec,)),
+        ("test_branches", {"either": '{"a": 1}', "one": "[1, 2]"}),
+    )
+    assert given(result) == {"either": {"a": 1}, "one": [1, 2]}
+
+
+def test_a_string_or_array_argument_reads_only_a_list_of_strings() -> None:
+    [spec] = [spec for spec in TOOLS if spec.name == "hou_compare"]
+    assert spec.structured["detail_crops"] == (list,)
+    for sent, arrived in (
+        ('["keys"]', ["keys"]),
+        (' ["a", "b"]', ["a", "b"]),
+        ("auto", "auto"),
+        ("[1, 2]", "[1, 2]"),
+        ("[not json", "[not json"),
+    ):
+        assert spec.decode({"detail_crops": sent})["detail_crops"] == arrived
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["[NaN, 1]", "[Infinity, 1]", "[-Infinity, 1]", "[" * 100000 + "]" * 100000],
+    ids=["nan", "infinity", "minus infinity", "nested deep"],
+)
+def test_text_json_cannot_read_safely_is_refused_by_the_schema(text: str) -> None:
+    [spec] = [spec for spec in TOOLS if spec.name == "hou_capture"]
+    _, [result] = talk(
+        serve(Stage([]), tools=(echoing(spec),)), ("hou_capture", {"resolution": text})
+    )
+    assert result.is_error
+    error = result.structured_content["error"]
+    assert error["code"] == "BAD_ARGUMENTS"
+    assert error["details"]["argument"] == "resolution"
+
+
+def test_a_failure_while_reading_arguments_is_a_coded_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    [spec] = [spec for spec in TOOLS if spec.name == "hou_capture"]
+
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("broken")
+
+    monkeypatch.setattr(base, "decoded", broken)
+    _, [result] = talk(
+        serve(Stage([]), tools=(echoing(spec),)), ("hou_capture", {"resolution": "[1, 2]"})
+    )
+    assert result.is_error
+    assert result.structured_content["error"]["code"] == "TOOL_FAILED"
 
 
 @pytest.mark.parametrize(("tool", "argument"), sorted(SAMPLES))
@@ -118,7 +206,9 @@ def test_a_string_or_object_argument_reads_only_an_object_from_text() -> None:
         ({"properties": {"a": {}}}, (dict,)),
         ({"items": {"type": "number"}}, (list,)),
         ({"type": ["string", "object"]}, (dict,)),
-        ({"type": ["string", "array"]}, ()),
+        ({"type": ["string", "array"]}, (list,)),
+        ({"anyOf": [{"type": "string"}, {"items": {}}]}, (list,)),
+        ({"oneOf": [{"enum": ["a"]}, {"properties": {}}]}, (dict,)),
         ({"type": "string"}, ()),
         ({}, ()),
         ({"enum": ["a", "b"]}, ()),

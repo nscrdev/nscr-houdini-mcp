@@ -13,7 +13,7 @@ misspelled name comes back as `BAD_ARGUMENTS` with the nearest real one and
 the handler never sees it. Before the check, an argument the schema wants as
 an object or an array that arrived as a string holding that JSON is read into
 it: some clients send nested arguments that way. Where the schema takes a
-string as well as an object, only text holding a JSON object is read.
+string as well, only a JSON object or an array of strings is read.
 
 This module never imports `hou`.
 """
@@ -144,26 +144,36 @@ _OBJECT_WORDS = ("properties", "additionalProperties", "required", "propertyName
 _ARRAY_WORDS = ("items", "prefixItems", "minItems", "maxItems")
 
 
-def structured_kinds(schema: Mapping[str, Any]) -> tuple[type, ...]:
-    """What a string may be read into for this property schema: dict, list, or nothing.
+def type_names(schema: Any) -> set[str]:
+    """The JSON types a property schema takes.
 
-    Nothing when the schema names its values. Where it allows a string as well,
-    only an object is read: text starting with `{` is never a node path or a
-    name, while text starting with `[` might be meant as it is.
+    Declared, implied by its keywords, or taken by any branch of its `anyOf`
+    or `oneOf`. Named values count as their own type.
     """
-    if "enum" in schema or "const" in schema:
-        return ()
+    if not isinstance(schema, Mapping):
+        return set()
+    names: set[str] = set()
+    named = "enum" in schema or "const" in schema
+    if named:
+        values = schema["enum"] if "enum" in schema else [schema["const"]]
+        names |= {"string" if isinstance(value, str) else "named" for value in values}
     declared = schema.get("type")
     if declared is not None:
-        names = [declared] if isinstance(declared, str) else list(declared)
-        if "string" in names:
-            return (dict,) if "object" in names else ()
-    else:
-        names = []
+        names |= {declared} if isinstance(declared, str) else set(declared)
+    elif not named:
         if any(word in schema for word in _OBJECT_WORDS):
-            names.append("object")
+            names.add("object")
         if any(word in schema for word in _ARRAY_WORDS):
-            names.append("array")
+            names.add("array")
+    for word in ("anyOf", "oneOf"):
+        for branch in schema.get(word) or ():
+            names |= type_names(branch)
+    return names
+
+
+def structured_kinds(schema: Mapping[str, Any]) -> tuple[type, ...]:
+    """What a string may be read into for this property schema: dict, list, or nothing."""
+    names = type_names(schema)
     kinds: list[type] = []
     if "object" in names:
         kinds.append(dict)
@@ -172,13 +182,23 @@ def structured_kinds(schema: Mapping[str, Any]) -> tuple[type, ...]:
     return tuple(kinds)
 
 
+def _no_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not a JSON number")
+
+
 def decoded(
-    arguments: Mapping[str, Any], wanted: Mapping[str, tuple[type, ...]], tool: str = ""
+    arguments: Mapping[str, Any],
+    wanted: Mapping[str, tuple[type, ...]],
+    tool: str = "",
+    loose: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """The arguments with each JSON string read where the schema wants an object or array.
 
-    A string that does not read as JSON of the wanted kind is left as it is,
-    for the schema check to report.
+    Where the schema takes a string as well (`loose`), text starting with `{`
+    is never a node path or a name, so a JSON object is read; a JSON array is
+    read only when it holds nothing but strings. A string that does not read
+    as JSON of the wanted kind, including one with NaN or Infinity or nested
+    too deep to read, is left as it is for the schema check to report.
     """
     out = dict(arguments)
     for name, kinds in wanted.items():
@@ -189,12 +209,16 @@ def decoded(
         if not text or text[0] not in "{[":
             continue
         try:
-            parsed = json.loads(text)
-        except ValueError:
+            parsed = json.loads(text, parse_constant=_no_constant)
+        except (ValueError, RecursionError):
             continue
-        if isinstance(parsed, kinds):
-            out[name] = parsed
-            log.debug("%s: read %s from JSON text", tool, name)
+        if not isinstance(parsed, kinds):
+            continue
+        if name in loose and isinstance(parsed, list):
+            if not all(isinstance(item, str) for item in parsed):
+                continue
+        out[name] = parsed
+        log.debug("%s: read %s from JSON text", tool, name)
     return out
 
 
@@ -224,16 +248,20 @@ class ToolSpec:
     failed: Callable[[Mapping[str, Any]], bool] | None = None
     _validator: Any = field(default=None, init=False, repr=False, compare=False)
     _structured: Any = field(default=None, init=False, repr=False, compare=False)
+    _loose: Any = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         Draft202012Validator.check_schema(dict(self.input_schema))
         object.__setattr__(self, "_validator", Draft202012Validator(dict(self.input_schema)))
+        properties = self.input_schema.get("properties", {})
         structured = {
             name: kinds
-            for name, schema in self.input_schema.get("properties", {}).items()
+            for name, schema in properties.items()
             if isinstance(schema, Mapping) and (kinds := structured_kinds(schema))
         }
+        loose = frozenset(name for name in structured if "string" in type_names(properties[name]))
         object.__setattr__(self, "_structured", structured)
+        object.__setattr__(self, "_loose", loose)
 
     @property
     def structured(self) -> dict[str, tuple[type, ...]]:
@@ -242,7 +270,7 @@ class ToolSpec:
 
     def decode(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         """The arguments with objects and arrays sent as JSON text read into them."""
-        return decoded(arguments, self._structured, self.name)
+        return decoded(arguments, self._structured, self.name, self._loose)
 
     def as_tool(self) -> MCPTool:
         return MCPTool(

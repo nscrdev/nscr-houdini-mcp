@@ -133,12 +133,12 @@ class Runtime:
                     },
                 )
             )
-        arguments = spec.decode(arguments)
-        refused = spec.check(arguments)
-        if refused is not None:
-            return error_result(refused)
         call: Call | None = None
         try:
+            arguments = spec.decode(arguments)
+            refused = spec.check(arguments)
+            if refused is not None:
+                return error_result(refused)
             config, router = self.settings()
             call = Call(
                 spec,

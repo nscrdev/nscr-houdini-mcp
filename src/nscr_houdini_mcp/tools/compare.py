@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import re
 import sqlite3
@@ -308,9 +309,15 @@ def check_adjust(value: Any) -> dict[str, float] | None:
     moved: dict[str, float] = {}
     for key, fallback in (("dx", 0.0), ("dy", 0.0), ("scale", 1.0)):
         number = value.get(key, fallback)
-        if isinstance(number, bool) or not isinstance(number, (int, float)):
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, (int, float))
+            or not math.isfinite(number)
+        ):
             raise CallError(
-                "BAD_ARGUMENTS", f"adjust.{key} must be a number", details={"argument": key}
+                "BAD_ARGUMENTS",
+                f"adjust.{key} must be a finite number",
+                details={"argument": f"adjust.{key}"},
             )
         moved[key] = float(number)
     for key in ("dx", "dy"):
@@ -1499,7 +1506,7 @@ HOU_COMPARE = ToolSpec(
             "region": {"type": "array"},
             "mode": {"enum": list(MODES)},
             "mask": {},
-            "detail_crops": {},
+            "detail_crops": {"type": ["string", "array"]},
             "match_exposure": {"type": "boolean"},
             "tolerance": {"type": "number"},
             "name": {},

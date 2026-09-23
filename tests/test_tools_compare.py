@@ -143,8 +143,8 @@ def test_the_tool_is_listed_after_hou_jobs_and_within_its_token_budget(bench: Be
     assert names.index("hou_compare") > names.index("hou_jobs")
     [tool] = [tool for tool in listed.tools if tool.name == "hou_compare"]
     payload = tool.model_dump(mode="json", by_alias=True, exclude_none=True)
-    # Under 320 tokens by the estimate of four bytes to a token.
-    assert len(json.dumps(payload, separators=(",", ":"))) <= 4 * 319
+    # Under 325 tokens by the estimate of four bytes to a token.
+    assert len(json.dumps(payload, separators=(",", ":"))) <= 4 * 324
     assert "No pass or fail" in tool.description
     assert tool.input_schema["additionalProperties"] is False
 
@@ -331,6 +331,39 @@ def test_an_unknown_crop_name_is_refused_with_the_names_there_are(bench: Bench, 
     result = compare(bench, hip, FRONT, "front", detail_crops=["kyes"])
     assert code(result) == "BAD_ARGUMENTS"
     assert result.structured_content["error"]["details"]["did_you_mean"] == ["keys"]
+
+
+def test_detail_crops_sent_as_json_text_is_the_list_it_holds(bench: Bench, hip: Path) -> None:
+    register(bench, hip, FRONT, name="front", regions={"keys": [0.2, 0.2, 0.8, 0.8]})
+    data = body(compare(bench, hip, FRONT, "front", detail_crops='["keys"]'))
+    assert set(data["crops"]) == {"keys"}
+    one = body(compare(bench, hip, FRONT, "front", detail_crops="keys"))
+    assert set(one["crops"]) == {"keys"}
+
+
+@pytest.mark.parametrize(
+    "adjust",
+    [
+        '{"dx": 0, "dy": 0, "scale": NaN}',
+        '{"dx": Infinity}',
+        {"scale": "1"},
+    ],
+)
+def test_an_adjust_that_is_not_finite_numbers_is_refused(bench: Bench, adjust: Any) -> None:
+    result = run(bench, candidate=str(FRONT), reference=str(FRONT), adjust=adjust)
+    assert code(result) == "BAD_ARGUMENTS"
+    assert result.structured_content["error"]["details"]["argument"].startswith("adjust")
+    assert bench.sent.calls == []
+
+
+@pytest.mark.parametrize("number", [float("nan"), float("inf"), float("-inf")])
+def test_check_adjust_refuses_a_number_that_is_not_finite(number: float) -> None:
+    from nscr_houdini_mcp.tools.compare import check_adjust
+
+    with pytest.raises(results.CallError) as raised:
+        check_adjust({"scale": number})
+    assert raised.value.code == "BAD_ARGUMENTS"
+    assert raised.value.details["argument"] == "adjust.scale"
 
 
 # Section: masks
