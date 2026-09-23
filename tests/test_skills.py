@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import stat
 import sys
 import tomllib
 from pathlib import Path
@@ -276,6 +277,18 @@ def test_a_junction_inside_the_skill_is_never_written_through(tmp_path: Path) ->
     results = agent_skills.install(dest, force=True)
     assert [item.outcome for item in results] == [agent_skills.KEPT]
     assert list(elsewhere.iterdir()) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_a_fresh_install_is_readable_by_everyone(tmp_path: Path) -> None:
+    mask = os.umask(0o022)
+    try:
+        assert cli.main(["skills", "install", str(tmp_path)]) == 0
+    finally:
+        os.umask(mask)
+    folder = tmp_path / "houdini-artist"
+    assert stat.S_IMODE(folder.stat().st_mode) == 0o755
+    assert stat.S_IMODE((folder / "SKILL.md").stat().st_mode) == 0o644
 
 
 def test_a_first_install_that_fails_part_way_leaves_nothing(

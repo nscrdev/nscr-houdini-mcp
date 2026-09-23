@@ -136,6 +136,28 @@ def _copy(source: Path, target: Path) -> None:
         shutil.copyfile(source / rel, there)
 
 
+def _umask() -> int:
+    """The process umask. Reading it means setting it, so it is put straight back."""
+    mask = os.umask(0o022)
+    os.umask(mask)
+    return mask
+
+
+def _open_up(folder: Path) -> None:
+    """Give a staged folder the permissions a plain copy would have had.
+
+    A temporary folder is made for its owner only, so without this a fresh
+    install would leave a skill other accounts cannot read. Folders get 0o777
+    and files 0o666, each masked by the umask, as `mkdir` and `open` would.
+    """
+    mask = _umask()
+    os.chmod(folder, 0o777 & ~mask)
+    for path in folder.rglob("*"):
+        if is_link(path):
+            continue
+        os.chmod(path, (0o777 if path.is_dir() else 0o666) & ~mask)
+
+
 def _copy_new(source: Path, target: Path) -> None:
     """Copy a skill that is not there yet, whole or not at all.
 
@@ -146,6 +168,7 @@ def _copy_new(source: Path, target: Path) -> None:
     staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent))
     try:
         _copy(source, staging)
+        _open_up(staging)
         os.replace(staging, target)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
