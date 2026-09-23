@@ -24,6 +24,7 @@ from mcp.shared.inbound import find_invalid_x_mcp_header
 
 from nscr_houdini_mcp.bridge import client as bridge_client
 from nscr_houdini_mcp.config import Config, ConfigError
+from nscr_houdini_mcp.results import CallError
 from nscr_houdini_mcp.router import Router
 from nscr_houdini_mcp.server import INSTRUCTIONS, SERVER_NAME, build_server
 from nscr_houdini_mcp.tools.base import (
@@ -524,3 +525,25 @@ def test_the_server_exits_at_once_when_stdin_closes_during_a_long_call(tmp_path:
         if child.poll() is None:
             child.kill()
             child.wait()
+
+
+def test_a_flood_refusal_tells_a_change_to_keep_its_id_and_a_read_nothing_more() -> None:
+    flood = {
+        "ok": False,
+        "error": {
+            "code": "FLOOD_GUARD",
+            "message": "more than 20000 signed requests arrived inside 120 seconds",
+            "hint": "wait 30 seconds, then call again",
+        },
+    }
+    stage = Stage([record("s-1", "w1")], replies=(flood, flood))
+    router = stage.router(Config(path=Path("config.toml")))
+    spec = next(tool for tool in TOOLS if tool.name == "hou_python")
+    change = Call(spec, {"code": "x = 1", "operation_id": "op-1"}, router)
+    with pytest.raises(CallError) as refused:
+        change.bridge("python.run", mutating=True)
+    assert refused.value.hint.endswith("send the same operation_id, since the change was not made")
+    read = Call(spec, {"code": "x = 1"}, router)
+    with pytest.raises(CallError) as refused:
+        read.bridge("python.run")
+    assert refused.value.hint == "wait 30 seconds, then call again"

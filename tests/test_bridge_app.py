@@ -485,6 +485,12 @@ def test_a_flood_of_signed_requests_gets_a_coded_answer_with_the_limit_and_the_w
         window = error["details"]["retry_after_s"]
         assert f"wait {window} seconds" in error["hint"]
         assert "not signed" not in error["message"]
+        assert "operation_id" not in error["hint"]
+        if driver == "stdlib":
+            # A signed refusal still proves the port answers, so a full table
+            # does not make the session look unreachable.
+            assert bridge.check_transport() is True
+            assert bridge.transport_ok is True
     finally:
         bridge.stop()
 

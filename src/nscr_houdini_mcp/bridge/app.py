@@ -736,8 +736,7 @@ class Bridge:
                 f" {flood.window_s} seconds, so this one was refused",
                 hint=(
                     f"the bridge takes at most {flood.limit} requests in any"
-                    f" {flood.window_s} seconds; wait {flood.wait_s} seconds, then call"
-                    " again with the same operation_id"
+                    f" {flood.window_s} seconds; wait {flood.wait_s} seconds, then call again"
                 ),
                 details={
                     "limit": flood.limit,
@@ -919,6 +918,9 @@ class Bridge:
         try:
             answer = client.health(session, timeout_s=self.config.self_check_timeout_s)
             ok = answer.status == 200 and bool(answer.payload.get("ok"))
+            # A flood refusal is signed by this bridge, so the port answered:
+            # the session is reachable, only too busy with signed requests.
+            ok = ok or _flood_refusal(answer)
         except (client.BridgeUnreachable, client.BridgeNotAuthentic) as error:
             self._log(f"this session's own port did not answer: {error}")
         except Exception as error:  # noqa: BLE001 - a failed check is a failed check
@@ -992,3 +994,10 @@ def _try(step: Any) -> str | None:
     except Exception as error:  # noqa: BLE001 - one failed step, not a failed cleanup
         return f"{type(error).__name__}: {error}"
     return None
+
+
+def _flood_refusal(answer: client.Answer) -> bool:
+    """Whether a signed answer is the flood guard turning a request away."""
+    payload = answer.payload if isinstance(answer.payload, dict) else {}
+    error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+    return answer.status == 429 and error.get("code") == "FLOOD_GUARD"

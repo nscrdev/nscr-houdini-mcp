@@ -308,6 +308,10 @@ class Call:
                 self.trace["operation_id"] = self._operation_id
                 if "operation_id" in error.details:
                     error.details["operation_id"] = self._operation_id
+                if error.code == "FLOOD_GUARD" and error.hint:
+                    # The bridge refused before it read the call, so it cannot
+                    # tell a change from a read; this end can.
+                    error.hint += "; send the same operation_id, since the change was not made"
             raise
         self._note(reply)
         if operation_id:
