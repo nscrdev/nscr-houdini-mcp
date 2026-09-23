@@ -1,8 +1,9 @@
 """Objects and arrays sent as JSON text are read into them before the schema check.
 
 Some clients send a nested argument as a string holding its JSON. Every tool
-argument the schema wants as an object or an array takes that form too, and
-a string the schema allows is left as it came.
+argument the schema wants as an object or an array takes that form too. Where
+the schema takes a string as well as an object, only text holding a JSON
+object is read, and a plain string is left as it came.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ SAMPLES: dict[tuple[str, str], Any] = {
     ("hou_capture", "resolution"): [640, 480],
     ("hou_capture", "frames"): [1, 12],
     ("hou_capture", "region"): [0, 0, 1, 1],
+    ("hou_capture", "camera"): {"position": [0, 1, 5], "look_at": [0, 0, 0]},
 }
 
 
@@ -86,12 +88,25 @@ def test_text_that_is_not_the_wanted_json_is_refused_by_the_schema() -> None:
         assert error["details"]["argument"] == "resolution"
 
 
-def test_a_string_the_schema_allows_is_left_as_it_came() -> None:
+def test_a_string_or_object_argument_reads_only_an_object_from_text() -> None:
     [spec] = [spec for spec in TOOLS if spec.name == "hou_capture"]
-    assert "camera" not in spec.structured
-    text = '{"path": "/obj/cam1"}'
-    _, [result] = talk(serve(Stage([]), tools=(echoing(spec),)), ("hou_capture", {"camera": text}))
-    assert given(result)["camera"] == text
+    assert spec.structured["camera"] == (dict,)
+    camera = {"position": [0, 1, 5], "look_at": [0, 0, 0]}
+    _, results = talk(
+        serve(Stage([]), tools=(echoing(spec),)),
+        ("hou_capture", {"camera": json.dumps(camera)}),
+        ("hou_capture", {"camera": "  " + json.dumps(camera)}),
+        ("hou_capture", {"camera": camera}),
+        ("hou_capture", {"camera": "/obj/cam1"}),
+        ("hou_capture", {"camera": "[1, 2]"}),
+        ("hou_capture", {"camera": "{not json"}),
+    )
+    as_text, padded, as_value, plain, bracketed, broken = (given(r)["camera"] for r in results)
+    assert as_text == padded == as_value == camera
+    # Plain strings, and text that is not a JSON object, stay as they came.
+    assert plain == "/obj/cam1"
+    assert bracketed == "[1, 2]"
+    assert broken == "{not json"
 
 
 @pytest.mark.parametrize(
@@ -102,7 +117,8 @@ def test_a_string_the_schema_allows_is_left_as_it_came() -> None:
         ({"type": ["array", "object"]}, (dict, list)),
         ({"properties": {"a": {}}}, (dict,)),
         ({"items": {"type": "number"}}, (list,)),
-        ({"type": ["string", "object"]}, ()),
+        ({"type": ["string", "object"]}, (dict,)),
+        ({"type": ["string", "array"]}, ()),
         ({"type": "string"}, ()),
         ({}, ()),
         ({"enum": ["a", "b"]}, ()),

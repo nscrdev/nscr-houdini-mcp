@@ -12,7 +12,8 @@ Arguments are checked against the schema before the handler runs, so a
 misspelled name comes back as `BAD_ARGUMENTS` with the nearest real one and
 the handler never sees it. Before the check, an argument the schema wants as
 an object or an array that arrived as a string holding that JSON is read into
-it: some clients send nested arguments that way.
+it: some clients send nested arguments that way. Where the schema takes a
+string as well as an object, only text holding a JSON object is read.
 
 This module never imports `hou`.
 """
@@ -146,8 +147,9 @@ _ARRAY_WORDS = ("items", "prefixItems", "minItems", "maxItems")
 def structured_kinds(schema: Mapping[str, Any]) -> tuple[type, ...]:
     """What a string may be read into for this property schema: dict, list, or nothing.
 
-    Nothing when the schema allows a string itself, or names its values, since
-    a string there is meant as it is.
+    Nothing when the schema names its values. Where it allows a string as well,
+    only an object is read: text starting with `{` is never a node path or a
+    name, while text starting with `[` might be meant as it is.
     """
     if "enum" in schema or "const" in schema:
         return ()
@@ -155,7 +157,7 @@ def structured_kinds(schema: Mapping[str, Any]) -> tuple[type, ...]:
     if declared is not None:
         names = [declared] if isinstance(declared, str) else list(declared)
         if "string" in names:
-            return ()
+            return (dict,) if "object" in names else ()
     else:
         names = []
         if any(word in schema for word in _OBJECT_WORDS):
