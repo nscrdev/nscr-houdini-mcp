@@ -333,7 +333,7 @@ def default_registry(
         output_module.freeze_parm,
         mutating=True,
         arguments=output_module.FREEZE_ARGUMENTS,
-        required=output_module.FREEZE_ARGUMENTS,
+        required=("node", "parm", "run_id"),
         context=True,
         label="freeze output parameter",
         summary="hold a run's own path on an output parameter while the run goes",
@@ -343,10 +343,17 @@ def default_registry(
         output_module.restore_parm,
         mutating=True,
         arguments=output_module.RESTORE_ARGUMENTS,
-        required=("node", "parm"),
+        required=("node", "parm", "token"),
         context=True,
         label="restore output parameter",
-        summary="put a frozen output parameter's template back",
+        summary="give a frozen output parameter its own value back",
+    )
+    registry.add(
+        "outputs.variables",
+        output_module.variables,
+        arguments=(),
+        context=True,
+        summary="$HIP, $JOB and $HOUDINI_TEMP_DIR as this session has them",
     )
     registry.add(
         "outputs.lint",

@@ -11,6 +11,9 @@ Three actions.
   now. With them come the `version`, the `folder` the output goes to, the
   `run_id` and the `sidecar` record written beside it. A version is taken
   every time, so `resolve` changes the store even when it changes no scene.
+  With `operation_id` the run is `run-<operation_id>`, and the same id sent
+  again answers with the place it already took rather than a new version.
+  `job` and `spill` paths belong to the server and are never handed out.
 - `list` reads what this scene has made, newest first: every run of every
   kind for the scene's family in its folder, or for a scene never saved, the
   runs of this session. Each row has the path, the line, the kind, the
@@ -19,18 +22,20 @@ Three actions.
   time as ISO text or seconds since 1970.
 - `lint` reads the output parameters under `node` (`/` unless named) and
   reports each one that breaks the conventions, one row per problem:
-  `absolute_path`, `outside_hip`, `unversioned`, `missing_on_disk`, or
-  `frozen_after_run` for a run's own path that nobody gave back.
+  `absolute_path`, `outside_hip`, `unversioned`, `missing_on_disk`,
+  `frozen_after_run` for a run's own path that nobody gave back, `expression`
+  for a value only an evaluation could give, which is never run, and
+  `unexpanded` for a variable it cannot fill in.
 
 `list` and `lint` page like every read: a `limit`, and `next_page` to send
 back as `page` with the same arguments. A token from another action, session
 or query is `BAD_CURSOR`. A `lint` page after the scene was replaced still
 comes back and says `scene_changed`.
 
-Every action first puts back what a session that has gone left frozen in this
-scene, which is the sweep the parameter ruling asks of the next session to
-open a scene. `hou_scene open` does the same, and both say what they put back
-in `restored_parms`.
+What a session that has gone left frozen in a scene is put back by the next
+session that loads that scene with `hou_scene open`, or saves it with `save`
+or `save_increment`; `restore_left_over` here is that sweep, and those calls
+say what it did in `restored_parms`.
 
 This module never imports `hou`.
 """
@@ -41,8 +46,8 @@ import base64
 import binascii
 import hashlib
 import json
-import os
 import sqlite3
+import threading
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -52,16 +57,23 @@ from nscr_houdini_mcp import outputs as outputs_module
 from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge import client
 from nscr_houdini_mcp.bridge.errors import did_you_mean
-from nscr_houdini_mcp.bridge.security import InsecureLocation, private_dir
 from nscr_houdini_mcp.results import CallError
-from nscr_houdini_mcp.tools.base import SESSION, WAIT_S, Call, ToolSpec, inputs, outputs
+from nscr_houdini_mcp.tools.base import (
+    OPERATION_ID,
+    SESSION,
+    WAIT_S,
+    Call,
+    ToolSpec,
+    inputs,
+    outputs,
+)
 
 ACTIONS = ("resolve", "list", "lint")
 
-# Kinds a caller may ask for. Record kinds are the server's own.
-KINDS = tuple(
-    kind for kind in outputs_module.OUTPUT_KINDS if kind not in outputs_module.RECORD_KINDS
-)
+# Kinds a caller may ask for, the same ones code in a session is handed. A job
+# record and a spill are the server's own.
+KINDS = outputs_module.CODE_KINDS
+SERVER_KINDS = (*outputs_module.RECORD_KINDS, outputs_module.SPILL_KIND)
 FILTER_KEYS = ("kind", "name", "since")
 
 DEFAULT_LIST_LIMIT = 50
@@ -75,6 +87,9 @@ MAX_SCANNED = 5000
 
 # How many parameters one sweep puts back.
 MAX_RESTORES = 50
+
+# Stands for a scene the sweep has to ask the session for.
+ASK = object()
 
 TOKEN_VERSION = 1
 MAX_TOKEN_CHARS = 1800
@@ -111,6 +126,12 @@ def resolve(call: Call) -> dict[str, Any]:
             "resolve needs kind: which line of the output table to use",
             details={"argument": "kind", "kinds": list(KINDS)},
         )
+    if kind in SERVER_KINDS:
+        raise CallError(
+            "BAD_ARGUMENTS",
+            f"{kind} paths belong to the server and are never handed out",
+            details={"argument": "kind", "kinds": list(KINDS)},
+        )
     if kind not in KINDS:
         raise CallError(
             "BAD_ARGUMENTS",
@@ -119,26 +140,40 @@ def resolve(call: Call) -> dict[str, Any]:
         )
     node = node_argument(arguments.get("node"))
     target = call.target()
+    operation_id = arguments.get("operation_id")
+    run_id = f"run-{operation_id}" if operation_id else None
+    if operation_id:
+        call.trace["operation_id"] = operation_id
+        kept = replay(call, run_id, kind, node, arguments.get("name"))
+        if kept is not None:
+            return kept
     hip = scene_here(call)
     if node is not None:
         # A node that is not there is refused with the closest paths, rather
         # than naming an output after a typo.
         call.bridge("node.inspect", {"mode": "node", "paths": [node], "batch": False})
-    restored = restore_left_over(call, hip)
-    home = call.router.home
-    spill_root = call.config.spill_folder if call.config is not None else None
     with call.router.store(create=True) as store:
-        plan = allocate(
-            store,
-            kind,
-            name=arguments.get("name"),
-            ext=arguments.get("ext"),
-            node=node,
-            hip=hip,
-            session_id=target.session_id,
-            home=home,
-            spill_root=spill_root,
-        )
+        try:
+            plan = allocate(
+                store,
+                kind,
+                name=arguments.get("name"),
+                ext=arguments.get("ext"),
+                node=node,
+                hip=hip,
+                session_id=target.session_id,
+                home=call.router.home,
+                run_id=run_id,
+                variables=session_variables(call),
+            )
+        except _Taken:
+            plan = None
+    if plan is None:
+        # Another call with the same operation id took the place first.
+        kept = replay(call, run_id, kind, node, arguments.get("name"))
+        if kept is None:
+            raise unavailable(store_module.DuplicateRecord(str(run_id)))
+        return kept
     said: dict[str, Any] = {
         "action": "resolve",
         "kind": plan.kind,
@@ -154,9 +189,59 @@ def resolve(call: Call) -> dict[str, Any]:
         said["unsaved_hip"] = True
     if plan.warnings:
         said["warnings"] = list(plan.warnings)
-    if restored:
-        said["restored_parms"] = restored
     return said
+
+
+def replay(
+    call: Call, run_id: str | None, kind: str, node: str | None, name: Any
+) -> dict[str, Any] | None:
+    """The place an earlier call under the same operation id took, or nothing.
+
+    The same id for another output is `OPERATION_MISMATCH`, as it is for
+    every change.
+    """
+    if run_id is None:
+        return None
+    with call.router.store() as store:
+        record = None if store is None else stored(lambda: store.get_run(run_id))
+    if record is None:
+        return None
+    wanted = None if name is None else outputs_module.sanitize_name(str(name))
+    same = (
+        record.kind == kind
+        and record.source_node == node
+        and record.session_id == call.target().session_id
+        and (wanted is None or record.name == wanted)
+    )
+    if not same:
+        raise CallError(
+            "OPERATION_MISMATCH",
+            "that operation id already took a place for another output",
+            details={"operation_id": call.arguments.get("operation_id"), "kind": record.kind},
+        )
+    paths = record.paths if isinstance(record.paths, Mapping) else {}
+    scene = record.scene if isinstance(record.scene, Mapping) else {}
+    said: dict[str, Any] = {
+        "action": "resolve",
+        "kind": record.kind,
+        "name": record.name,
+        "parm_string": paths.get("template"),
+        "expanded_path": paths.get("path"),
+        "version": record.version,
+        "folder": paths.get("directory"),
+        "run_id": record.run_id,
+        "sidecar": paths.get("sidecar"),
+        "replayed": True,
+    }
+    if scene.get("unsaved_hip"):
+        said["unsaved_hip"] = True
+    if paths.get("warnings"):
+        said["warnings"] = list(paths["warnings"])
+    return said
+
+
+class _Taken(Exception):
+    """A run under this id was recorded by another call first."""
 
 
 def allocate(
@@ -169,15 +254,15 @@ def allocate(
     hip: str | None,
     session_id: str,
     home: Any,
-    spill_root: Path | None,
+    run_id: str | None = None,
+    variables: Mapping[str, str | None] | None = None,
 ) -> outputs_module.OutputPlan:
-    """A place for one output, claimed on disk and recorded as a run."""
-    scratch = None if os.environ.get("HOUDINI_TEMP_DIR") else Path(home) / "temp"
+    """A place for one output, claimed on disk and recorded as a run.
+
+    `$JOB` and `$HOUDINI_TEMP_DIR` are the session's, never this process's.
+    """
+    scratch = Path(home) / "temp"
     try:
-        if kind == outputs_module.SPILL_KIND and spill_root is not None:
-            # The spill folder is kept private, as the server keeps it for
-            # results it writes there itself.
-            private_dir(Path(spill_root))
         conventions = outputs_module.load_conventions(home=home, hip_path=hip)
         return outputs_module.allocate(
             store,
@@ -186,10 +271,11 @@ def allocate(
             hip_path=hip,
             node_path=node,
             session_id=session_id,
+            run_id=run_id,
             ext=None if ext is None else str(ext),
             conventions=conventions,
             scratch_root=scratch,
-            spill_root=spill_root,
+            variables=variables if variables is not None else {},
         )
     except outputs_module.AllocationFailed as error:
         raise CallError("OUTPUT_BUSY", str(error), details={"kind": kind}) from None
@@ -203,9 +289,13 @@ def allocate(
                 "conventions": list(CONVENTION_FILES),
             },
         ) from None
+    except store_module.DuplicateRecord:
+        if run_id is None:
+            raise unavailable(store_module.DuplicateRecord("run")) from None
+        raise _Taken(run_id) from None
     except (store_module.StoreError, sqlite3.Error) as error:
         raise unavailable(error) from None
-    except (OSError, InsecureLocation) as error:
+    except OSError as error:
         raise CallError(
             "OUTPUT_UNWRITABLE",
             "the folder for the output could not be made",
@@ -227,7 +317,6 @@ def list_outputs(call: Call) -> dict[str, Any]:
     query = fingerprint("list", family, folder, wanted)
     token = read_token(arguments.get("page"), "list", target.session_id, query)
     before = None if token is None else (float(token["k"][0]), int(token["k"][1]))
-    restored = restore_left_over(call, hip)
 
     rows: list[dict[str, Any]] = []
     last: tuple[float, int] | None = None
@@ -271,8 +360,6 @@ def list_outputs(call: Call) -> dict[str, Any]:
             query=query,
             key=[last[0], last[1]],
         )
-    if restored:
-        said["restored_parms"] = restored
     return said
 
 
@@ -389,8 +476,6 @@ def lint(call: Call) -> dict[str, Any]:
     target = call.target()
     query = fingerprint("lint", tidy(scope))
     token = read_token(arguments.get("page"), "lint", target.session_id, query)
-    hip = scene_here(call)
-    restored = restore_left_over(call, hip)
     sent: dict[str, Any] = {"scope": scope, "limit": limit}
     if token is not None:
         sent["after"] = token["k"]
@@ -411,36 +496,46 @@ def lint(call: Call) -> dict[str, Any]:
         )
     if token is not None and token["e"] != epoch:
         said["scene_changed"] = True
-    if restored:
-        said["restored_parms"] = restored
     return said
 
 
 # Section: the sweep for parameters a gone session left frozen
 
 
-def restore_left_over(call: Call, hip: str | None) -> list[dict[str, Any]]:
+def restore_left_over(call: Call, hip: Any = ASK) -> list[dict[str, Any]]:
     """Put back what a session that has gone left frozen in this scene.
 
-    A session that dies while a run holds a parameter cannot give the
-    template back, and the scene may have been saved with the run's path in
-    it. The next session to open the scene does it instead, asked here. A
-    record from a scene that was never saved can never be given back, so it
-    is dropped. Each parameter is its own change, under an id of its own, and
-    one that fails says so and leaves the rest to go on.
+    A session that dies while a run holds a parameter cannot give it back,
+    and the scene may have been saved with the run's path in it. The session
+    that loads the scene next, or is about to save it, does it instead, asked
+    here. `hip` is the scene file when the caller knows it; left out, the
+    session is asked only when there is something left over at all. The
+    session keeps a record while the file on disk still holds the path, so a
+    copy older than the file does not lose it. A record from a scene that was
+    never saved can never be given back, so it is dropped. Each parameter is
+    its own change, under an id of its own, and one that fails says so and
+    leaves the rest to go on.
     """
-    key = outputs_module.scene_key(hip)
     with call.router.store() as store:
         if store is None:
             return []
         stored(store.forget_unrestorable_frozen_parms)
-        if key is None:
-            return []
-        rows = stored(lambda: store.orphan_frozen_parms(hip_key=key))
+        rows = stored(store.orphan_frozen_parms)
+    if not rows:
+        return []
+    if hip is ASK:
+        hip = scene_here(call)
+    key = outputs_module.scene_key(hip)
+    rows = [row for row in rows if key is not None and row.hip_key == key]
     done: list[dict[str, Any]] = []
     target = call.target()
     for row in rows[:MAX_RESTORES]:
-        arguments = {"node": row.node_path, "parm": row.parm_name, "owner": row.session_id}
+        arguments = {
+            "node": row.node_path,
+            "parm": row.parm_name,
+            "owner": row.session_id,
+            "token": row.token,
+        }
         try:
             reply = call.router.call(
                 target,
@@ -450,7 +545,15 @@ def restore_left_over(call: Call, hip: str | None) -> list[dict[str, Any]]:
                 wait_s=call.arguments.get("wait_s"),
             )
         except CallError as error:
-            done.append({**arguments, "restored": False, "reason": error.code})
+            done.append(
+                {
+                    "node": row.node_path,
+                    "parm": row.parm_name,
+                    "owner": row.session_id,
+                    "restored": False,
+                    "reason": error.code,
+                }
+            )
             continue
         answer = dict(reply.get("data") or {})
         answer["owner"] = row.session_id
@@ -459,6 +562,28 @@ def restore_left_over(call: Call, hip: str | None) -> list[dict[str, Any]]:
 
 
 # Section: shared pieces
+
+# The output table's variables as each session has them, asked once per
+# session: they are the session's environment, which does not change while it
+# runs. Keyed by the state folder too, since a session id is only unique in one.
+_variables: dict[tuple[str, str], dict[str, str | None]] = {}
+_variables_lock = threading.Lock()
+
+
+def session_variables(call: Call) -> dict[str, str | None]:
+    """`$JOB` and `$HOUDINI_TEMP_DIR` as the session has them, asked once."""
+    key = (str(call.router.home), call.target().session_id)
+    with _variables_lock:
+        kept = _variables.get(key)
+    if kept is not None:
+        return kept
+    data = dict(call.bridge("outputs.variables").get("data") or {})
+    found = {
+        name: (str(data[name]) if data.get(name) else None) for name in ("JOB", "HOUDINI_TEMP_DIR")
+    }
+    with _variables_lock:
+        _variables[key] = found
+    return found
 
 
 def scene_here(call: Call) -> str | None:
@@ -603,6 +728,11 @@ HOU_OUTPUTS = ToolSpec(
             "filter": {"type": "object"},
             "limit": {"type": "integer"},
             "page": {"type": "string"},
+            "operation_id": {
+                "type": "string",
+                "maxLength": OPERATION_ID["maxLength"],
+                "pattern": OPERATION_ID["pattern"],
+            },
             "wait_s": WAIT_S,
         }
     ),

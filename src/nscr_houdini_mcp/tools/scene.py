@@ -11,8 +11,9 @@ Four actions.
   sent, so a mistyped path is refused without the session touching its own
   scene. What the load could not resolve comes back as data. The scene is
   replaced, so the trace carries the new scene epoch. An output parameter a
-  session that has gone left frozen in this scene gets its template back,
-  and `restored_parms` says which.
+  session that has gone left frozen in this scene gets its own value back,
+  and `restored_parms` says which; `save` and `save_increment` do the same
+  before they write, so a new file never carries that session's path.
 - `save` writes the scene over its own file. A scene with no file yet is
   refused, because saving it means picking a name, which is what
   `save_increment` is for.
@@ -165,8 +166,14 @@ def open_scene(call: Call) -> dict[str, Any]:
 
 
 def save_scene(call: Call) -> dict[str, Any]:
+    # What a session that has gone left frozen goes back before the file is
+    # written, so the save does not carry its path on.
+    restored = restore_left_over(call)
     reply = call.bridge("scene.save", mutating=True)
-    return dict(reply.get("data") or {})
+    data = dict(reply.get("data") or {})
+    if restored:
+        data["restored_parms"] = restored
+    return data
 
 
 def save_increment(call: Call) -> dict[str, Any]:
@@ -184,6 +191,7 @@ def save_increment(call: Call) -> dict[str, Any]:
     digest = store_module.digest_arguments(
         {"action": "save_increment", "session_id": target.session_id}
     )
+    restored: list[dict[str, Any]] = []
     with call.router.store(create=True) as store:
         pending = claim_increment(store, key, digest)
         if pending is not None and "result" in pending:
@@ -192,6 +200,7 @@ def save_increment(call: Call) -> dict[str, Any]:
             try:
                 info = dict(call.bridge("scene.info").get("data") or {})
                 hip = None if info.get("untitled") else info.get("hip_path")
+                restored = restore_left_over(call, hip)
                 plan = planned(allocate(call, store, hip, target.session_id, operation_id))
             except BaseException:
                 stored(lambda: store.drop_operation(key))
@@ -224,6 +233,8 @@ def save_increment(call: Call) -> dict[str, Any]:
             "warnings": list(plan["warnings"]) + list(data.get("warnings") or []),
             "undo": UNDO_NOTE,
         }
+        if restored:
+            result["restored_parms"] = restored
         stored(lambda: store.finish_operation(key, outcome={"result": result}))
     return result
 

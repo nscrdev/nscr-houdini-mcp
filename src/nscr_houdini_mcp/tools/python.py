@@ -61,8 +61,9 @@ The `mcp` helper in every namespace:
   makes up, and never a spill, which is the server's own.
 - `mcp.freeze_parm(parm, path)`: puts a path this call was handed on an
   output parameter, a `hou.Parm` or its path, for as long as the call runs.
-  When the call ends, however it ends, the parameter gets the path's `$HIP`
-  template back, and `restored_parms` in the answer says so. One changed by
+  When the call ends, however it ends, the parameter gets back what it held
+  before, its value or its expression, and `restored_parms` in the answer
+  says so; a save while the call runs writes that value too. One changed by
   the code in between is left as the code left it.
 - `mcp.progress(done, total=None, message=None)`: a note health and
   `hou_ping` show while the call runs. Finite numbers only.
