@@ -33,6 +33,9 @@ packages = ["src/nscr_houdini_mcp"]
 # `bridge install` has nothing to install.
 [tool.hatch.build.targets.wheel.force-include]
 "houdini" = "nscr_houdini_mcp/houdini"
+# The agent skills travel the same way, so `skills path` and `skills install`
+# work from an installed copy as well as from a checkout.
+"skills" = "nscr_houdini_mcp/skills"
 
 [tool.ruff]
 line-length = 100

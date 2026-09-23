@@ -486,6 +486,34 @@ A scene that has never been saved has no `$HIP`, so its runs go under
 `unsaved_hip`, which is the cue to save and run again. The template keeps the
 variable, so saving that scene later leaves nothing about this machine in it.
 
+## Skills
+
+A skill is a plain `SKILL.md` file that tells an agent how to work: what to
+plan before building, what to look at before calling something finished, and
+when to stop and report. The first one, `houdini-artist`, covers modelling,
+lookdev, cleaning up a network, matching a reference, finding out why a scene
+is slow and getting a scene ready to hand on. It works best with this server
+connected, and still helps with planning when it is not.
+
+The skills ship with the package:
+
+```sh
+nscr-houdini-mcp skills path                # where the shipped skills are
+nscr-houdini-mcp skills install <folder>    # copy them into a folder you name
+```
+
+Clients that read skills usually look in a skills folder in your user settings
+or in the project, with one subfolder per skill. Point `install` at the one
+yours uses. A copy already there that differs from the shipped one is left
+alone, so your edits survive an upgrade; `--force` writes the shipped files
+over it.
+
+The skills are yours to edit. The block at the top, House conventions, is the
+dial: the output marker, when to save an increment, how many attempts one
+detail gets, what good enough means for this pass, what node colours mean and
+where files may be written. Change those lines to fit how you work, and keep
+the output marker in step with the `[conventions]` table above.
+
 ## License
 
 MIT
