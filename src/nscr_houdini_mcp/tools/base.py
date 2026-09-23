@@ -225,6 +225,8 @@ class Call:
         self.transport = transport
         self.config = config
         self._progress = progress
+        # Content blocks that go out after the text block, such as a picture.
+        self.content: list[Any] = []
         self.trace: dict[str, Any] = empty_trace()
         self._target: Target | None = None
         self._epoch: int | None = self.arguments.get("scene_epoch")
@@ -253,6 +255,10 @@ class Call:
             self._progress(done, total, message)
         except Exception:  # noqa: BLE001 - a note that cannot be sent is not a failed call
             pass
+
+    def attach(self, block: Any) -> None:
+        """Send one more content block with the result, after the text."""
+        self.content.append(block)
 
     def health(self) -> dict[str, Any]:
         """What the session says about itself. Answers while it is busy."""

@@ -29,7 +29,7 @@ import hashlib
 import json
 import secrets
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -64,6 +64,9 @@ SERVER_CODES: dict[str, str] = {
     "OUTPUT_UNWRITABLE": "the folder for an output could not be made",
     "BAD_CURSOR": "the page token is not one this read handed out",
     "JOB_UNKNOWN": "no job is kept under that id",
+    "NOT_YET_AVAILABLE": "this build does not offer that yet",
+    "IMAGE_UNREADABLE": "the file is not an image this can read",
+    "REFERENCE_UNKNOWN": "no reference is registered under that name",
 }
 
 CODES: dict[str, str] = {**BRIDGE_CODES, **SERVER_CODES}
@@ -121,6 +124,9 @@ HINTS: dict[str, str] = {
     "SCENE_UNTITLED": "use save_increment, which picks a versioned file for the scene",
     "JOB_UNKNOWN": "list the jobs to see the ids that are kept; a job is kept for 7 days",
     "JOB_ID_TAKEN": "use a new operation_id; the job under this one is kept for 7 days",
+    "NOT_YET_AVAILABLE": "use what the details name instead, or pass the image as a file",
+    "IMAGE_UNREADABLE": "export the image as PNG, JPEG, TIFF or EXR and pass that file",
+    "REFERENCE_UNKNOWN": "pass a registered name from list_references, or a file path",
 }
 
 # The largest result whose text block repeats the whole JSON. Larger ones get a
@@ -292,13 +298,17 @@ def ok_result(
     tool: str = "result",
     summary: str | None = None,
     is_error: bool = False,
+    extra: Sequence[Any] = (),
 ) -> CallToolResult:
     """A result, or the path to it when it is too large to return.
 
     `is_error` marks a result that is whole and still reports a failure, such
     as code that ran and raised: the client reads it as an error and gets
-    everything the call has to say about it.
+    everything the call has to say about it. `extra` is content that goes
+    after the text block, such as a picture, and goes whether or not the
+    result itself was spilled.
     """
+    blocks = list(extra)
     flag = bool(is_error)
     body = {**data, "trace": dict(trace)}
     try:
@@ -323,13 +333,17 @@ def ok_result(
             f" Read that file for all of it. First part:\n{text[:PREVIEW_CHARS]}"
         )
         return CallToolResult(
-            content=[TextContent(type="text", text=line)], structured_content=body, is_error=flag
+            content=[TextContent(type="text", text=line), *blocks],
+            structured_content=body,
+            is_error=flag,
         )
     if len(text) > MIRROR_CHARS:
         line = summary or f"{tool}: {len(text)} characters, keys {', '.join(sorted(data))}"
         text = f"{line}\ntrace: {compact(dict(trace))}\nThe full result is in structuredContent."
     return CallToolResult(
-        content=[TextContent(type="text", text=text)], structured_content=body, is_error=flag
+        content=[TextContent(type="text", text=text), *blocks],
+        structured_content=body,
+        is_error=flag,
     )
 
 
