@@ -167,7 +167,7 @@ the namespace the code ran in.
 Every call is also a job, with a `job_id` made from its operation id, so a
 reply that never arrived can still be followed. `background` says how long
 the call itself waits. `auto`, the default, waits up to `inline_wait_s` from
-`config.toml` (ten seconds unless you say, from 1 to 300, and never longer
+`config.toml` (ten seconds unless you say, from 1 to 50, and never longer
 than `timeout_s`): code that finishes in that time answers as usual with its
 `state`, and slower code answers with the job to follow at that moment and
 carries on. `true` answers with the job as soon as the session has taken the

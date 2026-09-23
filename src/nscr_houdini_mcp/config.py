@@ -74,7 +74,8 @@ MAX_PYTHON_TIMEOUT_CAP_S = 3600
 # How long `hou_python` waits for code before it hands back a job to follow
 # instead. The code goes on either way.
 DEFAULT_INLINE_WAIT_S = 10
-MAX_INLINE_WAIT_S = 300
+# Within what a client commonly waits for one answer before it gives up.
+MAX_INLINE_WAIT_S = 50
 
 _BUILD = re.compile(r"^\d+\.\d+(\.\d+)*$")
 
