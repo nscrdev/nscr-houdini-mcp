@@ -138,9 +138,11 @@ class Running:
     ended: threading.Event = field(default_factory=threading.Event)
     # The job this call runs as, for a tool whose calls are jobs.
     job_id: str | None = None
-    # Whether the work found out it should stop, and whether a progress note
-    # has come since the job row was last written.
+    # Whether the work found out it should stop, because the call was
+    # cancelled or because the session is going down, and whether a progress
+    # note has come since the job row was last written.
     cancel_seen: bool = False
+    stop_seen: bool = False
     noted: threading.Event = field(default_factory=threading.Event)
 
     def elapsed_s(self) -> float:
@@ -151,8 +153,11 @@ class Running:
         self.progress.append({**note, "elapsed_s": self.elapsed_s()})
         self.noted.set()
 
-    def saw_stop(self) -> None:
-        self.cancel_seen = True
+    def saw_stop(self, *, cancelled: bool) -> None:
+        if cancelled:
+            self.cancel_seen = True
+        else:
+            self.stop_seen = True
 
     def as_dict(self) -> dict[str, Any]:
         said = {

@@ -215,7 +215,11 @@ class JobKeeper:
         if job is None:
             return False
         state, outputs, error = job_rules.ending(
-            job.kind, running.operation_id, payload, cancelled=bool(running.cancel_seen)
+            job.kind,
+            running.operation_id,
+            payload,
+            cancelled=bool(running.cancel_seen),
+            session_ended=bool(getattr(running, "stop_seen", False)),
         )
         progress = job_rules.progress_of(latest(running)) or None
         repair = {**job.repair, "scene": dict(job.repair["scene"])}

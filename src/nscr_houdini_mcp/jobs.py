@@ -122,17 +122,24 @@ def ending(
     payload: Mapping[str, Any],
     *,
     cancelled: bool = False,
+    session_ended: bool = False,
 ) -> tuple[str, dict[str, Any], Any]:
     """How a job ended, what it made and what went wrong, from its call's answer.
 
-    Work that saw its cancel and stopped is `cancelled`. Otherwise a call
+    Work that saw its cancel and stopped is `cancelled`. Work that stopped
+    because its session was going down, with no cancel, is `lost` with
+    `SESSION_ENDED`, as it would be had the session gone first. Otherwise a call
     that failed, or Python code that raised, is `failed`, and the rest is
     `done`. The outputs hold the answer the call gave, so a job can be read
     back whole after the receipt that also holds it has gone.
     """
     outputs: dict[str, Any] = {"operation_id": operation_id}
     if not payload.get("ok"):
-        return ("cancelled" if cancelled else "failed"), outputs, payload.get("error")
+        if cancelled:
+            return "cancelled", outputs, payload.get("error")
+        if session_ended:
+            return "lost", outputs, store_module.SESSION_ENDED_ERROR
+        return "failed", outputs, payload.get("error")
     data = payload.get("data")
     data = dict(data) if isinstance(data, Mapping) else {}
     outputs["answer"] = data
@@ -142,4 +149,6 @@ def ending(
     error = data.get("error") if kind == "python" else None
     if cancelled:
         return "cancelled", outputs, error
+    if session_ended:
+        return "lost", outputs, store_module.SESSION_ENDED_ERROR
     return ("failed" if error is not None else "done"), outputs, error

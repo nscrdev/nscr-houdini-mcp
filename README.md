@@ -186,9 +186,10 @@ finite numbers only, that health and `hou_ping` show while the call runs.
 The same note is written to the call's job, at most once a second.
 `mcp.cancelled()` says whether the call should stop, for a long loop to look
 at between pieces of work. It turns true when `hou_jobs` cancels the job or
-the session is going down. Code that stops once it has seen it ends
+the session is going down. Code that stops once it has seen a cancel ends
 `cancelled`; code that never looks runs to the end and ends `done`, with the
-request still on the job.
+request still on the job. Code that stops because its session is going down
+ends `lost`, as it would had the session gone first.
 
 `hou_jobs` follows long running work by id. `status`, the default, reads one
 job: its state (`queued`, `running`, `done`, `failed`, `cancelled` or

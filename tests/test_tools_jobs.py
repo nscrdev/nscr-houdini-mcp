@@ -810,3 +810,16 @@ def test_a_joint_write_that_does_not_land_leaves_the_receipt_for_the_sweep(
     status = job(bench, body["job_id"])
     assert status["state"] == "done"
     assert status["outputs"]["result"] == 11
+
+
+def test_a_job_stopped_by_its_session_going_down_is_lost_not_cancelled(bench: Bench) -> None:
+    handle = in_the_background(bench, LOOP)
+    job_id = handle["job_id"]
+    support.wait_until(lambda: row(bench, job_id).state == "running", timeout_s=5.0)
+    through(bench).stopping.set()
+    idle(bench)
+    ended = row(bench, job_id)
+    assert ended.state == "lost"
+    assert ended.error == store_module.SESSION_ENDED_ERROR
+    assert ended.cancel_requested is False
+    assert ended.outputs["answer"]["result"] < 2000

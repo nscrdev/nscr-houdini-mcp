@@ -160,18 +160,21 @@ class ToolContext:
     # The state folder, and a way to open the store, for managed outputs.
     home: Any = None
     open_store: Any = None
-    # Told when the call finds out it should stop, so a job that stopped on
-    # request can be told from one that ran to the end regardless.
+    # Told when the call finds out it should stop, and whether that was a
+    # cancel of the call or the session going down, so a job that stopped on
+    # request is told from one that ran to the end and from one whose session
+    # went.
     saw_stop: Any = None
     # The bridge's own mark of whether the scene has changes not on disk.
     dirty: Any = None
 
     def should_stop(self) -> bool:
         """Whether this call has been asked to stop, or the session has."""
-        stop = any(flag is not None and flag.is_set() for flag in (self.cancel, self.stopping))
-        if stop and self.saw_stop is not None:
-            self.saw_stop()
-        return stop
+        cancelled = self.cancel is not None and self.cancel.is_set()
+        ending = self.stopping is not None and self.stopping.is_set()
+        if (cancelled or ending) and self.saw_stop is not None:
+            self.saw_stop(cancelled=cancelled)
+        return cancelled or ending
 
 
 # Section: reads
@@ -2561,8 +2564,9 @@ class Helper:
     `progress(done, total, message)` leaves a note health and the call's job
     show while it runs. `cancelled()` says whether the call should stop, for a
     long loop to look at between pieces of work: it turns true when the job
-    is cancelled or the session is going down, and a call that stops once it
-    has seen it ends `cancelled` rather than `done`.
+    is cancelled or the session is going down. A call that stops once it has
+    seen a cancel ends `cancelled` rather than `done`, and one that stops for
+    the session going down ends `lost`.
 
     It answers only while its call runs and only on the thread the call runs
     on, so a thread the code started cannot report into a later call.

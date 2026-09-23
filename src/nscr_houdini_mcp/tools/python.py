@@ -62,8 +62,9 @@ The `mcp` helper in every namespace:
   `hou_ping` show while the call runs. Finite numbers only.
 - `mcp.cancelled()`: whether the call should stop, for a long loop to look
   at. It turns true when `hou_jobs` cancels the job or the session is going
-  down. Code that stops once it has seen it ends `cancelled`; code that never
-  looks runs to the end and ends `done`.
+  down. Code that stops once it has seen a cancel ends `cancelled`, and code
+  that stops for its session going down ends `lost`; code that never looks
+  runs to the end and ends `done`.
 
 This module never imports `hou`.
 """
