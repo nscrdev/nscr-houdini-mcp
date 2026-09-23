@@ -390,12 +390,16 @@ class Router:
         scene_epoch: int | None = None,
         wait_s: float | None = None,
         timeout_s: float | None = None,
+        skip_if_busy: bool = False,
     ) -> dict[str, Any]:
         """Send one bridge call and hand back the reply, or raise `CallError`.
 
         A call that carries an `operation_id` is sent once more if its reply is
         lost, with the same id, which the client does on its own.
+        `skip_if_busy` asks for `SESSION_BUSY` at once rather than a place in
+        the queue, including behind a main thread that is away.
         """
+        extra: dict[str, Any] = {"skip_if_busy": True} if skip_if_busy else {}
         try:
             answer = self._send(
                 target.session,
@@ -407,6 +411,7 @@ class Router:
                 wait_s=wait_s,
                 timeout_s=timeout_s,
                 http_timeout_s=socket_wait(wait_s, timeout_s),
+                **extra,
             )
         except client.BridgeUnreachable as error:
             self._lost(target, operation_id, error)
