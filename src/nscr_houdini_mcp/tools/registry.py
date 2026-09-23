@@ -10,6 +10,7 @@ from __future__ import annotations
 from nscr_houdini_mcp.tools.base import ToolSpec
 from nscr_houdini_mcp.tools.inspect import HOU_INSPECT
 from nscr_houdini_mcp.tools.jobs import HOU_JOBS
+from nscr_houdini_mcp.tools.node_type import HOU_NODE_TYPE
 from nscr_houdini_mcp.tools.ping import HOU_PING
 from nscr_houdini_mcp.tools.python import HOU_PYTHON
 from nscr_houdini_mcp.tools.scene import HOU_SCENE
@@ -22,4 +23,5 @@ TOOLS: tuple[ToolSpec, ...] = (
     HOU_INSPECT,
     HOU_PYTHON,
     HOU_JOBS,
+    HOU_NODE_TYPE,
 )
