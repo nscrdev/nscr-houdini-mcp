@@ -28,6 +28,7 @@ from nscr_houdini_mcp.config import Config, ConfigError
 from nscr_houdini_mcp.results import CallError
 from nscr_houdini_mcp.router import Router
 from nscr_houdini_mcp.server import INSTRUCTIONS, SERVER_NAME, build_server
+from nscr_houdini_mcp.tools import ping as ping_tool
 from nscr_houdini_mcp.tools.base import (
     OPERATION_ID,
     SCENE_EPOCH,
@@ -232,6 +233,80 @@ def test_hou_ping_shows_the_progress_the_running_call_reported() -> None:
     health = result.structured_content["health"]
     assert health["current_op"] == "python.run"
     assert health["progress"] == [note]
+
+
+def health_saying(stage: Stage, **said: Any) -> None:
+    data = {**HEALTH["data"], **said}
+    stage.health = lambda session, **rest: bridge_client.Answer(  # type: ignore[method-assign]
+        200, {"ok": True, "data": data}, {}
+    )
+
+
+def test_hou_ping_of_a_session_running_a_call_answers_from_health_alone() -> None:
+    stage = Stage([record("s-1", "w1")])
+    health_saying(stage, busy=True, current_op="python.run", current_op_elapsed_s=12.5)
+    began = time.time()
+    _, [result] = talk(serve(stage), ("hou_ping", {}))
+    assert not result.is_error
+    body = result.structured_content
+    # Nothing is sent to wait behind the running call.
+    assert stage.sent.calls == []
+    assert body["call"]["ok"] is False
+    assert body["call"]["code"] == "SESSION_BUSY"
+    assert body["call"]["skipped"] is True
+    assert "python.run" in body["call"]["message"]
+    health = body["health"]
+    assert health["busy"] is True
+    assert health["current_op"] == "python.run"
+    assert health["busy_cause"] == "running python.run"
+    assert health["busy_for_s"] == 12.5
+    assert began - 12.5 - 1.0 <= health["busy_since"] <= time.time() - 12.5 + 1.0
+
+
+def test_hou_ping_during_a_cook_answers_from_the_main_thread_pulse() -> None:
+    stage = Stage([record("s-1", "acc-1", kind="gui")])
+    thread = {"installed": True, "pulse_age_s": 3.25, "away": True}
+    health_saying(stage, kind="gui", busy=False, main_thread=thread)
+    _, [result] = talk(serve(stage), ("hou_ping", {}))
+    body = result.structured_content
+    assert stage.sent.calls == []
+    assert body["call"]["skipped"] is True
+    assert body["health"]["busy"] is True
+    assert body["health"]["busy_cause"] == "main thread busy"
+    assert body["health"]["busy_for_s"] == 3.25
+
+
+def test_hou_ping_reads_a_main_thread_quiet_for_longer_than_a_tick_as_busy() -> None:
+    stage = Stage([record("s-1", "acc-1", kind="gui")])
+    thread = {"installed": True, "pulse_age_s": ping_tool.FREE_PULSE_S + 0.2, "away": False}
+    health_saying(stage, kind="gui", busy=False, main_thread=thread)
+    _, [result] = talk(serve(stage), ("hou_ping", {}))
+    assert stage.sent.calls == []
+    assert result.structured_content["call"]["skipped"] is True
+
+
+def test_hou_ping_of_a_free_session_asks_it_within_a_short_wait() -> None:
+    stage = Stage([record("s-1", "acc-1", kind="gui")], replies=(pong(),))
+    thread = {"installed": True, "pulse_age_s": 0.2, "away": False}
+    health_saying(stage, kind="gui", busy=False, main_thread=thread)
+    _, [result] = talk(serve(stage), ("hou_ping", {}))
+    body = result.structured_content
+    assert body["call"]["ok"] is True
+    assert "skipped" not in body["call"]
+    assert "busy_since" not in body["health"]
+    [sent] = stage.sent.calls
+    assert sent["wait_s"] == ping_tool.PING_WAIT_S
+
+
+def test_hou_ping_with_a_wait_of_its_own_still_queues_behind_a_busy_session() -> None:
+    stage = Stage([record("s-1", "w1")], replies=(pong(),))
+    health_saying(stage, busy=True, current_op="python.run", current_op_elapsed_s=1.0)
+    _, [result] = talk(serve(stage), ("hou_ping", {"wait_s": 5}))
+    body = result.structured_content
+    assert body["call"]["ok"] is True
+    [sent] = stage.sent.calls
+    assert sent["wait_s"] == 5
+    assert body["health"]["busy_cause"] == "running python.run"
 
 
 def test_an_ambiguous_ping_is_an_error_the_text_alone_can_fix() -> None:
