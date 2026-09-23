@@ -885,6 +885,9 @@ def test_a_stream_the_code_replaces_never_outlives_the_call(bench: Bench) -> Non
         ("x = " + "-" * 100_000 + "1", ("RecursionError", "MemoryError", "SyntaxError")),
         ("x = 1\0", ("ValueError", "SyntaxError")),
     ],
+    # Short ids: the test id lands in an environment variable, which Windows
+    # caps at 32,767 characters.
+    ids=["deep-unary-minus", "null-byte"],
 )
 def test_code_the_compiler_refuses_is_data_not_a_failed_call(
     bench: Bench, code: str, kinds: tuple[str, ...]
