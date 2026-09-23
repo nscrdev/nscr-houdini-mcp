@@ -13,7 +13,10 @@ from the shipped one is left alone unless the caller says to write over it.
 from __future__ import annotations
 
 import filecmp
+import os
 import shutil
+import stat
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +27,10 @@ INSTALLED = "installed"
 REPLACED = "replaced"
 UNCHANGED = "unchanged"
 KEPT = "kept"
+
+# The attribute Windows sets on a junction or any other reparse point. The
+# `stat` module has it only on Windows, and the value is fixed.
+REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 
 class SkillsError(RuntimeError):
@@ -59,13 +66,50 @@ def shipped_skills(root: Path | None = None) -> list[Path]:
     return sorted(path.parent for path in base.glob(f"*/{SKILL_FILE}"))
 
 
+def is_link(path: Path) -> bool:
+    """Whether a path is a link of any kind, without following it.
+
+    A symbolic link counts, and so does a Windows junction, which
+    `Path.is_symlink` does not see before Python 3.12. Any reparse point
+    counts on Windows, since writing through one lands somewhere else.
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    attributes = getattr(info, "st_file_attributes", 0)
+    if attributes & REPARSE_POINT:
+        return True
+    isjunction = getattr(os.path, "isjunction", None)
+    return bool(isjunction is not None and isjunction(path))
+
+
+def _link_inside(folder: Path) -> Path | None:
+    """The first link at or under a folder, never following one, or None."""
+    if is_link(folder):
+        return folder
+    pending = [folder]
+    while pending:
+        current = pending.pop()
+        with os.scandir(current) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                if is_link(path):
+                    return path
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(path)
+    return None
+
+
 def _files(folder: Path) -> list[Path]:
     """The files under a folder, relative to it, skipping caches and links."""
     return sorted(
         path.relative_to(folder)
         for path in folder.rglob("*")
         if path.is_file()
-        and not path.is_symlink()
+        and not is_link(path)
         and "__pycache__" not in path.parts
         and path.name != ".DS_Store"
     )
@@ -81,21 +125,47 @@ def _same(source: Path, target: Path) -> bool:
 
 
 def _copy(source: Path, target: Path) -> None:
-    """Write the shipped files into the target, leaving anything else there."""
+    """Write the shipped files into the target, leaving anything else there.
+
+    The caller has made sure there is no link anywhere in the target, so no
+    write here can land outside it.
+    """
     for rel in _files(source):
         there = target / rel
         there.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source / rel, there)
 
 
+def _copy_new(source: Path, target: Path) -> None:
+    """Copy a skill that is not there yet, whole or not at all.
+
+    The files go into a temporary folder beside the target, which is renamed
+    into place once every file is in it. A copy that fails part way leaves
+    nothing at the target, so the next run does not mistake it for an edit.
+    """
+    staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent))
+    try:
+        _copy(source, staging)
+        os.replace(staging, target)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
 def install(dest: Path, *, force: bool = False, root: Path | None = None) -> list[Copied]:
     """Copy each shipped skill into `dest/<skill name>`.
 
-    A skill that is not there yet is copied. One that is there with the same
-    files is left as it is. One that differs, which usually means someone
-    edited it, is kept unless `force`, and with `force` only the shipped files
-    are written over, so a file of the person's own beside them stays. A link
-    or a plain file where a skill folder should be is never touched.
+    A skill that is not there yet is copied whole, through a temporary folder.
+    One that is there with the same files is left as it is. One that differs,
+    which usually means someone edited it, is kept unless `force`, and with
+    `force` only the shipped files are written over, so a file of the person's
+    own beside them stays. A plain file where a skill folder should be, or a
+    link anywhere at or under the skill folder, is never written through, with
+    or without `force`.
+
+    Raises `SkillsError` when there is nothing to copy or the folder is not a
+    folder, and `OSError` when a copy fails. Keeping an edited skill is not a
+    failure.
     """
     dest = Path(dest).expanduser().absolute()
     if dest.exists() and not dest.is_dir():
@@ -108,13 +178,18 @@ def install(dest: Path, *, force: bool = False, root: Path | None = None) -> lis
     results: list[Copied] = []
     for source in skills:
         target = dest / source.name
-        if target.is_symlink() or (target.exists() and not target.is_dir()):
+        if is_link(target) or (target.exists() and not target.is_dir()):
             note = "a link or a file of that name is there, left as it is"
             results.append(Copied(source.name, target, KEPT, note))
             continue
         if not target.exists():
-            _copy(source, target)
+            _copy_new(source, target)
             results.append(Copied(source.name, target, INSTALLED))
+            continue
+        link = _link_inside(target)
+        if link is not None:
+            note = f"holds a link, {link}, so nothing is written into it"
+            results.append(Copied(source.name, target, KEPT, note))
             continue
         if _same(source, target):
             results.append(Copied(source.name, target, UNCHANGED))

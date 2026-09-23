@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import sys
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -195,7 +196,8 @@ def test_an_edited_skill_is_kept_unless_forced(
     mine.write_text("mine\n", encoding="utf-8")
     capsys.readouterr()
 
-    assert cli.main(["skills", "install", str(tmp_path)]) == 1
+    # Keeping an edit is the normal upgrade path, so it is not a failure.
+    assert cli.main(["skills", "install", str(tmp_path)]) == 0
     out = capsys.readouterr().out
     assert "kept houdini-artist" in out and "--force" in out
     assert copied.read_text(encoding="utf-8") == "my own conventions\n"
@@ -215,8 +217,70 @@ def test_a_link_where_the_skill_goes_is_never_touched(tmp_path: Path) -> None:
         os.symlink(elsewhere, dest / "houdini-artist", target_is_directory=True)
     except (OSError, NotImplementedError):
         pytest.skip("this system cannot make a symlink here")
-    assert cli.main(["skills", "install", str(dest), "--force"]) == 1
+    assert cli.main(["skills", "install", str(dest), "--force"]) == 0
     assert list(elsewhere.iterdir()) == []
+
+
+def test_a_linked_skill_file_is_never_written_through(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    outside = tmp_path / "outside.md"
+    outside.write_text("not yours to change\n", encoding="utf-8")
+    dest = tmp_path / "dest"
+    (dest / "houdini-artist").mkdir(parents=True)
+    try:
+        os.symlink(outside, dest / "houdini-artist" / "SKILL.md")
+    except (OSError, NotImplementedError):
+        pytest.skip("this system cannot make a symlink here")
+    assert cli.main(["skills", "install", str(dest), "--force"]) == 0
+    out = capsys.readouterr().out
+    assert "kept houdini-artist" in out and "holds a link" in out
+    assert outside.read_text(encoding="utf-8") == "not yours to change\n"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="junctions are a Windows thing")
+def test_a_junction_where_the_skill_goes_is_never_written_through(tmp_path: Path) -> None:
+    import _winapi
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    _winapi.CreateJunction(str(elsewhere), str(dest / "houdini-artist"))
+    assert agent_skills.is_link(dest / "houdini-artist")
+    results = agent_skills.install(dest, force=True)
+    assert [item.outcome for item in results] == [agent_skills.KEPT]
+    assert list(elsewhere.iterdir()) == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="junctions are a Windows thing")
+def test_a_junction_inside_the_skill_is_never_written_through(tmp_path: Path) -> None:
+    import _winapi
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    dest = tmp_path / "dest"
+    (dest / "houdini-artist").mkdir(parents=True)
+    _winapi.CreateJunction(str(elsewhere), str(dest / "houdini-artist" / "extra"))
+    results = agent_skills.install(dest, force=True)
+    assert [item.outcome for item in results] == [agent_skills.KEPT]
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_a_first_install_that_fails_part_way_leaves_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def broken(*_args: object, **_kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(agent_skills.shutil, "copyfile", broken)
+    assert cli.main(["skills", "install", str(tmp_path)]) == 1
+    assert "disk full" in capsys.readouterr().out
+    assert list(tmp_path.iterdir()) == []
+
+    monkeypatch.undo()
+    assert cli.main(["skills", "install", str(tmp_path)]) == 0
+    assert "installed houdini-artist" in capsys.readouterr().out
 
 
 def test_install_refuses_a_file_as_the_folder(

@@ -113,7 +113,16 @@ def _add_skills_commands(commands: Any) -> None:
     where = actions.add_parser("path", help="print the folder the shipped skills are in")
     where.set_defaults(handler=_skills_path)
 
-    copy = actions.add_parser("install", help="copy the skills into a folder you name")
+    copy = actions.add_parser(
+        "install",
+        help="copy the skills into a folder you name",
+        description=(
+            "Copy each shipped skill into <dest>/<skill name>. A skill you have edited "
+            "is kept as it is unless --force, and a link in its place is never written "
+            "through. Exit status: 0 when every skill was installed, left unchanged, "
+            "replaced or kept; 1 when the skills could not be found or copied."
+        ),
+    )
     copy.add_argument("dest", type=Path, help="the folder your client reads skills from")
     copy.add_argument(
         "--force",
@@ -468,13 +477,13 @@ def _skills_install(args: argparse.Namespace) -> int:
     except (skills_module.SkillsError, OSError) as error:
         print(str(error))
         return 1
-    kept = False
+    # A kept skill is the person's own edit, or a link they placed, so it is
+    # reported and is not a failure.
     for item in results:
         print(f"{item.outcome} {item.name}: {item.path}")
         if item.note:
             print(f"  {item.note}")
-        kept = kept or item.outcome == skills_module.KEPT
-    return 1 if kept else 0
+    return 0
 
 
 # Section: what status prints
