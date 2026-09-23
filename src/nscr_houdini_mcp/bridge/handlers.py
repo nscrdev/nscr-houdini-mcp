@@ -68,6 +68,11 @@ class Tool:
     # How much of its answer is carried, when that is more than the default
     # caps in `encoding`: a keyword for each cap `encoding.convert` takes.
     caps: Mapping[str, int] | None = None
+    # The kind of job each call runs as, for a tool whose calls are followed
+    # by a job id. Nothing for a tool whose calls are not.
+    job_kind: str | None = None
+    # What the job row says the call runs, from its arguments.
+    job_spec: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None
 
     def undo_label(self, arguments: Mapping[str, Any] | None = None) -> str:
         if self.label_argument and arguments:
@@ -118,6 +123,8 @@ class ToolRegistry:
         timeout_s: float | None = None,
         summary: str = "",
         caps: Mapping[str, int] | None = None,
+        job_kind: str | None = None,
+        job_spec: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
     ) -> Tool:
         if name in self._tools:
             raise ValueError(f"tool {name} is already registered")
@@ -136,6 +143,8 @@ class ToolRegistry:
             timeout_s=timeout_s,
             summary=summary,
             caps=dict(caps) if caps else None,
+            job_kind=job_kind,
+            job_spec=job_spec,
         )
         self._tools[name] = tool
         return tool
@@ -186,6 +195,11 @@ PYTHON_ARGUMENTS = ("code", "namespace", "default_namespace", "reset", "undo_lab
 # many values. The server spills an answer that large to a file rather than
 # cut it, so the bridge carries all of it.
 INSPECT_CAPS = {"max_items": 4096, "max_values": 500_000}
+
+
+def python_job_spec(arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """What a `python.run` job row says it runs: the namespace, not the code."""
+    return {"namespace": arguments.get("namespace") or arguments.get("default_namespace")}
 
 
 def ping(arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -310,6 +324,8 @@ def default_registry(
         digest_ignores=("default_namespace",),
         summary="run Python with hou in a namespace kept between calls",
         caps=tool_module.PYTHON_CAPS,
+        job_kind="python",
+        job_spec=python_job_spec,
     )
     registry.add_report("namespaces", namespaces.state)
     return registry

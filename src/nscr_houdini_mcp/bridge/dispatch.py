@@ -47,6 +47,16 @@ tool that does not poll it holds the session until it returns on its own, and
 nothing here will take the session off it: killing work part way through an
 edit is how a scene gets left half built. The tools this project ships poll
 it; anything that runs arbitrary code cannot promise to.
+
+A tool whose calls run as jobs gets a job row for each call it takes, written
+by the job keeper: `queued` when the session has taken the call, `running`
+once a thread has picked it up, and how it ended before the session is given
+to the next caller, beside the receipt. The keeper also carries a cancel
+request made through the store to the call's own flag.
+
+Every call that may change the scene also moves the bridge's mark of whether
+the scene has changes that are not on disk, which a headless session cannot
+answer for itself.
 """
 
 from __future__ import annotations
@@ -67,6 +77,7 @@ from nscr_houdini_mcp.bridge.errors import BridgeError, did_you_mean, map_except
 from nscr_houdini_mcp.bridge.gate import Gate
 from nscr_houdini_mcp.bridge.handlers import Tool, ToolRegistry, UnknownTool
 from nscr_houdini_mcp.bridge.identity import Identity
+from nscr_houdini_mcp.bridge.jobs import JobKeeper
 from nscr_houdini_mcp.bridge.tools import ToolContext
 from nscr_houdini_mcp.bridge.undo import run_in_undo_group
 
@@ -125,6 +136,12 @@ class Running:
     progress: deque = field(default_factory=lambda: deque(maxlen=PROGRESS_KEPT))
     # Set once the call has given the session back.
     ended: threading.Event = field(default_factory=threading.Event)
+    # The job this call runs as, for a tool whose calls are jobs.
+    job_id: str | None = None
+    # Whether the work found out it should stop, and whether a progress note
+    # has come since the job row was last written.
+    cancel_seen: bool = False
+    noted: threading.Event = field(default_factory=threading.Event)
 
     def elapsed_s(self) -> float:
         return round(max(0.0, time.monotonic() - self.began), 3)
@@ -132,10 +149,15 @@ class Running:
     def note_progress(self, note: Mapping[str, Any]) -> None:
         """Keep one progress note from the running tool, with when it came."""
         self.progress.append({**note, "elapsed_s": self.elapsed_s()})
+        self.noted.set()
+
+    def saw_stop(self) -> None:
+        self.cancel_seen = True
 
     def as_dict(self) -> dict[str, Any]:
         said = {
             "operation_id": self.operation_id,
+            "job_id": self.job_id,
             "tool": self.tool,
             "elapsed_s": self.elapsed_s(),
             "timed_out": self.timed_out,
@@ -170,6 +192,7 @@ class Dispatcher:
         home: Any = None,
         open_store: Callable[[], Any] | None = None,
         lease_renew_s: float = LEASE_RENEW_S,
+        jobs: JobKeeper | None = None,
     ) -> None:
         self.tools = tools
         self.kind = kind
@@ -190,6 +213,10 @@ class Dispatcher:
         self._home = home
         self._open_store = open_store
         self._lease_renew_s = lease_renew_s
+        # A bridge with no store keeps no job rows.
+        self._jobs = jobs
+        if jobs is None and open_store is not None:
+            self._jobs = JobKeeper(open_store, session_id=session_id, home=home, log=self._log)
         self._gate = Gate(lock)
         self._running: Running | None = None
         self._last: dict[str, Any] | None = None
@@ -218,6 +245,7 @@ class Dispatcher:
             "main_thread": self._main_thread_state(),
             "current_op": None if running is None else running.tool,
             "current_op_id": None if running is None else running.operation_id,
+            "current_job_id": None if running is None else running.job_id,
             "current_op_elapsed_s": None if running is None else running.elapsed_s(),
             "current_op_timed_out": False if running is None else running.timed_out,
             "current_op_progress": None if running is None else list(running.progress),
@@ -401,7 +429,16 @@ class Dispatcher:
             progress=running.note_progress,
             home=self._home,
             open_store=self._open_store,
+            saw_stop=running.saw_stop,
+            dirty=self.identity.dirty,
         )
+        if tool.job_kind and self._jobs is not None:
+            self._jobs.accept(
+                running,
+                kind=tool.job_kind,
+                spec=tool.job_spec(envelope.arguments) if tool.job_spec else None,
+                identity=self.identity.trace(),
+            )
 
         work = marshal.Work(
             lambda: self._work(tool, envelope.arguments, context, running, carried, wanted, trace)
@@ -467,6 +504,7 @@ class Dispatcher:
                             "operation_id": operation_id,
                             "timeout_s": timeout_s,
                             "still_running": True,
+                            **({"job_id": running.job_id} if running.job_id else {}),
                         },
                     ),
                     **self._said(trace),
@@ -493,6 +531,8 @@ class Dispatcher:
             reply = self._failed(tool, work.error or RuntimeError("no answer"), running, trace)
             if wanted:
                 self.receipts.finish(wanted, reply.payload)
+            if running.job_id and self._jobs is not None:
+                self._jobs.finish(running, reply.payload)
             return reply
         if work.picked_by is not None:
             # Which route to the main thread reached the work first, so a check
@@ -634,6 +674,8 @@ class Dispatcher:
                 "current_op_id": running.operation_id,
             }
         running.cancel.set()
+        if running.job_id and self._jobs is not None:
+            self._jobs.asked_to_stop(running)
         return {
             "asked": True,
             "operation_id": running.operation_id,
@@ -666,6 +708,7 @@ class Dispatcher:
         began = time.monotonic()
         value: Any = None
         error: BaseException | None = None
+        marked = False
         try:
             try:
                 # The last look at the scene, here on the thread that is about
@@ -673,6 +716,11 @@ class Dispatcher:
                 # the session may have loaded another scene while it waited:
                 # the paths in its arguments would then mean something else.
                 self._still_the_same_scene(carried)
+                if running.job_id and self._jobs is not None:
+                    self._jobs.started(running, self._hou)
+                if tool.mutating:
+                    self.identity.dirty.began(tool.name)
+                    marked = True
                 if not tool.mutating or not tool.undoable or self._hou is None:
                     value = tool.run(arguments, context)
                 else:
@@ -688,10 +736,16 @@ class Dispatcher:
                     value = outcome.value
             except BaseException as raised:  # noqa: BLE001 - becomes the coded answer
                 error = raised
+            if marked:
+                self.identity.dirty.ended(tool.name, ok=error is None)
             timing_ms = (time.monotonic() - began) * 1000.0
             reply = self._settle(tool, value, error, running, dict(trace or {}), timing_ms)
             if wanted:
                 self.receipts.finish(wanted, reply.payload)
+            if running.job_id and self._jobs is not None:
+                # Written before the session is given back, as the receipt
+                # is, so a caller following the job sees it end with the call.
+                self._jobs.finish(running, reply.payload)
             return reply
         finally:
             self._release(running)
@@ -707,6 +761,8 @@ class Dispatcher:
         self._release(running)
         if wanted:
             self.receipts.drop(wanted)
+        if running.job_id and self._jobs is not None:
+            self._jobs.drop(running)
 
     def _release(self, running: Running) -> None:
         """Note how the call ended and give the session to the next caller."""
@@ -733,6 +789,8 @@ class Dispatcher:
 
         converted = encoding.convert(value, **(tool.caps or {}))
         payload = {**ok_payload(converted.value, timing_ms=timing_ms), **self._said(trace)}
+        if running.job_id:
+            payload["job_id"] = running.job_id
         if converted.lossy:
             payload["lossy"] = True
             payload["cut"] = converted.cut

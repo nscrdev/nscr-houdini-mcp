@@ -160,10 +160,18 @@ class ToolContext:
     # The state folder, and a way to open the store, for managed outputs.
     home: Any = None
     open_store: Any = None
+    # Told when the call finds out it should stop, so a job that stopped on
+    # request can be told from one that ran to the end regardless.
+    saw_stop: Any = None
+    # The bridge's own mark of whether the scene has changes not on disk.
+    dirty: Any = None
 
     def should_stop(self) -> bool:
         """Whether this call has been asked to stop, or the session has."""
-        return any(flag is not None and flag.is_set() for flag in (self.cancel, self.stopping))
+        stop = any(flag is not None and flag.is_set() for flag in (self.cancel, self.stopping))
+        if stop and self.saw_stop is not None:
+            self.saw_stop()
+        return stop
 
 
 # Section: reads
@@ -186,7 +194,7 @@ def scene_info(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, 
         "frame_range": _range(hou),
         "nodes": _counts(hou),
         "undo_entries": _undo_entries(hou),
-        "unsaved": _unsaved(hou, context),
+        **_unsaved(hou, context),
         "scene_epoch": context.scene_epoch,
         "session_id": context.session_id,
         "kind": context.kind,
@@ -281,16 +289,18 @@ def _capture_routes(hou: Any) -> list[str]:
     return routes
 
 
-def _unsaved(hou: Any, context: ToolContext) -> bool | None:
-    """Whether the scene has edits that are not on disk, where that is known.
+def _unsaved(hou: Any, context: ToolContext) -> dict[str, Any]:
+    """Whether the scene has edits that are not on disk, and who says so.
 
-    A headless session answers yes to this even straight after a save, so the
-    answer is only meaningful with a user interface. Nothing is better than a
-    value that is always the same.
+    With a user interface Houdini's own answer is used. A headless session
+    answers yes even straight after a save, so there the bridge's own mark is
+    used instead, which is nothing when it cannot tell.
     """
-    if context.kind != "gui":
-        return None
-    return _quiet(hou.hipFile.hasUnsavedChanges)
+    if context.kind == "gui":
+        return {"unsaved": _quiet(hou.hipFile.hasUnsavedChanges), "unsaved_source": "houdini"}
+    if context.dirty is None:
+        return {"unsaved": None, "unsaved_source": None}
+    return {"unsaved": context.dirty.unsaved, "unsaved_source": "bridge"}
 
 
 def _undo_entries(hou: Any) -> int | None:
@@ -479,7 +489,9 @@ def scene_open(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, 
             {"suffix": Path(path).suffix},
             hint="check the path, or list the folder, then open a file that is there",
         )
-    unsaved = _unsaved(hou, context)
+    # Only a session somebody works in is guarded: a worker's scene is the
+    # caller's own, whatever the bridge's mark says about it.
+    unsaved = _unsaved(hou, context)["unsaved"] if context.kind == "gui" else None
     if unsaved is None and context.kind == "gui":
         # A session with a user interface that will not say is taken to have
         # changes, because the cost of being wrong is somebody's work.
@@ -2546,10 +2558,11 @@ class Helper:
     `output_path(kind, name, ext)` hands out a managed path for this session
     and scene, from the same table and the same version sequence the server
     uses: render, flipbook, comp, cache, usd, hip, capture or compare.
-    `progress(done, total, message)` leaves a note health shows while the
-    call runs. `cancelled()` says whether the call should stop, for a long
-    loop to look at between pieces of work: it turns true when the session is
-    going down; a tool that asks a call to stop comes with background jobs.
+    `progress(done, total, message)` leaves a note health and the call's job
+    show while it runs. `cancelled()` says whether the call should stop, for a
+    long loop to look at between pieces of work: it turns true when the job
+    is cancelled or the session is going down, and a call that stops once it
+    has seen it ends `cancelled` rather than `done`.
 
     It answers only while its call runs and only on the thread the call runs
     on, so a thread the code started cannot report into a later call.
