@@ -176,6 +176,8 @@ def test_a_node_candidate_against_a_reference_from_a_first_capture(
     assert made["framed_by"] == "reference"
     assert made["camera"] == {"kind": "node", "path": camera}
     assert made["route"] == "flipbook_rop"
+    assert made["job_id"] == f"job-{same['trace']['operation_id']}:capture"
+    assert made["frame"] == 1.0
     assert made["size_px"] == SIZE
     path = Path(made["path"])
     assert path.is_file() and path != Path(reference["path"])
@@ -223,3 +225,49 @@ def test_a_node_candidate_against_a_reference_from_a_first_capture(
     by_job = compared(place, {"source": "render", "job_id": reference["job_id"]})
     assert by_job["sources"]["candidate"]["path"] == reference["path"]
     assert by_job["metrics"]["mae"]["overall"] == 0.0
+
+
+# A Python job that writes a small PNG, by hand, to a path the job was handed.
+PYTHON_RENDER = """
+import struct, zlib
+path = mcp.output_path('render', 'flat', 'png').replace('$F4', '0001')
+width, height = 64, 32
+rows = b''.join(b'\\x00' + bytes((128, 128, 128, 255)) * width for _ in range(height))
+def chunk(tag, body):
+    return (struct.pack('>I', len(body)) + tag + body
+            + struct.pack('>I', zlib.crc32(tag + body) & 0xffffffff))
+header = struct.pack('>IIBBBBB', width, height, 8, 6, 0, 0, 0)
+data = (b'\\x89PNG\\r\\n\\x1a\\n' + chunk(b'IHDR', header)
+        + chunk(b'IDAT', zlib.compress(rows)) + chunk(b'IEND', b''))
+with open(path, 'wb') as handle:
+    handle.write(data)
+result = path
+"""
+
+
+def test_a_render_candidate_by_the_job_id_of_a_python_job(place: dict[str, Any]) -> None:
+    [written] = run(place, ("hou_python", {"code": PYTHON_RENDER}))
+    job = ok(written)
+    path = job["result"]
+    assert Path(path).is_file()
+    [registered] = run(
+        place,
+        ("hou_compare", {"action": "set_reference", "reference": path, "name": "flat"}),
+    )
+    ok(registered)
+    [result] = run(
+        place,
+        (
+            "hou_compare",
+            {
+                "candidate": {"source": "render", "job_id": job["job_id"]},
+                "reference": "flat",
+                "return_image": "none",
+            },
+        ),
+    )
+    body = ok(result)
+    made = body["sources"]["candidate"]
+    assert made["path"] == path
+    assert made["job_kind"] == "python"
+    assert body["metrics"]["mae"]["overall"] == 0.0
