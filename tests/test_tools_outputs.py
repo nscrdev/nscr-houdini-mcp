@@ -24,6 +24,7 @@ from fake_hou import Scene
 from nscr_houdini_mcp import outputs as output_rules
 from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge import client, tools
+from nscr_houdini_mcp.pacing import Pacer
 from nscr_houdini_mcp.tools import outputs as output_tool
 from nscr_houdini_mcp.tools import scene as scene_tool
 from test_server import talk, text_of
@@ -850,6 +851,52 @@ def test_a_record_left_prepared_puts_the_old_value_back_whatever_the_parm_holds(
     assert picture(scene).expression() == 'chs("../karma2/picture")'
     with store(bench) as opened:
         assert opened.list_frozen_parms() == []
+
+
+def test_the_wait_before_a_left_over_restore_is_counted_in_the_trace(
+    bench: Bench, scene: Scene, project: Path, killed: subprocess.Popen
+) -> None:
+    # Every paced call waits the pause on a clock that moves only when waited
+    # on, so each of the three calls after the first adds 50 ms: the scene
+    # read, the restore, and the save.
+    now = [100.0]
+
+    def wait(condition: Any, seconds: float) -> None:
+        now[0] += seconds
+
+    made = bench.router
+
+    def paced(config: Any) -> Any:
+        router = made(config)
+        router.pacer = Pacer(
+            min_pause_s=0.05, max_per_s=0, clock=lambda: now[0], wall=lambda: now[0], wait=wait
+        )
+        router.pace_workers = True
+        return router
+
+    bench.router = paced  # type: ignore[method-assign]
+    karma(scene.node("/out"))
+    stamp = store_module.process_start_stamp(killed.pid)
+    with store(bench) as opened:
+        opened.register_session(
+            "s-dead", kind="hython", pid=killed.pid, pid_start=stamp, alias="w9"
+        )
+        opened.freeze_parm(
+            session_id="s-dead",
+            node_path="/out/karma1",
+            parm_name="picture",
+            template="$HIP/x_v001.exr",
+            frozen=f"{project.as_posix()}/x_v001.exr",
+            hip_key=output_rules.scene_key(scene.hipFile.path()),
+            original="$HIP/x_v001.exr",
+            token="t-dead",
+        )
+    killed.kill()
+    killed.wait(timeout=30)
+    body = ok(call(bench, "hou_scene", action="save"))
+    assert body["restored_parms"][0]["restored"] is True
+    assert body["trace"]["throttled_ms"] == 100
+    assert body["trace"]["admitted_at"] == pytest.approx(100.1)
 
 
 # Section: a session that died with a parameter frozen

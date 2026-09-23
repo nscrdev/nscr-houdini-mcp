@@ -62,9 +62,9 @@ The closing message contains:
 
 - Which Houdini you are talking to, and spare workers for heavy work: `hou_ping`, `hou_sessions`.
 - Open, save in place, save the next increment, and see what failed to load: `hou_scene`.
-- Read the network, parameters and errors before changing them: `hou_inspect`.
+- Read the network, parameters and errors before changing them: `hou_inspect`. Check a node type or a help page instead of guessing: `hou_node_type`, `hou_docs`.
 - Build and change things, filtering inside Houdini so only the answer comes back: `hou_python`. Inside it, `mcp.output_path` hands out a managed path for a render, cache or capture, `mcp.progress` reports how far a long loop has got, and `mcp.cancelled` says when to stop.
 - Wait on long work instead of sleeping, read a finished job's result, or cancel it: `hou_jobs`.
-- Arriving, use them once they appear: `hou_capture` for views and flipbooks, `hou_compare` for matched views against a reference, `hou_outputs` for managed output paths, `hou_docs` and `hou_node_type` to check a node or parameter instead of guessing.
-- With a different Houdini server, use its tools for the same jobs; nothing above depends on these names.
-- Only when there are no Houdini tools at all, say so plainly and continue with planning only: the mechanism, the system, its boundaries, and the checks you would run.
+- Managed output paths, and a lint of where a scene writes: `hou_outputs`. A candidate image beside the reference, with the differences as pictures and numbers: `hou_compare`.
+- Arriving, use it once it appears: `hou_capture` for views and flipbooks.
+- With a different Houdini server, use its tools for the same jobs; nothing above depends on these names. With no Houdini tools at all, say so plainly and continue with planning only: the mechanism, the system, its boundaries, and the checks you would run.

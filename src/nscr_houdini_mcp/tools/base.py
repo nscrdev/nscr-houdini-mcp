@@ -17,6 +17,7 @@ This module never imports `hou`.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -218,8 +219,11 @@ class Call:
         transport: str = "stdio",
         config: Config | None = None,
         progress: Callable[[float, float | None, str | None], None] | None = None,
+        cancelled: threading.Event | None = None,
     ) -> None:
         self.spec = spec
+        # Set when the client has gone, so work not yet sent is not sent.
+        self.cancelled = cancelled
         self.arguments = dict(arguments)
         self.router = router
         self.transport = transport
@@ -301,6 +305,7 @@ class Call:
                 wait_s=self.arguments.get("wait_s") if wait_s is None else wait_s,
                 timeout_s=self.arguments.get("timeout_s") if timeout_s is None else timeout_s,
                 skip_if_busy=skip_if_busy,
+                cancelled=self.cancelled,
             )
         except CallError as error:
             self._note(error.trace)
@@ -308,6 +313,10 @@ class Call:
                 self.trace["operation_id"] = self._operation_id
                 if "operation_id" in error.details:
                     error.details["operation_id"] = self._operation_id
+                if error.code == "FLOOD_GUARD" and error.hint:
+                    # The bridge refused before it read the call, so it cannot
+                    # tell a change from a read; this end can.
+                    error.hint += "; send the same operation_id, since the change was not made"
             raise
         self._note(reply)
         if operation_id:
@@ -333,6 +342,11 @@ class Call:
             return self._operation_id
         return f"{self._operation_id}{OPERATION_ID_SEPARATOR}{self._changes}"
 
+    def note(self, said: Mapping[str, Any]) -> None:
+        """Take what a reply, or an error's trace, says into this call's trace,
+        for a tool that calls the router itself rather than through `bridge`."""
+        self._note(said)
+
     def _note(self, said: Mapping[str, Any]) -> None:
         """Take what a reply says about who answered and which scene it was."""
         for key in ("session_id", "alias", "scene_epoch"):
@@ -341,6 +355,14 @@ class Call:
         warnings = said.get("warnings")
         if warnings:
             self.trace["warnings"] = warnings
+        # Pacing waits add up over the bridge calls one tool call makes, and
+        # the moment pacing let the last of them through is kept.
+        waited = said.get("throttled_ms")
+        if isinstance(waited, int) and not isinstance(waited, bool) and waited > 0:
+            self.trace["throttled_ms"] = int(self.trace.get("throttled_ms") or 0) + waited
+        admitted = said.get("admitted_at")
+        if isinstance(admitted, (int, float)) and not isinstance(admitted, bool):
+            self.trace["admitted_at"] = admitted
         # A caller that guards on the epoch is guarding on the scene, so a
         # later step of the same call follows a scene this call replaced.
         if self._epoch is not None and isinstance(said.get("scene_epoch"), int):

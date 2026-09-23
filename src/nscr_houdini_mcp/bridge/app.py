@@ -724,13 +724,43 @@ class Bridge:
             self._verifier.check(
                 headers, method=request.method, path=request.path, body=request.body
             )
+        except signing.FloodGuard as flood:
+            # The signature matched, so the caller holds the token and is told
+            # what the limit is and how long to wait, not that it is a stranger.
+            self._log(f"refused a request to {request.path}: {flood.reason}")
+            return self._refuse(
+                request,
+                429,
+                "FLOOD_GUARD",
+                f"more than {flood.limit} signed requests arrived inside"
+                f" {flood.window_s} seconds, so this one was refused",
+                hint=(
+                    f"the bridge takes at most {flood.limit} requests in any"
+                    f" {flood.window_s} seconds; wait {flood.wait_s} seconds, then call again"
+                ),
+                details={
+                    "limit": flood.limit,
+                    "window_s": flood.window_s,
+                    "retry_after_s": flood.wait_s,
+                },
+            )
         except signing.SignatureRefused as refused:
             self._log(f"refused a request to {request.path}: {refused.reason}")
             return self._refuse(request, 401, "UNAUTHORIZED", "the request was not signed for me")
         return None
 
-    def _refuse(self, request: RawRequest, status: int, code: str, message: str) -> RawReply:
-        return self._answer(request, Reply(status, error_payload(code, message)))
+    def _refuse(
+        self,
+        request: RawRequest,
+        status: int,
+        code: str,
+        message: str,
+        *,
+        hint: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> RawReply:
+        payload = error_payload(code, message, hint=hint, details=details)
+        return self._answer(request, Reply(status, payload))
 
     def _answer(self, request: RawRequest, reply: Reply) -> RawReply:
         """Sign an answer, so a caller can tell this bridge from a squatter."""
@@ -888,6 +918,9 @@ class Bridge:
         try:
             answer = client.health(session, timeout_s=self.config.self_check_timeout_s)
             ok = answer.status == 200 and bool(answer.payload.get("ok"))
+            # A flood refusal is signed by this bridge, so the port answered:
+            # the session is reachable, only too busy with signed requests.
+            ok = ok or _flood_refusal(answer)
         except (client.BridgeUnreachable, client.BridgeNotAuthentic) as error:
             self._log(f"this session's own port did not answer: {error}")
         except Exception as error:  # noqa: BLE001 - a failed check is a failed check
@@ -961,3 +994,10 @@ def _try(step: Any) -> str | None:
     except Exception as error:  # noqa: BLE001 - one failed step, not a failed cleanup
         return f"{type(error).__name__}: {error}"
     return None
+
+
+def _flood_refusal(answer: client.Answer) -> bool:
+    """Whether a signed answer is the flood guard turning a request away."""
+    payload = answer.payload if isinstance(answer.payload, dict) else {}
+    error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+    return answer.status == 429 and error.get("code") == "FLOOD_GUARD"

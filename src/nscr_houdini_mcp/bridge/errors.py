@@ -56,6 +56,7 @@ CODES: dict[str, str] = {
     # The transport refuses these before a tool is ever chosen.
     "BAD_ENVELOPE": "the request envelope could not be read",
     "UNAUTHORIZED": "the request was not signed for this bridge",
+    "FLOOD_GUARD": "more signed requests arrived than the bridge remembers in its window",
     "FORBIDDEN": "the request came from somewhere this bridge does not answer",
     "METHOD_REFUSED": "that endpoint takes POST",
     "NOT_FOUND": "this bridge has nothing on that path",

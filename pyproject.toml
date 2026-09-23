@@ -28,6 +28,9 @@ dev = [
     # Only for the integration check that reads which addresses a port listens
     # on. The tests that use it skip when it is not installed.
     "psutil>=6",
+    # Only for scripts/tools_list_cost.py, which counts with a real tokenizer
+    # when this imports and falls back to an estimate when it does not.
+    "tiktoken>=0.7",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -53,4 +56,5 @@ select = ["E", "F", "I", "UP", "B"]
 testpaths = ["tests"]
 markers = [
     "houdini: needs a Houdini install on this machine, skipped when there is none",
+    "timeout(seconds): a test's own deadline, read by pytest-timeout when it is installed",
 ]

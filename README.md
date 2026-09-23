@@ -38,13 +38,19 @@ Checks, the same ones CI runs:
 ruff check . && ruff format --check .
 pytest -q
 python scripts/lint_client_names.py   # shipped text must not name any client or vendor
-python scripts/tools_list_cost.py     # estimated token cost of the tools/list payload
+python scripts/tools_list_cost.py     # token cost of the tools/list payload
 ```
 
 `scripts/tools_list_cost.py` serialises the tool list the way a client receives
-it and estimates tokens as bytes divided by four, rounded up. That is a budget
-signal to watch across commits, not an exact count. Pass `--max-tokens N` to
-make it fail over a budget.
+it and counts its tokens, in total and per tool, against a budget of 4,000.
+With the dev extras installed it counts with `tiktoken` and the `o200k_base`
+encoding (`--encoding` names another), read from tiktoken's cache, or fetched
+once with a ten second limit when it is not there. Without the package, or
+with the encoding neither cached nor fetched, it falls back to bytes divided
+by four, rounded up, and says which of the two happened. `tiktoken` is only ever a dev
+dependency. Either count is a budget signal to watch across commits, since a
+client on another encoding pays a somewhat different number. Pass
+`--max-tokens N` to make it fail over a budget.
 
 Git hooks:
 
@@ -527,6 +533,45 @@ as the pool does for its workers. On another plugin and a dense display a
 render node draws larger than asked; a capture then reads the scale and makes
 up for it, or says `framing_unverified` when it cannot.
 
+### Pacing a Houdini with a user interface
+
+In a session with a user interface every call runs on Houdini's main thread,
+the one that draws the interface. Calls sent back to back leave it no room,
+and an agent in a loop can send a great many, so the server paces the calls it
+sends to such a session: one call out at a time, a pause after each one ends,
+and a cap on how many start in a second. Two keys in `config.toml` set the pace:
+
+```toml
+gui_min_pause_ms = 50     # least time from one call ending to the next starting
+gui_max_calls_per_s = 10  # most calls that may start in any one second
+```
+
+A value of 0 turns that rule off, and both at 0 turn pacing off altogether;
+a negative value is refused.
+
+The wait for a turn comes out of the call's own `wait_s` (a second unless it
+says), and the bridge gets what is left. When the turn is further off than
+that, or the call passed `skip_if_busy`, it is answered at once with
+`SESSION_BUSY` and `retry_after_s`, and nothing is sent, so a caller that has
+given up never has its change made later. A call that did wait says how long
+in its trace, as `throttled_ms`, and when it was let through, as
+`admitted_at`.
+
+The pace is kept per server process and per session. Two agents sharing one
+server process share its one allowance; two server processes, one per
+client, each have their own, so together they get no more than twice it.
+A call sent again under the operation id of the call that is out goes
+straight through, since the bridge answers it from that call's receipt, and a
+call behind one that named a timeout running past its own wait is refused at
+once. At most 32 calls wait on one session's turn; one more is answered
+`SESSION_BUSY` at once, and a call whose client cancels leaves the queue
+without being sent. Workers are headless and are not paced. A cancel is never
+paced either, since it runs beside the call it stops.
+
+The bridge has a limit of its own, whoever sends: it remembers the signed
+requests of the last two minutes, 20,000 at most, and refuses one more with
+`FLOOD_GUARD`, naming the limit and how many seconds to wait.
+
 ### Installing the Houdini side
 
 One command writes the Houdini package that puts this on a session's path:
@@ -646,6 +691,34 @@ Tests marked `houdini` need a Houdini on the machine and skip when there is
 none, so `pytest -q` is complete everywhere. Run only those with `pytest -m
 houdini`, or skip them with `pytest -m "not houdini"`. The bridge is found
 through `NSCR_MCP_HYTHON`, then `HFS`, then the usual install folder.
+
+### Running the sequence yourself
+
+`tests/sequence.py` is one scripted pass over every tool, the way a client
+would go about a first piece of work: list the tools, find a session, start a
+worker, read its scene, build three nodes with a lost reply sent again under
+the same operation id, read them back, look up `attribwrangle` and its help
+page, take a cache path, save the next version, follow slow code that became a
+job, compare two images and stop the worker. Every step checks the shape of
+its result and records the tool, how long it took, and whether the reply
+carried structured content, a text block and an image.
+
+```sh
+pytest -m houdini -s tests/test_sequence_hython.py
+```
+
+runs it three times, each with a server process of its own over stdio: under
+the current protocol revision, under the older handshake revision, and through
+the SDK's lower level client class. `-s` prints each run's steps. A last check
+holds the three to the same shapes. The only difference the revision makes is
+its own: the current one stamps every result with the server's details in its
+metadata. Everything the pass writes stays in pytest's temporary folder.
+
+`tests/test_storm_cap_hython.py` has two server processes hammer one worker
+that is paced as if it had an interface, which only a test can ask for, through
+the server's constructor, and prints the rates with and without the pace. Both
+files carry their own deadline of 900 seconds, longer than the suite's usual
+limit, for a slow Houdini to start in.
 
 ## Output folders
 

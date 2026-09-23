@@ -545,6 +545,7 @@ def restore_left_over(call: Call, hip: Any = ASK) -> list[dict[str, Any]]:
                 wait_s=call.arguments.get("wait_s"),
             )
         except CallError as error:
+            call.note(error.trace)
             done.append(
                 {
                     "node": row.node_path,
@@ -555,6 +556,7 @@ def restore_left_over(call: Call, hip: Any = ASK) -> list[dict[str, Any]]:
                 }
             )
             continue
+        call.note(reply)
         answer = dict(reply.get("data") or {})
         answer["owner"] = row.session_id
         done.append(answer)
