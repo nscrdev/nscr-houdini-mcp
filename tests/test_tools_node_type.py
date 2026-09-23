@@ -719,6 +719,7 @@ def test_an_embedded_help_page_is_read_whole_for_its_labels() -> None:
 
 def test_a_label_written_without_quotes_is_read(bench: Bench) -> None:
     body = ok(lookup(bench, context="sop", type="kinefx::ragdollsolver", detail="standard"))
+    assert body["type"] == "kinefx::ragdollsolver::2.0"
     assert body["inputs"] == [
         {"index": 0, "label": "Skeleton", "optional": False},
         {"index": 1, "label": "Constraint Geometry", "optional": True},
@@ -726,6 +727,22 @@ def test_a_label_written_without_quotes_is_read(bench: Bench) -> None:
     ]
     assert body["outputs"] == [{"index": 0, "label": "Skeleton"}]
     assert body["labels_from"] == "dialog_script"
+
+
+def test_a_namespaced_name_without_a_version_is_its_newest_version(bench: Bench) -> None:
+    body = ok(lookup(bench, context="sop", type="kinefx::ragdollsolver"))
+    assert body["type"] == "kinefx::ragdollsolver::2.0"
+    assert body["resolved_from"] == "kinefx::ragdollsolver"
+    assert body["max_inputs"] == 3
+    # A version asked for is that version.
+    older = ok(lookup(bench, context="sop", type="kinefx::ragdollsolver::2.0"))
+    assert "resolved_from" not in older
+
+
+def test_a_namespaced_name_never_resolves_to_another_namespace(bench: Bench) -> None:
+    body = ok(lookup(bench, context="sop", type="apex::invokegraph"))
+    assert body["type"] == "apex::invokegraph"
+    assert "resolved_from" not in body
 
 
 def test_help_labels_skip_directives_and_notes_and_stop_at_the_count(bench: Bench) -> None:

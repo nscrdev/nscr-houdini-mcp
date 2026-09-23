@@ -1031,13 +1031,31 @@ def type_library() -> dict[str, NodeTypeCategory]:
             library="/shared/assets/tool.hda",
         ),
         NodeType("null", "Sop", label="Null"),
+        # A namespaced name with no version makes the newest version of it.
         NodeType(
             "kinefx::ragdollsolver",
             "Sop",
             label="Ragdoll Solver",
+            inputs=(1, 4),
+            order=("kinefx::ragdollsolver::2.0", "kinefx::ragdollsolver"),
+        ),
+        NodeType(
+            "kinefx::ragdollsolver::2.0",
+            "Sop",
+            label="Ragdoll Solver",
             inputs=(1, 3),
             dialog=RAGDOLL_DIALOG,
+            order=("kinefx::ragdollsolver::2.0", "kinefx::ragdollsolver"),
         ),
+        # One whose namespace order puts a type of another namespace first,
+        # which making a node of it never goes to.
+        NodeType(
+            "apex::invokegraph",
+            "Sop",
+            label="Invoke Graph",
+            order=("invokegraph", "apex::invokegraph"),
+        ),
+        NodeType("invokegraph", "Sop", label="Invoke Graph (old)"),
         NodeType("splitter", "Sop", label="Splitter", outputs=2),
         NodeType("labs::thing::1.0", "Sop", label="Labs Thing"),
         NodeType(

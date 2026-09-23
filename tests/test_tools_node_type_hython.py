@@ -222,16 +222,36 @@ def test_a_menu_whose_items_toggle_is_read_without_asking_for_its_token(
     assert ok(alive)["call"]["ok"] is True
 
 
-def test_a_ragdoll_solver_has_its_bare_label(place: dict[str, Any]) -> None:
-    [result] = run(
+# A namespaced name whose newest version is another type, and one whose
+# namespace order starts with a type of another namespace.
+MADE_AS = ("kinefx::ragdollsolver", "apex::invokegraph")
+
+MAKE = """
+geo = hou.node("/obj").createNode("geo", "made_as_probe")
+result = {}
+for name in %r:
+    try:
+        result[name] = geo.createNode(name).type().name()
+    except hou.OperationFailed:
+        result[name] = None
+geo.destroy()
+"""
+
+
+def test_a_card_is_the_type_making_a_node_of_that_name_gives(place: dict[str, Any]) -> None:
+    made, *cards = run(
         place,
-        (
-            "hou_node_type",
-            {"context": "sop", "type": "kinefx::ragdollsolver", "detail": "standard"},
-        ),
+        ("hou_python", {"code": MAKE % (MADE_AS,)}),
+        *(("hou_node_type", {"context": "sop", "type": name}) for name in MADE_AS),
     )
-    if result.is_error and result.structured_content["error"]["code"] == "TYPE_NOT_FOUND":
-        pytest.skip("this build has no ragdoll solver")
-    body = ok(result)
-    assert body["inputs"][0]["label"] == "Skeleton"
-    assert body["labels_from"] == "dialog_script"
+    created = ok(made)["result"]
+    checked = 0
+    for name, card in zip(MADE_AS, cards, strict=True):
+        if created[name] is None:
+            continue
+        assert ok(card)["type"] == created[name], name
+        checked += 1
+    if not checked:
+        pytest.skip("this build has neither type")
+    [tree] = run(place, ("hou_inspect", {"path": "/obj"}))
+    assert ok(tree)["rows"] == []

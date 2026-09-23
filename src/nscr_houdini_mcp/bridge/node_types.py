@@ -316,11 +316,22 @@ def _resolve(hou: Any, category: Any, name: str) -> Any:
     """The type Houdini makes for a name in one category, or nothing.
 
     A name with no namespace and no version is the one Houdini prefers for
-    it, which is the newest version where there are several.
+    it, which is the newest version where there are several. A namespaced
+    name with no version is the newest version of that same namespace and
+    name, as making a node of it gives: the type's namespace order can put a
+    type of another namespace or name first, such as `invokegraph` for
+    `apex::invokegraph`, and making the node never goes there.
     """
     types = _types_of(category)
     exact = types.get(name)
     if "::" in name:
+        namespace, base, version = _split_name(name)
+        if exact is None or version:
+            return exact
+        for candidate in _ask(exact, "namespaceOrder") or ():
+            kind = types.get(str(candidate))
+            if kind is not None and _components(kind)[1:3] == (namespace, base):
+                return kind
         return exact
     preferred = _quiet(lambda: hou.preferredNodeType(f"{_category_name(category)}/{name}"))
     if preferred is not None and _category_name(_ask(preferred, "category")) in (
