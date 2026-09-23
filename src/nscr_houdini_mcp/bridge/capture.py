@@ -40,14 +40,17 @@ The routes for a view, in order, and the first that writes a file wins:
 Framing `all` goes around the geometry of the objects shown at the frames
 captured, the first and last of a sequence together, whatever frame the scene
 is on: not cameras, lights, what sits inside them, or an object of a guide
-type (a null, a bone, a rivet) that still draws its stock shape. A
-simulation network draws no geometry node to read, so it is drawn but not
-framed; an instance object is framed around its points grown by what it
-copies. With nothing to frame the view or camera frames the origin and says
-so. Without guides the objects drawn are all of them less those guides, left
-out by name, so Houdini still decides what else is shown at each frame. A
-Scene Viewer inside a geometry network or showing a stage keeps Houdini's own
-frame all and draws every object.
+type (a null, a bone, a rivet, a path) that still draws its stock shape.
+Only object networks are walked, never what sits inside a simulation, and
+the walk is made once per view. A simulation network draws no geometry node
+to read, so it is drawn but not framed; an instance object is framed around
+its points grown by what it copies. With nothing to frame the view or camera
+frames the origin and says so. The viewport is framed for the picture's
+shape, not its own, so a picture of another shape is not cut. Without guides
+the objects drawn are all of them less those guides, left out by name, so
+Houdini still decides what else is shown at each frame. A Scene Viewer
+inside a geometry network or showing a stage keeps Houdini's own frame all
+and draws every object.
 
 `cop` reads the COP's image layer and writes it as an 8 bit PNG, or saves an
 older COP's image with its own writer. `network` and `pane` grab the pane's
@@ -157,10 +160,15 @@ GUIDE_SHAPES = {
     "bone": "bonelink",
     "fetch": "sphere",
     "blend": "sphere",
+    "pathcv": "control",
+    "path": "convert",
+    "handle": "merge",
+    "muscle": "muscle",
 }
 NOTHING_TO_FRAME = "nothing to frame was found, so the {} frames the origin"
 # How many objects framing "all" reads. Each costs a read of its displayed
-# geometry, a few microseconds once cooked, on the main thread.
+# geometry's box and transform, about 10 microseconds once cooked, on the
+# main thread.
 MAX_FRAMED = 10000
 TOO_MANY_TO_FRAME = f"only the first {MAX_FRAMED} shown objects were framed"
 
@@ -860,9 +868,10 @@ def flipbook_viewer(
     done: list[float] = []
     stopped = False
     objects = shows_objects(viewer)
+    scene = scene_objects(hou) if objects else None
     try:
-        described, warnings = apply_view(hou, spec, camera, viewport, frames, objects)
-        settings, unset = flipbook_settings(hou, viewer, spec, path, frames, objects)
+        described, warnings = apply_view(hou, spec, camera, viewport, frames, objects, scene)
+        settings, unset = flipbook_settings(hou, viewer, spec, path, frames, objects, scene)
         if unset:
             warnings.append(
                 "these flipbook settings could not be set and keep the artist's: "
@@ -908,6 +917,7 @@ def flipbook_settings(
     path: str,
     frames: Sequence[float],
     objects: bool = True,
+    scene: SceneObjects | None = None,
 ) -> tuple[Any, list[str]]:
     """A copy of the viewer's flipbook settings with every one this capture needs set.
 
@@ -929,7 +939,7 @@ def flipbook_settings(
         ("useResolution", True),
         ("resolution", spec.resolution),
         ("beautyPassOnly", not spec.guides),
-        ("visibleObjects", guide_mask(hou, spec) if objects else "*"),
+        ("visibleObjects", guide_mask(hou, spec, scene) if objects else "*"),
         ("visibleTypes", getattr(kinds, "Visible", _NO_VALUE)),
         ("useSheetSize", False),
         ("useMotionBlur", False),
@@ -972,6 +982,9 @@ class ViewState:
     camera: Any
     default: Any
     shading: dict[str, Any] = field(default_factory=dict)
+    # Put back on its own: a perspective view does not take it back with the
+    # rest of its camera.
+    ortho_width: Any = None
 
     @classmethod
     def save(cls, hou: Any, viewport: Any) -> ViewState:
@@ -987,6 +1000,7 @@ class ViewState:
             camera=_quiet(lambda: viewport.camera()),
             default=viewport.defaultCamera().stash(),
             shading=shading,
+            ortho_width=_quiet(lambda: viewport.defaultCamera().orthoWidth()),
         )
 
     def restore(self, hou: Any, viewport: Any, attempt: Attempt) -> None:
@@ -1002,6 +1016,11 @@ class ViewState:
         attempt.attempt(
             "put the viewport's camera back", lambda: viewport.setDefaultCamera(self.default)
         )
+        if self.ortho_width is not None:
+            attempt.attempt(
+                "put the viewport's ortho width back",
+                lambda: viewport.defaultCamera().setOrthoWidth(self.ortho_width),
+            )
         for name, mode in self.shading.items():
             kind = getattr(hou.displaySetType, name, None)
             if kind is None or mode is None:
@@ -1033,6 +1052,7 @@ def apply_view(
     viewport: Any,
     frames: Sequence[float] = (),
     objects: bool = True,
+    scene: SceneObjects | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Look through the camera asked for, shade and frame, on a viewport that is put back."""
     warnings: list[str] = []
@@ -1079,8 +1099,8 @@ def apply_view(
         elif target == "all":
             # Houdini's own frame all counts cameras, lights and nulls, so a
             # shown camera away from the subject pulls the view off it.
-            bounds = bounds_of_all(hou, frames, warnings, "view")
-            viewport.frameBoundingBox(hou.BoundingBox(*bounds[0], *bounds[1]))
+            bounds = bounds_of_all(hou, frames, warnings, "view", scene)
+            frame_box(hou, viewport, bounds, spec.resolution)
         elif target == "selection":
             viewport.frameSelected()
         else:
@@ -1088,9 +1108,34 @@ def apply_view(
             if bounds is None:
                 warnings.append("the target has no geometry to frame")
             else:
-                viewport.frameBoundingBox(hou.BoundingBox(*bounds[0], *bounds[1]))
+                frame_box(hou, viewport, bounds, spec.resolution)
         described["target"] = target
     return described, warnings
+
+
+def frame_box(
+    hou: Any,
+    viewport: Any,
+    bounds: tuple[Sequence[float], Sequence[float]],
+    resolution: tuple[int, int],
+) -> None:
+    """Frame a box so it stays whole in a picture of another shape than the viewport.
+
+    The viewport frames for its own shape, and a flipbook of another shape
+    is cut from that, so the box is grown about its middle by how far apart
+    the two shapes are, whichever is the wider.
+    """
+    size = _quiet(lambda: viewport.size())
+    grow = 1.0
+    if size is not None and len(size) == 4 and size[2] > 0 and size[3] > 0:
+        shown = size[2] / size[3]
+        asked = resolution[0] / resolution[1]
+        grow = max(shown / asked, asked / shown)
+    low, high = bounds
+    middle = [(a + b) / 2.0 for a, b in zip(low, high, strict=True)]
+    low = [m + (a - m) * grow for a, m in zip(low, middle, strict=True)]
+    high = [m + (b - m) * grow for b, m in zip(high, middle, strict=True)]
+    viewport.frameBoundingBox(hou.BoundingBox(*low, *high))
 
 
 # Section: the flipbook render node
@@ -1133,9 +1178,10 @@ def rop_route(
                 # other way, draws at its screen's ratio.
                 scale = drawing_scale(hou, parent, os.path.dirname(path), attempt)
             # Read before the capture's own camera is made, so it is not named.
-            mask = guide_mask(hou, spec) if objects is None else None
+            scene = scene_objects(hou) if objects is None else None
+            mask = guide_mask(hou, spec, scene) if scene is not None else None
             camera_path, described, warnings = rop_camera(
-                hou, spec, camera, targets, made, scale or 1.0, frames
+                hou, spec, camera, targets, made, scale or 1.0, frames, scene
             )
             if scale is None:
                 warnings.append("the render node's drawing scale could not be read")
@@ -1481,6 +1527,7 @@ def rop_camera(
     made: list[Any],
     scale: float = 1.0,
     frames: Sequence[float] = (),
+    scene: SceneObjects | None = None,
 ) -> tuple[str, dict[str, Any], list[str]]:
     """The camera the render node looks through, always one made for the capture.
 
@@ -1505,7 +1552,7 @@ def rop_camera(
         view = camera or "persp"
         orbit, elevation, ortho = FITTED[view]
     if targets is None:
-        bounds = bounds_of_all(hou, frames, warnings, "camera")
+        bounds = bounds_of_all(hou, frames, warnings, "camera", scene)
     else:
         found = world_bounds(hou, targets, frames)
         if found is None:
@@ -1666,11 +1713,82 @@ def _dot(a: Sequence[float], b: Sequence[float]) -> float:
     return sum(x * y for x, y in zip(a, b, strict=True))
 
 
+@dataclass
+class SceneObjects:
+    """The objects of the scene, sorted once per view: the guides, and the rest
+    that Houdini counts as geometry."""
+
+    guides: list[Any]
+    geometry: list[Any]
+
+
+def scene_objects(hou: Any) -> SceneObjects:
+    """Every object in an object network, sorted into guides and geometry.
+
+    Houdini's own kinds sort them, one filtered glob each for geometry, cameras
+    and lights, a few milliseconds in all on a scene of ten thousand nodes. A
+    node found inside anything that is not an object network, such as the
+    networks inside a simulation, is not an object of the scene and is left
+    out.
+    """
+    root = _quiet(lambda: hou.node("/obj"))
+    kinds = getattr(hou, "nodeTypeFilter", None)
+    if root is None or kinds is None:
+        return SceneObjects([], [])
+
+    def found(kind: Any) -> list[Any]:
+        matched = _quiet(lambda: root.recursiveGlob("*", kind)) if kind is not None else None
+        return [node for node in matched or () if _in_object_networks(node, root)]
+
+    guides: dict[str, Any] = {}
+    for name in GUIDE_KINDS:
+        for node in found(getattr(kinds, name, None)):
+            guides[node.path()] = node
+    inside = tuple(path + "/" for path in guides)
+    geometry = []
+    for node in found(getattr(kinds, "ObjGeometry", None)):
+        path = node.path()
+        if path in guides:
+            continue
+        if path.startswith(inside) or _stock_shape(node):
+            guides[path] = node
+        else:
+            geometry.append(node)
+    return SceneObjects(list(guides.values()), geometry)
+
+
+def _in_object_networks(node: Any, root: Any) -> bool:
+    """Whether every network between a node and /obj holds objects, so the walk
+    never counts what sits inside a simulation or a geometry network."""
+    top = _quiet(lambda: root.path())
+    current = _quiet(lambda: node.parent())
+    while current is not None and _quiet(lambda current=current: current.path()) != top:
+        held = _quiet(lambda current=current: current.childTypeCategory().name())
+        if held != "Object":
+            return False
+        current = _quiet(lambda current=current: current.parent())
+    return current is not None
+
+
+def _stock_shape(node: Any) -> bool:
+    """Whether an object is of a guide type and still draws the shape it came with."""
+    type_name = _quiet(lambda: node.type().nameComponents()[2])
+    shape = GUIDE_SHAPES.get(type_name)
+    if shape is None:
+        return False
+    shown = _quiet(lambda: node.displayNode())
+    return shown is None or _quiet(lambda: shown.type().name()) == shape
+
+
 def bounds_of_all(
-    hou: Any, frames: Sequence[float], warnings: list[str], what: str
+    hou: Any,
+    frames: Sequence[float],
+    warnings: list[str],
+    what: str,
+    objects: SceneObjects | None = None,
 ) -> tuple[Sequence[float], Sequence[float]]:
     """The box "all" frames, or one at the origin, with a warning, when there is none."""
-    nodes, capped = drawn_objects(hou, frames)
+    nodes, capped = drawn_objects(hou, frames, objects)
     if capped:
         warnings.append(TOO_MANY_TO_FRAME)
     bounds = world_bounds(hou, nodes, frames)
@@ -1683,7 +1801,8 @@ def bounds_of_all(
 def framing_frames(hou: Any, frames: Sequence[float]) -> tuple[float, ...]:
     """The frames bounds are read at: a sequence is framed on its first and last
     frames together, so what moves across it stays in, and a single frame on
-    itself, whatever frame the scene is on."""
+    itself, whatever frame the scene is on. Framing a sequence so cooks its
+    last frame before the first is drawn."""
     if not frames:
         return (_current_frame(hou),)
     if frames[0] == frames[-1]:
@@ -1715,39 +1834,7 @@ def world_bounds(
     return (low[0], low[1], low[2]), (high[0], high[1], high[2])
 
 
-def guide_objects(hou: Any) -> list[Any]:
-    """Every object that draws only a guide: cameras and lights with whatever is
-    inside them, and objects that draw their type's stock shape."""
-    root = _quiet(lambda: hou.node("/obj"))
-    kinds = getattr(hou, "nodeTypeFilter", None)
-    if root is None or kinds is None:
-        return []
-    guides: dict[str, Any] = {}
-    for name in GUIDE_KINDS:
-        kind = getattr(kinds, name, None)
-        for node in (
-            _quiet(lambda kind=kind: root.recursiveGlob("*", kind)) if kind else None
-        ) or ():
-            guides[node.path()] = node
-    inside = tuple(path + "/" for path in guides)
-    for node in _quiet(lambda: root.recursiveGlob("*", kinds.ObjGeometry)) or ():
-        path = node.path()
-        if path not in guides and (path.startswith(inside) or _stock_shape(node)):
-            guides[path] = node
-    return list(guides.values())
-
-
-def _stock_shape(node: Any) -> bool:
-    """Whether an object is of a guide type and still draws the shape it came with."""
-    type_name = _quiet(lambda: node.type().nameComponents()[2])
-    shape = GUIDE_SHAPES.get(type_name)
-    if shape is None:
-        return False
-    shown = _quiet(lambda: node.displayNode())
-    return shown is None or _quiet(lambda: shown.type().name()) == shape
-
-
-def guide_mask(hou: Any, spec: Spec) -> str:
+def guide_mask(hou: Any, spec: Spec, objects: SceneObjects | None = None) -> str:
     """The objects a flipbook draws: all of them, less the guides unless guides are asked for.
 
     Houdini still decides per frame what is shown, so an object shown only at
@@ -1756,24 +1843,22 @@ def guide_mask(hou: Any, spec: Spec) -> str:
     """
     if spec.guides:
         return "*"
-    return " ".join(["*", *(f"^{node.path()}" for node in guide_objects(hou))])
+    guides = (objects or scene_objects(hou)).guides
+    return " ".join(["*", *(f"^{node.path()}" for node in guides)])
 
 
-def drawn_objects(hou: Any, frames: Sequence[float] = ()) -> tuple[list[Any], bool]:
+def drawn_objects(
+    hou: Any, frames: Sequence[float] = (), objects: SceneObjects | None = None
+) -> tuple[list[Any], bool]:
     """The objects "all" frames, inside subnets too, and whether there were more.
 
     Every object Houdini counts as geometry that is shown at a frame framed
     and is not a guide, up to `MAX_FRAMED`.
     """
-    root = _quiet(lambda: hou.node("/obj"))
-    kinds = getattr(hou, "nodeTypeFilter", None)
-    if root is None or kinds is None:
-        return [], False
-    guides = {node.path() for node in guide_objects(hou)}
     at = framing_frames(hou, frames)
     drawn: list[Any] = []
-    for node in _quiet(lambda: root.recursiveGlob("*", kinds.ObjGeometry)) or ():
-        if node.path() in guides or not any(_shown(node, frame) for frame in at):
+    for node in (objects or scene_objects(hou)).geometry:
+        if not any(_shown(node, frame) for frame in at):
             continue
         if len(drawn) == MAX_FRAMED:
             return drawn, True
@@ -1820,7 +1905,10 @@ def _box_at(source: Any, frame: float) -> tuple[list[float], list[float]] | None
     box = _quiet(lambda: geometry.boundingBox()) if geometry is not None else None
     if box is None or _quiet(lambda: box.isValid()) is False:
         return None
-    return list(box.minvec()), list(box.maxvec())
+    # Read by index: a Houdini vector has no iterator, so list() would read on
+    # until the fourth item fails, which costs far more than the three reads.
+    low, high = box.minvec(), box.maxvec()
+    return [low[0], low[1], low[2]], [high[0], high[1], high[2]]
 
 
 def _instanced_box(node: Any, frame: float) -> tuple[list[float], list[float]] | None:

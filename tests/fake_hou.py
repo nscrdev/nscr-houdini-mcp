@@ -65,18 +65,25 @@ for _kind in (Error, OperationFailed, ObjectWasDeleted, InvalidInput, Permission
 
 
 class Vector3:
-    """A vector reads as a sequence, and has no `asTuple`, as in Houdini 22."""
+    """A vector reads by index, and has no iterator and no `asTuple`, as in Houdini 22.
+
+    Anything that iterates it reads on until an index fails, which is slow in
+    a real session; each such read is counted.
+    """
+
+    # How many reads went past the last item.
+    overreads = 0
 
     def __init__(self, *values: float) -> None:
         self._values = tuple(float(value) for value in values)
-
-    def __iter__(self) -> Any:
-        return iter(self._values)
 
     def __len__(self) -> int:
         return len(self._values)
 
     def __getitem__(self, index: int) -> float:
+        if not -len(self._values) <= index < len(self._values):
+            Vector3.overreads += 1
+            raise IndexError("vector index out of range")
         return self._values[index]
 
 
@@ -1122,6 +1129,7 @@ class Node:
     def recursiveGlob(self, pattern: str, filter: str) -> tuple[Node, ...]:  # noqa: A002, N802
         """Every node below of the kind asked for, as `nodeTypeFilter` names it."""
         assert pattern == "*", pattern
+        self._scene.globbed += 1
         wanted = OBJECT_KINDS[filter]
         return tuple(node for node in self.allSubChildren() if node._type.name() in wanted)
 
@@ -1190,7 +1198,21 @@ def time_to_frame(time: float) -> float:
 # Houdini's kinds of object, by the types `nodeTypeFilter` matches, as a real
 # 22.0 sorts them: a null, a bone and a subnet count as geometry too.
 OBJECT_KINDS = {
-    "ObjGeometry": ("geo", "null", "subnet", "bone", "rivet", "fetch", "blend", "instance"),
+    "ObjGeometry": (
+        "geo",
+        "null",
+        "subnet",
+        "bone",
+        "rivet",
+        "fetch",
+        "blend",
+        "instance",
+        "dopnet",
+        "path",
+        "pathcv",
+        "handle",
+        "muscle",
+    ),
     "ObjCamera": ("cam",),
     "ObjLight": ("hlight::2.0", "envlight", "ambient"),
 }
@@ -1209,6 +1231,8 @@ def _category(parent: Node | None) -> str:
         return "Cop2"
     if kind == "subnet" and parent._type.category().name() == "Object":
         return "Object"
+    if kind == "dopnet":
+        return "Dop"
     return {"/obj": "Object", "/out": "Driver", "/stage": "Lop"}.get(parent.path(), "Sop")
 
 
@@ -1787,8 +1811,10 @@ class Scene:
         self.types = types
         self.undos = Undos()
         self.ui = MainThread()
-        # How many times any node was asked for its children.
+        # How many times any node was asked for its children, and how many
+        # filtered walks of a network were made.
         self.listed = 0
+        self.globbed = 0
         self.root = Node(self, "", "root", None)
         self._counts: dict[str, int] = {}
         # What a person has selected in the interface.
@@ -2103,6 +2129,10 @@ class Viewport:
         self.framed: list[Any] = []
         # Set to make putting the viewport's own camera back fail.
         self.refuse_default = False
+        # Set to have a perspective view keep its ortho width when given a camera.
+        self.keeps_ortho_width = False
+        # Where the viewport sits in its pane, and its width and height.
+        self.box: tuple[int, int, int, int] | None = None
 
     def type(self) -> str:
         return self._type
@@ -2122,15 +2152,26 @@ class Viewport:
         self._camera = None
 
     def defaultCamera(self) -> ViewCamera:  # noqa: N802 - the name is Houdini's
-        return self._default.stash()
+        # The viewport's own camera, not a copy: what is set on it is set.
+        return self._default
 
     def setDefaultCamera(self, view: ViewCamera) -> None:  # noqa: N802 - the name is Houdini's
         if self.refuse_default:
             raise OperationFailed("the viewport would not take its camera")
+        width = self._default.orthoWidth()
         self._default = view.stash()
+        if self._type == "Perspective" and self.keeps_ortho_width:
+            # As a real 22.0.429 perspective view was seen to do: the ortho
+            # width it had stays, whatever the camera given says.
+            self._default.setOrthoWidth(width)
 
     def settings(self) -> ViewportSettings:
         return self._settings
+
+    def size(self) -> tuple[int, int, int, int]:
+        if self.box is None:
+            raise OperationFailed("the viewport has no size yet")
+        return self.box
 
     def frameAll(self) -> None:  # noqa: N802 - the name is Houdini's
         self.framed.append("all")
@@ -2142,8 +2183,10 @@ class Viewport:
         self._default.setTranslation((6.0, 6.0, 6.0))
 
     def frameBoundingBox(self, box: BoundingBox) -> None:  # noqa: N802 - the name is Houdini's
-        self.framed.append((tuple(box.minvec()), tuple(box.maxvec())))
+        low, high = box.minvec(), box.maxvec()
+        self.framed.append(((low[0], low[1], low[2]), (high[0], high[1], high[2])))
         self._default.setTranslation((7.0, 7.0, 7.0))
+        self._default.setOrthoWidth(5.03)
 
     def viewTransform(self) -> Matrix4:  # noqa: N802 - the name is Houdini's
         translation = self._default.translation()

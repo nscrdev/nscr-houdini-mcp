@@ -472,3 +472,36 @@ def test_a_scene_with_only_a_null_draws_no_cross_without_guides(place: dict[str,
     body = ok(guided)
     assert any("frames the origin" in item for item in body["warnings"])
     assert green(body["path"]) > 20
+
+
+# Fifteen hundred boxes, then the time framing all of them takes in the worker,
+# cooked once first, as a capture would find them.
+MANY = """
+import time
+from nscr_houdini_mcp.bridge import capture
+obj = hou.node('/obj')
+made = []
+for index in range(1500):
+    geo = obj.createNode('geo', f'many{index}')
+    geo.createNode('box').setDisplayFlag(True)
+    geo.parmTuple('t').set((index % 50, index // 50, 0))
+    made.append(geo)
+nodes, capped = capture.drawn_objects(hou, (1.0,))
+capture.world_bounds(hou, nodes, (1.0,))
+started = time.perf_counter()
+bounds = capture.world_bounds(hou, nodes, (1.0,))
+took = time.perf_counter() - started
+for geo in made:
+    geo.destroy()
+result = {'took': took, 'count': len(nodes), 'capped': capped, 'bounds': bounds}
+"""
+
+
+def test_framing_many_objects_is_quick(place: dict[str, Any]) -> None:
+    [said] = run(place, ("hou_python", {"code": MANY}))
+    result = ok(said)["result"]
+    assert result["count"] == 1501 and result["capped"] is False
+    assert result["bounds"][1][:2] == [49.5, 29.5]
+    # About 10 microseconds an object, 17 ms in all; reading the vectors with
+    # list() took 0.3 s here. The bound leaves room for a busy machine.
+    assert result["took"] < 0.15, result["took"]

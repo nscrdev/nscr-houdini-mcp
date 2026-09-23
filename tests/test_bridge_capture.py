@@ -31,6 +31,7 @@ from fake_hou import (
     Scene,
     SceneViewerTab,
     Tab,
+    Vector3,
     Window,
 )
 from nscr_houdini_mcp import outputs
@@ -56,6 +57,13 @@ TYPES = (
     "hlight::2.0",
     "control",
     "instance",
+    "dopnet",
+    "pathcv",
+    "path",
+    "handle",
+    "muscle",
+    "merge",
+    "convert",
 )
 # The box every geometry node in the stand in draws, as framing reads it.
 UNIT = ((-0.5, -0.5, -0.5), (0.5, 0.5, 0.5))
@@ -1092,6 +1100,79 @@ def test_framing_stops_at_the_cap_and_says_so(
     said = take(scene, home, kind="gui", frame_target="all")
     assert viewer.viewport.framed == [UNIT]
     assert capture.TOO_MANY_TO_FRAME in said["warnings"]
+
+
+def test_bounds_read_vectors_by_index(scene: Scene, home: Path) -> None:
+    busy_scene(scene)
+    viewer_scene(scene)
+    Vector3.overreads = 0
+    take(scene, home, kind="gui", frame_target="all")
+    take(scene, home, frame_target="all")
+    assert Vector3.overreads == 0
+
+
+def test_framing_fits_the_picture_s_shape_not_the_viewport_s(scene: Scene, home: Path) -> None:
+    viewer = viewer_scene(scene)
+    viewer.viewport.box = (0, 0, 950, 653)
+    take(scene, home, kind="gui", camera="top", resolution=[1280, 720])
+    grow = (1280 / 720) / (950 / 653)
+    [(low, high)] = viewer.viewport.framed
+    assert low == pytest.approx((-0.5 * grow,) * 3)
+    assert high == pytest.approx((0.5 * grow,) * 3)
+
+
+def test_guide_types_that_draw_their_stock_shape_are_left_out(scene: Scene, home: Path) -> None:
+    viewer = viewer_scene(scene)
+    for type_name, shape in (
+        ("pathcv", "control"),
+        ("path", "convert"),
+        ("handle", "merge"),
+        ("muscle", "muscle"),
+    ):
+        made = scene.node("/obj").createNode(type_name, f"stock_{type_name}")
+        made.parmTuple("t").set((30.0, 0.0, 0.0))
+        drawn = made.createNode(shape, "shape")
+        drawn.bounds = UNIT
+        drawn.setDisplayFlag(True)
+    # A path whose display flag is on geometry of its own is geometry.
+    own = scene.node("/obj").createNode("path", "own_path")
+    own.parmTuple("t").set((3.0, 0.0, 0.0))
+    own.createNode("box", "mine").setDisplayFlag(True)
+    take(scene, home, kind="gui", frame_target="all")
+    assert viewer.viewport.framed == [((-0.5, -0.5, -0.5), (3.5, 0.5, 0.5))]
+    assert scene.capture.seen[-1]["settings"]["visibleObjects"] == (
+        "* ^/obj/stock_pathcv ^/obj/stock_path ^/obj/stock_handle ^/obj/stock_muscle"
+    )
+
+
+def test_the_walk_stays_in_object_networks_and_is_made_once(scene: Scene, home: Path) -> None:
+    viewer = viewer_scene(scene)
+    sim = scene.node("/obj").createNode("dopnet", "f_dopnet")
+    sim.hidden = True
+    # A node inside a simulation of a type Houdini counts as geometry.
+    guide_shape(scene, "/obj/f_dopnet", "geo", "inside", (40.0, 0.0, 0.0))
+    guide_shape(scene, "/obj/f_dopnet", "null", "marker", (40.0, 0.0, 0.0))
+    scene.globbed = 0
+    take(scene, home, kind="gui", frame_target="all")
+    assert viewer.viewport.framed == [UNIT]
+    assert scene.capture.seen[-1]["settings"]["visibleObjects"] == "*"
+    # One filtered walk for each of geometry, cameras and lights.
+    assert scene.globbed == 3
+    scene.globbed = 0
+    take(scene, home, frame_target="all")
+    assert scene.globbed == 3
+
+
+def test_the_ortho_width_is_put_back_after_framing_a_perspective_view(
+    scene: Scene, home: Path
+) -> None:
+    viewer = viewer_scene(scene)
+    viewport = viewer.viewport
+    viewport.keeps_ortho_width = True
+    viewport._default.setOrthoWidth(7.7)
+    take(scene, home, kind="gui", frame_target="all")
+    assert viewport.framed == [UNIT]
+    assert viewport._default.orthoWidth() == 7.7
 
 
 # Section: grabbing a pane that is not the current tab
