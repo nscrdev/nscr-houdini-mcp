@@ -207,7 +207,11 @@ Houdini's main thread, and only code that looks at `mcp.cancelled()` stops.
 `list` gives jobs newest first, by session and state, with `next_page`.
 
 Jobs live in the coordination store, so any server can answer for any job,
-including one started after the call that began it. A job whose session ends,
+including one started after the call that began it. A job's row is written
+before its code may run, and the call is refused with `STORE_UNAVAILABLE`
+when it cannot be; an operation id whose job is still kept cannot start
+another (`JOB_ID_TAKEN`). The same call sent again while it runs is answered
+at once with its job rather than queued behind itself. A job whose session ends,
 whether stopped or found gone, is `lost` with the progress and outputs it had
 written. Silence alone never ends a job, since a long cook can hold Houdini's
 interpreter and a machine can sleep; a job still going says how long its
@@ -370,7 +374,9 @@ and it stays when its server exits, so a client restart does not throw the
 warm pool away. The log is private to its owner and is rolled over when it
 grows, keeping the last two. What ends a worker is its lease: it watches its
 own row and goes when a server asks it to, or when nobody has wanted it for
-half an hour. Routing a call to it renews the lease. `stop` asks first and
+half an hour. Routing a call to it renews the lease, and a worker running a
+call or a job is never idle, however long the work takes and whether or not
+anybody routes to it meanwhile. `stop` asks first and
 ends the process itself only if the ask was not enough, and never unless that
 process can be shown to still be the worker. `start` exits 3 when the pool is
 full and 1 when the start went wrong.
