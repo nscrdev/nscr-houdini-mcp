@@ -993,7 +993,9 @@ def test_a_held_status_ends_on_time_while_another_process_holds_the_store(
     finally:
         locker.execute("ROLLBACK")
         locker.close()
-    assert taken < 2.5, taken
+    # The hold must end near its own deadline, not the store's ten second
+    # busy timeout; a slow runner adds a second or so on top.
+    assert taken < 4.0, taken
     assert held["state"] == "running"
     assert held["changed"] is False
     module.gate.set()

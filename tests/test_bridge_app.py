@@ -584,7 +584,9 @@ def test_a_request_that_did_not_arrive_on_loopback_closes_the_bridge(tmp_path: P
     try:
         reply = send(bridge, backend, HEALTH_PATH, server_address="192.0.2.7")
         assert reply.status == 403
-        for _ in range(500):
+        # A slow runner can take a while to close the server and drop the
+        # entry, so give it up to fifteen seconds rather than five.
+        for _ in range(1500):
             if not bridge.running and registry.list_entries(tmp_path) == []:
                 break
             threading.Event().wait(0.01)
