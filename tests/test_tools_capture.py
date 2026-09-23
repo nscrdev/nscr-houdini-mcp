@@ -243,6 +243,16 @@ def test_an_empty_picture_is_capture_empty(bench: Bench, scene: Scene) -> None:
     assert "check the camera" in error["hint"]
 
 
+def test_a_render_that_fails_is_capture_failed_with_its_error(bench: Bench, scene: Scene) -> None:
+    scene.capture.fail_at_frame = 1.0
+    result = shoot(bench)
+    error = refused(result)
+    assert error["code"] == "CAPTURE_FAILED"
+    assert error["details"]["error"].startswith("OperationFailed")
+    assert result.content[0].text.startswith("CAPTURE_FAILED")
+    assert "camera" in error["hint"]
+
+
 def test_the_network_in_hython_is_ui_unavailable(bench: Bench) -> None:
     result = shoot(bench, source="network")
     error = refused(result)

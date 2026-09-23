@@ -1465,7 +1465,7 @@ class FlipbookSettings:
         "audioFilename": "take.wav",
         "outputZoom": 50,
         "cropOutMaskOverlay": False,
-        "antialias": "HighQuality",
+        "antialias": "Fast",
         "setUseFrameTimeLimit": True,
         "setUseFrameProgressLimit": True,
     }

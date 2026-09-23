@@ -29,11 +29,13 @@ The routes for a view, in order, and the first that writes a file wins:
   It always looks through a camera made for the capture: one fitted to the
   target, or one that follows a named camera as its child and reads its lens
   and window by reference, so a named camera is never written. A worker
-  draws at one pixel to a point because the pool starts it on Qt's offscreen
-  screen plugin. In a session with a user interface a tiny render of a known
-  box says whether the render node draws larger than asked, read again when
-  the screen's pixel ratio changes, and the made camera's window makes up for
-  it.
+  draws at one pixel to a point because the pool, and the bridge's own
+  start, put it on Qt's offscreen screen plugin. In a session with a user
+  interface, or a hython on another plugin whose screen is not one to one, a
+  tiny render of a known box says whether the render node draws larger than
+  asked, read again when the screen's pixel ratio changes, and the made
+  camera's window makes up for it. A scale that cannot be read leaves the
+  framing marked unverified.
 
 `cop` reads the COP's image layer and writes it as an 8 bit PNG, or saves an
 older COP's image with its own writer. `network` and `pane` grab the pane's
@@ -45,7 +47,9 @@ Everything made for a capture, the render node, a fitted camera and a moved
 display flag, is made and taken away with undo turned off, so the artist's
 undo history is as it was. A route that finishes without writing a file, or
 writes an empty one, counts as a route that did not work, and the next one is
-tried, and whatever frames it wrote are taken away. A capture stopped on
+tried, and whatever frames it wrote are taken away. When a route that
+applies ran and Houdini stopped it with an error, the answer is
+`CAPTURE_FAILED` with that error. A capture stopped on
 request keeps the frames it wrote and lists them. Only when every route that
 applies fails is the answer
 `UI_UNAVAILABLE`, or `CAPTURE_EMPTY` when every one ran and wrote nothing.
@@ -475,7 +479,7 @@ def shoot(
     gui: bool,
 ) -> dict[str, Any]:
     """One view, by the first route that writes it."""
-    tried: list[dict[str, str]] = []
+    tried: list[dict[str, Any]] = []
     for route, run in routes_for(spec.source, gui):
         try:
             shot = run(hou, context, spec, camera, path, frames, gui)
@@ -488,7 +492,7 @@ def shoot(
             discard(frame_files(path, frames, spec.sequence))
             if isinstance(error, BridgeError) or not _is_hou_error(error):
                 raise
-            tried.append({"route": route, "reason": _reason(error)})
+            tried.append({"route": route, "reason": _reason(error), "failed": True})
             continue
         written = [item for item in shot["files"] if _written(item)]
         if not written or len(written) < len(shot["files"]):
@@ -505,6 +509,15 @@ def shoot(
             "every route ran and none wrote an image",
             {"source": spec.source, "tried": tried},
             hint="check the camera and the node shown, then capture again",
+        )
+    failed = [item for item in tried if item.get("failed")]
+    if failed:
+        # A route that applies here ran and Houdini said why it stopped.
+        raise BridgeError(
+            "CAPTURE_FAILED",
+            "the capture ran and Houdini stopped it with an error",
+            {"source": spec.source, "error": failed[-1]["reason"], "tried": tried},
+            hint="check the camera and the node shown, and the error in the details",
         )
     hint = {"network": NETWORK_HINT, "pane": PANE_HINT}.get(spec.source)
     raise BridgeError(
@@ -663,7 +676,7 @@ def flipbook_settings(
         ("audioFilename", ""),
         ("outputZoom", 100),
         ("cropOutMaskOverlay", True),
-        ("antialias", getattr(smoothing, "UseDefault", _NO_VALUE)),
+        ("antialias", getattr(smoothing, "UseViewportSetting", _NO_VALUE)),
         ("setUseFrameTimeLimit", False),
         ("setUseFrameProgressLimit", False),
     )
@@ -814,9 +827,10 @@ def rop_route(
             if isolated is not None:
                 objects, put_back = isolate(isolated)
             targets = [isolated] if isolated is not None else _targets(hou, spec.frame_target)
-            if gui:
-                # A worker's render nodes draw at one pixel to a point; a
-                # session with a user interface draws at its screen's ratio.
+            if gui or needs_scale(hou):
+                # A pool worker draws offscreen at one pixel to a point. A
+                # session with a user interface, or a hython started some
+                # other way, draws at its screen's ratio.
                 scale = drawing_scale(hou, parent, os.path.dirname(path))
             camera_path, described, warnings = rop_camera(
                 hou, spec, camera, targets, made, scale or 1.0
@@ -879,11 +893,48 @@ PROBE_NAME = "nscr_capture_probe"
 PROBE_SLACK = 0.1
 
 
+# Where Qt is told which screen plugin to use.
+QT_PLATFORM_ENV_VAR = "QT_QPA_PLATFORM"
+OFFSCREEN = "offscreen"
+
+
 def screen_ratio(hou: Any) -> float | None:
-    """The main window's device pixel ratio, or nothing when the build will not say."""
-    window = _quiet(lambda: hou.ui.mainQtWindow())
-    ratio = _quiet(window.devicePixelRatioF) if window is not None else None
-    return float(ratio) if ratio else None
+    """The screen's device pixel ratio, or nothing when nothing will say.
+
+    With a user interface, the main window's. Without one, Qt's primary
+    screen, when this process has a Qt application to ask.
+    """
+    if getattr(hou, "ui", None) is not None:
+        window = _quiet(lambda: hou.ui.mainQtWindow())
+        ratio = _quiet(window.devicePixelRatioF) if window is not None else None
+        if ratio:
+            return float(ratio)
+    return primary_screen_ratio()
+
+
+def primary_screen_ratio() -> float | None:
+    for binding in ("PySide6", "PySide2"):
+        try:
+            gui = __import__(f"{binding}.QtGui", fromlist=["QGuiApplication"])
+        except ImportError:
+            continue
+        application = _quiet(gui.QGuiApplication.instance)
+        screen = _quiet(application.primaryScreen) if application is not None else None
+        ratio = _quiet(screen.devicePixelRatio) if screen is not None else None
+        return float(ratio) if ratio else None
+    return None
+
+
+def needs_scale(hou: Any) -> bool:
+    """Whether a session without a user interface has to read its drawing scale.
+
+    Not on the offscreen screen plugin, which draws one pixel to a point, and
+    not when the primary screen says it is one to one. Anything else, a
+    screen plugin named in the shell or a ratio nobody will say, is read.
+    """
+    if os.environ.get(QT_PLATFORM_ENV_VAR, "").strip().lower() == OFFSCREEN:
+        return False
+    return screen_ratio(hou) != 1.0
 
 
 def drawing_scale(hou: Any, parent: Any, folder: str) -> float | None:
@@ -897,8 +948,9 @@ def drawing_scale(hou: Any, parent: Any, folder: str) -> float | None:
     not be read or its edges disagree, which leaves the framing unverified.
     """
     ratio = screen_ratio(hou)
-    if _found and _found[0] is hou and _found[1] == ratio:
-        return _found[2]
+    platform = os.environ.get(QT_PLATFORM_ENV_VAR)
+    if _found and _found[0] is hou and _found[1:3] == [ratio, platform]:
+        return _found[3]
     obj = hou.node(CAMERA_PARENT)
     # A fixed name: the capture's own path can hold a frame token.
     probe_file = os.path.join(folder, f"{PROBE_NAME}_{os.getpid()}.probe.png")
@@ -939,7 +991,7 @@ def drawing_scale(hou: Any, parent: Any, folder: str) -> float | None:
             _quiet(node.destroy)
         discard([probe_file])
     if scale is not None:
-        _found[:] = [hou, ratio, scale]
+        _found[:] = [hou, ratio, platform, scale]
     return scale
 
 

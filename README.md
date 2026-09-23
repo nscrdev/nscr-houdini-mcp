@@ -254,7 +254,8 @@ undo turned off. A route that fails part way takes its frames with it; a
 capture stopped on request keeps the frames it wrote and lists them, and the
 run record names each file. The network editor and panes are made the
 current tab and grabbed from their own window, which needs a user interface;
-a worker answers `UI_UNAVAILABLE`.
+a worker answers `UI_UNAVAILABLE`. A render Houdini stops with an error is
+`CAPTURE_FAILED`, with that error in the details.
 
 `views: quad` captures persp, top, front and right, `turntable4` four orbits
 a quarter turn apart, and both add a two by two contact sheet, which is then
@@ -323,7 +324,11 @@ Start one in a headless Houdini:
 hython -m nscr_houdini_mcp.bridge.main --home <state folder>
 ```
 
-It stops when its input closes, or on the word `stop`.
+It stops when its input closes, or on the word `stop`. A start like this puts
+Qt on its offscreen screen plugin unless `QT_QPA_PLATFORM` already names one,
+as the pool does for its workers. On another plugin and a dense display a
+render node draws larger than asked; a capture then reads the scale and makes
+up for it, or says `framing_unverified` when it cannot.
 
 ### Installing the Houdini side
 

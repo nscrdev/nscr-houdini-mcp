@@ -91,6 +91,7 @@ HINTS: dict[str, str] = {
     "BODY_REFUSED": "send a smaller or less deeply nested request",
     "CAPTURE_EMPTY": "check the camera and the node shown, then capture again",
     "UI_UNAVAILABLE": "use a source this session can show, or a session with a user interface",
+    "CAPTURE_FAILED": "check the camera and the node shown, and the error in the details",
     "BAD_ENVELOPE": "the server sent a request the bridge could not read; report it",
     "UNAUTHORIZED": "the session's token changed; call again so the session is read afresh",
     "FORBIDDEN": "the request did not come from this machine's loopback; report it",

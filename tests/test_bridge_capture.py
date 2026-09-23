@@ -57,6 +57,12 @@ def scene(tmp_path: Path) -> Iterator[Scene]:
         made.ui.stop()
 
 
+@pytest.fixture(autouse=True)
+def no_named_screen_plugin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each check says which Qt screen plugin it has; the shell's is not one of them."""
+    monkeypatch.delenv(capture.QT_PLATFORM_ENV_VAR, raising=False)
+
+
 @pytest.fixture
 def home(tmp_path: Path) -> Path:
     folder = tmp_path / "home"
@@ -683,9 +689,44 @@ def test_a_dense_screen_is_worked_out_and_the_made_camera_makes_up_for_it(
     assert names(scene, "/out") == []
 
 
-def test_a_worker_never_draws_a_calibration(scene: Scene, home: Path) -> None:
+def test_a_hython_on_the_offscreen_plugin_never_draws_a_calibration(
+    scene: Scene, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(capture.QT_PLATFORM_ENV_VAR, "offscreen")
+    scene.ui.ratio = 2.0
     take(scene, home)
     assert scene.capture.probes == []
+
+
+def test_a_hython_on_a_one_to_one_screen_draws_no_calibration(scene: Scene, home: Path) -> None:
+    take(scene, home)
+    assert scene.capture.probes == []
+
+
+def test_a_hython_on_another_plugin_and_a_dense_screen_is_calibrated(
+    scene: Scene, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(capture.QT_PLATFORM_ENV_VAR, "cocoa")
+    scene.ui.ratio = 2.0
+    scene.capture.backing = 2.0
+    said = take(scene, home, resolution=[320, 160])
+    [shot] = said["views"]
+    assert len(scene.capture.probes) == 1
+    assert "framing_unverified" not in shot
+    assert picture(shot["files"][0]).getchannel("A").getbbox() == (80, 40, 240, 120)
+
+
+def test_a_hython_whose_screen_will_not_say_is_calibrated_or_unverified(
+    scene: Scene, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = scene.module()
+    del module.ui
+    monkeypatch.setattr(capture, "alpha_box", lambda path: None)
+    context = tools.ToolContext(**{**Run(scene, home, "hython").context.__dict__, "hou": module})
+    said = capture.capture_image({}, context)
+    assert len(scene.capture.probes) == 1
+    assert said["views"][0]["framing_unverified"] is True
+    assert any("drawing scale" in item for item in said["warnings"])
 
 
 def test_the_scale_is_read_again_when_the_screen_ratio_changes(scene: Scene, home: Path) -> None:
@@ -790,7 +831,9 @@ def test_the_run_record_lists_the_numbered_frames(scene: Scene, home: Path) -> N
 def test_a_render_that_fails_part_way_leaves_no_frames(scene: Scene, home: Path) -> None:
     scene.capture.fail_at_frame = 2.0
     error = refused(scene, home, frames=[1, 3, 1])
-    assert error.code == "UI_UNAVAILABLE"
+    assert error.code == "CAPTURE_FAILED"
+    assert error.details["error"] == "OperationFailed: the render stopped with an error"
+    assert "camera" in error.hint
     assert error.details["tried"][0]["reason"].startswith("OperationFailed")
     folder = next((home.parent / ".agent" / "captures").iterdir())
     assert list(folder.iterdir()) == []
@@ -819,7 +862,13 @@ def test_every_flipbook_setting_is_set_not_carried(scene: Scene, home: Path) -> 
     viewer_scene(scene)
     module = scene.module()
     module.flipbookObjectType = SimpleNamespace(Visible="Visible")
-    module.flipbookAntialias = SimpleNamespace(UseDefault="UseDefault")
+    module.flipbookAntialias = SimpleNamespace(
+        Fast="Fast",
+        Good="Good",
+        HighQuality="HighQuality",
+        Off="Off",
+        UseViewportSetting="UseViewportSetting",
+    )
     context = tools.ToolContext(**{**Run(scene, home, "gui").context.__dict__, "hou": module})
     said = capture.capture_image({"resolution": [64, 36]}, context)
     [seen] = scene.capture.seen
@@ -888,3 +937,30 @@ def test_a_pane_behind_another_is_brought_forward_then_put_back(
     take(scene, home, kind="gui", source="network")
     assert order == ["paint", "grab"]
     assert pane.currentTab() is other
+
+
+# Section: a hython started by hand
+
+
+class _Stopped(Exception):
+    pass
+
+
+def _no_bridge(config: Any) -> Any:
+    raise _Stopped
+
+
+@pytest.mark.parametrize(("given", "expected"), [(None, "offscreen"), ("cocoa", "cocoa")])
+def test_a_bridge_started_by_hand_draws_offscreen_unless_told(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, given: str | None, expected: str
+) -> None:
+    import os
+
+    from nscr_houdini_mcp.bridge import main as bridge_main
+
+    if given is not None:
+        monkeypatch.setenv(bridge_main.QT_PLATFORM_ENV_VAR, given)
+    monkeypatch.setattr(bridge_main, "Bridge", _no_bridge)
+    with pytest.raises(_Stopped):
+        bridge_main.main(["--home", str(tmp_path)])
+    assert os.environ[bridge_main.QT_PLATFORM_ENV_VAR] == expected
