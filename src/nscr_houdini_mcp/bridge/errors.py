@@ -48,6 +48,7 @@ CODES: dict[str, str] = {
     "SCENE_UNTITLED": "the scene has never been saved, so it has no file to save to",
     "STORE_UNAVAILABLE": "the coordination store could not be read or written",
     "JOB_ID_TAKEN": "a job is still kept under the id that operation id makes",
+    "PARM_FROZEN": "the output parameter is held by another run",
     # The transport refuses these before a tool is ever chosen.
     "BAD_ENVELOPE": "the request envelope could not be read",
     "UNAUTHORIZED": "the request was not signed for this bridge",

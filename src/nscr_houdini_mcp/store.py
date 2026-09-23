@@ -150,6 +150,14 @@ class OperationMismatch(StoreError):
     """An operation id came back with different arguments than the first time."""
 
 
+class ParmHeld(StoreError):
+    """An output parameter is already frozen by another run."""
+
+    def __init__(self, message: str, *, run_id: str | None) -> None:
+        super().__init__(message)
+        self.run_id = run_id
+
+
 class SceneReplaced(StoreError):
     """An operation id came back against a scene that has since been replaced."""
 
@@ -678,14 +686,22 @@ class RunRecord:
         )
 
 
+FROZEN_PREPARED = "prepared"
+FROZEN_ACTIVE = "active"
+
+
 @dataclass(frozen=True)
 class FrozenParm:
-    """An output parameter a run set to its own path, owed its template back.
+    """An output parameter a run set to its own path, owed its own value back.
 
-    `frozen` is the path the run wrote on the node and `template` the line
-    with its Houdini variables that goes back when the run is over. `hip_key`
-    is the scene the parameter was frozen in, for the session that opens the
-    scene next when the one that froze it has gone.
+    `frozen` is the path the run wrote on the node. `original` is what the
+    parameter held before, as text, or `original_expression` and
+    `original_language` when it held an expression, and that is what goes
+    back when the run is over. `template` is the run's own line with its
+    Houdini variables, kept for a reader. `node_sid` is the node's session
+    id, which follows the node through a rename in the session that froze
+    it. `hip_key` is the scene the parameter was frozen in, for the session
+    that opens the scene next when the one that froze it has gone.
     """
 
     session_id: str
@@ -696,6 +712,16 @@ class FrozenParm:
     run_id: str | None
     hip_key: str | None
     created_at: float
+    node_sid: int | None = None
+    original: str | None = None
+    original_expression: str | None = None
+    original_language: str | None = None
+    # Whose freeze this is: only a call holding the token may give it back.
+    token: str | None = None
+    # `prepared` from the moment it is written until the run's path is on the
+    # node, `active` after. A prepared record is one whose run never took
+    # hold, so its parameter gets its own value back whatever it holds.
+    state: str = FROZEN_PREPARED
 
     @classmethod
     def _from_row(cls, row: sqlite3.Row) -> FrozenParm:
@@ -708,6 +734,12 @@ class FrozenParm:
             run_id=row["run_id"],
             hip_key=row["hip_key"],
             created_at=row["created_at"],
+            node_sid=row["node_sid"],
+            original=row["original"],
+            original_expression=row["original_expression"],
+            original_language=row["original_language"],
+            token=row["token"],
+            state=row["state"],
         )
 
 
@@ -878,7 +910,7 @@ _SCHEMA_9 = (
     """,
 )
 
-# Output parameters a run has set to its own path, each owed its template back
+# Output parameters a run has set to its own path, each owed its own value back
 # when the run is over, and the index a scene's list of its runs reads by.
 _SCHEMA_10 = (
     """
@@ -891,6 +923,12 @@ _SCHEMA_10 = (
         run_id     TEXT,
         hip_key    TEXT,
         created_at REAL NOT NULL,
+        node_sid   INTEGER,
+        original   TEXT,
+        original_expression TEXT,
+        original_language   TEXT,
+        token      TEXT,
+        state      TEXT NOT NULL DEFAULT 'prepared',
         PRIMARY KEY (session_id, node_path, parm_name)
     )
     """,
@@ -2444,19 +2482,44 @@ class Store:
         frozen: str,
         run_id: str | None = None,
         hip_key: str | None = None,
+        node_sid: int | None = None,
+        original: str | None = None,
+        original_expression: str | None = None,
+        original_language: str | None = None,
+        token: str | None = None,
     ) -> FrozenParm:
-        """Record that a run set a parameter to its own path.
+        """Record that a run is about to set a parameter to its own path.
 
-        Written before the parameter is set, so a process that dies between
-        the two leaves a record rather than a machine path nobody knows of. A
-        second run freezing the same parameter takes the record over: the
-        template it owes back is the newer run's.
+        Written, `prepared`, before the parameter is touched, with what it
+        holds now, so a process that dies part way leaves a record of what to
+        put back rather than a machine path nobody knows of. A parameter
+        already frozen under another token is `ParmHeld`, naming the run that
+        holds it. The same token freezing it again, for a later run of the
+        same call, takes the record over, and what it owes back stays the
+        value from before the first: the path in between was never the
+        parameter's own.
         """
         with self._txn(write=True) as db:
+            held = db.execute(
+                "SELECT token, run_id FROM frozen_parms WHERE session_id = ? AND node_path = ?"
+                " AND parm_name = ?",
+                (session_id, node_path, parm_name),
+            ).fetchone()
+            if held is not None and held["token"] != token:
+                raise ParmHeld(
+                    f"{node_path}/{parm_name} is held by run {held['run_id']}",
+                    run_id=held["run_id"],
+                )
             db.execute(
-                "INSERT OR REPLACE INTO frozen_parms (session_id, node_path, parm_name,"
-                " template, frozen, run_id, hip_key, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO frozen_parms (session_id, node_path, parm_name, template, frozen,"
+                " run_id, hip_key, created_at, node_sid, original, original_expression,"
+                " original_language, token, state)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT (session_id, node_path, parm_name) DO UPDATE SET"
+                " template = excluded.template, frozen = excluded.frozen,"
+                " run_id = excluded.run_id, hip_key = excluded.hip_key,"
+                " created_at = excluded.created_at, node_sid = excluded.node_sid,"
+                " state = excluded.state",
                 (
                     session_id,
                     node_path,
@@ -2466,6 +2529,12 @@ class Store:
                     run_id,
                     hip_key,
                     self._now(),
+                    node_sid,
+                    original,
+                    original_expression,
+                    original_language,
+                    token,
+                    FROZEN_PREPARED,
                 ),
             )
             return FrozenParm._from_row(
@@ -2502,15 +2571,48 @@ class Store:
         sql += " ORDER BY node_path, parm_name, session_id"
         return [FrozenParm._from_row(row) for row in self._read_all(sql, args)]
 
-    def thaw_parm(self, session_id: str, node_path: str, parm_name: str) -> bool:
-        """Take off the record of a parameter that has had its template back."""
+    def activate_frozen_parm(
+        self, session_id: str, node_path: str, parm_name: str, *, token: str | None
+    ) -> bool:
+        """Mark a record `active` once the run's path is on the parameter."""
         with self._txn(write=True) as db:
             return (
                 db.execute(
-                    "DELETE FROM frozen_parms WHERE session_id = ? AND node_path = ?"
-                    " AND parm_name = ?",
-                    (session_id, node_path, parm_name),
+                    "UPDATE frozen_parms SET state = ? WHERE session_id = ? AND node_path = ?"
+                    " AND parm_name = ? AND token IS ?",
+                    (FROZEN_ACTIVE, session_id, node_path, parm_name, token),
                 ).rowcount
+                > 0
+            )
+
+    def thaw_parm(
+        self,
+        session_id: str,
+        node_path: str,
+        parm_name: str,
+        *,
+        token: str | None = None,
+        state: str | None = None,
+        any_token: bool = False,
+    ) -> bool:
+        """Take off the record of a parameter that has had its own value back.
+
+        Only the record under this token, and in this state when one is
+        named, goes: a record another freeze has taken over since stays.
+        `any_token` is for a record whose session has ended and was read a
+        moment ago, and for a check.
+        """
+        clauses = ["session_id = ?", "node_path = ?", "parm_name = ?"]
+        args: list[Any] = [session_id, node_path, parm_name]
+        if not any_token:
+            clauses.append("token IS ?")
+            args.append(token)
+        if state is not None:
+            clauses.append("state = ?")
+            args.append(state)
+        with self._txn(write=True) as db:
+            return (
+                db.execute(f"DELETE FROM frozen_parms WHERE {' AND '.join(clauses)}", args).rowcount
                 > 0
             )
 
@@ -2549,7 +2651,9 @@ class Store:
         """
         dropped = 0
         for row in self.orphan_frozen_parms():
-            if row.hip_key is None and self.thaw_parm(row.session_id, row.node_path, row.parm_name):
+            if row.hip_key is None and self.thaw_parm(
+                row.session_id, row.node_path, row.parm_name, token=row.token
+            ):
                 dropped += 1
         return dropped
 

@@ -1239,11 +1239,58 @@ def test_a_frozen_parm_is_recorded_until_it_is_thawed(timed_store: Store, clock:
     assert timed_store.get_frozen_parm("s1", "/out/karma1", "picture") is None
 
 
-def test_freezing_the_same_parm_again_owes_the_newer_runs_template(store: Store) -> None:
-    _freeze(store)
-    again = _freeze(store, run_id="run-2", template="$HIP/renders/x/v002/x_v002.$F4.exr")
+def test_freezing_the_same_parm_again_still_owes_the_value_from_before_the_first(
+    store: Store,
+) -> None:
+    first = _freeze(
+        store, node_sid=7, original_expression='chs("../a/picture")', original_language="hscript"
+    )
+    assert first.node_sid == 7
+    again = _freeze(
+        store,
+        run_id="run-2",
+        template="$HIP/renders/x/v002/x_v002.$F4.exr",
+        node_sid=7,
+        original=first.frozen,
+    )
     assert again.run_id == "run-2"
+    assert again.template.endswith("x_v002.$F4.exr")
+    # The first run's path was never the parameter's own.
+    assert again.original is None
+    assert again.original_expression == 'chs("../a/picture")'
+    assert again.original_language == "hscript"
     assert [row.run_id for row in store.list_frozen_parms()] == ["run-2"]
+
+
+def test_a_parm_held_under_one_token_is_refused_to_another(store: Store) -> None:
+    held = _freeze(store, token="a")
+    assert held.state == store_module.FROZEN_PREPARED
+    with pytest.raises(store_module.ParmHeld) as refused:
+        _freeze(store, run_id="run-2", token="b")
+    assert refused.value.run_id == "run-1"
+    assert store.activate_frozen_parm("s1", "/out/karma1", "picture", token="b") is False
+    assert store.activate_frozen_parm("s1", "/out/karma1", "picture", token="a") is True
+    row = store.get_frozen_parm("s1", "/out/karma1", "picture")
+    assert row.state == store_module.FROZEN_ACTIVE
+    # The same token freezing it again starts over as prepared.
+    assert _freeze(store, run_id="run-3", token="a").state == store_module.FROZEN_PREPARED
+
+
+def test_a_record_goes_only_under_its_own_token_and_state(store: Store) -> None:
+    _freeze(store, token="a")
+    assert store.thaw_parm("s1", "/out/karma1", "picture", token="b") is False
+    assert (
+        store.thaw_parm("s1", "/out/karma1", "picture", token="a", state=store_module.FROZEN_ACTIVE)
+        is False
+    )
+    assert (
+        store.thaw_parm(
+            "s1", "/out/karma1", "picture", token="a", state=store_module.FROZEN_PREPARED
+        )
+        is True
+    )
+    _freeze(store, token="c")
+    assert store.thaw_parm("s1", "/out/karma1", "picture", any_token=True) is True
 
 
 def test_only_a_session_that_is_over_leaves_orphans(store: Store) -> None:
