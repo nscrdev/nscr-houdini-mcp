@@ -122,12 +122,12 @@ Quick start is not needed.
 3. Updates are off by default for a marketplace you add yourself. To turn
    them on, run `/plugin`, open Marketplaces, pick `nscr-houdini-mcp` and
    choose Enable auto-update. Every new commit on `main` counts as a new
-   version. To update by hand instead, run these from a shell:
-
-   ```sh
-   claude plugin marketplace update nscr-houdini-mcp  # lint-allow: client-names
-   claude plugin update nscr-houdini@nscr-houdini-mcp  # lint-allow: client-names
-   ```
+   version. To update by hand instead, refresh the marketplace, then the
+   plugin, from a shell:
+   <!-- lint-allow: client-names -->
+   `claude plugin marketplace update nscr-houdini-mcp`, then
+   <!-- lint-allow: client-names -->
+   `claude plugin update nscr-houdini@nscr-houdini-mcp`.
 
 Every other client keeps the Quick start install. If you also added the
 server by hand, remove that entry, or the agent sees two copies of every tool.
