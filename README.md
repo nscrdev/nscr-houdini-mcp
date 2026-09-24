@@ -87,6 +87,51 @@ published to a package index; everything installs from this repository.
 5. Start Houdini, then your client. Ask the agent to run `hou_ping`; it
    answers with the session it found.
 
+<!-- lint-allow: client-names -->
+## Install as a Claude Code plugin
+
+This repository is also a plugin marketplace. Its one plugin, `nscr-houdini`,
+brings the server and the `houdini-artist` skill in a single install. You
+still need [uv](https://docs.astral.sh/uv/). The plugin starts the server
+with `uvx`, which builds it from the plugin's own files, so step 1 of the
+Quick start is not needed.
+
+1. Add the marketplace, then install the plugin:
+
+   ```text
+   /plugin marketplace add nscrdev/nscr-houdini-mcp
+   /plugin install nscr-houdini@nscr-houdini-mcp
+   ```
+
+   <!-- lint-allow: client-names -->
+   From a shell, run the same two commands with `claude plugin` in place of
+   `/plugin`. The desktop app reads the same marketplaces: add this one from
+   a shell, then in a Code session click **+**, choose Plugins, then Add
+   plugin, and install `nscr-houdini`.
+
+2. Install the Houdini side once, as in step 2 of the Quick start. If
+   `nscr-houdini-mcp` is not on your path, run it through `uvx`:
+
+   ```sh
+   uvx --from git+https://github.com/nscrdev/nscr-houdini-mcp nscr-houdini-mcp bridge install --autostart
+   ```
+
+   The install copies what Houdini needs into a folder of its own, so it
+   keeps working when uv clears its cache.
+
+3. Updates are off by default for a marketplace you add yourself. To turn
+   them on, run `/plugin`, open Marketplaces, pick `nscr-houdini-mcp` and
+   choose Enable auto-update. Every new commit on `main` counts as a new
+   version. To update by hand instead, run these from a shell:
+
+   ```sh
+   claude plugin marketplace update nscr-houdini-mcp  # lint-allow: client-names
+   claude plugin update nscr-houdini@nscr-houdini-mcp  # lint-allow: client-names
+   ```
+
+Every other client keeps the Quick start install. If you also added the
+server by hand, remove that entry, or the agent sees two copies of every tool.
+
 ## Development
 
 Python 3.11 or newer. The server process never imports `hou`.

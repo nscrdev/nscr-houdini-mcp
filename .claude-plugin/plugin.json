@@ -1,0 +1,19 @@
+{
+  "name": "nscr-houdini",
+  "displayName": "nscr Houdini",
+  "description": "Drive SideFX Houdini 22 over MCP, with the houdini-artist skill.",
+  "author": {
+    "name": "nscr",
+    "url": "https://github.com/nscrdev"
+  },
+  "homepage": "https://github.com/nscrdev/nscr-houdini-mcp",
+  "repository": "https://github.com/nscrdev/nscr-houdini-mcp",
+  "license": "MIT",
+  "keywords": ["houdini", "sidefx", "mcp", "vfx", "3d"],
+  "mcpServers": {
+    "houdini": {
+      "command": "uvx",
+      "args": ["--from", "${CLAUDE_PLUGIN_ROOT}", "nscr-houdini-mcp"]
+    }
+  }
+}

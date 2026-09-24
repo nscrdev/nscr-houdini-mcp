@@ -1,0 +1,20 @@
+{
+  "name": "nscr-houdini-mcp",
+  "description": "An MCP server for SideFX Houdini 22 and an agent skill for working in it.",
+  "owner": {
+    "name": "nscr",
+    "url": "https://github.com/nscrdev"
+  },
+  "plugins": [
+    {
+      "name": "nscr-houdini",
+      "source": "./",
+      "description": "Drive SideFX Houdini 22 over MCP, with the houdini-artist skill.",
+      "homepage": "https://github.com/nscrdev/nscr-houdini-mcp",
+      "repository": "https://github.com/nscrdev/nscr-houdini-mcp",
+      "license": "MIT",
+      "keywords": ["houdini", "sidefx", "mcp", "vfx", "3d"],
+      "category": "design"
+    }
+  ]
+}
