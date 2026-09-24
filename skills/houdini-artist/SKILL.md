@@ -61,7 +61,7 @@ The closing message contains:
 
 ## With the nscr-houdini-mcp server connected
 
-- Which Houdini you are talking to, and spare workers for heavy work: `hou_ping`, `hou_sessions`. Use those workers, or start one with `hou_sessions` `start`; never launch a Houdini or hython yourself. After an `ALIAS_RENAMED` warning, use the new name. `hou_sessions` counts top level nodes only; for real counts use `hou_inspect`.
+- Which Houdini you are talking to, and spare workers for heavy work: `hou_ping`, `hou_sessions`. Start a worker or a headless hython whenever it helps, and stop each one you started when its work is done. Before a GPU heavy job, such as a Karma XPU render or an OpenCL solve, check what else is running and queue it rather than stack it. After an `ALIAS_RENAMED` warning, use the new name. `hou_sessions` counts top level nodes only; for real counts use `hou_inspect`.
 - Open, save in place, save the next increment, and see what failed to load: `hou_scene`.
 - Read the network, parameters and errors before changing them: `hou_inspect`. Ask for all you need in one call; a burst of small calls to a session with an interface is slowed on purpose. Check a node type or a help page instead of guessing: `hou_node_type`, `hou_docs`.
 - Build and change things, filtering inside Houdini so only the answer comes back: `hou_python`. Inside it, `mcp.output_path` hands out a managed path for a render, cache or capture, `mcp.progress` reports how far a long loop has got, and `mcp.cancelled` says when to stop.
