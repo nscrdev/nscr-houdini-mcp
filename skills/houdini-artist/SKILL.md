@@ -50,8 +50,9 @@ Work to the budget in the house conventions. Each attempt on one detail should t
 
 The closing message contains:
 
-- The checks you ran and what they showed: cook errors or their absence, which views you looked at, and what you saw in them.
-- If a reference was supplied and a compare tool is available, `hou_compare` here: the compare run folder, the numbers it produced, and the three largest remaining differences in plain words. A closing message with no compare path is not done.
+- First, what you need from the person, if anything: a decision, a file, or a check only they can make.
+- The checks you ran and what they showed: cook errors or their absence, which views you looked at, and what you saw in them. Mark anything you did not check yourself as unchecked.
+- If a reference was supplied and a compare tool is available, `hou_compare` here, one run for every view you judged: the compare run folder, the numbers it produced, and the three largest remaining differences in plain words. A closing message with no compare path is not done.
 - If a reference was supplied and there is no compare tool: say that no compare run was possible, and list the differences you saw in the matched views, largest first.
 - The scene path and the version you saved.
 - What a person must know to pick it up: where the controls are, which `OUT_` nodes to read from, what is cached and where.
@@ -60,11 +61,11 @@ The closing message contains:
 
 ## With the nscr-houdini-mcp server connected
 
-- Which Houdini you are talking to, and spare workers for heavy work: `hou_ping`, `hou_sessions`.
+- Which Houdini you are talking to, and spare workers for heavy work: `hou_ping`, `hou_sessions`. Use those workers, or start one with `hou_sessions` `start`; never launch a Houdini or hython yourself. After an `ALIAS_RENAMED` warning, use the new name. `hou_sessions` counts top level nodes only; for real counts use `hou_inspect`.
 - Open, save in place, save the next increment, and see what failed to load: `hou_scene`.
-- Read the network, parameters and errors before changing them: `hou_inspect`. Check a node type or a help page instead of guessing: `hou_node_type`, `hou_docs`.
+- Read the network, parameters and errors before changing them: `hou_inspect`. Ask for all you need in one call; a burst of small calls to a session with an interface is slowed on purpose. Check a node type or a help page instead of guessing: `hou_node_type`, `hou_docs`.
 - Build and change things, filtering inside Houdini so only the answer comes back: `hou_python`. Inside it, `mcp.output_path` hands out a managed path for a render, cache or capture, `mcp.progress` reports how far a long loop has got, and `mcp.cancelled` says when to stop.
-- Wait on long work instead of sleeping, read a finished job's result, or cancel it: `hou_jobs`.
+- Wait on long work instead of sleeping, read a finished job's result, or cancel it: `hou_jobs`. When a call says the session is busy, wait the `retry_after_s` it gives and call again, or pass a `wait_s` longer than that to queue.
 - Managed output paths, and a lint of where a scene writes: `hou_outputs`. A candidate image beside the reference, with the differences as pictures and numbers: `hou_compare`.
 - See what a session shows, from one view, four views, a turntable or a flipbook, as saved pictures you then look at: `hou_capture`. To see the viewport exactly as the person sees it, grid and handles included, use `source: "pane"` with no path; `viewport` draws the geometry alone.
 - With no Houdini tools connected, say so plainly and continue with planning only: the mechanism, the system, its boundaries, and the checks you would run.
