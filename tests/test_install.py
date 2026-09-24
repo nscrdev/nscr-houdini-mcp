@@ -13,7 +13,7 @@ import subprocess
 import time
 import tomllib
 from collections.abc import Iterator
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 
 import pytest
 
@@ -603,6 +603,84 @@ def test_install_state_names_no_folder_outside_home_in_full(
     for entry in state_asking_nothing(monkeypatch)["checked"]:
         assert str(Path.home()) not in entry["path"]
         assert entry["path"].startswith(("~/", install_module.PATH_MARKER))
+
+
+def ours_in(version: str, *, stale_by: Path | None = None) -> Path:
+    """Our package file in the preference folder of one version, current or,
+    given a folder holding other libraries, stale."""
+    folder = Path(
+        os.environ[install_module.PREF_DIR_ENV_VAR].replace(install_module.VERSION_TOKEN, version)
+    )
+    path = folder / install_module.PACKAGES_DIR_NAME / install_module.PACKAGE_FILE_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if stale_by is None:
+        body = install_module.document()
+    else:
+        body = install_module.document(source=stale_by, payload=stale_by / "houdini")
+    path.write_text(json.dumps(body), encoding="utf-8")
+    return path
+
+
+def test_a_stale_package_for_the_version_houdini_reads_is_not_hidden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = site_with_strays(tmp_path)
+    ours_in(install_module.DEFAULT_HOUDINI_VERSION, stale_by=site)
+    ours_in("21.0")
+    summary = state_asking_nothing(monkeypatch)
+    assert summary["state"] == install_module.INSTALL_STALE
+    assert summary["stale_versions"] == [install_module.DEFAULT_HOUDINI_VERSION]
+
+
+def test_a_stale_package_for_another_version_leaves_ready_and_is_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = site_with_strays(tmp_path)
+    ours_in(install_module.DEFAULT_HOUDINI_VERSION)
+    ours_in("21.0", stale_by=site)
+    summary = state_asking_nothing(monkeypatch)
+    assert summary["state"] == install_module.INSTALL_READY
+    assert summary["stale_versions"] == ["21.0"]
+
+
+def test_with_nothing_in_the_chosen_folder_any_stale_package_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = site_with_strays(tmp_path)
+    ours_in("21.0")
+    ours_in("20.5", stale_by=site)
+    summary = state_asking_nothing(monkeypatch)
+    assert summary["state"] == install_module.INSTALL_STALE
+    assert summary["stale_versions"] == ["20.5"]
+
+
+def test_a_current_install_names_no_stale_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    install_module.install()
+    assert "stale_versions" not in state_asking_nothing(monkeypatch)
+
+
+@pytest.mark.parametrize(
+    ("path", "shown"),
+    [
+        (
+            PureWindowsPath("D:/prefs/houdini22.0/packages/nscr_houdini_mcp.json"),
+            "<path>\\houdini22.0\\packages\\nscr_houdini_mcp.json",
+        ),
+        (
+            PureWindowsPath("D:/packages/nscr_houdini_mcp.json"),
+            "<path>\\packages\\nscr_houdini_mcp.json",
+        ),
+        (
+            PurePosixPath("/srv/prefs/houdini22.0/packages/nscr_houdini_mcp.json"),
+            "<path>/houdini22.0/packages/nscr_houdini_mcp.json",
+        ),
+        (PurePosixPath("/packages/nscr_houdini_mcp.json"), "<path>/packages/nscr_houdini_mcp.json"),
+    ],
+)
+def test_a_path_outside_home_is_shortened_with_its_own_separator(
+    path: PurePath, shown: str
+) -> None:
+    assert install_module._shown(path) == shown
 
 
 def test_install_state_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:

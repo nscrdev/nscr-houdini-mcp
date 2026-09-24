@@ -162,8 +162,13 @@ NO_SESSION_NO_AUTOSTART_HINT = (
 def no_session_hint(install: Mapping[str, Any]) -> str:
     """The hint for NO_SESSION, given what `install.install_state` found."""
     state = install.get("state")
+    stale = [str(version) for version in install.get("stale_versions") or []]
     if state in NO_SESSION_HINTS:
-        return NO_SESSION_HINTS[state]
+        hint = NO_SESSION_HINTS[state]
+        if state == "stale" and stale:
+            hint += f" (stale for Houdini {', '.join(stale)})"
+        return hint
+    hint = HINTS["NO_SESSION"]
     if state == "ready":
         ours = [
             entry
@@ -171,8 +176,13 @@ def no_session_hint(install: Mapping[str, Any]) -> str:
             if isinstance(entry, Mapping) and entry.get("found") == "ours"
         ]
         if ours and not any(entry.get("autostart") for entry in ours):
-            return NO_SESSION_NO_AUTOSTART_HINT
-    return HINTS["NO_SESSION"]
+            hint = NO_SESSION_NO_AUTOSTART_HINT
+        for version in stale:
+            hint += (
+                f"; the package for Houdini {version} is stale:"
+                f" nscr-houdini-mcp bridge install --houdini-version {version}"
+            )
+    return hint
 
 
 # The largest result whose text block repeats the whole JSON. Larger ones get a

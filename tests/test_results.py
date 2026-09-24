@@ -173,6 +173,19 @@ def test_no_session_hint_follows_the_install_state() -> None:
     assert no_session_hint(ready_on) == HINTS["NO_SESSION"]
 
 
+def test_no_session_hint_names_the_stale_versions() -> None:
+    stale = no_session_hint({"state": "stale", "stale_versions": ["21.0", "22.0"]})
+    assert stale.endswith("(stale for Houdini 21.0, 22.0)")
+    ready = {
+        "state": "ready",
+        "stale_versions": ["21.0"],
+        "checked": [{"found": "ours", "autostart": True}],
+    }
+    hint = no_session_hint(ready)
+    assert hint.startswith(HINTS["NO_SESSION"])
+    assert "bridge install --houdini-version 21.0" in hint
+
+
 def test_a_small_result_is_mirrored_whole_in_the_text() -> None:
     result = ok_result({"pong": True}, TRACE)
     assert result.is_error in (None, False)

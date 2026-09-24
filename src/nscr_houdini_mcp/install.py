@@ -43,7 +43,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath
 from typing import Any
 
 from nscr_houdini_mcp import store as store_module
@@ -1269,8 +1269,12 @@ def install_state(
     `state` is `missing` when no folder holds this tool's package file,
     `stale` when one does but its copy of the package is another version or
     it puts other libraries on Houdini's path, and `ready` when one is
-    current. `checked` names every package file read. Never raises: anything
-    that goes wrong reads as `unknown`, with the reason.
+    current. The folder the lookup chose, the one Houdini reads first, decides
+    between the two when it holds this package; when it does not, one stale
+    package anywhere is enough for `stale`. `stale_versions` names the
+    Houdini versions whose package is stale, whatever the state, and
+    `checked` names every package file read. Never raises: anything that goes
+    wrong reads as `unknown`, with the reason.
     """
     try:
         found = lookup or resolve(override=packages, ask_houdini=False)
@@ -1279,13 +1283,17 @@ def install_state(
         return {"state": INSTALL_UNKNOWN, "reason": _reason(error)}
     checked = [_checked(state) for state in states]
     ours = [state for state in states if state.ours]
-    if any(not _is_stale(state) for state in ours):
-        overall = INSTALL_READY
-    elif ours:
-        overall = INSTALL_STALE
-    else:
+    stale = [state for state in ours if _is_stale(state)]
+    chosen = next((state for state in ours if state.path == found.path / PACKAGE_FILE_NAME), None)
+    if not ours:
         overall = INSTALL_MISSING
+    elif chosen is not None:
+        overall = INSTALL_STALE if _is_stale(chosen) else INSTALL_READY
+    else:
+        overall = INSTALL_STALE if stale else INSTALL_READY
     summary: dict[str, Any] = {"state": overall, "checked": checked}
+    if stale:
+        summary["stale_versions"] = sorted({state.version for state in stale}, key=_sort_key)
     if overall == INSTALL_MISSING and found.source == SOURCE_DEFAULT:
         summary["note"] = NOT_ASKED_NOTE
     return summary
@@ -1303,20 +1311,25 @@ def _checked(state: InstalledPackage) -> dict[str, Any]:
         entry["found"] = "another package"
     else:
         entry["found"] = "stale" if _is_stale(state) else "ours"
+        entry["version"] = state.version
         entry["autostart"] = bool(state.autostart)
     return entry
 
 
-def _shown(path: Path) -> str:
+def _shown(path: PurePath) -> str:
     """A path short enough for an error, which names no place on disk in full.
 
     Under the home folder it is written from `~`. Anywhere else only its last
-    folders are kept, behind the marker errors use for a place on disk.
+    folders are kept, behind the marker errors use for a place on disk, joined
+    with the path's own separator and never a drive or root among them.
     """
     try:
         return "~/" + path.relative_to(Path.home()).as_posix()
-    except (ValueError, RuntimeError, OSError):
-        return "/".join((PATH_MARKER, *path.parts[-3:]))
+    except (ValueError, TypeError, RuntimeError, OSError):
+        pass
+    sep = "\\" if isinstance(path, PureWindowsPath) else "/"
+    tail = [part for part in path.parts if part != path.anchor][-3:]
+    return sep.join((PATH_MARKER, *tail))
 
 
 def _reason(error: Exception) -> str:
