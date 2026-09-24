@@ -13,7 +13,7 @@ import subprocess
 import time
 import tomllib
 from collections.abc import Iterator
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 
 import pytest
 
@@ -497,6 +497,211 @@ def test_installed_reports_somebody_elses_package_as_not_ours() -> None:
     path.write_text(json.dumps({"enable": True}), encoding="utf-8")
     state = install_module.installed("22.0")[0]
     assert (state.present, state.ours, state.autostart) == (True, False, None)
+
+
+# Section: the short answer a call with no session carries
+
+
+def state_asking_nothing(monkeypatch: pytest.MonkeyPatch, **rest: object) -> dict:
+    """The summary, failing the test if it tries to ask a Houdini anything."""
+
+    def asked(version: object = None) -> tuple[None, str]:
+        raise AssertionError("the summary asked a Houdini")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(install_module, "ask_houdini", asked)
+        return install_module.install_state(**rest)
+
+
+def site_with_strays(tmp_path: Path) -> Path:
+    site = tmp_path / "site-packages"
+    (site / install_module.PACKAGE_NAME).mkdir(parents=True)
+    (site / "numpy").mkdir()
+    (site / "numpy" / "__init__.py").write_text("", encoding="utf-8")
+    return site
+
+
+def write_package(body: dict) -> None:
+    path = package_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(body), encoding="utf-8")
+
+
+def found_in(summary: dict) -> list[str]:
+    return [entry["found"] for entry in summary["checked"]]
+
+
+def test_install_state_is_missing_when_nothing_was_ever_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = state_asking_nothing(monkeypatch)
+    assert summary["state"] == install_module.INSTALL_MISSING
+    assert summary["checked"]
+    assert set(found_in(summary)) == {"nothing"}
+    for entry in summary["checked"]:
+        assert entry["path"].endswith(install_module.PACKAGE_FILE_NAME)
+
+
+def test_install_state_does_not_count_somebody_elses_package(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_package({"enable": True})
+    summary = state_asking_nothing(monkeypatch)
+    assert summary["state"] == install_module.INSTALL_MISSING
+    assert "another package" in found_in(summary)
+
+
+def test_install_state_is_ready_and_says_whether_autostart_is_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_module.install(autostart=True)
+    summary = state_asking_nothing(monkeypatch)
+    assert summary["state"] == install_module.INSTALL_READY
+    [ours] = [entry for entry in summary["checked"] if entry["found"] == "ours"]
+    assert ours["autostart"] is True
+    others = [entry for entry in summary["checked"] if entry is not ours]
+    assert all("autostart" not in entry for entry in others)
+
+    install_module.install(autostart=False)
+    summary = state_asking_nothing(monkeypatch)
+    [ours] = [entry for entry in summary["checked"] if entry["found"] == "ours"]
+    assert ours["autostart"] is False
+
+
+def test_install_state_is_stale_when_the_file_names_a_whole_site_packages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = site_with_strays(tmp_path)
+    write_package(install_module.document(source=site, payload=site / "houdini"))
+    summary = state_asking_nothing(monkeypatch)
+    assert summary["state"] == install_module.INSTALL_STALE
+    assert "stale" in found_in(summary)
+
+
+def test_install_state_is_stale_when_the_copy_is_another_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copy = tmp_path / "copy-with-no-stamp"
+    (copy / install_module.PACKAGE_NAME).mkdir(parents=True)
+    write_package(install_module.document(source=copy, payload=copy / "houdini", copy=copy))
+    assert state_asking_nothing(monkeypatch)["state"] == install_module.INSTALL_STALE
+
+
+def test_install_state_reads_a_packages_folder_it_is_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder = tmp_path / "given"
+    install_module.install(packages=folder)
+    summary = state_asking_nothing(monkeypatch, packages=folder)
+    assert summary["state"] == install_module.INSTALL_READY
+    assert found_in(summary) == ["ours"]
+
+
+def test_install_state_names_no_folder_outside_home_in_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for entry in state_asking_nothing(monkeypatch)["checked"]:
+        assert str(Path.home()) not in entry["path"]
+        assert entry["path"].startswith(("~/", install_module.PATH_MARKER))
+
+
+def ours_in(version: str, *, stale_by: Path | None = None) -> Path:
+    """Our package file in the preference folder of one version, current or,
+    given a folder holding other libraries, stale."""
+    folder = Path(
+        os.environ[install_module.PREF_DIR_ENV_VAR].replace(install_module.VERSION_TOKEN, version)
+    )
+    path = folder / install_module.PACKAGES_DIR_NAME / install_module.PACKAGE_FILE_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if stale_by is None:
+        body = install_module.document()
+    else:
+        body = install_module.document(source=stale_by, payload=stale_by / "houdini")
+    path.write_text(json.dumps(body), encoding="utf-8")
+    return path
+
+
+def test_a_stale_package_for_the_version_houdini_reads_is_not_hidden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = site_with_strays(tmp_path)
+    ours_in(install_module.DEFAULT_HOUDINI_VERSION, stale_by=site)
+    ours_in("21.0")
+    summary = state_asking_nothing(monkeypatch)
+    assert summary["state"] == install_module.INSTALL_STALE
+    assert summary["stale_versions"] == [install_module.DEFAULT_HOUDINI_VERSION]
+
+
+def test_a_stale_package_for_another_version_leaves_ready_and_is_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = site_with_strays(tmp_path)
+    ours_in(install_module.DEFAULT_HOUDINI_VERSION)
+    ours_in("21.0", stale_by=site)
+    summary = state_asking_nothing(monkeypatch)
+    assert summary["state"] == install_module.INSTALL_READY
+    assert summary["stale_versions"] == ["21.0"]
+
+
+def test_with_nothing_in_the_chosen_folder_any_stale_package_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = site_with_strays(tmp_path)
+    ours_in("21.0")
+    ours_in("20.5", stale_by=site)
+    summary = state_asking_nothing(monkeypatch)
+    assert summary["state"] == install_module.INSTALL_STALE
+    assert summary["stale_versions"] == ["20.5"]
+
+
+def test_a_current_install_names_no_stale_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    install_module.install()
+    assert "stale_versions" not in state_asking_nothing(monkeypatch)
+
+
+@pytest.mark.parametrize(
+    ("path", "shown"),
+    [
+        (
+            PureWindowsPath("D:/prefs/houdini22.0/packages/nscr_houdini_mcp.json"),
+            "<path>\\houdini22.0\\packages\\nscr_houdini_mcp.json",
+        ),
+        (
+            PureWindowsPath("D:/packages/nscr_houdini_mcp.json"),
+            "<path>\\packages\\nscr_houdini_mcp.json",
+        ),
+        (
+            PurePosixPath("/srv/prefs/houdini22.0/packages/nscr_houdini_mcp.json"),
+            "<path>/houdini22.0/packages/nscr_houdini_mcp.json",
+        ),
+        (PurePosixPath("/packages/nscr_houdini_mcp.json"), "<path>/packages/nscr_houdini_mcp.json"),
+    ],
+)
+def test_a_path_outside_home_is_shortened_with_its_own_separator(
+    path: PurePath, shown: str
+) -> None:
+    assert install_module._shown(path) == shown
+
+
+def test_install_state_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(*args: object, **kwargs: object) -> list:
+        raise PermissionError("the folder could not be read")
+
+    monkeypatch.setattr(install_module, "installed", broken)
+    assert install_module.install_state() == {
+        "state": install_module.INSTALL_UNKNOWN,
+        "reason": "PermissionError: the folder could not be read",
+    }
+
+
+def test_status_leads_the_packages_with_the_same_short_answer(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli.main(["bridge", "status", "--home", str(home)])
+    assert "packages: missing" in capsys.readouterr().out
+    install_module.install()
+    cli.main(["bridge", "status", "--home", str(home)])
+    assert "packages: ready" in capsys.readouterr().out
 
 
 # Section: the Houdini installs on this machine

@@ -43,10 +43,11 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath
 from typing import Any
 
 from nscr_houdini_mcp import store as store_module
+from nscr_houdini_mcp.bridge.errors import PATH_MARKER
 
 PACKAGE_NAME = "nscr_houdini_mcp"
 PACKAGE_FILE_NAME = "nscr_houdini_mcp.json"
@@ -1241,6 +1242,101 @@ def _autostart_of(loaded: dict[str, Any] | None) -> bool | None:
         if isinstance(item, dict) and AUTOSTART_ENV_VAR in item:
             return str(item[AUTOSTART_ENV_VAR]).strip().lower() in ("1", "true", "yes", "on")
     return None
+
+
+# Section: a short answer for a call that found no session
+#
+# A call with no live session to go to cannot tell a machine where the bridge
+# was never installed from one where Houdini is simply closed. This reads the
+# package files, and nothing else, so the refusal can say which it is. No
+# Houdini is asked: a call that is being refused must not wait on one.
+
+INSTALL_MISSING = "missing"
+INSTALL_STALE = "stale"
+INSTALL_READY = "ready"
+INSTALL_UNKNOWN = "unknown"
+
+NOT_ASKED_NOTE = "read without asking Houdini, so a folder set only in houdini.env is not seen"
+
+
+def install_state(
+    *,
+    packages: Path | str | None = None,
+    lookup: Lookup | None = None,
+) -> dict[str, Any]:
+    """Whether the Houdini side was ever installed here, in a few keys.
+
+    `state` is `missing` when no folder holds this tool's package file,
+    `stale` when one does but its copy of the package is another version or
+    it puts other libraries on Houdini's path, and `ready` when one is
+    current. The folder the lookup chose, the one Houdini reads first, decides
+    between the two when it holds this package; when it does not, one stale
+    package anywhere is enough for `stale`. `stale_versions` names the
+    Houdini versions whose package is stale, whatever the state, and
+    `checked` names every package file read. Never raises: anything that goes
+    wrong reads as `unknown`, with the reason.
+    """
+    try:
+        found = lookup or resolve(override=packages, ask_houdini=False)
+        states = installed(packages=packages, lookup=found)
+    except Exception as error:  # noqa: BLE001 - a refusal must not fail on its own report
+        return {"state": INSTALL_UNKNOWN, "reason": _reason(error)}
+    checked = [_checked(state) for state in states]
+    ours = [state for state in states if state.ours]
+    stale = [state for state in ours if _is_stale(state)]
+    chosen = next((state for state in ours if state.path == found.path / PACKAGE_FILE_NAME), None)
+    if not ours:
+        overall = INSTALL_MISSING
+    elif chosen is not None:
+        overall = INSTALL_STALE if _is_stale(chosen) else INSTALL_READY
+    else:
+        overall = INSTALL_STALE if stale else INSTALL_READY
+    summary: dict[str, Any] = {"state": overall, "checked": checked}
+    if stale:
+        summary["stale_versions"] = sorted({state.version for state in stale}, key=_sort_key)
+    if overall == INSTALL_MISSING and found.source == SOURCE_DEFAULT:
+        summary["note"] = NOT_ASKED_NOTE
+    return summary
+
+
+def _is_stale(state: InstalledPackage) -> bool:
+    return state.copy_current is False or bool(state.source_strays)
+
+
+def _checked(state: InstalledPackage) -> dict[str, Any]:
+    entry: dict[str, Any] = {"path": _shown(state.path)}
+    if not state.present:
+        entry["found"] = "nothing"
+    elif not state.ours:
+        entry["found"] = "another package"
+    else:
+        entry["found"] = "stale" if _is_stale(state) else "ours"
+        entry["version"] = state.version
+        entry["autostart"] = bool(state.autostart)
+    return entry
+
+
+def _shown(path: PurePath) -> str:
+    """A path short enough for an error, which names no place on disk in full.
+
+    Under the home folder it is written from `~`. Anywhere else only its last
+    folders are kept, behind the marker errors use for a place on disk, joined
+    with the path's own separator and never a drive or root among them.
+    """
+    try:
+        return "~/" + path.relative_to(Path.home()).as_posix()
+    except (ValueError, TypeError, RuntimeError, OSError):
+        pass
+    sep = "\\" if isinstance(path, PureWindowsPath) else "/"
+    tail = [part for part in path.parts if part != path.anchor][-3:]
+    return sep.join((PATH_MARKER, *tail))
+
+
+def _reason(error: Exception) -> str:
+    text = str(error).strip().splitlines()
+    first = text[0] if text else ""
+    reason = f"{type(error).__name__}: {first}" if first else type(error).__name__
+    return reason[:200]
 
 
 # Section: the Houdini installs on this machine
