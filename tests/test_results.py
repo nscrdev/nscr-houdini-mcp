@@ -17,11 +17,13 @@ from nscr_houdini_mcp.results import (
     CODES,
     HINTS,
     MIRROR_CHARS,
+    NO_SESSION_NO_AUTOSTART_HINT,
     PREVIEW_CHARS,
     SERVER_CODES,
     CallError,
     Spill,
     error_result,
+    no_session_hint,
     ok_result,
     reap_spill,
 )
@@ -149,6 +151,26 @@ def test_an_error_before_any_session_still_carries_an_empty_trace() -> None:
         "alias": None,
         "scene_epoch": None,
     }
+
+
+def test_no_session_carries_a_home_relative_package_path_out_whole() -> None:
+    """The install report names package files from `~`, which is no place on
+    disk in full, so it reaches the caller as it was written."""
+    install = {"state": "missing", "checked": [{"path": "~/houdini/p.json", "found": "nothing"}]}
+    error = CallError("NO_SESSION", "no Houdini session is live", details={"install": install})
+    body = error_result(error).structured_content["error"]
+    assert body["details"]["install"] == install
+
+
+def test_no_session_hint_follows_the_install_state() -> None:
+    assert "bridge install," in no_session_hint({"state": "missing"})
+    assert "install again" in no_session_hint({"state": "stale"})
+    assert no_session_hint({"state": "unknown"}) == HINTS["NO_SESSION"]
+    assert no_session_hint({}) == HINTS["NO_SESSION"]
+    ready_off = {"state": "ready", "checked": [{"found": "ours", "autostart": False}]}
+    assert no_session_hint(ready_off) == NO_SESSION_NO_AUTOSTART_HINT
+    ready_on = {"state": "ready", "checked": [{"found": "ours", "autostart": True}]}
+    assert no_session_hint(ready_on) == HINTS["NO_SESSION"]
 
 
 def test_a_small_result_is_mirrored_whole_in_the_text() -> None:

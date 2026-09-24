@@ -146,6 +146,35 @@ HINTS: dict[str, str] = {
     "NO_OUTPUT": "make the image first, or pass it as a file",
 }
 
+# NO_SESSION says what to do next by what the package files show: a machine
+# where the bridge was never installed needs another step than one where
+# Houdini is only closed. A state not named here keeps the usual hint.
+NO_SESSION_HINTS = {
+    "missing": "run: nscr-houdini-mcp bridge install, then open Houdini",
+    "stale": "run: nscr-houdini-mcp bridge install again, then restart Houdini",
+}
+NO_SESSION_NO_AUTOSTART_HINT = (
+    "in an open Houdini, run the Python from: nscr-houdini-mcp bridge snippet;"
+    " or start a worker: bridge worker start"
+)
+
+
+def no_session_hint(install: Mapping[str, Any]) -> str:
+    """The hint for NO_SESSION, given what `install.install_state` found."""
+    state = install.get("state")
+    if state in NO_SESSION_HINTS:
+        return NO_SESSION_HINTS[state]
+    if state == "ready":
+        ours = [
+            entry
+            for entry in install.get("checked") or []
+            if isinstance(entry, Mapping) and entry.get("found") == "ours"
+        ]
+        if ours and not any(entry.get("autostart") for entry in ours):
+            return NO_SESSION_NO_AUTOSTART_HINT
+    return HINTS["NO_SESSION"]
+
+
 # The largest result whose text block repeats the whole JSON. Larger ones get a
 # summary line, so a client that shows both does not pay for the result twice.
 MIRROR_CHARS = 2000

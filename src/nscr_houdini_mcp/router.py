@@ -18,7 +18,9 @@ the last call. The rules, in order:
 2. No `session` and exactly one live session: that one.
 3. No `session` and several live: the config's `default_session` when it
    names one of them, otherwise `SESSION_AMBIGUOUS` with the candidates.
-4. No live session at all: `NO_SESSION`.
+4. No live session at all: `NO_SESSION`. A router given a way to read the
+   package files adds what they show under `install`, and a hint to match:
+   install the bridge, install it again, or start it in an open Houdini.
 
 The signed client for a session is kept per session id and dropped the moment
 the session proves dead, unreachable or unable to sign, so the next call reads
@@ -72,7 +74,7 @@ from nscr_houdini_mcp.bridge.dispatch import DEFAULT_TIMEOUT_S as BRIDGE_TIMEOUT
 from nscr_houdini_mcp.bridge.dispatch import DEFAULT_WAIT_S as BRIDGE_WAIT_S
 from nscr_houdini_mcp.bridge.errors import did_you_mean
 from nscr_houdini_mcp.pacing import NoTurn, Pacer, throttled_ms
-from nscr_houdini_mcp.results import CallError
+from nscr_houdini_mcp.results import CallError, no_session_hint
 from nscr_houdini_mcp.store import SessionRecord
 
 LIVE_STATES = ("live", "busy")
@@ -337,8 +339,12 @@ class Router:
         renew_lease: Callable[[Any, str], Any] = pool.touch,
         pacer: Pacer | None = None,
         pace_workers: bool = False,
+        check_install: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self.home = Path(home)
+        # Reads the package files when no session is live. Without it, a
+        # refusal carries no install report and the usual hint.
+        self._check_install = check_install
         # No pacer means no pacing, which is what a router built by hand gets.
         self.pacer = pacer if pacer is not None else Pacer(min_pause_s=0, max_per_s=0)
         self.pace_workers = pace_workers
@@ -365,7 +371,12 @@ class Router:
         """
         records = self._records(include_gone=bool(handle))
         self._prune(records)
-        record = choose(records, handle, default=self.default_session)
+        try:
+            record = choose(records, handle, default=self.default_session)
+        except CallError as error:
+            if error.code == "NO_SESSION":
+                self._explain_no_session(error)
+            raise
         session, facts = self._client(record, records)
         if record.kind == "hython":
             self._renew(record.session_id)
@@ -375,6 +386,21 @@ class Router:
             houdini_version=facts.get("houdini_version"),
             warnings=renamed(record, handle),
         )
+
+    def _explain_no_session(self, error: CallError) -> None:
+        """Say whether the bridge was ever installed, and hint to match.
+
+        A report that fails says so under `install` and leaves the usual hint:
+        the refusal itself always goes out.
+        """
+        if self._check_install is None:
+            return
+        try:
+            summary = dict(self._check_install())
+        except Exception as problem:  # noqa: BLE001 - the refusal must still go out
+            summary = {"state": "unknown", "reason": type(problem).__name__}
+        error.details["install"] = summary
+        error.hint = no_session_hint(summary)
 
     def reach(self, record: SessionRecord) -> Target:
         """A target for a row already read, for a look that is not a use.

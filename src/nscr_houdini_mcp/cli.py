@@ -645,7 +645,8 @@ def _print_packages(lookup: install_module.Lookup) -> None:
         tail = f"  ({candidate.note})" if candidate.note else ""
         print(f"    {mark} {candidate.source}: {candidate.path}{tail}")
 
-    print("packages:")
+    summary = install_module.install_state(lookup=lookup)
+    print(f"packages: {summary['state']}")
     for state in install_module.installed(lookup=lookup):
         if not state.present:
             word = "not installed"

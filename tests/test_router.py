@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from nscr_houdini_mcp.bridge import client
-from nscr_houdini_mcp.results import CallError
+from nscr_houdini_mcp.results import HINTS, CallError
 from nscr_houdini_mcp.router import SOCKET_MARGIN_S, Router, choose, socket_wait
 from nscr_houdini_mcp.store import SessionRecord
 
@@ -291,6 +291,84 @@ def test_a_machine_with_no_store_yet_has_no_session(tmp_path: Path) -> None:
         router.resolve(None)
     assert caught.value.code == "NO_SESSION"
     assert not (tmp_path / "home").exists()
+
+
+def router_checking_install(summary: Any) -> Router:
+    """A router with no store yet, whose install report is `summary`."""
+
+    def check() -> Any:
+        if isinstance(summary, Exception):
+            raise summary
+        return summary
+
+    return Router(Path("nowhere"), open_store=lambda path: None, check_install=check)
+
+
+def refused(router: Router, handle: str | None = None) -> CallError:
+    with pytest.raises(CallError) as caught:
+        router.resolve(handle)
+    return caught.value
+
+
+@pytest.mark.parametrize(
+    ("state", "hint"),
+    [
+        ("missing", "run: nscr-houdini-mcp bridge install, then open Houdini"),
+        ("stale", "run: nscr-houdini-mcp bridge install again, then restart Houdini"),
+    ],
+)
+def test_no_session_says_what_the_package_files_show(state: str, hint: str) -> None:
+    summary = {"state": state, "checked": [{"path": "~/p.json", "found": "nothing"}]}
+    error = refused(router_checking_install(summary))
+    assert error.code == "NO_SESSION"
+    assert error.details["install"] == summary
+    assert error.hint == hint
+
+
+def test_no_session_keeps_the_usual_hint_when_the_bridge_starts_itself() -> None:
+    summary = {
+        "state": "ready",
+        "checked": [{"path": "~/p.json", "found": "ours", "autostart": True}],
+    }
+    assert refused(router_checking_install(summary)).hint == HINTS["NO_SESSION"]
+
+
+def test_no_session_points_at_the_snippet_when_no_bridge_starts_itself() -> None:
+    summary = {
+        "state": "ready",
+        "checked": [{"path": "~/p.json", "found": "ours", "autostart": False}],
+    }
+    hint = refused(router_checking_install(summary)).hint
+    assert "nscr-houdini-mcp bridge snippet" in hint
+
+
+def test_no_session_goes_out_even_when_the_install_report_fails() -> None:
+    error = refused(router_checking_install(OSError("unreadable")))
+    assert error.code == "NO_SESSION"
+    assert error.details["install"] == {"state": "unknown", "reason": "OSError"}
+    assert error.hint == HINTS["NO_SESSION"]
+
+
+def test_the_install_report_is_read_only_when_no_session_is_live() -> None:
+    router, _, _, _ = router_for([record("s-1", "w1")])
+    asked: list[int] = []
+
+    def check() -> dict[str, Any]:
+        asked.append(1)
+        return {"state": "missing"}
+
+    router._check_install = check
+    router.resolve(None)
+    error = refused(router, "w9")
+    assert error.code == "SESSION_UNKNOWN"
+    assert "install" not in error.details
+    assert asked == []
+
+
+def test_a_router_given_no_install_check_reads_no_package_file() -> None:
+    error = refused(Router(Path("nowhere"), open_store=lambda path: None))
+    assert "install" not in error.details
+    assert error.hint == HINTS["NO_SESSION"]
 
 
 def test_the_router_keeps_one_client_per_session() -> None:

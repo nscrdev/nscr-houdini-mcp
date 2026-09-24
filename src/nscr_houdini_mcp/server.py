@@ -38,6 +38,7 @@ from nscr_houdini_mcp import logs
 from nscr_houdini_mcp import store as store_module
 from nscr_houdini_mcp.bridge.errors import did_you_mean
 from nscr_houdini_mcp.config import Config, ConfigError, load_config
+from nscr_houdini_mcp.install import install_state
 from nscr_houdini_mcp.pacing import Pacer
 from nscr_houdini_mcp.results import CallError, Spill, error_result, ok_result, reap_spill
 from nscr_houdini_mcp.router import Router
@@ -282,6 +283,7 @@ def _router_for(config: Config, *, pace_workers: bool = False) -> Router:
         default_session=config.default_session,
         pacer=pacer,
         pace_workers=pace_workers,
+        check_install=install_state,
     )
 
 
