@@ -183,7 +183,18 @@ def test_waiting_for_wal_cleanup_has_a_deadline(tmp_path: Path) -> None:
         raise error
 
     with Store(tmp_path / "coord.sqlite", busy_timeout_s=0) as store:
-        with pytest.raises(StoreBusy):
+        with pytest.raises(StoreError, match="disk I/O error") as caught:
+            store._retry_while_busy(read)
+        assert not isinstance(caught.value, StoreBusy)
+        assert caught.value.__cause__.sqlite_errorcode == sqlite3.SQLITE_IOERR_TRUNCATE
+
+
+def test_waiting_for_a_locked_store_still_raises_store_busy(tmp_path: Path) -> None:
+    def read():
+        raise sqlite3.OperationalError("database is locked")
+
+    with Store(tmp_path / "coord.sqlite", busy_timeout_s=0) as store:
+        with pytest.raises(StoreBusy, match="stayed locked"):
             store._retry_while_busy(read)
 
 

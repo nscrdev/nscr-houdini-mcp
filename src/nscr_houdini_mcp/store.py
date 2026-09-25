@@ -617,6 +617,14 @@ def _is_busy(error: sqlite3.Error) -> bool:
     return "locked" in text or "busy" in text
 
 
+def _is_pending_wal_close(error: sqlite3.Error) -> bool:
+    """Windows can hold the WAL file open for a moment after a worker is killed."""
+    return (
+        sys.platform == "win32"
+        and getattr(error, "sqlite_errorcode", None) == sqlite3.SQLITE_IOERR_TRUNCATE
+    )
+
+
 def _translate(error: sqlite3.Error) -> StoreError:
     """Turn a raw database failure into one of this module's errors."""
     if isinstance(error, sqlite3.IntegrityError):
@@ -1230,7 +1238,7 @@ class Store:
             self._in_txn = False
 
     def _retry_while_busy(self, action: Callable[[], Any]) -> Any:
-        """Repeat an action that other processes can lock out, then give up.
+        """Retry locks and pending Windows WAL closes, then preserve the final error.
 
         Uses a monotonic clock for the wait itself, which is safe because the
         value never leaves this call.
@@ -1242,15 +1250,12 @@ class Store:
                 return action()
             except (sqlite3.OperationalError, StoreBusy) as error:
                 if isinstance(error, sqlite3.OperationalError) and not (
-                    _is_busy(error)
-                    or (
-                        sys.platform == "win32"
-                        and getattr(error, "sqlite_errorcode", None)
-                        == sqlite3.SQLITE_IOERR_TRUNCATE
-                    )
+                    _is_busy(error) or _is_pending_wal_close(error)
                 ):
                     raise _translate(error) from error
                 if time.monotonic() >= deadline:
+                    if isinstance(error, sqlite3.OperationalError) and _is_pending_wal_close(error):
+                        raise _translate(error) from error
                     raise StoreBusy(f"{self.path} stayed locked by other processes") from error
                 time.sleep(delay)
                 delay = min(delay * 2, 0.1)
