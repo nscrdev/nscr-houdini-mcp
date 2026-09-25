@@ -150,8 +150,7 @@ def test_sessions_and_scene_files_through_a_real_worker(place: dict[str, Path]) 
     )
     assert ok(empty)["sessions"] == []
     worker = ok(started)["session"]
-    if worker.get("lifetime") == "server":
-        pytest.skip("Windows refused worker breakaway; this test needs it to outlive its server")
+    support.require_independent_worker(worker)
     session_id = worker["session_id"]
     assert worker["kind"] == "hython"
     assert worker["state"] == "live"

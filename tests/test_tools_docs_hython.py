@@ -179,8 +179,7 @@ def test_docs_with_a_live_worker_a_busy_one_and_none(
         ("hou_python", {"code": "result = hou.helpServerUrl()"}),
     )
     session_id = ok(started[0])["session"]["session_id"]
-    if ok(started[0])["session"].get("lifetime") == "server":
-        pytest.skip("Windows refused worker breakaway; this test needs it to outlive its server")
+    support.require_independent_worker(ok(started[0])["session"])
     wrangle, noise, found = (ok(result) for result, _ in reads)
     # The worker's build has its folder here, so the folder answers.
     assert wrangle["source"] == "corpus"

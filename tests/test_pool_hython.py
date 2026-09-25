@@ -152,8 +152,7 @@ def test_eight_processes_asking_at_once_agree_on_one_winner(home: Path) -> None:
     assert len({report["pid"] for report in reports}) == RACERS
     winners = [report for report in reports if report.get("alias")]
     assert len(winners) == 1
-    if winners[0].get("lifetime") == "server":
-        pytest.skip("Windows refused worker breakaway; this test needs it to outlive its server")
+    support.require_independent_worker(winners[0])
     assert [report.get("full") for report in reports if not report.get("alias")] == [True] * (
         RACERS - 1
     )
@@ -214,8 +213,7 @@ def test_a_worker_outlives_its_launcher_and_a_new_server_sees_it(home: Path) -> 
     [report] = run_children(
         start_and_leave, 1, (str(home), str(hython), WARM_IDLE_S), barrier=False
     )
-    if report.get("lifetime") == "server":
-        pytest.skip("Windows refused worker breakaway; this test needs it to outlive its server")
+    support.require_independent_worker(report)
     alias = str(report["alias"])
     session_id = str(report["session_id"])
 
@@ -245,8 +243,7 @@ def test_a_worker_nobody_wants_ends_itself(home: Path) -> None:
     [report] = run_children(
         start_and_leave, 1, (str(home), str(hython), SHORT_IDLE_S), barrier=False
     )
-    if report.get("lifetime") == "server":
-        pytest.skip("Windows refused worker breakaway; this test needs it to outlive its server")
+    support.require_independent_worker(report)
     token = str(report["token"])
     worker_pid = int(report["worker_pid"])
 

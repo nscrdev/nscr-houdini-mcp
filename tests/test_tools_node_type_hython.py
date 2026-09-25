@@ -68,10 +68,7 @@ def place(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Any]]:
     try:
         [started] = run(found, ("hou_sessions", {"action": "start"}))
         found["session"] = ok(started)["session"]["session_id"]
-        if ok(started)["session"].get("lifetime") == "server":
-            pytest.skip(
-                "Windows refused worker breakaway; this test needs it to outlive its server"
-            )
+        support.require_independent_worker(ok(started)["session"])
         yield found
     finally:
         left = support.stop_everything(home, pool.PoolConfig(home=home))

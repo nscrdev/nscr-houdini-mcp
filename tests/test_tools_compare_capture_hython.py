@@ -89,10 +89,7 @@ def place(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Any]]:
     try:
         [started] = run(made, ("hou_sessions", {"action": "start"}))
         made["worker"] = ok(started)["session"]
-        if made["worker"].get("lifetime") == "server":
-            pytest.skip(
-                "Windows refused worker breakaway; this test needs it to outlive its server"
-            )
+        support.require_independent_worker(made["worker"])
         hip = scenes / "compare_scene.hip"
         [built] = run(made, ("hou_python", {"code": BUILD.format(hip=str(hip))}))
         made["box"], made["camera"] = ok(built)["result"]

@@ -23,8 +23,8 @@ supported system, so a child imports this module by name and calls a function
 it was given at module level. Anything a child runs has to be importable that
 way, which is why the targets are plain module level functions.
 
-Nothing here imports pytest, so the acceptance script can use the same helpers
-without the test runner.
+Only the persistence skip imports pytest, so the acceptance script can use
+the other helpers without the test runner.
 """
 
 from __future__ import annotations
@@ -54,8 +54,11 @@ __all__ = [
     "hython_session",
     "kill_bridge",
     "live_sessions",
+    "persistent_client",
+    "require_independent_worker",
     "run_children",
     "stop_everything",
+    "stop_server_bound_workers",
     "wait_until",
 ]
 
@@ -137,6 +140,31 @@ def live_sessions(home: Path) -> list[str]:
     """The names of the sessions this state folder still has a file for."""
     entries = registry.list_entries(Path(home))
     return [str(entry.get("alias") or entry.get("session_id")) for entry in entries]
+
+
+@contextmanager
+def persistent_client(parameters: Any, *, timeout_s: float) -> Iterator[Callable[..., list[Any]]]:
+    """Keep one real client and its event loop open across a module's call batches."""
+    from anyio.from_thread import start_blocking_portal
+    from mcp.client.client import Client
+
+    with start_blocking_portal() as portal:
+        with portal.wrap_async_context_manager(
+            Client(parameters, mode="auto", read_timeout_seconds=timeout_s)
+        ) as connected:
+
+            async def batch(calls):
+                return [await connected.call_tool(name, arguments) for name, arguments in calls]
+
+            yield lambda *calls: portal.call(batch, calls)
+
+
+def require_independent_worker(worker: Mapping[str, Any]) -> None:
+    """Skip only checks that need the launching server to exit before the worker."""
+    if worker.get("lifetime") == "server":
+        import pytest
+
+        pytest.skip("Windows refused worker breakaway; this test needs it to outlive its server")
 
 
 async def stop_server_bound_workers(connected: Any, results: Sequence[Any]) -> None:
