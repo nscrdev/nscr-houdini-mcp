@@ -71,6 +71,10 @@ def place(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Any]]:
     try:
         [started] = run(made, ("hou_sessions", {"action": "start"}))
         made["worker"] = ok(started)["session"]
+        if made["worker"].get("lifetime") == "server":
+            pytest.skip(
+                "Windows refused worker breakaway; this test needs it to outlive its server"
+            )
         yield made
     finally:
         left = support.stop_everything(home, pool.PoolConfig(home=home))
@@ -97,7 +101,9 @@ async def _run(place: dict[str, Any], calls: list[tuple[str, dict]]) -> list[Any
     async with Client(
         server_params(place), mode="auto", read_timeout_seconds=READ_TIMEOUT_S
     ) as connected:
-        return [await connected.call_tool(name, arguments) for name, arguments in calls]
+        results = [await connected.call_tool(name, arguments) for name, arguments in calls]
+        await support.stop_server_bound_workers(connected, results)
+        return results
 
 
 def run(place: dict[str, Any], *calls: tuple[str, dict]) -> list[Any]:

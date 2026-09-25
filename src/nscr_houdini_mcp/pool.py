@@ -28,6 +28,7 @@ This module never imports `hou`. The worker it starts does.
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 import signal
@@ -178,6 +179,7 @@ class Launched:
     kill: Callable[[], None] | None = None
     # Waits for that same process to end, for up to the seconds given.
     wait: Callable[[float], Any] | None = None
+    server_bound: bool = False
 
 
 @dataclass(frozen=True)
@@ -383,30 +385,70 @@ def spawn_detached(
     """
     open_log(log)
     extra: dict[str, Any] = {}
+    server_bound = False
     if sys.platform == "win32":
         creation = (
             subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
             | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
         )
-        extra["creationflags"] = creation
+        extra["creationflags"] = creation | subprocess.CREATE_BREAKAWAY_FROM_JOB
     else:
         extra["start_new_session"] = True
     handle = log.open("a", encoding="utf-8")
     try:
-        process = subprocess.Popen(  # noqa: S603 - the binary is ours to name
-            list(command),
+        arguments = dict(
             stdin=subprocess.DEVNULL,
             stdout=handle,
             stderr=subprocess.STDOUT,
             close_fds=True,
             env=dict(env) if env is not None else None,
-            **extra,
         )
+        try:
+            process = subprocess.Popen(  # noqa: S603 - the binary is ours to name
+                list(command), **arguments, **extra
+            )
+        except OSError as error:
+            if sys.platform != "win32" or error.winerror != 5:
+                raise
+            process = subprocess.Popen(list(command), **arguments, creationflags=creation)
+            server_bound = True
+        if sys.platform == "win32":
+            server_bound = server_bound or (
+                _windows_in_job(os.getpid()) and _windows_in_job(process.pid)
+            )
+        if server_bound:
+            logging.getLogger(__name__).info(
+                "Windows refused worker breakaway; worker %s will end with its server",
+                process.pid,
+            )
     finally:
         # The child holds its own handle on the file from here on.
         handle.close()
     _STARTED.append(process)
-    return Launched(process.pid, process.poll, process.kill, process.wait)
+    return Launched(process.pid, process.poll, process.kill, process.wait, server_bound)
+
+
+def _windows_in_job(pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.IsProcessInJob.argtypes = [
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return False
+    try:
+        in_job = wintypes.BOOL()
+        return bool(kernel.IsProcessInJob(handle, None, ctypes.byref(in_job)) and in_job.value)
+    finally:
+        kernel.CloseHandle(handle)
 
 
 def wait_for_entry(
@@ -526,6 +568,8 @@ def start_worker(
             timeout_s=config.start_timeout_s if timeout_s is None else timeout_s,
         )
         capabilities = probe(entry)
+        if launched.server_bound:
+            capabilities["lifetime"] = "server"
         # From here the worker owns its own slot. The process that started it
         # may go away without taking the warm worker with it.
         record = store.set_worker_state(

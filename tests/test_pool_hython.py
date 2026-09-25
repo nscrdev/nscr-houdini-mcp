@@ -90,6 +90,7 @@ def ask_for_a_worker(home: str, hython: str, index: int, barrier, results) -> No
                 record = pool.start_worker(config, store, hython=hython)
                 report["alias"] = record.alias
                 report["session_id"] = record.session_id
+                report["lifetime"] = (record.capabilities or {}).get("lifetime")
             except PoolFull:
                 report["alias"] = None
                 report["full"] = True
@@ -109,6 +110,7 @@ def start_and_leave(home: str, hython: str, max_idle_s: float, index, barrier, r
         report["session_id"] = record.session_id
         report["token"] = record.token
         report["worker_pid"] = record.pid
+        report["lifetime"] = (record.capabilities or {}).get("lifetime")
     except BaseException as error:
         report["error"] = f"{type(error).__name__}: {error}"
     results.put(report)
@@ -150,6 +152,8 @@ def test_eight_processes_asking_at_once_agree_on_one_winner(home: Path) -> None:
     assert len({report["pid"] for report in reports}) == RACERS
     winners = [report for report in reports if report.get("alias")]
     assert len(winners) == 1
+    if winners[0].get("lifetime") == "server":
+        pytest.skip("Windows refused worker breakaway; this test needs it to outlive its server")
     assert [report.get("full") for report in reports if not report.get("alias")] == [True] * (
         RACERS - 1
     )
@@ -191,6 +195,8 @@ def test_a_worker_outlives_its_launcher_and_a_new_server_sees_it(home: Path) -> 
     [report] = run_children(
         start_and_leave, 1, (str(home), str(hython), WARM_IDLE_S), barrier=False
     )
+    if report.get("lifetime") == "server":
+        pytest.skip("Windows refused worker breakaway; this test needs it to outlive its server")
     alias = str(report["alias"])
     session_id = str(report["session_id"])
 
@@ -220,6 +226,8 @@ def test_a_worker_nobody_wants_ends_itself(home: Path) -> None:
     [report] = run_children(
         start_and_leave, 1, (str(home), str(hython), SHORT_IDLE_S), barrier=False
     )
+    if report.get("lifetime") == "server":
+        pytest.skip("Windows refused worker breakaway; this test needs it to outlive its server")
     token = str(report["token"])
     worker_pid = int(report["worker_pid"])
 

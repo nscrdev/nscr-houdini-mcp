@@ -887,8 +887,8 @@ which every account on the machine can read, and its thread cap is either the
 one you named with `--max-threads` or the one the weight implies: a heavy
 worker gets the machine, a light one is left at Houdini's own default.
 
-The Windows side of this, the detached start, the kill and the start stamp,
-is written and read but has not been run on Windows yet.
+On Windows, a worker stays with its server if the client's process job refuses breakaway,
+and its session reports `lifetime: server`.
 
 Each worker is asked once, when it comes up, what it can do: the build, the
 license it got, the renderers that are really installed, how it can make a

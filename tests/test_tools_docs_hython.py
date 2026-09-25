@@ -121,7 +121,9 @@ async def _timed(connected: Any, name: str, arguments: dict) -> tuple[Any, float
 async def _run(place: dict[str, Path], calls: list[tuple[str, dict]]) -> list[tuple[Any, float]]:
     """Each call's result and how long its answer took, as the client saw it."""
     async with client(place) as connected:
-        return [await _timed(connected, name, arguments) for name, arguments in calls]
+        results = [await _timed(connected, name, arguments) for name, arguments in calls]
+        await support.stop_server_bound_workers(connected, [result for result, _ in results])
+        return results
 
 
 def run(place: dict[str, Path], *calls: tuple[str, dict]) -> list[tuple[Any, float]]:
@@ -177,6 +179,8 @@ def test_docs_with_a_live_worker_a_busy_one_and_none(
         ("hou_python", {"code": "result = hou.helpServerUrl()"}),
     )
     session_id = ok(started[0])["session"]["session_id"]
+    if ok(started[0])["session"].get("lifetime") == "server":
+        pytest.skip("Windows refused worker breakaway; this test needs it to outlive its server")
     wrangle, noise, found = (ok(result) for result, _ in reads)
     # The worker's build has its folder here, so the folder answers.
     assert wrangle["source"] == "corpus"

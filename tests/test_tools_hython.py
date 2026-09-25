@@ -100,7 +100,9 @@ async def _run(place: dict[str, Path], calls: list[tuple[str, dict]]) -> list[An
     async with Client(
         server_params(place), mode="auto", read_timeout_seconds=READ_TIMEOUT_S
     ) as connected:
-        return [await connected.call_tool(name, arguments) for name, arguments in calls]
+        results = [await connected.call_tool(name, arguments) for name, arguments in calls]
+        await support.stop_server_bound_workers(connected, results)
+        return results
 
 
 def run(place: dict[str, Path], *calls: tuple[str, dict]) -> list[Any]:
@@ -148,6 +150,8 @@ def test_sessions_and_scene_files_through_a_real_worker(place: dict[str, Path]) 
     )
     assert ok(empty)["sessions"] == []
     worker = ok(started)["session"]
+    if worker.get("lifetime") == "server":
+        pytest.skip("Windows refused worker breakaway; this test needs it to outlive its server")
     session_id = worker["session_id"]
     assert worker["kind"] == "hython"
     assert worker["state"] == "live"

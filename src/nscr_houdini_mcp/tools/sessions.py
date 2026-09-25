@@ -272,6 +272,8 @@ def session_row(
     if worker is not None:
         row["job"] = worker.job_id
         row["lease_age_s"] = round(max(0.0, now - worker.leased_at), 1)
+        if isinstance(worker.capabilities, Mapping) and worker.capabilities.get("lifetime"):
+            row["lifetime"] = worker.capabilities["lifetime"]
     if state in ("gone", "crashed"):
         row["ended_at"] = record.heartbeat_at
     if not full:

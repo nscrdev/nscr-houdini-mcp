@@ -139,6 +139,16 @@ def live_sessions(home: Path) -> list[str]:
     return [str(entry.get("alias") or entry.get("session_id")) for entry in entries]
 
 
+async def stop_server_bound_workers(connected: Any, results: Sequence[Any]) -> None:
+    for result in results:
+        body = result.structured_content or {}
+        worker = body.get("session", {})
+        if worker.get("lifetime") == "server":
+            await connected.call_tool(
+                "hou_sessions", {"action": "stop", "session": worker["session_id"]}
+            )
+
+
 def stop_everything(home: Path, config: pool.PoolConfig) -> list[str]:
     """Stop every worker this state folder knows. Returns the ones that stayed."""
     if not pool.store_path(home).exists():

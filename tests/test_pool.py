@@ -160,6 +160,19 @@ def test_a_worker_comes_up_and_records_what_it_is(
     assert record.weight == pool.WEIGHTS["light"]
 
 
+def test_a_worker_bound_to_its_server_records_that_lifetime(
+    config: pool.PoolConfig, store: Store, hython: Path
+) -> None:
+    launcher = FakeLauncher(config.home)
+
+    def spawn(command, *, log, env):
+        launched = launcher.spawn(command, log=log, env=env)
+        return pool.Launched(launched.pid, server_bound=True)
+
+    record = pool.start_worker(config, store, hython=hython, spawn=spawn, probe=launcher.probe)
+    assert record.capabilities["lifetime"] == "server"
+
+
 def test_the_worker_owns_its_own_slot_once_it_is_up(
     config: pool.PoolConfig, store: Store, hython: Path
 ) -> None:

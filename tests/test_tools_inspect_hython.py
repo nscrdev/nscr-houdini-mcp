@@ -165,7 +165,9 @@ async def _run(place: dict[str, Path], calls: list[tuple[str, dict]]) -> list[An
     async with Client(
         server_params(place), mode="auto", read_timeout_seconds=READ_TIMEOUT_S
     ) as connected:
-        return [await connected.call_tool(name, arguments) for name, arguments in calls]
+        results = [await connected.call_tool(name, arguments) for name, arguments in calls]
+        await support.stop_server_bound_workers(connected, results)
+        return results
 
 
 def run(place: dict[str, Path], *calls: tuple[str, dict]) -> list[Any]:
@@ -211,6 +213,8 @@ def test_reads_against_a_real_worker(place: dict[str, Path]) -> None:
         COUNT,
     )
     session_id = ok(started)["session"]["session_id"]
+    if ok(started)["session"].get("lifetime") == "server":
+        pytest.skip("Windows refused worker breakaway; this test needs it to outlive its server")
     assert ok(opened)["hip_path"] == str(hip)
 
     # No read without evaluate cooks, at any level, whatever the values hold.
