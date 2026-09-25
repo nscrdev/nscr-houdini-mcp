@@ -294,6 +294,85 @@ def test_repeated_viewport_captures_leave_the_worker_alive(tmp_path: Path) -> No
         assert support.stop_everything(home, pool.PoolConfig(home=home)) == []
 
 
+def test_material_bearing_geometry_survives_repeated_viewport_captures(tmp_path: Path) -> None:
+    home, scratch = tmp_path / "home", tmp_path / "scratch"
+    home.mkdir()
+    scratch.mkdir()
+    (home / "config.toml").write_text(
+        f"pool_cap = 1\nworker_ports = [{PORT_RANGE[0]}, {PORT_RANGE[1]}]\n", encoding="utf-8"
+    )
+    place = {"home": home, "scratch": scratch}
+
+    async def capture() -> None:
+        async with Client(
+            server_params(place), mode="auto", read_timeout_seconds=READ_TIMEOUT_S
+        ) as connected:
+            worker = ok(
+                await connected.call_tool("hou_sessions", {"action": "start", "weight": "light"})
+            )["session"]
+            try:
+                built = ok(
+                    await connected.call_tool(
+                        "hou_python",
+                        {
+                            "code": (
+                                "import os\n"
+                                "g = hou.node('/obj').createNode('geo', 'retest')\n"
+                                "t = g.createNode('testgeometry_rubbertoy', 'toy')\n"
+                                "x = g.createNode('xform', 'spin')\n"
+                                "x.setInput(0, t)\n"
+                                "x.parm('ry').setExpression('$F*10')\n"
+                                "x.setDisplayFlag(True)\n"
+                                "geo = x.geometry()\n"
+                                "result = {'points': len(geo.points()), "
+                                "'materials': list(set("
+                                "geo.primStringAttribValues('shop_materialpath'))), "
+                                "'threading': os.environ.get("
+                                "'HOUDINI_VULKAN_VIEWER_MULTITHREADING')}"
+                            )
+                        },
+                    )
+                )
+                assert built["result"]["points"] > 0
+                assert any(built["result"]["materials"]), built
+                print(built["result"])
+                paths = []
+                for frame in (1, 6, 11):
+                    result = await connected.call_tool(
+                        "hou_capture",
+                        {
+                            "session": worker["session_id"],
+                            "source": "viewport",
+                            "frame_target": "/obj/retest/spin",
+                            "resolution": [320, 240],
+                            "frame": frame,
+                            "return_image": "none",
+                            "wait_s": 30,
+                        },
+                    )
+                    body = ok(result)
+                    assert body["image_stats"]["non_empty"] is True
+                    assert is_png(body["path"])
+                    paths.append(body["path"])
+                    print({"frame": frame, "path": body["path"]})
+                assert len(set(paths)) == 3
+                info = ok(
+                    await connected.call_tool(
+                        "hou_sessions", {"action": "info", "session": worker["session_id"]}
+                    )
+                )
+                assert info["session"]["state"] == "live"
+            finally:
+                await connected.call_tool(
+                    "hou_sessions", {"action": "stop", "session": worker["session_id"]}
+                )
+
+    try:
+        asyncio.run(capture())
+    finally:
+        assert support.stop_everything(home, pool.PoolConfig(home=home)) == []
+
+
 def test_a_fresh_worker_s_first_capture_is_a_framed_sequence(place: dict[str, Any]) -> None:
     """Run first: a worker that has captured nothing yet, asked for frames."""
     [platform, sequence] = run(
