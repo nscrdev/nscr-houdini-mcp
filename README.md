@@ -184,17 +184,6 @@ dependency. Either count is a budget signal to watch across commits, since a
 client on another encoding pays a somewhat different number. Pass
 `--max-tokens N` to make it fail over a budget.
 
-Git hooks:
-
-```sh
-python scripts/install_hooks.py
-```
-
-This sets `core.hooksPath` to the tracked `hooks/` directory. The hooks check
-staged content and the commit message against a private term list at
-`.context/leak-terms.txt`, which is ignored by git and kept only on your own
-machine. They fail closed: with no list, every commit is refused.
-
 Run the server on stdio:
 
 ```sh

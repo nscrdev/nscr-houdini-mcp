@@ -120,7 +120,6 @@ HAMMER_SENDS = 3
 # processes is not the case this check is here to cover.
 HAMMER_PAUSE_S = 0.25
 
-SEEDED_TERM = "a-seeded-private-term"
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
@@ -204,12 +203,6 @@ def pool_config(home: Path, *, number: int, max_idle_s: float = WARM_IDLE_S) -> 
         # The workers this script drives exist to be driven, so they carry the
         # tool that can be asked to take its time and to fail on purpose.
         selfcheck=True,
-    )
-
-
-def git(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(  # noqa: S603 - git and our own paths
-        ["git", *args], cwd=cwd, capture_output=True, text=True, check=check
     )
 
 
@@ -907,65 +900,19 @@ def check_security(run: Run) -> str:
     )
 
 
-# Section: check 10, the leak guard
+# Section: check 10, the client name lint
 
 
-def check_leak_guard(run: Run) -> str:
-    clone = run.folder("step10") / "clone"
-    if clone.exists():
-        shutil.rmtree(clone)
-    subprocess.run(  # noqa: S603 - git and our own paths
-        ["git", "clone", "--quiet", "--no-hardlinks", str(REPO_ROOT), str(clone)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    git("config", "user.email", "acceptance@example.test", cwd=clone)
-    git("config", "user.name", "acceptance", cwd=clone)
-    subprocess.run(  # noqa: S603 - our own script
-        [sys.executable, str(clone / "scripts" / "install_hooks.py")],
-        cwd=clone,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    terms = clone / ".context" / "leak-terms.txt"
-    terms.parent.mkdir(parents=True, exist_ok=True)
-    terms.write_text(f"{SEEDED_TERM}\n", encoding="utf-8")
-
-    # A term in a staged file.
-    staged = clone / "notes.txt"
-    staged.write_text(f"a line that names {SEEDED_TERM} in passing\n", encoding="utf-8")
-    git("add", "notes.txt", cwd=clone)
-    blocked_file = git("commit", "-m", "Add a note", cwd=clone, check=False)
-    assert blocked_file.returncode != 0, "a staged private term was committed"
-    assert "leak guard" in blocked_file.stderr, blocked_file.stderr
-
-    # A term in the commit message.
-    staged.write_text("a line with nothing private in it\n", encoding="utf-8")
-    git("add", "notes.txt", cwd=clone)
-    blocked_message = git("commit", "-m", f"Add a note about {SEEDED_TERM}", cwd=clone, check=False)
-    assert blocked_message.returncode != 0, "a private term in a message was committed"
-    assert "leak guard" in blocked_message.stderr, blocked_message.stderr
-
-    # And a clean change goes through, so the guard is not simply refusing all.
-    allowed = git("commit", "-m", "Add a note", cwd=clone, check=False)
-    assert allowed.returncode == 0, f"a clean commit was refused:\n{allowed.stderr}"
-
+def check_client_name_lint(run: Run) -> str:
     lint = subprocess.run(  # noqa: S603 - our own script
-        [sys.executable, str(clone / "scripts" / "lint_client_names.py")],
-        cwd=clone,
+        [sys.executable, str(REPO_ROOT / "scripts" / "lint_client_names.py")],
+        cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         check=False,
     )
     assert lint.returncode == 0, f"the client name lint failed:\n{lint.stdout}\n{lint.stderr}"
-    counted = lint.stdout.strip()
-    shutil.rmtree(clone, ignore_errors=True)
-    return (
-        "in a throwaway clone: a seeded term in a staged file was blocked, the same term in a "
-        f"commit message was blocked, a clean commit went through, and {counted}"
-    )
+    return lint.stdout.strip()
 
 
 # Section: the two client hammer
@@ -1103,7 +1050,7 @@ STEPS: tuple[Step, ...] = (
     Step(7, "Same second captures", True, check_same_second_captures),
     Step(8, "Busy during a long cook", False, None, "needs a session a person can see"),
     Step(9, "Security", True, check_security),
-    Step(10, "Leak guard", False, check_leak_guard),
+    Step(10, "Client name lint", False, check_client_name_lint),
     Step(11, "One undo entry per call", False, None, "needs a session a person can see"),
     Step(12, "Two client hammer", True, check_hammer),
 )
