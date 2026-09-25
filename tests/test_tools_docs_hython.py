@@ -18,7 +18,6 @@ import asyncio
 import sys
 import time
 from collections.abc import Iterator
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -73,7 +72,7 @@ def real_corpus() -> helpdocs.Corpus:
 
 
 @pytest.fixture(scope="module")
-def place(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Path]]:
+def place(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Any]]:
     """A state folder with a config of its own, cleared of workers at the end."""
     root = tmp_path_factory.mktemp("docs")
     home = root / "home"
@@ -85,18 +84,21 @@ def place(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Path]]
         f"pool_cap = 1\nworker_ports = [{PORT_RANGE[0]}, {PORT_RANGE[1]}]\nhython = '{hython}'\n",
         encoding="utf-8",
     )
-    try:
-        yield {"home": home, "scratch": scratch, "root": root}
-    finally:
-        left = support.stop_everything(home, pool.PoolConfig(home=home))
-        assert left == [], f"workers were left running: {left}"
-        with pool.open_store(home) as store:
-            for worker in store.list_workers(active_only=False):
-                assert worker.pid is None or not pool.worker_is_alive(worker), worker.alias
-        assert registry.live_entries(home) == []
+    made = {"home": home, "scratch": scratch, "root": root}
+    with support.persistent_client(server_params(made), timeout_s=READ_TIMEOUT_S) as send:
+        made["send"] = send
+        try:
+            yield made
+        finally:
+            left = support.stop_everything(home, pool.PoolConfig(home=home))
+            assert left == [], f"workers were left running: {left}"
+            with pool.open_store(home) as store:
+                for worker in store.list_workers(active_only=False):
+                    assert worker.pid is None or not pool.worker_is_alive(worker), worker.alias
+            assert registry.live_entries(home) == []
 
 
-def server_params(place: dict[str, Path]) -> StdioServerParameters:
+def server_params(place: dict[str, Any]) -> StdioServerParameters:
     return StdioServerParameters(
         command=sys.executable,
         args=["-c", SERVER_CODE],
@@ -108,7 +110,7 @@ def server_params(place: dict[str, Path]) -> StdioServerParameters:
     )
 
 
-def client(place: dict[str, Path]) -> Client:
+def client(place: dict[str, Any]) -> Client:
     return Client(server_params(place), mode="auto", read_timeout_seconds=READ_TIMEOUT_S)
 
 
@@ -118,7 +120,7 @@ async def _timed(connected: Any, name: str, arguments: dict) -> tuple[Any, float
     return result, time.perf_counter() - started
 
 
-async def _run(place: dict[str, Path], calls: list[tuple[str, dict]]) -> list[tuple[Any, float]]:
+async def _run(place: dict[str, Any], calls: list[tuple[str, dict]]) -> list[tuple[Any, float]]:
     """Each call's result and how long its answer took, as the client saw it."""
     async with client(place) as connected:
         results = [await _timed(connected, name, arguments) for name, arguments in calls]
@@ -126,12 +128,19 @@ async def _run(place: dict[str, Path], calls: list[tuple[str, dict]]) -> list[tu
         return results
 
 
-def run(place: dict[str, Path], *calls: tuple[str, dict]) -> list[tuple[Any, float]]:
+def run(place: dict[str, Any], *calls: tuple[str, dict]) -> list[tuple[Any, float]]:
+    if "send" in place:
+        results = []
+        for call in calls:
+            started = time.perf_counter()
+            [result] = place["send"](call)
+            results.append((result, time.perf_counter() - started))
+        return results
     return asyncio.run(_run(place, list(calls)))
 
 
 async def _while_busy(
-    place: dict[str, Path], calls: list[tuple[str, dict]]
+    place: dict[str, Any], calls: list[tuple[str, dict]]
 ) -> tuple[Any, list[tuple[Any, float]]]:
     """The calls, made while the worker runs a loop of Python, and the loop's answer."""
     async with client(place) as connected:
@@ -167,7 +176,7 @@ def check_noise(body: dict[str, Any]) -> None:
 
 
 def test_docs_with_a_live_worker_a_busy_one_and_none(
-    place: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+    place: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     build = real_corpus().build
     started, *reads, asked = run(
@@ -179,7 +188,6 @@ def test_docs_with_a_live_worker_a_busy_one_and_none(
         ("hou_python", {"code": "result = hou.helpServerUrl()"}),
     )
     session_id = ok(started[0])["session"]["session_id"]
-    support.require_independent_worker(ok(started[0])["session"])
     wrangle, noise, found = (ok(result) for result, _ in reads)
     # The worker's build has its folder here, so the folder answers.
     assert wrangle["source"] == "corpus"
@@ -258,13 +266,14 @@ def test_docs_with_a_live_worker_a_busy_one_and_none(
     check_noise(noise)
     assert box["title"] == "Box"
     assert {row["source"] for row in found["results"]} == {"corpus"}
-    assert "read from the cache" in found["results"][0]["note"]
+    [(cached, _)] = asyncio.run(_run(place, [SEARCH]))
+    assert "read from the cache" in ok(cached)["results"][0]["note"]
     print(f"folder page read: {cold_s * 1000:.1f} ms, then {warm_s * 1000:.1f} ms from the cache")
     assert cold_s < FOLDER_READ_S
     assert warm_s < FOLDER_READ_S
 
 
-def test_folder_reads_do_not_wait_for_a_server_bound_worker(place: dict[str, Path]) -> None:
+def test_folder_reads_do_not_wait_for_a_server_bound_worker(place: dict[str, Any]) -> None:
     async def check() -> list[tuple[Any, float]]:
         async with client(place) as connected:
             started = ok(await connected.call_tool("hou_sessions", {"action": "start"}))

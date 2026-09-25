@@ -58,7 +58,7 @@ BUSY_S = 8.0
 
 
 @pytest.fixture(scope="module")
-def place(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Path]]:
+def place(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Any]]:
     """A state folder with a config of its own, cleared of workers at the end."""
     root = tmp_path_factory.mktemp("tools")
     home = root / "home"
@@ -70,18 +70,21 @@ def place(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Path]]
     (home / "config.toml").write_text(
         f"pool_cap = 1\nworker_ports = [{PORT_RANGE[0]}, {PORT_RANGE[1]}]\n", encoding="utf-8"
     )
-    try:
-        yield {"home": home, "scratch": scratch, "scenes": scenes}
-    finally:
-        left = support.stop_everything(home, pool.PoolConfig(home=home))
-        assert left == [], f"workers were left running: {left}"
-        with pool.open_store(home) as store:
-            for worker in store.list_workers(active_only=False):
-                assert worker.pid is None or not pool.worker_is_alive(worker), worker.alias
-        assert registry.live_entries(home) == []
+    made = {"home": home, "scratch": scratch, "scenes": scenes}
+    with support.persistent_client(server_params(made), timeout_s=READ_TIMEOUT_S) as send:
+        made["send"] = send
+        try:
+            yield made
+        finally:
+            left = support.stop_everything(home, pool.PoolConfig(home=home))
+            assert left == [], f"workers were left running: {left}"
+            with pool.open_store(home) as store:
+                for worker in store.list_workers(active_only=False):
+                    assert worker.pid is None or not pool.worker_is_alive(worker), worker.alias
+            assert registry.live_entries(home) == []
 
 
-def server_params(place: dict[str, Path]) -> StdioServerParameters:
+def server_params(place: dict[str, Any]) -> StdioServerParameters:
     return StdioServerParameters(
         command=sys.executable,
         args=["-c", SERVER_CODE],
@@ -96,7 +99,7 @@ def server_params(place: dict[str, Path]) -> StdioServerParameters:
     )
 
 
-async def _run(place: dict[str, Path], calls: list[tuple[str, dict]]) -> list[Any]:
+async def _run(place: dict[str, Any], calls: list[tuple[str, dict]]) -> list[Any]:
     async with Client(
         server_params(place), mode="auto", read_timeout_seconds=READ_TIMEOUT_S
     ) as connected:
@@ -105,7 +108,9 @@ async def _run(place: dict[str, Path], calls: list[tuple[str, dict]]) -> list[An
         return results
 
 
-def run(place: dict[str, Path], *calls: tuple[str, dict]) -> list[Any]:
+def run(place: dict[str, Any], *calls: tuple[str, dict]) -> list[Any]:
+    if "send" in place:
+        return place["send"](*calls)
     return asyncio.run(_run(place, list(calls)))
 
 
@@ -138,7 +143,7 @@ def selfcheck(home: Path, session_id: str, arguments: dict[str, Any]) -> dict[st
     return answer.payload
 
 
-def test_sessions_and_scene_files_through_a_real_worker(place: dict[str, Path]) -> None:
+def test_sessions_and_scene_files_through_a_real_worker(place: dict[str, Any]) -> None:
     home, scratch, scenes = place["home"], place["scratch"], place["scenes"]
 
     # Start one worker; the pool has room for no second one.
@@ -150,7 +155,6 @@ def test_sessions_and_scene_files_through_a_real_worker(place: dict[str, Path]) 
     )
     assert ok(empty)["sessions"] == []
     worker = ok(started)["session"]
-    support.require_independent_worker(worker)
     session_id = worker["session_id"]
     assert worker["kind"] == "hython"
     assert worker["state"] == "live"
@@ -328,7 +332,7 @@ result = sop.path()
 
 
 def test_hou_ping_answers_from_health_while_a_cook_holds_the_worker(
-    place: dict[str, Path],
+    place: dict[str, Any],
 ) -> None:
     async def check() -> dict[str, Any]:
         seen: dict[str, Any] = {}

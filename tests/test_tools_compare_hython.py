@@ -75,18 +75,19 @@ def place(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Any]]:
         f"pool_cap = 1\nworker_ports = [{PORT_RANGE[0]}, {PORT_RANGE[1]}]\n", encoding="utf-8"
     )
     made: dict[str, Any] = {"home": home, "scratch": scratch, "images": images}
-    try:
-        [started] = run(made, ("hou_sessions", {"action": "start"}))
-        made["worker"] = ok(started)["session"]
-        support.require_independent_worker(made["worker"])
-        yield made
-    finally:
-        left = support.stop_everything(home, pool.PoolConfig(home=home))
-        assert left == [], f"workers were left running: {left}"
-        with pool.open_store(home) as store:
-            for worker in store.list_workers(active_only=False):
-                assert worker.pid is None or not pool.worker_is_alive(worker), worker.alias
-        assert registry.live_entries(home) == []
+    with support.persistent_client(server_params(made), timeout_s=READ_TIMEOUT_S) as send:
+        made["send"] = send
+        try:
+            [started] = run(made, ("hou_sessions", {"action": "start"}))
+            made["worker"] = ok(started)["session"]
+            yield made
+        finally:
+            left = support.stop_everything(home, pool.PoolConfig(home=home))
+            assert left == [], f"workers were left running: {left}"
+            with pool.open_store(home) as store:
+                for worker in store.list_workers(active_only=False):
+                    assert worker.pid is None or not pool.worker_is_alive(worker), worker.alias
+            assert registry.live_entries(home) == []
 
 
 def server_params(place: dict[str, Any]) -> StdioServerParameters:
@@ -111,6 +112,8 @@ async def _run(place: dict[str, Any], calls: list[tuple[str, dict]]) -> list[Any
 
 
 def run(place: dict[str, Any], *calls: tuple[str, dict]) -> list[Any]:
+    if "send" in place:
+        return place["send"](*calls)
     return asyncio.run(_run(place, list(calls)))
 
 

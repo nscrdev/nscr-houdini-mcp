@@ -205,13 +205,15 @@ def run_children(
     barrier: bool = False,
     result_timeout_s: float = RESULT_TIMEOUT_S,
     join_timeout_s: float = JOIN_TIMEOUT_S,
+    before_join: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Start `count` spawned children and collect what each one reports.
 
     Every child is called as `target(*args, index, barrier, results)`, where
     the barrier is `None` when none was asked for. A child that reports an
     error fails the run, and anything still alive at the end is ended here, so
-    a child that hangs cannot hold up the suite.
+    a child that hangs cannot hold up the suite. `before_join` can check the
+    reports while the children still own their workers.
     """
     context = mp.get_context("spawn")
     results = context.Queue()
@@ -226,6 +228,8 @@ def run_children(
             child.start()
         for _ in children:
             collected.append(results.get(timeout=result_timeout_s))
+        if before_join is not None:
+            before_join(collected)
         for child in children:
             child.join(join_timeout_s)
     except queue_module.Empty:

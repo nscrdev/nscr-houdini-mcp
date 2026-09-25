@@ -1,10 +1,33 @@
 import asyncio
+import multiprocessing as mp
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 import support
+from nscr_houdini_mcp.store import process_is_alive
+
+
+def report_and_wait(release, index, barrier, results) -> None:
+    results.put({"index": index, "pid": os.getpid(), "error": None})
+    release.wait(10)
+
+
+def test_child_reports_can_be_checked_before_the_launcher_exits() -> None:
+    release = mp.get_context("spawn").Event()
+
+    def check(reports):
+        try:
+            assert not release.is_set()
+            assert process_is_alive(reports[0]["pid"])
+        finally:
+            release.set()
+
+    reports = support.run_children(report_and_wait, 1, (release,), before_join=check)
+    assert release.is_set()
+    assert not process_is_alive(reports[0]["pid"])
 
 
 @pytest.mark.parametrize("session", ["worker-id", None, {}, {"lifetime": "independent"}])
