@@ -36,19 +36,21 @@ def test_failed_job_queries_report_unknown(monkeypatch, caplog, opened) -> None:
 
 @pytest.mark.parametrize("membership", [(None, False), (False, None), (None, None)])
 def test_unknown_job_membership_keeps_the_worker_server_bound(tmp_path, monkeypatch, membership):
+    from unittest.mock import Mock, call
+
     from nscr_houdini_mcp import pool
 
-    answers = iter(membership)
-    monkeypatch.setattr(pool, "_windows_in_job", lambda pid: next(answers))
-    worker = pool.spawn_detached(
-        [sys._base_executable, "-c", "import time; time.sleep(60)"], log=tmp_path / "worker.log"
-    )
-    try:
-        assert worker.server_bound
-    finally:
-        worker.kill()
-        worker.wait(10)
-        pool.reap_started()
+    process = Mock(pid=42)
+    created = Mock(return_value=process)
+    queries = Mock(side_effect=membership)
+    monkeypatch.setattr(pool.subprocess, "Popen", created)
+    monkeypatch.setattr(pool, "_windows_in_job", queries)
+    monkeypatch.setattr(pool, "_STARTED", [])
+    worker = pool.spawn_detached(["worker"], log=tmp_path / "worker.log")
+    assert worker.server_bound
+    created.assert_called_once()
+    assert created.call_args.kwargs["creationflags"] & subprocess.CREATE_BREAKAWAY_FROM_JOB
+    assert queries.call_args_list == [call(os.getpid()), call(process.pid)]
 
 
 @pytest.mark.parametrize("breakaway", [False, True])
