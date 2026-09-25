@@ -257,6 +257,43 @@ def test_a_changing_scene_writes_different_sequence_frames(
     assert all(count > 100 for count in differences), differences
 
 
+def test_repeated_viewport_captures_leave_the_worker_alive(tmp_path: Path) -> None:
+    home, scratch = tmp_path / "home", tmp_path / "scratch"
+    home.mkdir()
+    scratch.mkdir()
+    (home / "config.toml").write_text(
+        f"pool_cap = 1\nworker_ports = [{PORT_RANGE[0]}, {PORT_RANGE[1]}]\n", encoding="utf-8"
+    )
+    place = {"home": home, "scratch": scratch}
+    capture = (
+        "hou_capture",
+        {
+            "source": "viewport",
+            "camera": "front",
+            "resolution": [320, 180],
+            "return_image": "none",
+        },
+    )
+    try:
+        started, built, *captures, after = run(
+            place,
+            ("hou_sessions", {"action": "start"}),
+            ("hou_python", {"code": BUILD.format(hip=str(tmp_path / "repeated.hip"))}),
+            *([capture] * 5),
+            ("hou_python", {"code": LOOK}),
+        )
+        ok(started)
+        ok(built)
+        for result in captures:
+            assert is_png(ok(result)["path"])
+            assert ok(result)["route"] == "flipbook_rop"
+        assert len({ok(result)["path"] for result in captures}) == 5
+        assert ok(after)["result"]["out"] == []
+        assert ok(after)["result"]["obj"] == ["boxgeo"]
+    finally:
+        assert support.stop_everything(home, pool.PoolConfig(home=home)) == []
+
+
 def test_a_fresh_worker_s_first_capture_is_a_framed_sequence(place: dict[str, Any]) -> None:
     """Run first: a worker that has captured nothing yet, asked for frames."""
     [platform, sequence] = run(

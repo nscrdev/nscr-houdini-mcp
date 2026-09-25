@@ -108,6 +108,7 @@ THREADS_ENV_VAR = "HOUDINI_MAXTHREADS"
 # The Qt screen plugin a worker starts with, unless its shell names one.
 QT_PLATFORM_ENV_VAR = "QT_QPA_PLATFORM"
 QT_PLATFORM = "offscreen"
+VULKAN_THREADS_ENV_VAR = "HOUDINI_VULKAN_VIEWER_MULTITHREADING"
 
 # How large one worker's log may get before it is rolled over, and how many
 # rolled files are kept. A worker that runs for days and says something on
@@ -315,6 +316,8 @@ def worker_env(
     # only its bottom left corner. The offscreen plugin reports one pixel to a
     # point on every system. A value the shell already sets is kept.
     environment.setdefault(QT_PLATFORM_ENV_VAR, QT_PLATFORM)
+    if sys.platform == "win32":
+        environment.setdefault(VULKAN_THREADS_ENV_VAR, "0")
     return environment
 
 

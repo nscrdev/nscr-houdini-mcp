@@ -797,6 +797,18 @@ def test_a_worker_draws_offscreen_unless_its_shell_says_otherwise(
     assert kept[pool.QT_PLATFORM_ENV_VAR] == "xcb"
 
 
+@pytest.mark.parametrize("platform,expected", [("win32", "0"), ("darwin", None), ("linux", None)])
+def test_only_windows_workers_default_to_single_threaded_viewport_updates(
+    config: pool.PoolConfig, monkeypatch: pytest.MonkeyPatch, platform: str, expected: str | None
+) -> None:
+    with monkeypatch.context() as patch:
+        patch.setattr(pool.sys, "platform", platform)
+        given = pool.worker_env(config, base={})
+        kept = pool.worker_env(config, base={pool.VULKAN_THREADS_ENV_VAR: "1"})
+    assert given.get(pool.VULKAN_THREADS_ENV_VAR) == expected
+    assert kept[pool.VULKAN_THREADS_ENV_VAR] == "1"
+
+
 def test_a_heavy_worker_is_given_the_machine(home: Path, store: Store, hython: Path) -> None:
     config = pool.PoolConfig(home=home)
     launcher = FakeLauncher(home)
