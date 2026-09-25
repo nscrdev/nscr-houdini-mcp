@@ -61,14 +61,17 @@ def remove_entry(home: Path, session_id: str) -> None:
             path.unlink(missing_ok=True)
             return
         except OSError as error:
+            remaining = deadline - time.monotonic()
             if (
                 sys.platform != "win32"
                 or getattr(error, "winerror", None)
                 not in (ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION)
-                or time.monotonic() >= deadline
+                or remaining <= 0
             ):
                 raise
-            time.sleep(delay)
+            time.sleep(min(delay, remaining))
+            if time.monotonic() >= deadline:
+                raise
             delay = min(delay * 2, 0.1)
 
 

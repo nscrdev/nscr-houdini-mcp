@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -109,6 +110,37 @@ def test_failed_registry_removal_is_not_hidden_or_retried_forever(
     assert caught.value is failure
     assert attempts == 1
     assert path.exists()
+
+
+@pytest.mark.parametrize("winerror", [32, 33])
+@pytest.mark.parametrize("oversleep", [0.0, 0.02])
+def test_registry_removal_never_sleeps_or_retries_beyond_its_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winerror: int, oversleep: float
+) -> None:
+    clock = 0.0
+    sleeps, attempts = [], []
+    failure = PermissionError("file is held open")
+    failure.winerror = winerror
+
+    def refuse(*args, **kwargs):
+        attempts.append(clock)
+        raise failure
+
+    def sleep(seconds):
+        nonlocal clock
+        sleeps.append(seconds)
+        clock += seconds + oversleep
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    monkeypatch.setattr(registry, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(registry, "time", SimpleNamespace(monotonic=lambda: clock, sleep=sleep))
+    monkeypatch.setattr(registry, "REMOVE_TIMEOUT_S", 0.025)
+    with pytest.raises(PermissionError) as caught:
+        registry.remove_entry(tmp_path, "held")
+    assert caught.value is failure
+    assert sleeps == pytest.approx([0.01] if oversleep else [0.01, 0.015])
+    assert attempts == pytest.approx([0.0] if oversleep else [0.0, 0.01])
+    assert all(start < registry.REMOVE_TIMEOUT_S for start in attempts)
 
 
 def test_a_session_is_opened_only_while_its_process_is_there(tmp_path: Path) -> None:
