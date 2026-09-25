@@ -88,6 +88,29 @@ def test_removing_an_entry_that_is_not_there_is_not_a_failure(tmp_path: Path) ->
     assert registry.list_entries(tmp_path) == []
 
 
+@pytest.mark.parametrize("winerror,timeout", [(5, 1), (32, 0), (33, 0)])
+def test_failed_registry_removal_is_not_hidden_or_retried_forever(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winerror: int, timeout: float
+) -> None:
+    path = registry.write_entry(tmp_path, entry("held"))
+    attempts = 0
+    failure = PermissionError("file cannot be removed")
+    failure.winerror = winerror
+
+    def refuse(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise failure
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    monkeypatch.setattr(registry, "REMOVE_TIMEOUT_S", timeout)
+    with pytest.raises(PermissionError) as caught:
+        registry.remove_entry(tmp_path, "held")
+    assert caught.value is failure
+    assert attempts == 1
+    assert path.exists()
+
+
 def test_a_session_is_opened_only_while_its_process_is_there(tmp_path: Path) -> None:
     from nscr_houdini_mcp.bridge import client
 

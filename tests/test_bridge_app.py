@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import sys
 import threading
 import time
 from collections.abc import Mapping
@@ -631,6 +632,41 @@ def test_a_request_that_did_not_arrive_on_loopback_closes_the_bridge(tmp_path: P
         assert registry.list_entries(tmp_path) == []
     finally:
         bridge.stop()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows open-file sharing")
+def test_a_reader_during_shutdown_does_not_leave_the_registry_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, backend = make_bridge(tmp_path)
+    bridge.start()
+    path = registry.entry_path(tmp_path, bridge.session_id)
+    attempted = threading.Event()
+    refusals = []
+    unlink = Path.unlink
+
+    def observed_unlink(candidate, *args, **kwargs):
+        try:
+            return unlink(candidate, *args, **kwargs)
+        except OSError as error:
+            if candidate == path:
+                refusals.append(error.winerror)
+                attempted.set()
+            raise
+
+    monkeypatch.setattr(Path, "unlink", observed_unlink)
+    try:
+        with path.open("rb"):
+            reply = send(bridge, backend, HEALTH_PATH, server_address="192.0.2.7")
+            assert reply.status == 403
+            assert attempted.wait(5), "shutdown did not attempt to remove the open entry"
+        assert refusals and all(code == 32 for code in refusals)
+        support.wait_until(lambda: not backend.running and not path.exists(), timeout_s=3)
+        assert registry.list_entries(tmp_path) == []
+        assert not any("remove the session file" in problem for problem in bridge.problems)
+    finally:
+        bridge.stop()
+        path.unlink(missing_ok=True)
 
 
 def test_every_answer_is_signed_so_a_squatter_cannot_pass_for_the_bridge(
