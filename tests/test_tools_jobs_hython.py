@@ -115,7 +115,7 @@ async def _run(place: dict[str, Any], calls: list[tuple[str, dict]]) -> list[Any
 
 def run(place: dict[str, Any], *calls: tuple[str, dict]) -> list[Any]:
     """Send ordinary calls through the module's owning client."""
-    if "send" in place:
+    if place.get("send") is not None:
         return place["send"](*calls)
     return asyncio.run(_run(place, list(calls)))
 

@@ -32,6 +32,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import queue as queue_module
+import sys
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -143,8 +144,14 @@ def live_sessions(home: Path) -> list[str]:
 
 
 @contextmanager
-def persistent_client(parameters: Any, *, timeout_s: float) -> Iterator[Callable[..., list[Any]]]:
-    """Keep one real client and its event loop open across a module's call batches."""
+def persistent_client(
+    parameters: Any, *, timeout_s: float
+) -> Iterator[Callable[..., list[Any]] | None]:
+    """Keep a client across Windows call batches; elsewhere use the per-batch clients."""
+    if sys.platform != "win32":
+        yield None
+        return
+
     from anyio.from_thread import start_blocking_portal
     from mcp.client.client import Client
 

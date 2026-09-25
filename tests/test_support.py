@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import multiprocessing as mp
 import os
 from types import SimpleNamespace
@@ -8,6 +9,40 @@ import pytest
 
 import support
 from nscr_houdini_mcp.store import process_is_alive
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_non_windows_fixtures_do_not_open_a_persistent_client(monkeypatch, platform) -> None:
+    monkeypatch.setattr(support, "sys", SimpleNamespace(platform=platform))
+    with support.persistent_client(None, timeout_s=1) as send:
+        assert send is None
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        "capture",
+        "jobs",
+        "docs",
+        "hython",
+        "compare_capture",
+        "compare",
+        "node_type",
+        "outputs",
+        "inspect",
+        "python",
+    ],
+)
+def test_tool_fixtures_use_per_batch_clients_without_a_persistent_sender(monkeypatch, module):
+    name = "test_tools_hython" if module == "hython" else f"test_tools_{module}_hython"
+    tools = importlib.import_module(name)
+    result = [object()]
+    batch = AsyncMock(return_value=result)
+    monkeypatch.setattr(tools, "_run", batch)
+    place = {"send": None}
+    call = ("hou_ping", {})
+    assert tools.run(place, call) is result
+    batch.assert_awaited_once_with(place, [call])
 
 
 def report_and_wait(release, index, barrier, results) -> None:

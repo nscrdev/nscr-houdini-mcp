@@ -129,7 +129,7 @@ async def _run(place: dict[str, Any], calls: list[tuple[str, dict]]) -> list[tup
 
 
 def run(place: dict[str, Any], *calls: tuple[str, dict]) -> list[tuple[Any, float]]:
-    if "send" in place:
+    if place.get("send") is not None:
         results = []
         for call in calls:
             started = time.perf_counter()
