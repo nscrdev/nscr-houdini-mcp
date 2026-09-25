@@ -725,6 +725,18 @@ def test_houdini_installs_are_found_newest_first(
     assert found[0].hfs == tmp_path / "opt" / "hfs22.0.368"
 
 
+def test_installs_are_looked_for_on_the_system_drive_without_program_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The MCP SDK's stdio client starts a server with a trimmed environment
+    # that keeps SystemDrive but drops ProgramFiles.
+    monkeypatch.setattr(install_module.sys, "platform", "win32")
+    monkeypatch.delenv("ProgramFiles", raising=False)
+    monkeypatch.delenv("ProgramW6432", raising=False)
+    monkeypatch.setenv("SystemDrive", "D:")
+    assert install_module.install_roots() == [Path("D:\\Program Files") / "Side Effects Software"]
+
+
 def test_a_named_install_comes_first(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(install_module.sys, "platform", "linux")
     fake_installs(monkeypatch, tmp_path / "opt", ["hfs22.0.368"])

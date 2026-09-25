@@ -1362,10 +1362,18 @@ def install_roots() -> list[Path]:
     if sys.platform == "darwin":
         return [Path("/Applications/Houdini")]
     if sys.platform == "win32":
-        roots = []
-        for variable in ("ProgramFiles", "ProgramW6432"):
-            base = os.environ.get(variable)
-            if base:
+        # A client can start the server with a trimmed environment that has no
+        # ProgramFiles, as the MCP SDK's stdio client does, so the system
+        # drive's own Program Files is always looked at too.
+        drive = os.environ.get("SystemDrive") or "C:"
+        bases = (
+            os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramW6432"),
+            drive + "\\Program Files",
+        )
+        roots: list[Path] = []
+        for base in bases:
+            if base and Path(base) / "Side Effects Software" not in roots:
                 roots.append(Path(base) / "Side Effects Software")
         return roots
     return [Path("/opt")]
