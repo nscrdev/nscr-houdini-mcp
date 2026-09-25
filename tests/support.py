@@ -140,10 +140,11 @@ def live_sessions(home: Path) -> list[str]:
 
 
 async def stop_server_bound_workers(connected: Any, results: Sequence[Any]) -> None:
+    """Stop worker session records, not the session handles other tools return."""
     for result in results:
         body = result.structured_content or {}
         worker = body.get("session", {})
-        if worker.get("lifetime") == "server":
+        if isinstance(worker, Mapping) and worker.get("lifetime") == "server":
             await connected.call_tool(
                 "hou_sessions", {"action": "stop", "session": worker["session_id"]}
             )
