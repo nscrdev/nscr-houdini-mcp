@@ -921,6 +921,8 @@ def _lease_pass(
         # does once the process has gone, or the reaper.
         return "asked"
     now = clock()
+    # On every platform, cold startup can take longer than the idle lease.
+    # Give it the startup deadline; moving to running starts the idle wait.
     if (
         record.state in store_module.WORKER_STARTING_STATES
         and record.start_deadline is not None
