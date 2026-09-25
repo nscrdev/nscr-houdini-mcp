@@ -121,6 +121,8 @@ LOG_KEEP = 2
 # How long a process is given to go after it has been ended outright. The kill
 # is not a request, so this is short.
 KILL_WAIT_S = 5.0
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+ERROR_ACCESS_DENIED = 5
 
 
 class PoolError(Exception):
@@ -403,7 +405,7 @@ def spawn_detached(
             subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
             | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
         )
-        extra["creationflags"] = creation | subprocess.CREATE_BREAKAWAY_FROM_JOB
+        extra["creationflags"] = creation | subprocess.CREATE_BREAKAWAY_FROM_JOB  # type: ignore[attr-defined]
     else:
         extra["start_new_session"] = True
     handle = log.open("a", encoding="utf-8")
@@ -420,13 +422,15 @@ def spawn_detached(
                 list(command), **arguments, **extra
             )
         except OSError as error:
-            if sys.platform != "win32" or error.winerror != 5:
+            if sys.platform != "win32" or error.winerror != ERROR_ACCESS_DENIED:
                 raise
             process = subprocess.Popen(list(command), **arguments, creationflags=creation)
             server_bound = True
-        if sys.platform == "win32":
-            server_bound = server_bound or (
-                _windows_in_job(os.getpid()) and _windows_in_job(process.pid)
+        if sys.platform == "win32" and not server_bound:
+            parent_in_job = _windows_in_job(os.getpid())
+            worker_in_job = _windows_in_job(process.pid)
+            server_bound = (
+                parent_in_job is None or worker_in_job is None or (parent_in_job and worker_in_job)
             )
         if server_bound:
             _warn_server_bound(process.pid)
@@ -441,7 +445,8 @@ def _warn_server_bound(pid: int) -> None:
     log.warning("Windows worker %s ends when this server ends", pid)
 
 
-def _windows_in_job(pid: int) -> bool:
+def _windows_in_job(pid: int) -> bool | None:
+    """Read job membership, or report an unknown result so the worker stays server-bound."""
     import ctypes
     from ctypes import wintypes
 
@@ -454,12 +459,26 @@ def _windows_in_job(pid: int) -> bool:
         ctypes.POINTER(wintypes.BOOL),
     ]
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    handle = kernel.OpenProcess(0x1000, False, pid)
+    handle = kernel.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
-        return False
+        log.warning(
+            "Cannot open Windows process %s to check its lifetime (error %s); "
+            "treating the worker as server-bound",
+            pid,
+            ctypes.get_last_error(),
+        )
+        return None
     try:
         in_job = wintypes.BOOL()
-        return bool(kernel.IsProcessInJob(handle, None, ctypes.byref(in_job)) and in_job.value)
+        if not kernel.IsProcessInJob(handle, None, ctypes.byref(in_job)):
+            log.warning(
+                "Cannot check Windows process %s job membership (error %s); "
+                "treating the worker as server-bound",
+                pid,
+                ctypes.get_last_error(),
+            )
+            return None
+        return bool(in_job.value)
     finally:
         kernel.CloseHandle(handle)
 

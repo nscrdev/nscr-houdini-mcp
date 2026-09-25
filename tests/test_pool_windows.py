@@ -9,6 +9,44 @@ import pytest
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows process jobs")
 
 
+@pytest.mark.parametrize("opened", [False, True])
+def test_failed_job_queries_report_unknown(monkeypatch, caplog, opened) -> None:
+    import ctypes
+    from unittest.mock import Mock
+
+    from nscr_houdini_mcp import pool
+
+    kernel = Mock()
+    kernel.OpenProcess.return_value = 123 if opened else 0
+    kernel.IsProcessInJob.return_value = 0
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kwargs: kernel)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: pool.ERROR_ACCESS_DENIED)
+    assert pool._windows_in_job(42) is None
+    assert "error 5" in caplog.text
+    assert "server-bound" in caplog.text
+    if opened:
+        kernel.CloseHandle.assert_called_once_with(123)
+    else:
+        kernel.CloseHandle.assert_not_called()
+
+
+@pytest.mark.parametrize("membership", [(None, False), (False, None), (None, None)])
+def test_unknown_job_membership_keeps_the_worker_server_bound(tmp_path, monkeypatch, membership):
+    from nscr_houdini_mcp import pool
+
+    answers = iter(membership)
+    monkeypatch.setattr(pool, "_windows_in_job", lambda pid: next(answers))
+    worker = pool.spawn_detached(
+        [sys._base_executable, "-c", "import time; time.sleep(60)"], log=tmp_path / "worker.log"
+    )
+    try:
+        assert worker.server_bound
+    finally:
+        worker.kill()
+        worker.wait(10)
+        pool.reap_started()
+
+
 @pytest.mark.parametrize("breakaway", [False, True])
 def test_a_worker_breaks_away_or_stays_with_its_launchers_job(
     tmp_path: Path, breakaway: bool
