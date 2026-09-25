@@ -3,8 +3,8 @@
 An MCP server and a small set of agent skills for SideFX Houdini 22.
 
 Status: 0.1.0, the first release. The eleven tools described below work
-against a real Houdini 22 on macOS; see [Tested on](#tested-on) for what has
-and has not been run where. Names and arguments may still change before 1.0,
+against a real Houdini 22 on macOS and Windows; see [Tested on](#tested-on)
+for what has and has not been run where. Names and arguments may still change before 1.0,
 and [CHANGELOG.md](CHANGELOG.md) says what changed.
 
 ## Goals
@@ -22,9 +22,11 @@ and [CHANGELOG.md](CHANGELOG.md) says what changed.
 - macOS on Apple silicon (arm64), with Houdini 22.0.368 and 22.0.429: the unit
   tests, the tests that start a real hython, and GUI sessions driven through
   one MCP client.
-- Windows and Linux: the unit tests run in CI, on Python 3.11 and 3.13, for
-  every push to main and every pull request. Neither has been run against a
-  real Houdini yet, so treat Houdini on either as untried.
+- Windows 11 (x64), with Houdini 22.0.368: the unit tests, the tests that
+  start a real hython, and GUI sessions driven through one MCP client.
+- Linux: the unit tests run in CI, on Python 3.11 and 3.13, for every push to
+  main and every pull request, as they do on Windows. It has not been run
+  against a real Houdini yet, so treat Houdini on Linux as untried.
 
 ## Quick start
 
