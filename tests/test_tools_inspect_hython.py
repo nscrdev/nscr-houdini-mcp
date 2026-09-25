@@ -215,7 +215,7 @@ def test_reads_against_a_real_worker(place: dict[str, Path]) -> None:
     session_id = ok(started)["session"]["session_id"]
     if ok(started)["session"].get("lifetime") == "server":
         pytest.skip("Windows refused worker breakaway; this test needs it to outlive its server")
-    assert ok(opened)["hip_path"] == str(hip)
+    assert ok(opened)["hip_path"] == hip.as_posix()
 
     # No read without evaluate cooks, at any level, whatever the values hold.
     summary, tree, standard, full, parms, risky, after = run(
