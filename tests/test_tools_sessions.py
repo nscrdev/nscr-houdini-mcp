@@ -189,6 +189,16 @@ def test_list_says_live_and_busy_from_the_sessions_own_answer(bench: Bench) -> N
     assert bench.renewed == []
 
 
+def test_a_server_bound_worker_s_lifetime_is_visible(bench: Bench) -> None:
+    bench.session("s-1", "w1")
+    worker = bench.worker("s-1", "wk-1")
+    with bench.store() as store:
+        store.set_worker_state(
+            worker.token, "running", capabilities={**CAPABILITIES, "lifetime": "server"}
+        )
+    assert listed(bench)["w1"]["lifetime"] == "server"
+
+
 def test_a_killed_worker_lists_as_crashed_now_and_later(bench: Bench) -> None:
     bench.session("s-1", "w1", pid=DEAD_PID)
     bench.worker("s-1", "wk-1", pid=DEAD_PID)

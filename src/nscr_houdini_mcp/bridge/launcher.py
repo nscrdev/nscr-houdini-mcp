@@ -47,16 +47,7 @@ def _executable(name: str) -> str:
 
 def install_roots() -> list[Path]:
     """Where Houdini usually lives on this system."""
-    if sys.platform == "darwin":
-        return [Path("/Applications/Houdini")]
-    if sys.platform == "win32":
-        roots = []
-        for variable in ("ProgramFiles", "ProgramW6432"):
-            base = os.environ.get(variable)
-            if base:
-                roots.append(Path(base) / "Side Effects Software")
-        return roots
-    return [Path("/opt")]
+    return install_module.install_roots()
 
 
 def _from_hfs(hfs: Path) -> Path:

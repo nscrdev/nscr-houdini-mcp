@@ -28,6 +28,7 @@ This module never imports `hou`. The worker it starts does.
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 import signal
@@ -51,6 +52,8 @@ from nscr_houdini_mcp.store import (
     process_start_stamp,
     same_process,
 )
+
+log = logging.getLogger(__name__)
 
 # The path to hython, when the machine is not to be searched.
 HYTHON_ENV_VAR = "NSCR_MCP_HYTHON"
@@ -107,6 +110,7 @@ THREADS_ENV_VAR = "HOUDINI_MAXTHREADS"
 # The Qt screen plugin a worker starts with, unless its shell names one.
 QT_PLATFORM_ENV_VAR = "QT_QPA_PLATFORM"
 QT_PLATFORM = "offscreen"
+VULKAN_VIEWER_THREADING_ENV_VAR = "HOUDINI_VULKAN_VIEWER_MULTITHREADING"
 
 # How large one worker's log may get before it is rolled over, and how many
 # rolled files are kept. A worker that runs for days and says something on
@@ -117,6 +121,8 @@ LOG_KEEP = 2
 # How long a process is given to go after it has been ended outright. The kill
 # is not a request, so this is short.
 KILL_WAIT_S = 5.0
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+ERROR_ACCESS_DENIED = 5
 
 
 class PoolError(Exception):
@@ -178,6 +184,7 @@ class Launched:
     kill: Callable[[], None] | None = None
     # Waits for that same process to end, for up to the seconds given.
     wait: Callable[[float], Any] | None = None
+    server_bound: bool = False
 
 
 @dataclass(frozen=True)
@@ -255,10 +262,20 @@ def worker_command(config: PoolConfig, *, alias: str, hython: Path) -> list[str]
     another account's command lines, and the token is what proves who owns the
     reservation, so it travels in the environment instead.
     """
+    if sys.platform == "win32":
+        # A Houdini package can prepend another copy of our source to PYTHONPATH;
+        # put this server's copy first after Houdini has read its packages.
+        source = str(install_module.python_path_for_run(config.home))
+        entry = [
+            "-c",
+            f"import runpy, sys; sys.path.insert(0, {source!r}); "
+            f"runpy.run_module({WORKER_MODULE!r}, run_name='__main__', alter_sys=True)",
+        ]
+    else:
+        entry = ["-m", WORKER_MODULE]
     return [
         str(hython),
-        "-m",
-        WORKER_MODULE,
+        *entry,
         "--home",
         str(config.home),
         "--port",
@@ -313,6 +330,10 @@ def worker_env(
     # only its bottom left corner. The offscreen plugin reports one pixel to a
     # point on every system. A value the shell already sets is kept.
     environment.setdefault(QT_PLATFORM_ENV_VAR, QT_PLATFORM)
+    # Repeated captures crashed workers with threaded Vulkan updates on Windows;
+    # a value the shell already sets is kept.
+    if sys.platform == "win32":
+        environment.setdefault(VULKAN_VIEWER_THREADING_ENV_VAR, "0")
     return environment
 
 
@@ -383,30 +404,88 @@ def spawn_detached(
     """
     open_log(log)
     extra: dict[str, Any] = {}
+    server_bound = False
     if sys.platform == "win32":
         creation = (
             subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
             | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
         )
-        extra["creationflags"] = creation
+        extra["creationflags"] = creation | subprocess.CREATE_BREAKAWAY_FROM_JOB  # type: ignore[attr-defined]
     else:
         extra["start_new_session"] = True
     handle = log.open("a", encoding="utf-8")
     try:
-        process = subprocess.Popen(  # noqa: S603 - the binary is ours to name
-            list(command),
+        arguments = dict(
             stdin=subprocess.DEVNULL,
             stdout=handle,
             stderr=subprocess.STDOUT,
             close_fds=True,
             env=dict(env) if env is not None else None,
-            **extra,
         )
+        try:
+            process = subprocess.Popen(  # noqa: S603 - the binary is ours to name
+                list(command), **arguments, **extra
+            )
+        except OSError as error:
+            if sys.platform != "win32" or error.winerror != ERROR_ACCESS_DENIED:
+                raise
+            process = subprocess.Popen(list(command), **arguments, creationflags=creation)
+            server_bound = True
+        if sys.platform == "win32" and not server_bound:
+            parent_in_job = _windows_in_job(os.getpid())
+            worker_in_job = _windows_in_job(process.pid)
+            server_bound = (
+                parent_in_job is None or worker_in_job is None or (parent_in_job and worker_in_job)
+            )
+        if server_bound:
+            _warn_server_bound(process.pid)
     finally:
         # The child holds its own handle on the file from here on.
         handle.close()
     _STARTED.append(process)
-    return Launched(process.pid, process.poll, process.kill, process.wait)
+    return Launched(process.pid, process.poll, process.kill, process.wait, server_bound)
+
+
+def _warn_server_bound(pid: int) -> None:
+    log.warning("Windows worker %s ends when this server ends", pid)
+
+
+def _windows_in_job(pid: int) -> bool | None:
+    """Read job membership, or report an unknown result so the worker stays server-bound."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.IsProcessInJob.argtypes = [
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        log.warning(
+            "Cannot open Windows process %s to check its lifetime (error %s); "
+            "treating the worker as server-bound",
+            pid,
+            ctypes.get_last_error(),
+        )
+        return None
+    try:
+        in_job = wintypes.BOOL()
+        if not kernel.IsProcessInJob(handle, None, ctypes.byref(in_job)):
+            log.warning(
+                "Cannot check Windows process %s job membership (error %s); "
+                "treating the worker as server-bound",
+                pid,
+                ctypes.get_last_error(),
+            )
+            return None
+        return bool(in_job.value)
+    finally:
+        kernel.CloseHandle(handle)
 
 
 def wait_for_entry(
@@ -526,6 +605,8 @@ def start_worker(
             timeout_s=config.start_timeout_s if timeout_s is None else timeout_s,
         )
         capabilities = probe(entry)
+        if launched.server_bound:
+            capabilities["lifetime"] = "server"
         # From here the worker owns its own slot. The process that started it
         # may go away without taking the warm worker with it.
         record = store.set_worker_state(
@@ -839,9 +920,18 @@ def _lease_pass(
         # about to exit: the worker releases it then, or whoever stops it
         # does once the process has gone, or the reaper.
         return "asked"
+    now = clock()
+    # On every platform, cold startup can take longer than the idle lease.
+    # Give it the startup deadline; moving to running starts the idle wait.
+    if (
+        record.state in store_module.WORKER_STARTING_STATES
+        and record.start_deadline is not None
+        and now < record.start_deadline
+    ):
+        return None
     # A clock that stepped backwards must not make a worker look fresh or
     # old, so the age is never negative.
-    idle_for = max(0.0, clock() - record.leased_at)
+    idle_for = max(0.0, now - record.leased_at)
     if busy is not None and busy():
         return None
     if record.job_id is None and max_idle_s > 0 and idle_for >= max_idle_s:

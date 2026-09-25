@@ -19,6 +19,7 @@ files that need a crowd, in `support`.
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import os
 import sys
 import time
@@ -79,7 +80,7 @@ def config_for(home: Path, *, max_idle_s: float = WARM_IDLE_S) -> pool.PoolConfi
 # Section: what the children run
 
 
-def ask_for_a_worker(home: str, hython: str, index: int, barrier, results) -> None:
+def ask_for_a_worker(home: str, hython: str, release, index: int, barrier, results) -> None:
     """One racer: ask for the last slot, and say what came of it."""
     report: dict[str, object] = {"index": index, "pid": os.getpid(), "error": None}
     try:
@@ -90,12 +91,14 @@ def ask_for_a_worker(home: str, hython: str, index: int, barrier, results) -> No
                 record = pool.start_worker(config, store, hython=hython)
                 report["alias"] = record.alias
                 report["session_id"] = record.session_id
+                report["lifetime"] = (record.capabilities or {}).get("lifetime")
             except PoolFull:
                 report["alias"] = None
                 report["full"] = True
     except BaseException as error:  # reported, so a failure reads as a message
         report["error"] = f"{type(error).__name__}: {error}"
     results.put(report)
+    release.wait(support.JOIN_TIMEOUT_S)
 
 
 def start_and_leave(home: str, hython: str, max_idle_s: float, index, barrier, results) -> None:
@@ -109,6 +112,7 @@ def start_and_leave(home: str, hython: str, max_idle_s: float, index, barrier, r
         report["session_id"] = record.session_id
         report["token"] = record.token
         report["worker_pid"] = record.pid
+        report["lifetime"] = (record.capabilities or {}).get("lifetime")
     except BaseException as error:
         report["error"] = f"{type(error).__name__}: {error}"
     results.put(report)
@@ -145,22 +149,34 @@ def test_eight_processes_asking_at_once_agree_on_one_winner(home: Path) -> None:
     with pool.open_store(home) as store:
         for slot in range(POOL_CAP - 1):
             store.reserve_worker(cap=POOL_CAP, token=f"held-{slot}")
-    reports = run_children(ask_for_a_worker, RACERS, (str(home), str(hython)), barrier=True)
+    release = mp.get_context("spawn").Event()
 
-    assert len({report["pid"] for report in reports}) == RACERS
-    winners = [report for report in reports if report.get("alias")]
-    assert len(winners) == 1
-    assert [report.get("full") for report in reports if not report.get("alias")] == [True] * (
-        RACERS - 1
+    def check(reports):
+        try:
+            assert len({report["pid"] for report in reports}) == RACERS
+            winners = [report for report in reports if report.get("alias")]
+            assert len(winners) == 1
+            assert [report.get("full") for report in reports if not report.get("alias")] == [
+                True
+            ] * (RACERS - 1)
+            # The winner is a Houdini that is really there, while the child
+            # process that asked for it is still alive.
+            answer = health_of(home, str(winners[0]["session_id"]))
+            assert answer.payload["data"]["status"] == "ok"
+            with pool.open_store(home) as store:
+                running = [record for record in store.list_workers() if record.pid is not None]
+                assert len(running) == 1
+                assert pool.worker_is_alive(running[0])
+        finally:
+            release.set()
+
+    support.run_children(
+        ask_for_a_worker,
+        RACERS,
+        (str(home), str(hython), release),
+        barrier=True,
+        before_join=check,
     )
-    # The winner is a Houdini that is really there, and it outlived the child
-    # process that asked for it.
-    answer = health_of(home, str(winners[0]["session_id"]))
-    assert answer.payload["data"]["status"] == "ok"
-    with pool.open_store(home) as store:
-        running = [record for record in store.list_workers() if record.pid is not None]
-        assert len(running) == 1
-        assert pool.worker_is_alive(running[0])
 
 
 def failing_spawn(command, *, log: Path, env) -> pool.Launched:
@@ -186,11 +202,31 @@ def test_a_failed_start_gives_its_slot_back(home: Path) -> None:
 # Section: acceptance check 6, a worker outliving the process that started it
 
 
+def test_a_worker_imports_the_package_its_launcher_runs(home: Path) -> None:
+    with pool.open_store(home) as store:
+        record = pool.start_worker(config_for(home), store)
+    session = client.Session.open(home, record.session_id)
+    answer = client.call(
+        session,
+        "python.run",
+        arguments={
+            "namespace": "source_check",
+            "code": "import nscr_houdini_mcp.pool as p\nresult = p.__file__",
+        },
+        operation_id=client.new_operation_id(),
+        wait_s=30,
+        timeout_s=60,
+    )
+    assert answer.payload["ok"], answer.payload
+    assert Path(answer.payload["data"]["result"]).resolve() == Path(pool.__file__).resolve()
+
+
 def test_a_worker_outlives_its_launcher_and_a_new_server_sees_it(home: Path) -> None:
     hython = pool.hython_path()
     [report] = run_children(
         start_and_leave, 1, (str(home), str(hython), WARM_IDLE_S), barrier=False
     )
+    support.require_independent_worker(report)
     alias = str(report["alias"])
     session_id = str(report["session_id"])
 
@@ -216,12 +252,10 @@ def test_a_worker_outlives_its_launcher_and_a_new_server_sees_it(home: Path) -> 
 
 
 def test_a_worker_nobody_wants_ends_itself(home: Path) -> None:
-    hython = pool.hython_path()
-    [report] = run_children(
-        start_and_leave, 1, (str(home), str(hython), SHORT_IDLE_S), barrier=False
-    )
-    token = str(report["token"])
-    worker_pid = int(report["worker_pid"])
+    with pool.open_store(home) as store:
+        started = pool.start_worker(config_for(home, max_idle_s=SHORT_IDLE_S), store)
+    token = started.token
+    worker_pid = started.pid
 
     deadline = time.monotonic() + IDLE_EXIT_TIMEOUT_S
     while time.monotonic() < deadline:
@@ -234,6 +268,7 @@ def test_a_worker_nobody_wants_ends_itself(home: Path) -> None:
 
     gone = time.monotonic() + 30.0
     while process_is_alive(worker_pid) and time.monotonic() < gone:
+        pool.reap_started()
         time.sleep(0.5)
     assert not process_is_alive(worker_pid), "the idle worker is still running"
     # Its slot is free without anybody having tidied up after it.

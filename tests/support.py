@@ -23,8 +23,8 @@ supported system, so a child imports this module by name and calls a function
 it was given at module level. Anything a child runs has to be importable that
 way, which is why the targets are plain module level functions.
 
-Nothing here imports pytest, so the acceptance script can use the same helpers
-without the test runner.
+Only the persistence skip imports pytest, so the acceptance script can use
+the other helpers without the test runner.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import queue as queue_module
+import sys
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -54,8 +55,11 @@ __all__ = [
     "hython_session",
     "kill_bridge",
     "live_sessions",
+    "persistent_client",
+    "require_independent_worker",
     "run_children",
     "stop_everything",
+    "stop_server_bound_workers",
     "wait_until",
 ]
 
@@ -139,6 +143,48 @@ def live_sessions(home: Path) -> list[str]:
     return [str(entry.get("alias") or entry.get("session_id")) for entry in entries]
 
 
+@contextmanager
+def persistent_client(
+    parameters: Any, *, timeout_s: float
+) -> Iterator[Callable[..., list[Any]] | None]:
+    """Keep a client across Windows call batches; elsewhere use the per-batch clients."""
+    if sys.platform != "win32":
+        yield None
+        return
+
+    from anyio.from_thread import start_blocking_portal
+    from mcp.client.client import Client
+
+    with start_blocking_portal() as portal:
+        with portal.wrap_async_context_manager(
+            Client(parameters, mode="auto", read_timeout_seconds=timeout_s)
+        ) as connected:
+
+            async def batch(calls):
+                return [await connected.call_tool(name, arguments) for name, arguments in calls]
+
+            yield lambda *calls: portal.call(batch, calls)
+
+
+def require_independent_worker(worker: Mapping[str, Any]) -> None:
+    """Skip only checks that need the launching server to exit before the worker."""
+    if worker.get("lifetime") == "server":
+        import pytest
+
+        pytest.skip("Windows refused worker breakaway; this test needs it to outlive its server")
+
+
+async def stop_server_bound_workers(connected: Any, results: Sequence[Any]) -> None:
+    """Stop worker session records, not the session handles other tools return."""
+    for result in results:
+        body = result.structured_content or {}
+        worker = body.get("session", {})
+        if isinstance(worker, Mapping) and worker.get("lifetime") == "server":
+            await connected.call_tool(
+                "hou_sessions", {"action": "stop", "session": worker["session_id"]}
+            )
+
+
 def stop_everything(home: Path, config: pool.PoolConfig) -> list[str]:
     """Stop every worker this state folder knows. Returns the ones that stayed."""
     if not pool.store_path(home).exists():
@@ -166,13 +212,15 @@ def run_children(
     barrier: bool = False,
     result_timeout_s: float = RESULT_TIMEOUT_S,
     join_timeout_s: float = JOIN_TIMEOUT_S,
+    before_join: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Start `count` spawned children and collect what each one reports.
 
     Every child is called as `target(*args, index, barrier, results)`, where
     the barrier is `None` when none was asked for. A child that reports an
     error fails the run, and anything still alive at the end is ended here, so
-    a child that hangs cannot hold up the suite.
+    a child that hangs cannot hold up the suite. `before_join` can check the
+    reports while the children still own their workers.
     """
     context = mp.get_context("spawn")
     results = context.Queue()
@@ -187,6 +235,8 @@ def run_children(
             child.start()
         for _ in children:
             collected.append(results.get(timeout=result_timeout_s))
+        if before_join is not None:
+            before_join(collected)
         for child in children:
             child.join(join_timeout_s)
     except queue_module.Empty:

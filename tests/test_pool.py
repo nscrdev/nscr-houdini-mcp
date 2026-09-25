@@ -9,6 +9,7 @@ one process.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -158,6 +159,19 @@ def test_a_worker_comes_up_and_records_what_it_is(
     assert record.pid_start is not None
     assert record.capabilities == CAPABILITIES
     assert record.weight == pool.WEIGHTS["light"]
+
+
+def test_a_worker_bound_to_its_server_records_that_lifetime(
+    config: pool.PoolConfig, store: Store, hython: Path
+) -> None:
+    launcher = FakeLauncher(config.home)
+
+    def spawn(command, *, log, env):
+        launched = launcher.spawn(command, log=log, env=env)
+        return pool.Launched(launched.pid, server_bound=True)
+
+    record = pool.start_worker(config, store, hython=hython, spawn=spawn, probe=launcher.probe)
+    assert record.capabilities["lifetime"] == "server"
 
 
 def test_the_worker_owns_its_own_slot_once_it_is_up(
@@ -343,6 +357,30 @@ def test_an_idle_worker_ends_itself_when_nobody_has_wanted_it(home: Path, hython
         assert store.get_worker(record.token).state == "stopping"
         pool.release_on_exit(home, record.token)
         assert store.get_worker(record.token).state == "stopped"
+
+
+@pytest.mark.parametrize("state", ["reserved", "starting"])
+def test_startup_does_not_spend_the_workers_idle_lease(home: Path, state: str) -> None:
+    clock = FakeClock()
+    with lease_store(home, clock) as store:
+        record = store.reserve_worker(cap=1, token="cold", start_budget_s=180)
+        store.set_worker_state(record.token, state)
+        clock.tick(90)
+        assert pool._lease_pass(store, record.token, max_idle_s=5, clock=clock) is None
+        store.set_worker_state(record.token, "running")
+        clock.tick(4)
+        assert pool._lease_pass(store, record.token, max_idle_s=5, clock=clock) is None
+        clock.tick(2)
+        assert pool._lease_pass(store, record.token, max_idle_s=5, clock=clock) == "idle"
+
+
+def test_an_unfinished_start_does_not_keep_a_worker_forever(home: Path) -> None:
+    clock = FakeClock()
+    with lease_store(home, clock) as store:
+        record = store.reserve_worker(cap=1, token="unfinished", start_budget_s=180)
+        store.set_worker_state(record.token, "starting")
+        clock.tick(181)
+        assert pool._lease_pass(store, record.token, max_idle_s=5, clock=clock) == "idle"
 
 
 def test_a_worker_on_a_job_is_never_idle(home: Path, hython: Path) -> None:
@@ -572,9 +610,36 @@ def test_the_command_says_what_is_not_a_secret(
     start(config, store, launcher, hython)
     command = launcher.commands[0]
     assert command[0] == str(hython)
-    assert command[1:3] == ["-m", pool.WORKER_MODULE]
+    if sys.platform == "win32":
+        assert command[1] == "-c"
+        assert pool.WORKER_MODULE in command[2]
+    else:
+        assert command[1:3] == ["-m", pool.WORKER_MODULE]
     assert command[command.index("--max-idle-s") + 1] == str(config.max_idle_s)
     assert command[command.index("--alias") + 1] == "w1"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows worker bootstrap")
+def test_a_worker_uses_its_servers_source_before_other_packages(
+    config: pool.PoolConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected, shadow = tmp_path / "selected", tmp_path / "shadow"
+    selected.mkdir()
+    shadow.mkdir()
+    (selected / "worker_source_test.py").write_text("print('selected')", encoding="utf-8")
+    (shadow / "worker_source_test.py").write_text("print('shadow')", encoding="utf-8")
+    monkeypatch.setattr(pool, "WORKER_MODULE", "worker_source_test")
+    monkeypatch.setattr(install_module, "python_path_for_run", lambda home: selected)
+    command = pool.worker_command(config, alias="w1", hython=Path(sys.executable))
+    result = subprocess.run(
+        command,
+        env={**os.environ, "PYTHONPATH": str(shadow)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "selected"
 
 
 def test_the_token_never_appears_on_the_command_line(
@@ -758,6 +823,18 @@ def test_a_worker_draws_offscreen_unless_its_shell_says_otherwise(
     assert pool.worker_env(config, base={})[pool.QT_PLATFORM_ENV_VAR] == "offscreen"
     kept = pool.worker_env(config, base={pool.QT_PLATFORM_ENV_VAR: "xcb"})
     assert kept[pool.QT_PLATFORM_ENV_VAR] == "xcb"
+
+
+@pytest.mark.parametrize("platform,expected", [("win32", "0"), ("darwin", None), ("linux", None)])
+def test_only_windows_workers_default_to_single_threaded_viewport_updates(
+    config: pool.PoolConfig, monkeypatch: pytest.MonkeyPatch, platform: str, expected: str | None
+) -> None:
+    with monkeypatch.context() as patch:
+        patch.setattr(pool.sys, "platform", platform)
+        given = pool.worker_env(config, base={})
+        kept = pool.worker_env(config, base={pool.VULKAN_VIEWER_THREADING_ENV_VAR: "1"})
+    assert given.get(pool.VULKAN_VIEWER_THREADING_ENV_VAR) == expected
+    assert kept[pool.VULKAN_VIEWER_THREADING_ENV_VAR] == "1"
 
 
 def test_a_heavy_worker_is_given_the_machine(home: Path, store: Store, hython: Path) -> None:

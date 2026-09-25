@@ -14,6 +14,8 @@ reader clears those before handing any of them back.
 from __future__ import annotations
 
 import json
+import sys
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,9 @@ from nscr_houdini_mcp.bridge import liveness
 from nscr_houdini_mcp.bridge.security import private_dir, write_private
 
 REGISTRY_DIR_NAME = "sessions"
+REMOVE_TIMEOUT_S = 1.0
+ERROR_SHARING_VIOLATION = 32
+ERROR_LOCK_VIOLATION = 33
 
 
 def registry_dir(home: Path) -> Path:
@@ -47,8 +52,27 @@ def read_entry(path: Path) -> dict[str, Any]:
 
 
 def remove_entry(home: Path, session_id: str) -> None:
-    """Delete one session file. A missing file is already the wanted state."""
-    entry_path(home, session_id).unlink(missing_ok=True)
+    """Delete a session file, briefly waiting for Windows readers to release it."""
+    path = entry_path(home, session_id)
+    deadline = time.monotonic() + REMOVE_TIMEOUT_S
+    delay = 0.01
+    while True:
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except OSError as error:
+            remaining = deadline - time.monotonic()
+            if (
+                sys.platform != "win32"
+                or getattr(error, "winerror", None)
+                not in (ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION)
+                or remaining <= 0
+            ):
+                raise
+            time.sleep(min(delay, remaining))
+            if time.monotonic() >= deadline:
+                raise
+            delay = min(delay * 2, 0.1)
 
 
 def list_entries(home: Path) -> list[dict[str, Any]]:

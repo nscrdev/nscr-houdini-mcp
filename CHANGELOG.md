@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Windows
+
+- Runs against a real Houdini 22 on Windows 11, with GUI sessions and hython
+  workers.
+- A worker leaves the client's process group when Windows allows it, and
+  outlives its server as on macOS and Linux. When Windows does not allow it,
+  the worker lives as long as its server, reports `lifetime: server`, and a
+  warning says so.
+- The server finds Houdini on the system drive when a client starts it
+  without `ProgramFiles` set.
+- Repeated viewport captures in a worker no longer crash Houdini's Vulkan
+  viewport, and the pictures keep their materials.
+- A store or registry file that Windows still holds open for a moment is
+  tried again briefly, instead of failing or being left behind.
+
 ## 0.1.0
 
 The first release: an MCP server for SideFX Houdini 22, the bridge that runs

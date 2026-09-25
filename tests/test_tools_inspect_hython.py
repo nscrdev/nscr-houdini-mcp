@@ -108,7 +108,7 @@ hou.hipFile.save(sys.argv[1])
 
 
 @pytest.fixture(scope="module")
-def place(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Path]]:
+def place(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Any]]:
     """A state folder with a config of its own, cleared of workers at the end."""
     root = tmp_path_factory.mktemp("inspect")
     home = root / "home"
@@ -120,18 +120,21 @@ def place(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Path]]
     (home / "config.toml").write_text(
         f"pool_cap = 1\nworker_ports = [{PORT_RANGE[0]}, {PORT_RANGE[1]}]\n", encoding="utf-8"
     )
-    try:
-        yield {"home": home, "scratch": scratch, "scenes": scenes, "root": root}
-    finally:
-        left = support.stop_everything(home, pool.PoolConfig(home=home))
-        assert left == [], f"workers were left running: {left}"
-        with pool.open_store(home) as store:
-            for worker in store.list_workers(active_only=False):
-                assert worker.pid is None or not pool.worker_is_alive(worker), worker.alias
-        assert registry.live_entries(home) == []
+    made = {"home": home, "scratch": scratch, "scenes": scenes, "root": root}
+    with support.persistent_client(server_params(made), timeout_s=READ_TIMEOUT_S) as send:
+        made["send"] = send
+        try:
+            yield made
+        finally:
+            left = support.stop_everything(home, pool.PoolConfig(home=home))
+            assert left == [], f"workers were left running: {left}"
+            with pool.open_store(home) as store:
+                for worker in store.list_workers(active_only=False):
+                    assert worker.pid is None or not pool.worker_is_alive(worker), worker.alias
+            assert registry.live_entries(home) == []
 
 
-def build_scene(place: dict[str, Path]) -> Path:
+def build_scene(place: dict[str, Any]) -> Path:
     """Build the network in a hython of its own, which has ended when this returns."""
     script = place["root"] / "build_scene.py"
     script.write_text(BUILD.format(filler=FILLER), encoding="utf-8")
@@ -149,7 +152,7 @@ def build_scene(place: dict[str, Path]) -> Path:
     return hip
 
 
-def server_params(place: dict[str, Path]) -> StdioServerParameters:
+def server_params(place: dict[str, Any]) -> StdioServerParameters:
     return StdioServerParameters(
         command=sys.executable,
         args=["-c", SERVER_CODE],
@@ -161,14 +164,18 @@ def server_params(place: dict[str, Path]) -> StdioServerParameters:
     )
 
 
-async def _run(place: dict[str, Path], calls: list[tuple[str, dict]]) -> list[Any]:
+async def _run(place: dict[str, Any], calls: list[tuple[str, dict]]) -> list[Any]:
     async with Client(
         server_params(place), mode="auto", read_timeout_seconds=READ_TIMEOUT_S
     ) as connected:
-        return [await connected.call_tool(name, arguments) for name, arguments in calls]
+        results = [await connected.call_tool(name, arguments) for name, arguments in calls]
+        await support.stop_server_bound_workers(connected, results)
+        return results
 
 
-def run(place: dict[str, Path], *calls: tuple[str, dict]) -> list[Any]:
+def run(place: dict[str, Any], *calls: tuple[str, dict]) -> list[Any]:
+    if place.get("send") is not None:
+        return place["send"](*calls)
     return asyncio.run(_run(place, list(calls)))
 
 
@@ -201,7 +208,7 @@ def rows_of(result: Any) -> dict[str, dict[str, dict[str, Any]]]:
     }
 
 
-def test_reads_against_a_real_worker(place: dict[str, Path]) -> None:
+def test_reads_against_a_real_worker(place: dict[str, Any]) -> None:
     hip = build_scene(place)
 
     started, opened, before = run(
@@ -211,7 +218,7 @@ def test_reads_against_a_real_worker(place: dict[str, Path]) -> None:
         COUNT,
     )
     session_id = ok(started)["session"]["session_id"]
-    assert ok(opened)["hip_path"] == str(hip)
+    assert ok(opened)["hip_path"] == hip.as_posix()
 
     # No read without evaluate cooks, at any level, whatever the values hold.
     summary, tree, standard, full, parms, risky, after = run(

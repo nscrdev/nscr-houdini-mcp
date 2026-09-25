@@ -3,8 +3,8 @@
 An MCP server and a small set of agent skills for SideFX Houdini 22.
 
 Status: 0.1.0, the first release. The eleven tools described below work
-against a real Houdini 22 on macOS; see [Tested on](#tested-on) for what has
-and has not been run where. Names and arguments may still change before 1.0,
+against a real Houdini 22 on macOS and Windows; see [Tested on](#tested-on)
+for what has and has not been run where. Names and arguments may still change before 1.0,
 and [CHANGELOG.md](CHANGELOG.md) says what changed.
 
 ## Goals
@@ -22,9 +22,11 @@ and [CHANGELOG.md](CHANGELOG.md) says what changed.
 - macOS on Apple silicon (arm64), with Houdini 22.0.368 and 22.0.429: the unit
   tests, the tests that start a real hython, and GUI sessions driven through
   one MCP client.
-- Windows and Linux: the unit tests run in CI, on Python 3.11 and 3.13, for
-  every push to main and every pull request. Neither has been run against a
-  real Houdini yet, so treat Houdini on either as untried.
+- Windows 11 (x64), with Houdini 22.0.368: the unit tests, the tests that
+  start a real hython, and GUI sessions driven through one MCP client.
+- Linux: the unit tests run in CI, on Python 3.11 and 3.13, for every push to
+  main and every pull request, as they do on Windows. It has not been run
+  against a real Houdini yet, so treat Houdini on Linux as untried.
 
 ## Quick start
 
@@ -651,6 +653,12 @@ moment do not both write them. A viewport sequence goes a few frames at a
 time, so it can be stopped between them, and its job row names each run and
 the frames written so far.
 
+On Windows, a headless capture renders an empty one-pixel frame before removing
+its temporary flipbook node. This avoids the Vulkan material-binding crash seen
+on subsequent captures in Houdini 22.0.368. Materials and textures stay enabled
+in the requested images. The cost is one extra GPU draw and temporary PNG write
+per render-node capture; the cleanup PNG is deleted and is not published.
+
 `views: quad` captures persp, top, front and right, `turntable4` four orbits
 a quarter turn apart, and both add a two by two contact sheet, which is then
 `path`. `region` crops each saved image to `[x0, y0, x1, y1]`, fractions from
@@ -879,12 +887,13 @@ machine is busy even when a slot is free.
 
 A worker does not belong to the process that started it. It is started
 detached, with its output in `logs/worker-<name>.log` under the state folder,
-and it stays when its server exits, so a client restart does not throw the
-warm pool away. The log is private to its owner and is rolled over when it
-grows, keeping the last two. What ends a worker is its lease: it watches its
-own row and goes when a server asks it to, or when nobody has wanted it for
-half an hour. Routing a call to it renews the lease, and a worker running a
-call or a job is never idle, however long the work takes and whether or not
+and it stays when its server exits, except in the Windows case below, so a
+client restart normally keeps the warm pool. The log is private to its
+owner and is rolled over when it grows, keeping the last two. What ends a
+worker is its lease: it watches its own row and goes when a server asks
+it to, or when nobody has wanted it for half an hour. Routing a call to it
+renews the lease, and a worker running a call or a job is never idle,
+however long the work takes and whether or not
 anybody routes to it meanwhile. `stop` asks first and
 ends the process itself only if the ask was not enough, and never unless that
 process can be shown to still be the worker. `start` exits 3 when the pool is
@@ -899,8 +908,11 @@ which every account on the machine can read, and its thread cap is either the
 one you named with `--max-threads` or the one the weight implies: a heavy
 worker gets the machine, a light one is left at Houdini's own default.
 
-The Windows side of this, the detached start, the kill and the start stamp,
-is written and read but has not been run on Windows yet.
+On Windows, some clients do not let a worker run independently. Such a
+worker reports `lifetime: server`. Closing or restarting the client then
+ends the worker, interrupts its jobs and loses unsaved changes in that
+worker, so save first. It shows as `crashed` in `hou_sessions` list
+afterwards; that means the client ended it, not that Houdini crashed.
 
 Each worker is asked once, when it comes up, what it can do: the build, the
 license it got, the renderers that are really installed, how it can make a

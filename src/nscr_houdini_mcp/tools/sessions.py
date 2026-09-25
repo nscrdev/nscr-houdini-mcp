@@ -272,6 +272,8 @@ def session_row(
     if worker is not None:
         row["job"] = worker.job_id
         row["lease_age_s"] = round(max(0.0, now - worker.leased_at), 1)
+        if isinstance(worker.capabilities, Mapping) and worker.capabilities.get("lifetime"):
+            row["lifetime"] = worker.capabilities["lifetime"]
     if state in ("gone", "crashed"):
         row["ended_at"] = record.heartbeat_at
     if not full:
@@ -664,7 +666,8 @@ HOU_SESSIONS = ToolSpec(
     description=(
         "List sessions, or start and stop hython workers. state: live, busy, unresponsive, "
         "crashed, gone. A session_id lasts until its process exits; an alias like w1 may later "
-        "name a new one. stop never closes a GUI Houdini."
+        "name a new one. lifetime: server means that worker ends when this server does. "
+        "stop never closes a GUI Houdini."
     ),
     input_schema=inputs(
         {

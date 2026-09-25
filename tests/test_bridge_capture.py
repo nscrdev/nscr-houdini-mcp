@@ -175,6 +175,65 @@ def test_the_viewport_in_hython_is_a_fitted_camera_through_the_flipbook_rop(
     assert said["unsaved_hip"] is False
 
 
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+@pytest.mark.parametrize("kind", ["hython", "gui"])
+def test_only_windows_workers_release_rop_materials_before_removing_the_node(
+    scene: Scene, home: Path, monkeypatch: pytest.MonkeyPatch, platform: str, kind: str
+) -> None:
+    monkeypatch.setattr(capture, "sys", SimpleNamespace(platform=platform))
+    if kind == "gui":
+        gui_without_viewer(scene)
+    said = take(scene, home, kind=kind, frames=[1, 3, 1], resolution=[64, 64])
+    assert [seen["frame"] for seen in scene.capture.seen] == [1, 2, 3]
+    if platform == "win32" and kind == "hython":
+        [cleanup] = scene.capture.cleanups
+        assert cleanup["size"] == (1, 1)
+        assert cleanup["frame"] == 3
+        assert cleanup["vobjects"] == cleanup["forceobjects"] == ""
+        assert cleanup["displayed"] == {}
+        assert cleanup["undo_enabled"] is False
+        assert "$F4" not in cleanup["picture"]
+        assert not Path(cleanup["picture"]).exists()
+    else:
+        assert scene.capture.cleanups == []
+    assert len(said["views"][0]["files"]) == 3
+    assert names(scene, "/out") == []
+    assert names(scene, "/obj") == ["boxgeo"]
+    assert scene.undos.undoLabels() == []
+
+
+def test_a_material_release_failure_does_not_prevent_other_cleanup(
+    scene: Scene, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(capture, "sys", SimpleNamespace(platform="win32"))
+
+    def fail_cleanup(frame: float) -> None:
+        if scene.capture.cleanups:
+            raise OperationFailed("material release failed")
+
+    scene.capture.after_frame = fail_cleanup
+    error = refused(scene, home)
+    assert error.code == "CLEANUP_FAILED"
+    assert "material release failed" in str(error.details)
+    [cleanup] = scene.capture.cleanups
+    assert not Path(cleanup["picture"]).exists()
+    assert names(scene, "/out") == []
+    assert names(scene, "/obj") == ["boxgeo"]
+
+
+def test_material_release_is_attempted_after_a_render_raises(
+    scene: Scene, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(capture, "sys", SimpleNamespace(platform="win32"))
+    scene.capture.fail_at_frame = 1
+    refused(scene, home, frame=1)
+    [cleanup] = scene.capture.cleanups
+    assert cleanup["frame"] == 1
+    assert not Path(cleanup["picture"]).exists()
+    assert names(scene, "/out") == []
+    assert names(scene, "/obj") == ["boxgeo"]
+
+
 def camera_state(camera: Any) -> list[tuple[Any, ...]]:
     return [
         (parm.name(), parm.value, parm._expression, tuple(parm.keys), parm.locked)
@@ -1312,7 +1371,9 @@ def test_clean_up_that_fails_beside_a_failed_render_is_in_its_details(
     scene.capture.fail_at_frame = 1.0
     error = refused(scene, home)
     assert error.code == "CAPTURE_FAILED"
-    assert error.details["cleanup"][0]["step"] == "take away /out/nscr_capture"
+    steps = [step["step"] for step in error.details["cleanup"]]
+    expected = ["release viewport material bindings"] if capture.sys.platform == "win32" else []
+    assert steps == [*expected, "take away /out/nscr_capture"]
 
 
 def test_a_view_that_will_not_go_back_is_cleanup_failed_and_the_rest_goes_back(
@@ -1397,5 +1458,7 @@ def test_the_job_row_names_the_run_and_each_frame_as_it_goes(scene: Scene, home:
     assert dispatcher.dispatch(envelope).payload["ok"] is True
     runs = [row["capture"]["runs"][0] for row in rows]
     assert all(run["run_id"].startswith("run-") and "$F4" in run["path"] for run in runs)
-    assert [len(run["files"]) for run in runs] == [0, 1, 2]
-    assert [row["capture"]["frames_done"] for row in rows] == [0, 1, 2]
+    expected = [0, 1, 2, 3] if capture.sys.platform == "win32" else [0, 1, 2]
+    assert [len(run["files"]) for run in runs] == expected
+    assert [row["capture"]["frames_done"] for row in rows] == expected
+    assert all(not path.endswith(".cleanup.png") for run in runs for path in run["files"])
