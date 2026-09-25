@@ -883,9 +883,16 @@ def _lease_pass(
         # about to exit: the worker releases it then, or whoever stops it
         # does once the process has gone, or the reaper.
         return "asked"
+    now = clock()
+    if (
+        record.state in store_module.WORKER_STARTING_STATES
+        and record.start_deadline is not None
+        and now < record.start_deadline
+    ):
+        return None
     # A clock that stepped backwards must not make a worker look fresh or
     # old, so the age is never negative.
-    idle_for = max(0.0, clock() - record.leased_at)
+    idle_for = max(0.0, now - record.leased_at)
     if busy is not None and busy():
         return None
     if record.job_id is None and max_idle_s > 0 and idle_for >= max_idle_s:

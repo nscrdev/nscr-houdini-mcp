@@ -358,6 +358,30 @@ def test_an_idle_worker_ends_itself_when_nobody_has_wanted_it(home: Path, hython
         assert store.get_worker(record.token).state == "stopped"
 
 
+@pytest.mark.parametrize("state", ["reserved", "starting"])
+def test_startup_does_not_spend_the_workers_idle_lease(home: Path, state: str) -> None:
+    clock = FakeClock()
+    with lease_store(home, clock) as store:
+        record = store.reserve_worker(cap=1, token="cold", start_budget_s=180)
+        store.set_worker_state(record.token, state)
+        clock.tick(90)
+        assert pool._lease_pass(store, record.token, max_idle_s=5, clock=clock) is None
+        store.set_worker_state(record.token, "running")
+        clock.tick(4)
+        assert pool._lease_pass(store, record.token, max_idle_s=5, clock=clock) is None
+        clock.tick(2)
+        assert pool._lease_pass(store, record.token, max_idle_s=5, clock=clock) == "idle"
+
+
+def test_an_unfinished_start_does_not_keep_a_worker_forever(home: Path) -> None:
+    clock = FakeClock()
+    with lease_store(home, clock) as store:
+        record = store.reserve_worker(cap=1, token="unfinished", start_budget_s=180)
+        store.set_worker_state(record.token, "starting")
+        clock.tick(181)
+        assert pool._lease_pass(store, record.token, max_idle_s=5, clock=clock) == "idle"
+
+
 def test_a_worker_on_a_job_is_never_idle(home: Path, hython: Path) -> None:
     clock = FakeClock()
     with lease_store(home, clock) as store:
