@@ -1373,8 +1373,11 @@ def install_roots() -> list[Path]:
         )
         roots: list[Path] = []
         for base in bases:
-            if base and Path(base) / "Side Effects Software" not in roots:
-                roots.append(Path(base) / "Side Effects Software")
+            if not base:
+                continue
+            root = Path(base) / "Side Effects Software"
+            if root not in roots:
+                roots.append(root)
         return roots
     return [Path("/opt")]
 
