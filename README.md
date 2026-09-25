@@ -867,12 +867,13 @@ machine is busy even when a slot is free.
 
 A worker does not belong to the process that started it. It is started
 detached, with its output in `logs/worker-<name>.log` under the state folder,
-and it stays when its server exits, so a client restart does not throw the
-warm pool away. The log is private to its owner and is rolled over when it
-grows, keeping the last two. What ends a worker is its lease: it watches its
-own row and goes when a server asks it to, or when nobody has wanted it for
-half an hour. Routing a call to it renews the lease, and a worker running a
-call or a job is never idle, however long the work takes and whether or not
+and it stays when its server exits, except in the Windows case below, so a
+client restart normally keeps the warm pool. The log is private to its
+owner and is rolled over when it grows, keeping the last two. What ends a
+worker is its lease: it watches its own row and goes when a server asks
+it to, or when nobody has wanted it for half an hour. Routing a call to it
+renews the lease, and a worker running a call or a job is never idle,
+however long the work takes and whether or not
 anybody routes to it meanwhile. `stop` asks first and
 ends the process itself only if the ask was not enough, and never unless that
 process can be shown to still be the worker. `start` exits 3 when the pool is
@@ -887,8 +888,11 @@ which every account on the machine can read, and its thread cap is either the
 one you named with `--max-threads` or the one the weight implies: a heavy
 worker gets the machine, a light one is left at Houdini's own default.
 
-On Windows, a worker stays with its server if the client's process job refuses breakaway,
-and its session reports `lifetime: server`.
+On Windows, some clients do not let a worker run independently. Such a
+worker reports `lifetime: server`. Closing or restarting the client then
+ends the worker, interrupts its jobs and loses unsaved changes in that
+worker, so save first. It shows as `crashed` in `hou_sessions` list
+afterwards; that means the client ended it, not that Houdini crashed.
 
 Each worker is asked once, when it comes up, what it can do: the build, the
 license it got, the renderers that are really installed, how it can make a

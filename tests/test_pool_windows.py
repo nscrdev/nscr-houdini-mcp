@@ -77,7 +77,8 @@ def test_a_worker_breaks_away_or_stays_with_its_launchers_job(
         assert "spaces and café" in log.read_text(encoding="utf-8")
         _, messages = launcher.communicate("stop\n", timeout=30)
         assert launcher.returncode == 0
-        assert messages.count("Windows refused worker breakaway") == int(not breakaway)
+        assert messages.count("ends when this server ends") == int(not breakaway)
+        assert ("WARNING:nscr_houdini_mcp.pool:" in messages) is not breakaway
         job.Close()
         expected = win32con.WAIT_TIMEOUT if breakaway else win32con.WAIT_OBJECT_0
         assert win32event.WaitForSingleObject(worker, 1000) == expected

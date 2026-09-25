@@ -666,7 +666,8 @@ HOU_SESSIONS = ToolSpec(
     description=(
         "List sessions, or start and stop hython workers. state: live, busy, unresponsive, "
         "crashed, gone. A session_id lasts until its process exits; an alias like w1 may later "
-        "name a new one. stop never closes a GUI Houdini."
+        "name a new one. lifetime: server means that worker ends when this server does. "
+        "stop never closes a GUI Houdini."
     ),
     input_schema=inputs(
         {

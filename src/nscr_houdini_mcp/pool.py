@@ -53,6 +53,8 @@ from nscr_houdini_mcp.store import (
     same_process,
 )
 
+log = logging.getLogger(__name__)
+
 # The path to hython, when the machine is not to be searched.
 HYTHON_ENV_VAR = "NSCR_MCP_HYTHON"
 
@@ -427,15 +429,16 @@ def spawn_detached(
                 _windows_in_job(os.getpid()) and _windows_in_job(process.pid)
             )
         if server_bound:
-            logging.getLogger(__name__).info(
-                "Windows refused worker breakaway; worker %s will end with its server",
-                process.pid,
-            )
+            _warn_server_bound(process.pid)
     finally:
         # The child holds its own handle on the file from here on.
         handle.close()
     _STARTED.append(process)
     return Launched(process.pid, process.poll, process.kill, process.wait, server_bound)
+
+
+def _warn_server_bound(pid: int) -> None:
+    log.warning("Windows worker %s ends when this server ends", pid)
 
 
 def _windows_in_job(pid: int) -> bool:
