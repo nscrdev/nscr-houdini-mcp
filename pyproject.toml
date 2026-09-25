@@ -31,6 +31,8 @@ dev = [
     # Only for scripts/tools_list_cost.py, which counts with a real tokenizer
     # when this imports and falls back to an estimate when it does not.
     "tiktoken>=0.7",
+    # Only for tests that create and inspect Windows process jobs.
+    "pywin32>=306,<313 ; sys_platform == 'win32'",
 ]
 
 [tool.hatch.build.targets.wheel]

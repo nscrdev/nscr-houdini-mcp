@@ -1,3 +1,5 @@
+"""Worker lifetime and cleanup against real Windows process jobs."""
+
 import json
 import os
 import subprocess
@@ -7,6 +9,8 @@ from pathlib import Path
 import pytest
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows process jobs")
+
+# sys._base_executable avoids the venv redirector, whose child has a different pid.
 
 
 @pytest.mark.parametrize("opened", [False, True])
@@ -51,11 +55,11 @@ def test_unknown_job_membership_keeps_the_worker_server_bound(tmp_path, monkeypa
 def test_a_worker_breaks_away_or_stays_with_its_launchers_job(
     tmp_path: Path, breakaway: bool
 ) -> None:
-    import win32api
-    import win32con
-    import win32event
-    import win32job
-    import win32process
+    win32api = pytest.importorskip("win32api")
+    win32con = pytest.importorskip("win32con")
+    win32event = pytest.importorskip("win32event")
+    win32job = pytest.importorskip("win32job")
+    win32process = pytest.importorskip("win32process")
 
     script = tmp_path / "launcher.py"
     script.write_text(
@@ -104,12 +108,12 @@ def test_a_worker_breaks_away_or_stays_with_its_launchers_job(
         line = launcher.stdout.readline()
         assert line, launcher.stderr.read()
         report = json.loads(line)
-        assert report["server_bound"] is not breakaway
         worker = win32api.OpenProcess(
             win32con.SYNCHRONIZE | win32con.PROCESS_TERMINATE | win32con.PROCESS_QUERY_INFORMATION,
             False,
             report["pid"],
         )
+        assert report["server_bound"] is not breakaway
         assert win32event.WaitForSingleObject(worker, 1000) == win32con.WAIT_TIMEOUT
         assert win32job.IsProcessInJob(worker, None) is not breakaway
         assert "spaces and café" in log.read_text(encoding="utf-8")
@@ -121,12 +125,16 @@ def test_a_worker_breaks_away_or_stays_with_its_launchers_job(
         expected = win32con.WAIT_TIMEOUT if breakaway else win32con.WAIT_OBJECT_0
         assert win32event.WaitForSingleObject(worker, 1000) == expected
     finally:
-        if launcher.poll() is None:
-            launcher.kill()
-        launcher.wait(timeout=30)
-        job.Close()
-        if worker is not None:
-            if win32event.WaitForSingleObject(worker, 0) == win32con.WAIT_TIMEOUT:
-                win32process.TerminateProcess(worker, 1)
-            assert win32event.WaitForSingleObject(worker, 10000) == win32con.WAIT_OBJECT_0
-            worker.Close()
+        try:
+            if launcher.poll() is None:
+                launcher.kill()
+            launcher.wait(timeout=30)
+        finally:
+            job.Close()
+            if worker is not None:
+                try:
+                    if win32event.WaitForSingleObject(worker, 0) == win32con.WAIT_TIMEOUT:
+                        win32process.TerminateProcess(worker, 1)
+                    assert win32event.WaitForSingleObject(worker, 10000) == win32con.WAIT_OBJECT_0
+                finally:
+                    worker.Close()
