@@ -275,6 +275,38 @@ def test_sessions_and_scene_files_through_a_real_worker(place: dict[str, Path]) 
     shutil.rmtree(folder, ignore_errors=True)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows job shutdown")
+def test_the_store_reopens_after_a_server_bound_worker_is_killed(tmp_path: Path) -> None:
+    home, scratch = tmp_path / "home", tmp_path / "scratch"
+    home.mkdir()
+    scratch.mkdir()
+    (home / "config.toml").write_text(
+        f"pool_cap = 1\nworker_ports = [{PORT_RANGE[0]}, {PORT_RANGE[1]}]\n", encoding="utf-8"
+    )
+
+    async def start_and_leave() -> dict[str, Any]:
+        async with Client(
+            server_params({"home": home, "scratch": scratch}),
+            mode="auto",
+            read_timeout_seconds=READ_TIMEOUT_S,
+        ) as connected:
+            return ok(await connected.call_tool("hou_sessions", {"action": "start"}))["session"]
+
+    worker = asyncio.run(start_and_leave())
+    try:
+        if worker.get("lifetime") != "server":
+            pytest.skip("this client permits worker breakaway")
+        support.wait_until(lambda: not pool.process_is_alive(worker["pid"]), timeout_s=30)
+        with pool.open_store(home) as store:
+            assert store._conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            store.reclaim_workers()
+            record = store.reserve_worker(cap=1, token="after-hard-shutdown")
+            store.release_worker(record.token)
+    finally:
+        if pool.process_is_alive(worker["pid"]):
+            assert support.stop_everything(home, pool.PoolConfig(home=home)) == []
+
+
 def _busy(home: Path, session_id: str) -> bool:
     try:
         session = client.Session.open(home, session_id)

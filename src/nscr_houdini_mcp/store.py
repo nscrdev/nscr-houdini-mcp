@@ -1241,7 +1241,14 @@ class Store:
             try:
                 return action()
             except (sqlite3.OperationalError, StoreBusy) as error:
-                if isinstance(error, sqlite3.OperationalError) and not _is_busy(error):
+                if isinstance(error, sqlite3.OperationalError) and not (
+                    _is_busy(error)
+                    or (
+                        sys.platform == "win32"
+                        and getattr(error, "sqlite_errorcode", None)
+                        == sqlite3.SQLITE_IOERR_TRUNCATE
+                    )
+                ):
                     raise _translate(error) from error
                 if time.monotonic() >= deadline:
                     raise StoreBusy(f"{self.path} stayed locked by other processes") from error

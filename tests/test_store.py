@@ -158,6 +158,51 @@ def test_a_blocked_start_leaves_the_handle_usable(tmp_path) -> None:
         assert [s.session_id for s in waiter.list_sessions()] == ["s1", "s2"]
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows WAL handle cleanup")
+def test_open_waits_for_a_wal_file_that_is_still_being_closed(store: Store) -> None:
+    attempts = 0
+
+    def read():
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            error = sqlite3.OperationalError("disk I/O error")
+            error.sqlite_errorcode = sqlite3.SQLITE_IOERR_TRUNCATE
+            raise error
+        return store._conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+
+    assert store._retry_while_busy(read) == "wal"
+    assert attempts == 3
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows WAL handle cleanup")
+def test_waiting_for_wal_cleanup_has_a_deadline(tmp_path: Path) -> None:
+    def read():
+        error = sqlite3.OperationalError("disk I/O error")
+        error.sqlite_errorcode = sqlite3.SQLITE_IOERR_TRUNCATE
+        raise error
+
+    with Store(tmp_path / "coord.sqlite", busy_timeout_s=0) as store:
+        with pytest.raises(StoreBusy):
+            store._retry_while_busy(read)
+
+
+@pytest.mark.parametrize("code", [sqlite3.SQLITE_IOERR_READ, sqlite3.SQLITE_IOERR_WRITE])
+def test_other_io_errors_are_not_retried(store: Store, code: int) -> None:
+    attempts = 0
+
+    def read():
+        nonlocal attempts
+        attempts += 1
+        error = sqlite3.OperationalError("disk I/O error")
+        error.sqlite_errorcode = code
+        raise error
+
+    with pytest.raises(StoreError):
+        store._retry_while_busy(read)
+    assert attempts == 1
+
+
 def test_a_duplicate_id_comes_back_as_a_store_error(store: Store) -> None:
     store.register_session("s1", kind="gui", pid=1, alias="scene-1")
     store.end_session("s1")
