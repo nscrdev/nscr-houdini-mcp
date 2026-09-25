@@ -67,3 +67,32 @@ def test_no_version_is_pinned_so_each_commit_is_an_update() -> None:
     # A version string here would hold every install at it until it is bumped.
     assert "version" not in load(PLUGIN)
     assert all("version" not in entry for entry in load(MARKETPLACE)["plugins"])
+
+
+# A second client reads its own manifest, in a folder named for it, and the
+# marketplace above. The server sits inline in that manifest, so no
+# `.mcp.json` at the repo root starts a second copy in a client that reads one.
+SECOND = ROOT / ".codex-plugin" / "plugin.json"  # lint-allow: client-names
+
+
+def test_the_second_manifest_matches_the_first() -> None:
+    second = load(SECOND)
+    assert second["name"] == load(PLUGIN)["name"]
+    assert (ROOT / second["skills"]).resolve() == ROOT / "skills"
+    assert "version" not in second
+    assert not (ROOT / ".mcp.json").exists()
+
+
+def test_the_second_manifest_starts_the_same_entry_point() -> None:
+    servers = load(SECOND)["mcpServers"]
+    assert len(servers) == 1
+    (server,) = servers.values()
+    # This client keeps one folder across updates, and `uvx` keeps its first
+    # build for a folder, so the server runs through `uv run`, which rebuilds
+    # when the files change. A relative working folder is the plugin root.
+    assert server["command"] == "uv"
+    assert server["cwd"] == "."
+    args = server["args"]
+    assert args[:4] == ["run", "--no-dev", "--directory", "."]
+    assert args[4] in entry_points()
+    assert args[5:] == []

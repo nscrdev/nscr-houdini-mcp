@@ -129,6 +129,29 @@ Quick start is not needed.
    <!-- lint-allow: client-names -->
    `claude plugin update nscr-houdini@nscr-houdini-mcp`.
 
+<!-- lint-allow: client-names -->
+The ChatGPT desktop app and the `codex` CLI read the same marketplace:
+
+1. Add it and install the plugin from a shell:
+
+   ```sh
+   # lint-allow: client-names
+   codex plugin marketplace add nscrdev/nscr-houdini-mcp
+   # lint-allow: client-names
+   codex plugin add nscr-houdini@nscr-houdini-mcp
+   ```
+
+   After that the app lists it under Plugins, as `nscr Houdini`.
+
+2. Install the Houdini side once, as in step 2 above.
+
+3. Updates are on. Each time the app or the CLI starts, it checks this
+   repository for a new commit and reinstalls the plugin when there is one.
+   The server rebuilds from the new files the next time it starts. An app
+   left open does not check again until it restarts. To update by hand:
+   <!-- lint-allow: client-names -->
+   `codex plugin marketplace upgrade nscr-houdini-mcp`.
+
 Every other client keeps the Quick start install. If you also added the
 server by hand, remove that entry, or the agent sees two copies of every tool.
 
