@@ -176,6 +176,87 @@ def framed(path: str) -> None:
     assert left > 0 and top > 0 and right < width and bottom < height
 
 
+@pytest.mark.parametrize("update_mode", ["AutoUpdate", "Manual"])
+def test_a_changing_scene_writes_different_sequence_frames(
+    tmp_path: Path, update_mode: str
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    scratch = tmp_path / "houdini-temp"
+    scratch.mkdir()
+    (home / "config.toml").write_text(
+        f"pool_cap = 1\nworker_ports = [{PORT_RANGE[0]}, {PORT_RANGE[1]}]\n", encoding="utf-8"
+    )
+    place = {"home": home, "scratch": scratch}
+    hip = tmp_path / "moving.hip"
+
+    async def capture() -> dict[str, Any]:
+        async with Client(
+            server_params(place), mode="auto", read_timeout_seconds=READ_TIMEOUT_S
+        ) as connected:
+            worker = ok(await connected.call_tool("hou_sessions", {"action": "start"}))["session"]
+            try:
+                built = ok(
+                    await connected.call_tool(
+                        "hou_python",
+                        {
+                            "code": (
+                                "geo = hou.node('/obj').createNode('geo', 'moving')\n"
+                                "box = geo.createNode('box')\n"
+                                "box.parmTuple('size').set((1, 2, 3))\n"
+                                "turn = geo.createNode('xform')\n"
+                                "turn.setInput(0, box)\n"
+                                "turn.parm('ry').setExpression('$F*3')\n"
+                                "turn.setDisplayFlag(True)\n"
+                                "turn.setRenderFlag(True)\n"
+                                "hou.setFrame(7)\n"
+                                f"hou.hipFile.save({str(hip)!r})\n"
+                                "result = [list(turn.geometryAtFrame(f).points()[0].position()) "
+                                "for f in (1, 12, 23)]\n"
+                                f"hou.setUpdateMode(hou.updateMode.{update_mode})"
+                            )
+                        },
+                    )
+                )
+                assert len({tuple(point) for point in built["result"]}) == 3
+                result = ok(
+                    await connected.call_tool(
+                        "hou_capture",
+                        {
+                            "source": "viewport",
+                            "camera": "front",
+                            "frames": [1, 23, 11],
+                            "resolution": [320, 180],
+                            "return_image": "none",
+                        },
+                    )
+                )
+                frame = ok(
+                    await connected.call_tool("hou_python", {"code": "result = hou.frame()"})
+                )
+                assert frame["result"] == 7
+                return result
+            finally:
+                await connected.call_tool(
+                    "hou_sessions", {"action": "stop", "session": worker["session_id"]}
+                )
+
+    try:
+        body = asyncio.run(capture())
+    finally:
+        assert support.stop_everything(home, pool.PoolConfig(home=home)) == []
+    assert len(body["paths"]) == 3
+    pixels = []
+    for path in body["paths"]:
+        with Image.open(path) as image:
+            pixels.append(image.convert("RGBA").tobytes())
+    differences = [
+        sum(a != b for a, b in zip(pixels[0], other, strict=True)) for other in pixels[1:]
+    ]
+    print({"paths": body["paths"], "different_channel_values": differences})
+    assert all(count > 100 for count in differences), differences
+
+
 def test_a_fresh_worker_s_first_capture_is_a_framed_sequence(place: dict[str, Any]) -> None:
     """Run first: a worker that has captured nothing yet, asked for frames."""
     [platform, sequence] = run(
