@@ -832,9 +832,9 @@ def test_only_windows_workers_default_to_single_threaded_viewport_updates(
     with monkeypatch.context() as patch:
         patch.setattr(pool.sys, "platform", platform)
         given = pool.worker_env(config, base={})
-        kept = pool.worker_env(config, base={pool.VULKAN_THREADS_ENV_VAR: "1"})
-    assert given.get(pool.VULKAN_THREADS_ENV_VAR) == expected
-    assert kept[pool.VULKAN_THREADS_ENV_VAR] == "1"
+        kept = pool.worker_env(config, base={pool.VULKAN_VIEWER_THREADING_ENV_VAR: "1"})
+    assert given.get(pool.VULKAN_VIEWER_THREADING_ENV_VAR) == expected
+    assert kept[pool.VULKAN_VIEWER_THREADING_ENV_VAR] == "1"
 
 
 def test_a_heavy_worker_is_given_the_machine(home: Path, store: Store, hython: Path) -> None:
