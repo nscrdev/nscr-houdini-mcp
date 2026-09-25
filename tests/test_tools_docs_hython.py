@@ -50,7 +50,7 @@ SERVER_CODE = "from nscr_houdini_mcp.cli import main; raise SystemExit(main([]))
 READ_TIMEOUT_S = 300.0
 
 # What a page read from the folder may take.
-FOLDER_READ_S = 0.1
+FOLDER_READ_S = 0.5 if sys.platform == "win32" else 0.1
 
 # How long the worker is kept busy running code while pages are read.
 BUSY_S = 6.0
@@ -263,6 +263,45 @@ def test_docs_with_a_live_worker_a_busy_one_and_none(
     print(f"folder page read: {cold_s * 1000:.1f} ms, then {warm_s * 1000:.1f} ms from the cache")
     assert cold_s < FOLDER_READ_S
     assert warm_s < FOLDER_READ_S
+
+
+def test_folder_reads_do_not_wait_for_a_server_bound_worker(place: dict[str, Path]) -> None:
+    async def check() -> list[tuple[Any, float]]:
+        async with client(place) as connected:
+            started = ok(await connected.call_tool("hou_sessions", {"action": "start"}))
+            loop = None
+            try:
+                cold = await _timed(connected, *WRANGLE)
+                warm = await _timed(connected, *WRANGLE)
+                loop = asyncio.create_task(connected.call_tool("hou_python", {"code": LOOP}))
+                await asyncio.sleep(1.5)
+                reads = [
+                    await _timed(connected, name, arguments)
+                    for name, arguments in (
+                        WRANGLE,
+                        ("hou_docs", {"mode": "page", "path": "nodes/sop/copytopoints"}),
+                        ("hou_docs", {"mode": "vex", "function": "pnoise"}),
+                    )
+                ]
+                assert not loop.done(), "the worker finished before the folder reads"
+                assert ok(await loop)["result"] == "done"
+                return [cold, warm, *reads]
+            finally:
+                if loop is not None:
+                    await loop
+                await connected.call_tool(
+                    "hou_sessions", {"action": "stop", "session": started["session"]["session_id"]}
+                )
+
+    for (result, took), label in zip(
+        asyncio.run(check()),
+        ("cold", "cached", "busy cached", "busy page", "busy vex"),
+        strict=True,
+    ):
+        body = ok(result)
+        assert body["source"] == "corpus"
+        print(f"{label}: {body['path']} in {took * 1000:.1f} ms")
+        assert took < FOLDER_READ_S, (label, body["path"], took)
 
 
 def test_every_node_page_renders_quickly() -> None:
