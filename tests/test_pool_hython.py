@@ -190,6 +190,25 @@ def test_a_failed_start_gives_its_slot_back(home: Path) -> None:
 # Section: acceptance check 6, a worker outliving the process that started it
 
 
+def test_a_worker_imports_the_package_its_launcher_runs(home: Path) -> None:
+    with pool.open_store(home) as store:
+        record = pool.start_worker(config_for(home), store)
+    session = client.Session.open(home, record.session_id)
+    answer = client.call(
+        session,
+        "python.run",
+        arguments={
+            "namespace": "source_check",
+            "code": "import nscr_houdini_mcp.pool as p\nresult = p.__file__",
+        },
+        operation_id=client.new_operation_id(),
+        wait_s=30,
+        timeout_s=60,
+    )
+    assert answer.payload["ok"], answer.payload
+    assert Path(answer.payload["data"]["result"]).resolve() == Path(pool.__file__).resolve()
+
+
 def test_a_worker_outlives_its_launcher_and_a_new_server_sees_it(home: Path) -> None:
     hython = pool.hython_path()
     [report] = run_children(

@@ -9,6 +9,7 @@ one process.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -609,9 +610,36 @@ def test_the_command_says_what_is_not_a_secret(
     start(config, store, launcher, hython)
     command = launcher.commands[0]
     assert command[0] == str(hython)
-    assert command[1:3] == ["-m", pool.WORKER_MODULE]
+    if sys.platform == "win32":
+        assert command[1] == "-c"
+        assert pool.WORKER_MODULE in command[2]
+    else:
+        assert command[1:3] == ["-m", pool.WORKER_MODULE]
     assert command[command.index("--max-idle-s") + 1] == str(config.max_idle_s)
     assert command[command.index("--alias") + 1] == "w1"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows worker bootstrap")
+def test_a_worker_uses_its_servers_source_before_other_packages(
+    config: pool.PoolConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected, shadow = tmp_path / "selected", tmp_path / "shadow"
+    selected.mkdir()
+    shadow.mkdir()
+    (selected / "worker_source_test.py").write_text("print('selected')", encoding="utf-8")
+    (shadow / "worker_source_test.py").write_text("print('shadow')", encoding="utf-8")
+    monkeypatch.setattr(pool, "WORKER_MODULE", "worker_source_test")
+    monkeypatch.setattr(install_module, "python_path_for_run", lambda home: selected)
+    command = pool.worker_command(config, alias="w1", hython=Path(sys.executable))
+    result = subprocess.run(
+        command,
+        env={**os.environ, "PYTHONPATH": str(shadow)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "selected"
 
 
 def test_the_token_never_appears_on_the_command_line(
