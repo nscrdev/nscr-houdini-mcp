@@ -294,7 +294,10 @@ def test_repeated_viewport_captures_leave_the_worker_alive(tmp_path: Path) -> No
         assert support.stop_everything(home, pool.PoolConfig(home=home)) == []
 
 
-def test_material_bearing_geometry_survives_repeated_viewport_captures(tmp_path: Path) -> None:
+@pytest.mark.parametrize("source", ["viewport", "node"])
+def test_material_bearing_geometry_survives_repeated_viewport_captures(
+    tmp_path: Path, source: str
+) -> None:
     home, scratch = tmp_path / "home", tmp_path / "scratch"
     home.mkdir()
     scratch.mkdir()
@@ -336,14 +339,15 @@ def test_material_bearing_geometry_survives_repeated_viewport_captures(tmp_path:
                 assert built["result"]["points"] > 0
                 assert any(built["result"]["materials"]), built
                 print(built["result"])
-                paths = []
-                for frame in (1, 6, 11):
+                target = {"path" if source == "node" else "frame_target": "/obj/retest/spin"}
+                paths, pixels = [], []
+                for frame in (1, 6, 11, 16, 21, 26):
                     result = await connected.call_tool(
                         "hou_capture",
                         {
                             "session": worker["session_id"],
-                            "source": "viewport",
-                            "frame_target": "/obj/retest/spin",
+                            "source": source,
+                            **target,
                             "resolution": [320, 240],
                             "frame": frame,
                             "return_image": "none",
@@ -353,9 +357,40 @@ def test_material_bearing_geometry_survives_repeated_viewport_captures(tmp_path:
                     body = ok(result)
                     assert body["image_stats"]["non_empty"] is True
                     assert is_png(body["path"])
+                    with Image.open(body["path"]) as image:
+                        assert image.size == (320, 240)
+                        rgba = image.convert("RGBA")
+                        pixels.append(rgba.tobytes())
+                        assert (
+                            sum(
+                                count
+                                for count, (r, g, b, a) in rgba.getcolors(320 * 240)
+                                if a and max(r, g, b) - min(r, g, b) > 16
+                            )
+                            > 100
+                        )
+                    assert list(Path(body["path"]).parent.glob("*.cleanup.png")) == []
                     paths.append(body["path"])
                     print({"frame": frame, "path": body["path"]})
-                assert len(set(paths)) == 3
+                assert len(set(paths)) == len(set(pixels)) == 6
+                state = ok(
+                    await connected.call_tool(
+                        "hou_python",
+                        {
+                            "code": (
+                                "result = {'out': [n.name() for n in hou.node('/out').children()], "
+                                "'obj': [n.name() for n in hou.node('/obj').children()], "
+                                "'materials': list(set(hou.node('/obj/retest/spin').geometry()"
+                                ".primStringAttribValues('shop_materialpath')))}"
+                            )
+                        },
+                    )
+                )
+                assert state["result"] == {
+                    "out": [],
+                    "obj": ["retest"],
+                    "materials": built["result"]["materials"],
+                }
                 info = ok(
                     await connected.call_tool(
                         "hou_sessions", {"action": "info", "session": worker["session_id"]}

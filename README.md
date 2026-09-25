@@ -639,6 +639,12 @@ moment do not both write them. A viewport sequence goes a few frames at a
 time, so it can be stopped between them, and its job row names each run and
 the frames written so far.
 
+On Windows, a headless capture renders an empty one-pixel frame before removing
+its temporary flipbook node. This avoids the Vulkan material-binding crash seen
+on subsequent captures in Houdini 22.0.368. Materials and textures stay enabled
+in the requested images. The cost is one extra GPU draw and temporary PNG write
+per render-node capture; the cleanup PNG is deleted and is not published.
+
 `views: quad` captures persp, top, front and right, `turntable4` four orbits
 a quarter turn apart, and both add a two by two contact sheet, which is then
 `path`. `region` crops each saved image to `[x0, y0, x1, y1]`, fractions from
