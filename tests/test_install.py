@@ -364,7 +364,10 @@ def test_a_link_where_the_package_goes_is_never_written_through(tmp_path: Path) 
     path = package_file()
     path.parent.mkdir(parents=True)
     elsewhere = tmp_path / "somewhere" / "else.json"
-    path.symlink_to(elsewhere)
+    try:
+        path.symlink_to(elsewhere)
+    except (OSError, NotImplementedError):
+        pytest.skip("this system will not make a link here")
 
     with pytest.raises(install_module.NotOurs):
         install_module.install()
@@ -380,7 +383,10 @@ def test_a_link_to_a_package_of_ours_is_left_alone_too(tmp_path: Path) -> None:
     )
     path = package_file()
     path.parent.mkdir(parents=True)
-    path.symlink_to(real)
+    try:
+        path.symlink_to(real)
+    except (OSError, NotImplementedError):
+        pytest.skip("this system will not make a link here")
 
     with pytest.raises(install_module.NotOurs):
         install_module.install()
