@@ -262,14 +262,17 @@ def worker_command(config: PoolConfig, *, alias: str, hython: Path) -> list[str]
     another account's command lines, and the token is what proves who owns the
     reservation, so it travels in the environment instead.
     """
-    entry = ["-m", WORKER_MODULE]
     if sys.platform == "win32":
+        # A Houdini package can prepend another copy of our source to PYTHONPATH;
+        # put this server's copy first after Houdini has read its packages.
         source = str(install_module.python_path_for_run(config.home))
         entry = [
             "-c",
             f"import runpy, sys; sys.path.insert(0, {source!r}); "
             f"runpy.run_module({WORKER_MODULE!r}, run_name='__main__', alter_sys=True)",
         ]
+    else:
+        entry = ["-m", WORKER_MODULE]
     return [
         str(hython),
         *entry,
