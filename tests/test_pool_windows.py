@@ -79,6 +79,9 @@ def test_a_worker_breaks_away_or_stays_with_its_launchers_job(
         "sys.stdin.readline()\n",
         encoding="utf-8",
     )
+    # A CI runner can hold the test run itself in a job of its own, and a worker
+    # that leaves this test's job then stays in that one, so it is rightly server-bound.
+    outer_job = win32job.IsProcessInJob(win32api.GetCurrentProcess(), None)
     job = win32job.CreateJobObject(None, "")
     limits = win32job.QueryInformationJobObject(job, win32job.JobObjectExtendedLimitInformation)
     flags = win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
@@ -115,16 +118,21 @@ def test_a_worker_breaks_away_or_stays_with_its_launchers_job(
             False,
             report["pid"],
         )
-        assert report["server_bound"] is not breakaway
+        in_any_job = win32job.IsProcessInJob(worker, None)
+        in_this_job = win32job.IsProcessInJob(worker, job)
+        assert report["server_bound"] is in_any_job
+        if not breakaway:
+            assert in_this_job
+        elif not outer_job:
+            assert not in_any_job
         assert win32event.WaitForSingleObject(worker, 1000) == win32con.WAIT_TIMEOUT
-        assert win32job.IsProcessInJob(worker, None) is not breakaway
         assert "spaces and café" in log.read_text(encoding="utf-8")
         _, messages = launcher.communicate("stop\n", timeout=30)
         assert launcher.returncode == 0
-        assert messages.count("ends when this server ends") == int(not breakaway)
-        assert ("WARNING:nscr_houdini_mcp.pool:" in messages) is not breakaway
+        assert messages.count("ends when this server ends") == int(in_any_job)
+        assert ("WARNING:nscr_houdini_mcp.pool:" in messages) is in_any_job
         job.Close()
-        expected = win32con.WAIT_TIMEOUT if breakaway else win32con.WAIT_OBJECT_0
+        expected = win32con.WAIT_OBJECT_0 if in_this_job else win32con.WAIT_TIMEOUT
         assert win32event.WaitForSingleObject(worker, 1000) == expected
     finally:
         try:
