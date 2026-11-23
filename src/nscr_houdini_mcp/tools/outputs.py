@@ -9,7 +9,8 @@ Three actions.
   output twice: `parm_string`, the unexpanded line with `$HIP` that belongs
   on the node, and `expanded_path`, the absolute path for this run, frozen
   now. With them come the `version`, the `folder` the output goes to, the
-  `run_id` and the `sidecar` record written beside it. A version is taken
+  `run_id` and the `sidecar` written beside it (empty unless
+  `outputs.sidecars` is on). A version is taken
   every time, so `resolve` changes the store even when it changes no scene.
   With `operation_id` the run is `run-<operation_id>`, and the same id sent
   again answers with the place it already took rather than a new version.

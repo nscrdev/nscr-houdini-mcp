@@ -86,6 +86,7 @@ from __future__ import annotations
 import math
 import os
 import struct
+import sys
 import zlib
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -1161,6 +1162,7 @@ def rop_route(
     made: list[Any] = []
     put_back: list[tuple[str, Callable[[], Any]]] = []
     done: list[float] = []
+    rendered_frame: float | None = None
     stopped = False
     scale: float | None = 1.0
     with hou.undos.disabler():
@@ -1205,6 +1207,7 @@ def rop_route(
                         raise Stopped
                     stopped = True
                     break
+                rendered_frame = frame
                 rop.render(frame_range=(frame, frame))
                 done.append(frame)
                 attempt.wrote(frame_files(path, done, spec.sequence))
@@ -1213,6 +1216,14 @@ def rop_route(
                         {"done": index + 1, "total": len(frames), "message": f"frame {frame:g}"}
                     )
         finally:
+            if sys.platform == "win32" and not gui and rendered_frame is not None:
+                cleanup_path = (
+                    frame_files(path, [rendered_frame], spec.sequence)[0] + ".cleanup.png"
+                )
+                attempt.attempt(
+                    "release viewport material bindings",
+                    lambda: release_rop_materials(rop, rendered_frame, cleanup_path),
+                )
             for label, step in reversed(put_back):
                 attempt.attempt(label, step)
             for node in reversed(made):
@@ -1231,6 +1242,20 @@ def rop_route(
     if stopped:
         shot["stopped_early"] = True
     return shot
+
+
+def release_rop_materials(rop: Any, frame: float, path: str) -> None:
+    try:
+        _set(rop, "vobjects", "")
+        _set(rop, "forceobjects", "")
+        _set(rop, "res", (1, 1))
+        _set(rop, "picture", path)
+        rop.render(frame_range=(frame, frame))
+    finally:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
 
 
 # The drawing scale, worked out for the `hou` and the screen ratio it was read at.

@@ -2493,6 +2493,7 @@ class CaptureStandIn:
         # A frame at which a render raises after writing it, as a failed cook does.
         self.fail_at_frame: float | None = None
         self.probes: list[dict[str, Any]] = []
+        self.cleanups: list[dict[str, Any]] = []
 
     # Section: pictures
 
@@ -2577,6 +2578,8 @@ class CaptureStandIn:
                 time.sleep(self.delay_s)
             picture = str(rop.parm("picture").eval()).replace("$F4", f"{int(frame):04d}")
             kept = self.probes if picture.endswith(".probe.png") else self.seen
+            if picture.endswith(".cleanup.png"):
+                kept = self.cleanups
             kept.append(
                 {
                     "route": "rop",

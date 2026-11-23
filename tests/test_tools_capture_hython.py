@@ -95,21 +95,23 @@ def place(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Any]]:
         f"pool_cap = 1\nworker_ports = [{PORT_RANGE[0]}, {PORT_RANGE[1]}]\n", encoding="utf-8"
     )
     made: dict[str, Any] = {"home": home, "scratch": scratch, "scenes": scenes}
-    try:
-        [started] = run(made, ("hou_sessions", {"action": "start"}))
-        made["worker"] = ok(started)["session"]
-        hip = scenes / "capture_scene.hip"
-        [built] = run(made, ("hou_python", {"code": BUILD.format(hip=str(hip))}))
-        made["box"], made["ball"] = ok(built)["result"]
-        made["hip"] = hip
-        yield made
-    finally:
-        left = support.stop_everything(home, pool.PoolConfig(home=home))
-        assert left == [], f"workers were left running: {left}"
-        with pool.open_store(home) as store:
-            for worker in store.list_workers(active_only=False):
-                assert worker.pid is None or not pool.worker_is_alive(worker), worker.alias
-        assert registry.live_entries(home) == []
+    with support.persistent_client(server_params(made), timeout_s=READ_TIMEOUT_S) as send:
+        made["send"] = send
+        try:
+            [started] = run(made, ("hou_sessions", {"action": "start"}))
+            made["worker"] = ok(started)["session"]
+            hip = scenes / "capture_scene.hip"
+            [built] = run(made, ("hou_python", {"code": BUILD.format(hip=str(hip))}))
+            made["box"], made["ball"] = ok(built)["result"]
+            made["hip"] = hip
+            yield made
+        finally:
+            left = support.stop_everything(home, pool.PoolConfig(home=home))
+            assert left == [], f"workers were left running: {left}"
+            with pool.open_store(home) as store:
+                for worker in store.list_workers(active_only=False):
+                    assert worker.pid is None or not pool.worker_is_alive(worker), worker.alias
+            assert registry.live_entries(home) == []
 
 
 def server_params(place: dict[str, Any]) -> StdioServerParameters:
@@ -128,10 +130,14 @@ async def _run(place: dict[str, Any], calls: list[tuple[str, dict]]) -> list[Any
     async with Client(
         server_params(place), mode="auto", read_timeout_seconds=READ_TIMEOUT_S
     ) as connected:
-        return [await connected.call_tool(name, arguments) for name, arguments in calls]
+        results = [await connected.call_tool(name, arguments) for name, arguments in calls]
+        await support.stop_server_bound_workers(connected, results)
+        return results
 
 
 def run(place: dict[str, Any], *calls: tuple[str, dict]) -> list[Any]:
+    if place.get("send") is not None:
+        return place["send"](*calls)
     return asyncio.run(_run(place, list(calls)))
 
 
@@ -168,6 +174,238 @@ def framed(path: str) -> None:
     assert abs(middle[0] - 0.5) < 0.1 and abs(middle[1] - 0.5) < 0.1, (middle, image.size)
     assert (right - left) / width > 0.25 or (bottom - top) / height > 0.25
     assert left > 0 and top > 0 and right < width and bottom < height
+
+
+@pytest.mark.parametrize("update_mode", ["AutoUpdate", "Manual"])
+def test_a_changing_scene_writes_different_sequence_frames(
+    tmp_path: Path, update_mode: str
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    scratch = tmp_path / "houdini-temp"
+    scratch.mkdir()
+    (home / "config.toml").write_text(
+        f"pool_cap = 1\nworker_ports = [{PORT_RANGE[0]}, {PORT_RANGE[1]}]\n", encoding="utf-8"
+    )
+    place = {"home": home, "scratch": scratch}
+    hip = tmp_path / "moving.hip"
+
+    async def capture() -> dict[str, Any]:
+        async with Client(
+            server_params(place), mode="auto", read_timeout_seconds=READ_TIMEOUT_S
+        ) as connected:
+            worker = ok(await connected.call_tool("hou_sessions", {"action": "start"}))["session"]
+            try:
+                built = ok(
+                    await connected.call_tool(
+                        "hou_python",
+                        {
+                            "code": (
+                                "geo = hou.node('/obj').createNode('geo', 'moving')\n"
+                                "box = geo.createNode('box')\n"
+                                "box.parmTuple('size').set((1, 2, 3))\n"
+                                "turn = geo.createNode('xform')\n"
+                                "turn.setInput(0, box)\n"
+                                "turn.parm('ry').setExpression('$F*3')\n"
+                                "turn.setDisplayFlag(True)\n"
+                                "turn.setRenderFlag(True)\n"
+                                "hou.setFrame(7)\n"
+                                f"hou.hipFile.save({str(hip)!r})\n"
+                                "result = [list(turn.geometryAtFrame(f).points()[0].position()) "
+                                "for f in (1, 12, 23)]\n"
+                                f"hou.setUpdateMode(hou.updateMode.{update_mode})"
+                            )
+                        },
+                    )
+                )
+                assert len({tuple(point) for point in built["result"]}) == 3
+                result = ok(
+                    await connected.call_tool(
+                        "hou_capture",
+                        {
+                            "source": "viewport",
+                            "camera": "front",
+                            "frames": [1, 23, 11],
+                            "resolution": [320, 180],
+                            "return_image": "none",
+                        },
+                    )
+                )
+                frame = ok(
+                    await connected.call_tool("hou_python", {"code": "result = hou.frame()"})
+                )
+                assert frame["result"] == 7
+                return result
+            finally:
+                await connected.call_tool(
+                    "hou_sessions", {"action": "stop", "session": worker["session_id"]}
+                )
+
+    try:
+        body = asyncio.run(capture())
+    finally:
+        assert support.stop_everything(home, pool.PoolConfig(home=home)) == []
+    assert len(body["paths"]) == 3
+    pixels = []
+    for path in body["paths"]:
+        with Image.open(path) as image:
+            pixels.append(image.convert("RGBA").tobytes())
+    differences = [
+        sum(a != b for a, b in zip(pixels[0], other, strict=True)) for other in pixels[1:]
+    ]
+    print({"paths": body["paths"], "different_channel_values": differences})
+    assert all(count > 100 for count in differences), differences
+
+
+def test_repeated_viewport_captures_leave_the_worker_alive(tmp_path: Path) -> None:
+    home, scratch = tmp_path / "home", tmp_path / "scratch"
+    home.mkdir()
+    scratch.mkdir()
+    (home / "config.toml").write_text(
+        f"pool_cap = 1\nworker_ports = [{PORT_RANGE[0]}, {PORT_RANGE[1]}]\n", encoding="utf-8"
+    )
+    place = {"home": home, "scratch": scratch}
+    capture = (
+        "hou_capture",
+        {
+            "source": "viewport",
+            "camera": "front",
+            "resolution": [320, 180],
+            "return_image": "none",
+        },
+    )
+    try:
+        started, built, *captures, after = run(
+            place,
+            ("hou_sessions", {"action": "start"}),
+            ("hou_python", {"code": BUILD.format(hip=str(tmp_path / "repeated.hip"))}),
+            *([capture] * 5),
+            ("hou_python", {"code": LOOK}),
+        )
+        ok(started)
+        ok(built)
+        for result in captures:
+            assert is_png(ok(result)["path"])
+            assert ok(result)["route"] == "flipbook_rop"
+        assert len({ok(result)["path"] for result in captures}) == 5
+        assert ok(after)["result"]["out"] == []
+        assert ok(after)["result"]["obj"] == ["boxgeo"]
+    finally:
+        assert support.stop_everything(home, pool.PoolConfig(home=home)) == []
+
+
+@pytest.mark.parametrize("source", ["viewport", "node"])
+def test_material_bearing_geometry_survives_repeated_viewport_captures(
+    tmp_path: Path, source: str
+) -> None:
+    home, scratch = tmp_path / "home", tmp_path / "scratch"
+    home.mkdir()
+    scratch.mkdir()
+    (home / "config.toml").write_text(
+        f"pool_cap = 1\nworker_ports = [{PORT_RANGE[0]}, {PORT_RANGE[1]}]\n", encoding="utf-8"
+    )
+    place = {"home": home, "scratch": scratch}
+
+    async def capture() -> None:
+        async with Client(
+            server_params(place), mode="auto", read_timeout_seconds=READ_TIMEOUT_S
+        ) as connected:
+            worker = ok(
+                await connected.call_tool("hou_sessions", {"action": "start", "weight": "light"})
+            )["session"]
+            try:
+                built = ok(
+                    await connected.call_tool(
+                        "hou_python",
+                        {
+                            "code": (
+                                "import os\n"
+                                "g = hou.node('/obj').createNode('geo', 'retest')\n"
+                                "t = g.createNode('testgeometry_rubbertoy', 'toy')\n"
+                                "x = g.createNode('xform', 'spin')\n"
+                                "x.setInput(0, t)\n"
+                                "x.parm('ry').setExpression('$F*10')\n"
+                                "x.setDisplayFlag(True)\n"
+                                "geo = x.geometry()\n"
+                                "result = {'points': len(geo.points()), "
+                                "'materials': list(set("
+                                "geo.primStringAttribValues('shop_materialpath'))), "
+                                "'threading': os.environ.get("
+                                "'HOUDINI_VULKAN_VIEWER_MULTITHREADING')}"
+                            )
+                        },
+                    )
+                )
+                assert built["result"]["points"] > 0
+                assert any(built["result"]["materials"]), built
+                print(built["result"])
+                target = {"path" if source == "node" else "frame_target": "/obj/retest/spin"}
+                paths, pixels = [], []
+                for frame in (1, 6, 11, 16, 21, 26):
+                    result = await connected.call_tool(
+                        "hou_capture",
+                        {
+                            "session": worker["session_id"],
+                            "source": source,
+                            **target,
+                            "resolution": [320, 240],
+                            "frame": frame,
+                            "return_image": "none",
+                            "wait_s": 30,
+                        },
+                    )
+                    body = ok(result)
+                    assert body["image_stats"]["non_empty"] is True
+                    assert is_png(body["path"])
+                    with Image.open(body["path"]) as image:
+                        assert image.size == (320, 240)
+                        rgba = image.convert("RGBA")
+                        pixels.append(rgba.tobytes())
+                        assert (
+                            sum(
+                                count
+                                for count, (r, g, b, a) in rgba.getcolors(320 * 240)
+                                if a and max(r, g, b) - min(r, g, b) > 16
+                            )
+                            > 100
+                        )
+                    assert list(Path(body["path"]).parent.glob("*.cleanup.png")) == []
+                    paths.append(body["path"])
+                    print({"frame": frame, "path": body["path"]})
+                assert len(set(paths)) == len(set(pixels)) == 6
+                state = ok(
+                    await connected.call_tool(
+                        "hou_python",
+                        {
+                            "code": (
+                                "result = {'out': [n.name() for n in hou.node('/out').children()], "
+                                "'obj': [n.name() for n in hou.node('/obj').children()], "
+                                "'materials': list(set(hou.node('/obj/retest/spin').geometry()"
+                                ".primStringAttribValues('shop_materialpath')))}"
+                            )
+                        },
+                    )
+                )
+                assert state["result"] == {
+                    "out": [],
+                    "obj": ["retest"],
+                    "materials": built["result"]["materials"],
+                }
+                info = ok(
+                    await connected.call_tool(
+                        "hou_sessions", {"action": "info", "session": worker["session_id"]}
+                    )
+                )
+                assert info["session"]["state"] == "live"
+            finally:
+                await connected.call_tool(
+                    "hou_sessions", {"action": "stop", "session": worker["session_id"]}
+                )
+
+    try:
+        asyncio.run(capture())
+    finally:
+        assert support.stop_everything(home, pool.PoolConfig(home=home)) == []
 
 
 def test_a_fresh_worker_s_first_capture_is_a_framed_sequence(place: dict[str, Any]) -> None:

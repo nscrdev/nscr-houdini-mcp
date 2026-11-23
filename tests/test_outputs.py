@@ -382,6 +382,7 @@ def test_the_run_record_and_the_sidecar_hold_the_same_run(store: Store, scene: P
         session_id="s1",
         job_id="job-1",
         when=WHEN,
+        conventions=replace(outputs.DEFAULT_CONVENTIONS_TABLE, sidecars=True),
     )
     sidecar = json.loads(Path(made.sidecar).read_text(encoding="utf-8"))
     assert sidecar["run_id"] == made.run_id
@@ -441,7 +442,7 @@ def test_an_unsaved_scene_writes_to_scratch_and_says_so(store: Store, home: Path
     assert str(home) not in made.template
     assert any("saved" in line for line in made.warnings)
     assert store.get_run(made.run_id).scene["unsaved_hip"] is True
-    assert Path(made.sidecar).is_file()
+    assert made.sidecar == ""
 
 
 def test_a_folder_left_by_another_machine_is_never_written_into(store: Store, scene: Path) -> None:
@@ -569,8 +570,7 @@ def test_two_stores_over_one_scene_folder_do_not_take_the_same_hip_number(
     # disk, so the second store steps past it.
     assert first.version == 3
     assert second.version == 4
-    for made in (first, second):
-        assert json.loads(Path(made.sidecar).read_text(encoding="utf-8"))["run_id"] == made.run_id
+    assert list(scene.parent.glob("*_run.json")) == []
 
 
 def version_rows(path: Path) -> list[tuple]:
@@ -663,7 +663,7 @@ def test_versions_are_never_handed_out_twice_across_processes(tmp_path: Path) ->
     assert len({report["folder"] for report in collected}) == RACERS
     for report in collected:
         assert Path(report["folder"]).is_dir()
-        assert Path(report["sidecar"]).is_file()
+        assert report["sidecar"] == ""
 
 
 def test_a_run_id_used_twice_keeps_the_first_run_record(store: Store, scene: Path) -> None:
@@ -779,7 +779,7 @@ def test_a_spill_is_claimed_and_recorded_like_any_other_run(store: Store, tmp_pa
         spill_root=tmp_path / "spill",
         when=WHEN,
     )
-    assert Path(made.sidecar).is_file()
+    assert made.sidecar == ""
     assert store.get_run(made.run_id).kind == "spill"
     assert "big_answer" in made.path
 

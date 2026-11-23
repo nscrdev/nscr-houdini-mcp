@@ -6,6 +6,7 @@ run never reads or writes the folder the person at this machine works in.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import socket
@@ -364,7 +365,16 @@ def test_a_link_where_the_package_goes_is_never_written_through(tmp_path: Path) 
     path = package_file()
     path.parent.mkdir(parents=True)
     elsewhere = tmp_path / "somewhere" / "else.json"
-    path.symlink_to(elsewhere)
+    try:
+        path.symlink_to(elsewhere)
+    except OSError as error:
+        if getattr(error, "winerror", None) in (1314, 50) or error.errno in (
+            errno.ENOSYS,
+            errno.ENOTSUP,
+            errno.EOPNOTSUPP,
+        ):
+            pytest.skip("this system will not make a link here")
+        raise
 
     with pytest.raises(install_module.NotOurs):
         install_module.install()
@@ -380,7 +390,16 @@ def test_a_link_to_a_package_of_ours_is_left_alone_too(tmp_path: Path) -> None:
     )
     path = package_file()
     path.parent.mkdir(parents=True)
-    path.symlink_to(real)
+    try:
+        path.symlink_to(real)
+    except OSError as error:
+        if getattr(error, "winerror", None) in (1314, 50) or error.errno in (
+            errno.ENOSYS,
+            errno.ENOTSUP,
+            errno.EOPNOTSUPP,
+        ):
+            pytest.skip("this system will not make a link here")
+        raise
 
     with pytest.raises(install_module.NotOurs):
         install_module.install()
@@ -389,6 +408,39 @@ def test_a_link_to_a_package_of_ours_is_left_alone_too(tmp_path: Path) -> None:
     assert [(item.removed, item.reason) for item in removed] == [(False, "a link, kept")]
     assert path.is_symlink()
     assert real.exists()
+
+
+@pytest.mark.parametrize(
+    "check_link",
+    [
+        test_a_link_where_the_package_goes_is_never_written_through,
+        test_a_link_to_a_package_of_ours_is_left_alone_too,
+    ],
+)
+@pytest.mark.parametrize(
+    "code,winerror,skips",
+    [
+        (errno.ENOSYS, None, True),
+        (errno.ENOTSUP, None, True),
+        (errno.EACCES, 1314, True),
+        (errno.EINVAL, 50, True),
+        (errno.EACCES, 5, False),
+        (errno.EIO, None, False),
+    ],
+)
+def test_link_checks_only_skip_unsupported_operations(
+    tmp_path, monkeypatch, check_link, code, winerror, skips
+) -> None:
+    failure = OSError(code, "link failed")
+    if winerror is not None:
+        failure.winerror = winerror
+
+    def refuse(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(Path, "symlink_to", refuse)
+    with pytest.raises(pytest.skip.Exception if skips else OSError):
+        check_link(tmp_path)
 
 
 def test_a_path_houdini_would_expand_is_refused(tmp_path: Path) -> None:
@@ -723,6 +775,18 @@ def test_houdini_installs_are_found_newest_first(
     assert [item.version for item in found] == ["22.0.368", "21.5.100"]
     assert found[0].short_version == "22.0"
     assert found[0].hfs == tmp_path / "opt" / "hfs22.0.368"
+
+
+def test_installs_are_looked_for_on_the_system_drive_without_program_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The MCP SDK's stdio client starts a server with a trimmed environment
+    # that keeps SystemDrive but drops ProgramFiles.
+    monkeypatch.setattr(install_module.sys, "platform", "win32")
+    monkeypatch.delenv("ProgramFiles", raising=False)
+    monkeypatch.delenv("ProgramW6432", raising=False)
+    monkeypatch.setenv("SystemDrive", "D:")
+    assert install_module.install_roots() == [Path("D:\\Program Files") / "Side Effects Software"]
 
 
 def test_a_named_install_comes_first(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

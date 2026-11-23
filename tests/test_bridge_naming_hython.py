@@ -109,8 +109,8 @@ def test_a_session_started_before_its_file_loads_is_named_after_the_file(
     assert found["new_at_start"] is True
     assert found["started_as"] == "untitled-1"
     assert found["alias"] == "gui_v001-1"
-    assert found["stored"] == ["gui_v001-1", "untitled-1", str(hip)]
-    assert found["file"] == ["gui_v001-1", str(hip)]
+    assert found["stored"] == ["gui_v001-1", "untitled-1", hip.as_posix()]
+    assert found["file"] == ["gui_v001-1", hip.as_posix()]
     # A second empty Houdini is not handed the name a caller may still hold.
     assert found["second"] == "untitled-2"
     assert found["old_name_reaches"] == found["session_id"]

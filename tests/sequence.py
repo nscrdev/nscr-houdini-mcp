@@ -174,9 +174,15 @@ META_KEY = "_meta"
 
 def shape(step: Step) -> dict[str, Any]:
     """What two runs of the pass must agree on for this step, and, under
-    `meta`, the protocol's own additions, which may differ by revision."""
+    `meta`, the protocol's own additions, which may differ by revision.
+    `export_path` is left out because the export lands on its own schedule.
+    """
     dumped = step.result.model_dump(by_alias=True, exclude_none=True, mode="json")
     meta = dumped.get(META_KEY)
+    body = step.body
+    if step.tool == "hou_jobs" and "export_path" in body:
+        export_path = body.pop("export_path")
+        check(isinstance(export_path, str), "job export_path is not a string")
     return {
         "tool": step.tool,
         "is_error": step.is_error,
@@ -184,7 +190,7 @@ def shape(step: Step) -> dict[str, Any]:
         "meta": sorted(meta) if isinstance(meta, Mapping) else [],
         "blocks": step.blocks,
         "text": step.text,
-        "structured": key_shape(step.result.structured_content or {}, depth=1),
+        "structured": key_shape(body, depth=1),
     }
 
 

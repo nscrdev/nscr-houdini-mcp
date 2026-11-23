@@ -3,8 +3,8 @@
 An MCP server and a small set of agent skills for SideFX Houdini 22.
 
 Status: 0.1.0, the first release. The eleven tools described below work
-against a real Houdini 22 on macOS; see [Tested on](#tested-on) for what has
-and has not been run where. Names and arguments may still change before 1.0,
+against a real Houdini 22 on macOS and Windows; see [Tested on](#tested-on)
+for what has and has not been run where. Names and arguments may still change before 1.0,
 and [CHANGELOG.md](CHANGELOG.md) says what changed.
 
 ## Goals
@@ -22,9 +22,11 @@ and [CHANGELOG.md](CHANGELOG.md) says what changed.
 - macOS on Apple silicon (arm64), with Houdini 22.0.368 and 22.0.429: the unit
   tests, the tests that start a real hython, and GUI sessions driven through
   one MCP client.
-- Windows and Linux: the unit tests run in CI, on Python 3.11 and 3.13, for
-  every push to main and every pull request. Neither has been run against a
-  real Houdini yet, so treat Houdini on either as untried.
+- Windows 11 (x64), with Houdini 22.0.368: the unit tests, the tests that
+  start a real hython, and GUI sessions driven through one MCP client.
+- Linux: the unit tests run in CI, on Python 3.11 and 3.13, for every push to
+  main and every pull request, as they do on Windows. It has not been run
+  against a real Houdini yet, so treat Houdini on Linux as untried.
 
 ## Quick start
 
@@ -577,7 +579,8 @@ own extension is not the one wanted and `node` for the node the output
 belongs to, whose name is used when none is given. It answers with
 `parm_string`, the line with `$HIP` that belongs on the node,
 `expanded_path`, the absolute path for this run, and the `version`, `folder`,
-`run_id` and `sidecar` beside them. A version is taken on every call; with
+`run_id` and `sidecar` beside them (`sidecar` is empty unless
+`outputs.sidecars` is on). A version is taken on every call; with
 `operation_id` the same id sent again answers with the place it took. `$JOB`
 and `$HOUDINI_TEMP_DIR` are read from the session, once, never from the
 server's own environment. `job` and `spill` paths belong to the server and are
@@ -650,6 +653,12 @@ made once per operation, so a reply sent again and a job read at the same
 moment do not both write them. A viewport sequence goes a few frames at a
 time, so it can be stopped between them, and its job row names each run and
 the frames written so far.
+
+On Windows, a headless capture renders an empty one-pixel frame before removing
+its temporary flipbook node. This avoids the Vulkan material-binding crash seen
+on subsequent captures in Houdini 22.0.368. Materials and textures stay enabled
+in the requested images. The cost is one extra GPU draw and temporary PNG write
+per render-node capture; the cleanup PNG is deleted and is not published.
 
 `views: quad` captures persp, top, front and right, `turntable4` four orbits
 a quarter turn apart, and both add a two by two contact sheet, which is then
@@ -879,12 +888,13 @@ machine is busy even when a slot is free.
 
 A worker does not belong to the process that started it. It is started
 detached, with its output in `logs/worker-<name>.log` under the state folder,
-and it stays when its server exits, so a client restart does not throw the
-warm pool away. The log is private to its owner and is rolled over when it
-grows, keeping the last two. What ends a worker is its lease: it watches its
-own row and goes when a server asks it to, or when nobody has wanted it for
-half an hour. Routing a call to it renews the lease, and a worker running a
-call or a job is never idle, however long the work takes and whether or not
+and it stays when its server exits, except in the Windows case below, so a
+client restart normally keeps the warm pool. The log is private to its
+owner and is rolled over when it grows, keeping the last two. What ends a
+worker is its lease: it watches its own row and goes when a server asks
+it to, or when nobody has wanted it for half an hour. Routing a call to it
+renews the lease, and a worker running a call or a job is never idle,
+however long the work takes and whether or not
 anybody routes to it meanwhile. `stop` asks first and
 ends the process itself only if the ask was not enough, and never unless that
 process can be shown to still be the worker. `start` exits 3 when the pool is
@@ -899,8 +909,11 @@ which every account on the machine can read, and its thread cap is either the
 one you named with `--max-threads` or the one the weight implies: a heavy
 worker gets the machine, a light one is left at Houdini's own default.
 
-The Windows side of this, the detached start, the kill and the start stamp,
-is written and read but has not been run on Windows yet.
+On Windows, some clients do not let a worker run independently. Such a
+worker reports `lifetime: server`. Closing or restarting the client then
+ends the worker, interrupts its jobs and loses unsaved changes in that
+worker, so save first. It shows as `crashed` in `hou_sessions` list
+afterwards; that means the client ended it, not that Houdini crashed.
 
 Each worker is asked once, when it comes up, what it can do: the build, the
 license it got, the renderers that are really installed, how it can make a
@@ -1017,10 +1030,13 @@ several processes and several machines on the same scene folder. A hip file has
 no folder of its own, so it claims a small `.claim` file beside it instead,
 which is what stops two machines with their own stores from writing the same
 `v001`. Every file the agent writes for itself carries the run id, so two
-captures in the same second are two files. Each run leaves a readable
-`_run.json` beside its output with the scene, session, node, version and paths,
-absolute for the machine that made the run and again relative to the root, so
-the same folder read from somewhere else still makes sense.
+captures in the same second are two files. The store keeps a record of every
+run, with the scene, session, node, version and paths. Set
+`outputs.sidecars = true` to also write that record as a readable `_run.json`
+beside each output, with paths absolute for the machine that made the run and
+again relative to the root, so the same folder read from somewhere else still
+makes sense. Sidecars are off by default, so no extra JSON files appear next
+to your scenes and renders. Nothing in the server reads them back.
 
 Edit the table where it suits you. Built in defaults come first, then
 `config.toml` in the state folder (`NSCR_MCP_HOME` moves it), then
@@ -1033,6 +1049,7 @@ which key and why.
 producer = "3d/hip"        # an extra level under each kind, off by default
 cache_root = "$JOB/cache"  # heavy caches on a fast local disk
 version_width = 3
+sidecars = false           # true writes a readable _run.json beside each output
 
 [outputs.grammar]
 comp = "<output_root>/comp/<name>/v<ver>/<name>_v<ver>.<frame>.<ext>"

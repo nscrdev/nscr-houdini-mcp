@@ -126,7 +126,7 @@ def test_resolve_takes_a_cache_path_named_after_its_node(
     assert body["version"] == 1
     assert Path(body["folder"]) == project / "geo" / "filecache1" / "v001"
     assert Path(body["folder"]).is_dir()
-    assert Path(body["sidecar"]).is_file()
+    assert body["sidecar"] == ""
     with store(bench) as opened:
         run = opened.get_run(body["run_id"])
     assert run.source_node == "/obj/geo1/filecache1"

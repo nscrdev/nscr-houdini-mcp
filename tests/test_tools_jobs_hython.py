@@ -1,9 +1,9 @@
 """Jobs through the real server, against a real worker.
 
 A client starts the server over stdio, and the server starts a hython worker
-through the pool. Each `run` below is a server process of its own, so every
-check that follows a job across two of them is a client restart as it happens
-in use: the job is found again by its id in the store, and nothing else.
+through the pool. That client stays open for the module. Checks that follow
+a job from another server open a separate client, which finds the job by
+its id in the store and nothing else.
 
 Skipped, not failed, when there is no Houdini on this machine. House rules as
 in the other checks that start a Houdini: one worker at a time (the pool cap
@@ -77,17 +77,19 @@ def place(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Any]]:
         encoding="utf-8",
     )
     made: dict[str, Any] = {"home": home, "scratch": scratch}
-    try:
-        [started] = run(made, ("hou_sessions", {"action": "start"}))
-        made["worker"] = ok(started)["session"]
-        yield made
-    finally:
-        left = support.stop_everything(home, pool.PoolConfig(home=home))
-        assert left == [], f"workers were left running: {left}"
-        with pool.open_store(home) as store:
-            for worker in store.list_workers(active_only=False):
-                assert worker.pid is None or not pool.worker_is_alive(worker), worker.alias
-        assert registry.live_entries(home) == []
+    with support.persistent_client(server_params(made), timeout_s=READ_TIMEOUT_S) as send:
+        made["send"] = send
+        try:
+            [started] = run(made, ("hou_sessions", {"action": "start"}))
+            made["worker"] = ok(started)["session"]
+            yield made
+        finally:
+            left = support.stop_everything(home, pool.PoolConfig(home=home))
+            assert left == [], f"workers were left running: {left}"
+            with pool.open_store(home) as store:
+                for worker in store.list_workers(active_only=False):
+                    assert worker.pid is None or not pool.worker_is_alive(worker), worker.alias
+            assert registry.live_entries(home) == []
 
 
 def server_params(place: dict[str, Any]) -> StdioServerParameters:
@@ -106,11 +108,15 @@ async def _run(place: dict[str, Any], calls: list[tuple[str, dict]]) -> list[Any
     async with Client(
         server_params(place), mode="auto", read_timeout_seconds=READ_TIMEOUT_S
     ) as connected:
-        return [await connected.call_tool(name, arguments) for name, arguments in calls]
+        results = [await connected.call_tool(name, arguments) for name, arguments in calls]
+        await support.stop_server_bound_workers(connected, results)
+        return results
 
 
 def run(place: dict[str, Any], *calls: tuple[str, dict]) -> list[Any]:
-    """Every call through one server process of its own."""
+    """Send ordinary calls through the module's owning client."""
+    if place.get("send") is not None:
+        return place["send"](*calls)
     return asyncio.run(_run(place, list(calls)))
 
 
@@ -119,15 +125,99 @@ def ok(result: Any) -> dict[str, Any]:
     return result.structured_content
 
 
-def settled(place: dict[str, Any], job_id: str, *, rounds: int = 6) -> dict[str, Any]:
+def settled(
+    place: dict[str, Any], job_id: str, *, rounds: int = 6, new_server: bool = False
+) -> dict[str, Any]:
     """Wait on a job until it ends, one held status after another."""
     body: dict[str, Any] = {}
     for _ in range(rounds):
-        [held] = run(place, ("hou_jobs", {"job_id": job_id, "wait_s": 10}))
+        call = ("hou_jobs", {"job_id": job_id, "wait_s": 10})
+        [held] = asyncio.run(_run(place, [call])) if new_server else run(place, call)
         body = ok(held)
         if body["state"] not in ("queued", "running"):
             return body
     return body
+
+
+def test_a_running_job_is_followed_after_its_originating_server_exits(tmp_path: Path) -> None:
+    home, scratch = tmp_path / "home", tmp_path / "scratch"
+    home.mkdir()
+    scratch.mkdir()
+    (home / "config.toml").write_text(
+        f"pool_cap = 1\nworker_ports = [{PORT_RANGE[0]}, {PORT_RANGE[1]}]\n",
+        encoding="utf-8",
+    )
+    made = {"home": home, "scratch": scratch}
+    pid_file, release = tmp_path / "origin.pid", tmp_path / "release"
+    parameters = server_params(made)
+    parameters.args = [
+        "-c",
+        (
+            "import os; from pathlib import Path; "
+            f"Path({str(pid_file)!r}).write_text(str(os.getpid()), encoding='utf-8'); "
+            + SERVER_CODE
+        ),
+    ]
+    code = (
+        "import time\nfrom pathlib import Path\n"
+        f"release = Path({str(release)!r})\n"
+        "deadline = time.monotonic() + 60\n"
+        "while not release.exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.05)\n"
+        "assert release.exists(), 'restart did not release the job'\n"
+        "result = 'followed after restart'\n"
+    )
+
+    async def restart() -> None:
+        async with Client(parameters, mode="auto", read_timeout_seconds=READ_TIMEOUT_S) as origin:
+            worker = ok(await origin.call_tool("hou_sessions", {"action": "start"}))["session"]
+            if worker.get("lifetime") == "server":
+                ok(
+                    await origin.call_tool(
+                        "hou_sessions", {"action": "stop", "session": worker["session_id"]}
+                    )
+                )
+            else:
+                handle = ok(
+                    await origin.call_tool(
+                        "hou_python",
+                        {"session": worker["session_id"], "code": code, "background": True},
+                    )
+                )
+                running = ok(
+                    await origin.call_tool("hou_jobs", {"job_id": handle["job_id"], "wait_s": 1})
+                )
+                assert running["state"] == "running"
+        pid = int(pid_file.read_text(encoding="utf-8"))
+        support.wait_until(lambda: not pool.process_is_alive(pid), timeout_s=30)
+        support.require_independent_worker(worker)
+        async with Client(
+            server_params(made), mode="auto", read_timeout_seconds=READ_TIMEOUT_S
+        ) as following:
+            try:
+                running = ok(await following.call_tool("hou_jobs", {"job_id": handle["job_id"]}))
+                assert running["state"] == "running"
+                assert running["operation_id"] == handle["operation_id"]
+                release.write_text("release", encoding="utf-8")
+                ended = ok(
+                    await following.call_tool(
+                        "hou_jobs", {"job_id": handle["job_id"], "wait_s": 30}
+                    )
+                )
+                assert ended["state"] == "done"
+                assert ended["outputs"]["result"] == "followed after restart"
+            finally:
+                ok(
+                    await following.call_tool(
+                        "hou_sessions", {"action": "stop", "session": worker["session_id"]}
+                    )
+                )
+
+    try:
+        asyncio.run(restart())
+    finally:
+        assert support.stop_everything(home, pool.PoolConfig(home=home)) == []
+        assert registry.live_entries(home) == []
 
 
 def test_slow_code_becomes_a_job_that_a_held_status_sees_end(place: dict[str, Any]) -> None:
@@ -139,14 +229,22 @@ def test_slow_code_becomes_a_job_that_a_held_status_sees_end(place: dict[str, An
     assert "result" not in handle
     job_id = handle["job_id"]
     # Another server process, as a client restart makes.
-    [held] = run(place, ("hou_jobs", {"job_id": job_id, "wait_s": 10}))
+    [held] = asyncio.run(_run(place, [("hou_jobs", {"job_id": job_id, "wait_s": 10})]))
     body = ok(held)
     if body["state"] == "running":
-        body = settled(place, job_id)
+        body = settled(place, job_id, new_server=True)
     assert body["state"] == "done"
     assert body["outputs"]["result"] == {"slept": 5}
     assert body["operation_id"] == handle["operation_id"]
     assert body["elapsed_s"] >= 4.5
+
+    def exported() -> bool:
+        nonlocal body
+        [status] = run(place, ("hou_jobs", {"job_id": job_id}))
+        body = ok(status)
+        return "export_path" in body
+
+    support.wait_until(exported, timeout_s=10)
     # The worker's scene has no file, so the readable copy is in its scratch folder.
     copy = Path(body["export_path"])
     assert copy.is_file()
@@ -174,7 +272,7 @@ def test_a_second_server_follows_a_job_by_id(place: dict[str, Any]) -> None:
     code = "import time\ntime.sleep(3)\nresult = 'followed'"
     [started] = run(place, ("hou_python", {"code": code, "background": True}))
     job_id = ok(started)["job_id"]
-    body = settled(place, job_id)
+    body = settled(place, job_id, new_server=True)
     assert body["state"] == "done"
     assert body["outputs"]["result"] == "followed"
 
