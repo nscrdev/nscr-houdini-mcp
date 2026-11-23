@@ -173,7 +173,7 @@ def register(
     """Copy the image in, write its record, and hand the record back.
 
     The copy goes through the output allocation, so it gets a run id, a run
-    record and a readable sidecar like any other output. The record is made
+    record and, when sidecars are on, a readable sidecar. The record is made
     with an exclusive create, so an id is written once. A registration that
     fails part way takes back what it made: the copies first, then the place
     and the run record.

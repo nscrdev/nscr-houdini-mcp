@@ -754,7 +754,9 @@ def plan_path(
     if drop is not None:
         parts = frozen.rstrip("/").split("/")
         version_dir = "/".join(parts[: len(parts) - drop])
-    sidecar = _sidecar(frozen, directory, version_dir, is_directory, extension) if table.sidecars else ""
+    sidecar = (
+        _sidecar(frozen, directory, version_dir, is_directory, extension) if table.sidecars else ""
+    )
 
     return OutputPlan(
         kind=kind,
@@ -1150,7 +1152,7 @@ def allocate(
     variables: Mapping[str, str | None] | None = None,
     above: int = 0,
 ) -> OutputPlan:
-    """Take a version, claim it on disk, record the run and write the sidecar.
+    """Take a version, claim it on disk, record the run and write any sidecar.
 
     The number comes out of the store's transaction and the folder is then
     created with an exclusive `mkdir`. A folder that is already there means
@@ -1218,7 +1220,7 @@ def allocate(
 
 
 def record_files(store: Store, plan: OutputPlan, files: Iterable[str]) -> None:
-    """Name the files a run really wrote, in its record and in the file beside it.
+    """Name the files a run really wrote, in its record and in any sidecar.
 
     For an output that turned out to be several files, such as the frames of
     a capture, so the record lists each one rather than the path it was
@@ -1233,7 +1235,7 @@ def record_files(store: Store, plan: OutputPlan, files: Iterable[str]) -> None:
 def release(store: Store, plan: OutputPlan, *, drop_run: bool = True) -> None:
     """Give back a place that was claimed and never written.
 
-    The claim file and the record beside the output go, the run's record goes
+    The claim file and any sidecar beside the output go, the run's record goes
     unless it was written by an earlier call (drop_run false),
     and the number keeps its place in the sequence with no run on it. A file
     kind whose output is there after all is left alone. Version folders are

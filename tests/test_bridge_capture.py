@@ -952,7 +952,7 @@ def test_a_render_that_fails_part_way_leaves_no_frames(scene: Scene, home: Path)
 
 def test_a_stopped_sequence_keeps_and_lists_its_frames(scene: Scene, home: Path) -> None:
     sidecars_on(home)
-    run =Run(scene, home, "hython")
+    run = Run(scene, home, "hython")
 
     def note(said: dict[str, Any]) -> None:
         run.notes.append(said)
