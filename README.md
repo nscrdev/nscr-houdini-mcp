@@ -567,7 +567,8 @@ own extension is not the one wanted and `node` for the node the output
 belongs to, whose name is used when none is given. It answers with
 `parm_string`, the line with `$HIP` that belongs on the node,
 `expanded_path`, the absolute path for this run, and the `version`, `folder`,
-`run_id` and `sidecar` beside them. A version is taken on every call; with
+`run_id` and `sidecar` beside them (`sidecar` is empty unless
+`outputs.sidecars` is on). A version is taken on every call; with
 `operation_id` the same id sent again answers with the place it took. `$JOB`
 and `$HOUDINI_TEMP_DIR` are read from the session, once, never from the
 server's own environment. `job` and `spill` paths belong to the server and are
@@ -1017,10 +1018,13 @@ several processes and several machines on the same scene folder. A hip file has
 no folder of its own, so it claims a small `.claim` file beside it instead,
 which is what stops two machines with their own stores from writing the same
 `v001`. Every file the agent writes for itself carries the run id, so two
-captures in the same second are two files. Each run leaves a readable
-`_run.json` beside its output with the scene, session, node, version and paths,
-absolute for the machine that made the run and again relative to the root, so
-the same folder read from somewhere else still makes sense.
+captures in the same second are two files. The store keeps a record of every
+run, with the scene, session, node, version and paths. Set
+`outputs.sidecars = true` to also write that record as a readable `_run.json`
+beside each output, with paths absolute for the machine that made the run and
+again relative to the root, so the same folder read from somewhere else still
+makes sense. Sidecars are off by default, so no extra JSON files appear next
+to your scenes and renders. Nothing in the server reads them back.
 
 Edit the table where it suits you. Built in defaults come first, then
 `config.toml` in the state folder (`NSCR_MCP_HOME` moves it), then
@@ -1033,6 +1037,7 @@ which key and why.
 producer = "3d/hip"        # an extra level under each kind, off by default
 cache_root = "$JOB/cache"  # heavy caches on a fast local disk
 version_width = 3
+sidecars = false           # true writes a readable _run.json beside each output
 
 [outputs.grammar]
 comp = "<output_root>/comp/<name>/v<ver>/<name>_v<ver>.<frame>.<ext>"

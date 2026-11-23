@@ -303,7 +303,7 @@ def planned(plan: outputs_module.OutputPlan) -> dict[str, Any]:
         "name": plan.name,
         "hip_family": plan.hip_family,
         "template": plan.template,
-        "sidecar": native(plan.sidecar),
+        "sidecar": native(plan.sidecar) if plan.sidecar else "",
         "run_id": plan.run_id,
         "unsaved_hip": plan.unsaved_hip,
         "warnings": list(plan.warnings),

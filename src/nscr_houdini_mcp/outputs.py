@@ -152,6 +152,9 @@ DEFAULT_OUTPUTS = {
     "producer": "",
     "version_width": 3,
     "frame_token": "$F4",
+    # A readable `_run.json` beside each output. Off by default: the store
+    # keeps the same record, so the file is only for a person to read.
+    "sidecars": False,
 }
 
 # Which node marks an output. It is config because a studio that marks outputs
@@ -328,6 +331,7 @@ class Conventions:
     output_marker_type: str
     output_marker_prefix: str
     output_marker_enabled: bool
+    sidecars: bool = False
     sources: tuple[str, ...] = ()
 
     def template_for(self, kind: str) -> str:
@@ -367,6 +371,7 @@ DEFAULT_CONVENTIONS_TABLE = Conventions(
     output_marker_type=str(DEFAULT_CONVENTIONS["output_marker_type"]),
     output_marker_prefix=str(DEFAULT_CONVENTIONS["output_marker_prefix"]),
     output_marker_enabled=bool(DEFAULT_CONVENTIONS["output_marker_enabled"]),
+    sidecars=bool(DEFAULT_OUTPUTS["sidecars"]),
 )
 
 
@@ -497,6 +502,9 @@ def _merge(layers: list[tuple[Path, dict[str, Any]]]) -> Conventions:
     enabled = conventions["output_marker_enabled"]
     if not isinstance(enabled, bool):
         raise ConventionError("conventions.output_marker_enabled must be true or false")
+    sidecars = outputs["sidecars"]
+    if not isinstance(sidecars, bool):
+        raise ConventionError("outputs.sidecars must be true or false")
     for key in ("output_root", "cache_root", "producer", "frame_token"):
         _needs_text(f"outputs.{key}", outputs[key])
     for key in ("output_marker_type", "output_marker_prefix"):
@@ -524,6 +532,7 @@ def _merge(layers: list[tuple[Path, dict[str, Any]]]) -> Conventions:
         output_marker_type=str(conventions["output_marker_type"]),
         output_marker_prefix=str(conventions["output_marker_prefix"]),
         output_marker_enabled=enabled,
+        sidecars=sidecars,
         sources=tuple(sources),
     )
 
@@ -745,7 +754,7 @@ def plan_path(
     if drop is not None:
         parts = frozen.rstrip("/").split("/")
         version_dir = "/".join(parts[: len(parts) - drop])
-    sidecar = _sidecar(frozen, directory, version_dir, is_directory, extension)
+    sidecar = _sidecar(frozen, directory, version_dir, is_directory, extension) if table.sidecars else ""
 
     return OutputPlan(
         kind=kind,
@@ -1197,7 +1206,8 @@ def allocate(
             },
         )
         recorded = True
-        write_export(store.run_export(run), plan.sidecar)
+        if plan.sidecar:
+            write_export(store.run_export(run), plan.sidecar)
     except BaseException:
         # The place was claimed for a run that could not be recorded, so it
         # goes back rather than staying claimed by nobody. A run record that
@@ -1216,7 +1226,8 @@ def record_files(store: Store, plan: OutputPlan, files: Iterable[str]) -> None:
     """
     paths = {**plan.as_record(), "files": [str(item) for item in files]}
     store.set_run_paths(plan.run_id, paths)
-    write_export(store.run_export(plan.run_id), plan.sidecar)
+    if plan.sidecar:
+        write_export(store.run_export(plan.run_id), plan.sidecar)
 
 
 def release(store: Store, plan: OutputPlan, *, drop_run: bool = True) -> None:
@@ -1232,6 +1243,8 @@ def release(store: Store, plan: OutputPlan, *, drop_run: bool = True) -> None:
     if not plan.version_dir and not plan.is_directory and Path(plan.path).exists():
         return
     for leftover in (f"{plan.path}{CLAIM_SUFFIX}", plan.sidecar):
+        if not leftover:
+            continue
         try:
             Path(leftover).unlink(missing_ok=True)
         except OSError:

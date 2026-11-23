@@ -144,7 +144,7 @@ def test_a_cache_path_for_a_file_cache_node_in_a_saved_scene(place: dict[str, An
     assert expanded.name == "sim_v001.$F4.bgeo.sc"
     assert expanded.parent.resolve() == (place["scenes"] / "geo" / "sim" / "v001").resolve()
     assert Path(body["folder"]).is_dir()
-    assert Path(body["sidecar"]).is_file()
+    assert body["sidecar"] == ""
     assert body["version"] == 1
     [listed] = run(place, ("hou_outputs", {"action": "list", "filter": {"kind": "cache"}}))
     [row] = ok(listed)["runs"]

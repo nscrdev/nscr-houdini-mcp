@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Outputs
+
+- The readable `_run.json` beside each output is now off by default. Set
+  `outputs.sidecars = true` in `config.toml` or `.agent/outputs.toml` to
+  write it again. The store keeps the same record either way.
+
 ### Windows
 
 - Runs against a real Houdini 22 on Windows 11, with GUI sessions and hython

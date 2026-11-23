@@ -917,6 +917,10 @@ def test_alpha_box_reads_what_a_render_node_writes(tmp_path: Path) -> None:
 # Section: what a failed or stopped capture leaves
 
 
+def sidecars_on(home: Path) -> None:
+    (home / "config.toml").write_text("[outputs]\nsidecars = true\n", encoding="utf-8")
+
+
 def sidecar_of(path: str) -> dict[str, Any]:
     [record] = Path(path).parent.glob("*_run.json")
     import json
@@ -925,6 +929,7 @@ def sidecar_of(path: str) -> dict[str, Any]:
 
 
 def test_the_run_record_lists_the_numbered_frames(scene: Scene, home: Path) -> None:
+    sidecars_on(home)
     said = take(scene, home, frames=[1, 3, 1])
     [shot] = said["views"]
     record = sidecar_of(shot["files"][0])
@@ -946,7 +951,8 @@ def test_a_render_that_fails_part_way_leaves_no_frames(scene: Scene, home: Path)
 
 
 def test_a_stopped_sequence_keeps_and_lists_its_frames(scene: Scene, home: Path) -> None:
-    run = Run(scene, home, "hython")
+    sidecars_on(home)
+    run =Run(scene, home, "hython")
 
     def note(said: dict[str, Any]) -> None:
         run.notes.append(said)
@@ -1349,6 +1355,7 @@ def test_the_display_flag_goes_back_when_the_render_fails(
 
 
 def test_a_render_node_that_will_not_go_is_cleanup_failed(scene: Scene, home: Path) -> None:
+    sidecars_on(home)
     scene.capture.undestroyable = {"flipbook"}
     error = refused(scene, home, frames=[1, 2, 1])
     assert error.code == "CLEANUP_FAILED"

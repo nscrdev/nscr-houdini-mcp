@@ -228,9 +228,9 @@ def test_save_increment_goes_on_above_the_versions_beside_the_scene(
     # The versions that were there are as they were.
     assert (project / "shot_v001.hip").read_bytes() == b"shot_v001.hip"
     assert (project / "shot_v002.hip").read_bytes() == b"shot_v002.hip"
-    # The claim goes once the file is its own guard; the record stays.
+    # The claim goes once the file is its own guard; no sidecar by default.
     assert not Path(f"{target}{outputs.CLAIM_SUFFIX}").exists()
-    assert Path(body["sidecar"]).is_file()
+    assert body["sidecar"] == ""
 
 
 def test_save_increment_twice_takes_two_versions(bench: Bench, project: Path) -> None:
