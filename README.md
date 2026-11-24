@@ -2,10 +2,45 @@
 
 An MCP server and a small set of agent skills for SideFX Houdini 22.
 
-Status: 0.1.0, the first release. The eleven tools described below work
+## TL;DR
+
+This lets an AI agent work inside Houdini for you. It can look at your scene,
+build and change nodes, run Python, take pictures of the viewport, and compare
+a render with a reference image before it says it is done. It works with the
+Houdini you have open, and with background Houdinis it starts by itself.
+
+Renders, caches and captures go into versioned folders next to your scene
+file. Nothing is written over.
+
+You need Houdini 22. To set it up, copy this and give it to your agent:
+
+```text
+Install the nscr-houdini MCP server from https://github.com/nscrdev/nscr-houdini-mcp.
+If you can install plugins, install it as a plugin from that repository's
+marketplace and turn on auto-update. If you cannot, follow the "Manual install"
+steps in its README.
+Then install the Houdini side as the README says (bridge install --autostart)
+and tell me when to restart Houdini.
+When Houdini is open again, run hou_ping to check the connection.
+```
+
+## Status
+
+Version 0.1.0, the first release. The eleven tools described below work
 against a real Houdini 22 on macOS and Windows; see [Tested on](#tested-on)
 for what has and has not been run where. Names and arguments may still change before 1.0,
 and [CHANGELOG.md](CHANGELOG.md) says what changed.
+
+### Tested on
+
+- macOS on Apple silicon (arm64), with Houdini 22.0.368 and 22.0.429: the unit
+  tests, the tests that start a real hython, and GUI sessions driven through
+  one MCP client.
+- Windows 11 (x64), with Houdini 22.0.368: the unit tests, the tests that
+  start a real hython, and GUI sessions driven through one MCP client.
+- Linux: the unit tests run in CI, on Python 3.11 and 3.13, for every push to
+  main and every pull request, as they do on Windows. It has not been run
+  against a real Houdini yet, so treat Houdini on Linux as untried.
 
 ## Goals
 
@@ -17,18 +52,88 @@ and [CHANGELOG.md](CHANGELOG.md) says what changed.
 - Plain `SKILL.md` skills that help an agent build scenes a person can read, change and reuse. You can edit them to fit how you work.
 - Runs on macOS, Windows and Linux.
 
-## Tested on
+## Install
 
-- macOS on Apple silicon (arm64), with Houdini 22.0.368 and 22.0.429: the unit
-  tests, the tests that start a real hython, and GUI sessions driven through
-  one MCP client.
-- Windows 11 (x64), with Houdini 22.0.368: the unit tests, the tests that
-  start a real hython, and GUI sessions driven through one MCP client.
-- Linux: the unit tests run in CI, on Python 3.11 and 3.13, for every push to
-  main and every pull request, as they do on Windows. It has not been run
-  against a real Houdini yet, so treat Houdini on Linux as untried.
+Pick one. The plugin is easier and can update itself.
 
-## Quick start
+<!-- lint-allow: client-names -->
+### As a Claude Code plugin (recommended)
+
+This repository is also a plugin marketplace. Its one plugin, `nscr-houdini`,
+brings the server and the `houdini-artist` skill in a single install. You
+still need [uv](https://docs.astral.sh/uv/). The plugin starts the server
+with `uvx`, which builds it from the plugin's own files, so step 1 of the
+Quick start is not needed.
+
+1. Add the marketplace, then install the plugin:
+
+   ```text
+   /plugin marketplace add nscrdev/nscr-houdini-mcp
+   /plugin install nscr-houdini@nscr-houdini-mcp
+   ```
+
+   <!-- lint-allow: client-names -->
+   From a shell, run the same two commands with `claude plugin` in place of
+   `/plugin`. The desktop app reads the same marketplaces: add this one from
+   a shell, then in a Code session click **+**, choose Plugins, then Add
+   plugin, and install `nscr-houdini`.
+
+2. Install the Houdini side once, as in step 2 of the
+   [Quick start](#manual-install-any-mcp-client). If
+   `nscr-houdini-mcp` is not on your path, run it through `uvx`:
+
+   ```sh
+   uvx --from git+https://github.com/nscrdev/nscr-houdini-mcp nscr-houdini-mcp bridge install --autostart
+   ```
+
+   The install copies what Houdini needs into a folder of its own, so it
+   keeps working when uv clears its cache.
+
+3. Updates are off by default for a marketplace you add yourself. To turn
+   them on, run `/plugin`, open Marketplaces, pick `nscr-houdini-mcp` and
+   choose Enable auto-update. Every new commit on `main` counts as a new
+   version. To update by hand instead, refresh the marketplace, then the
+   plugin, from a shell:
+   <!-- lint-allow: client-names -->
+   `claude plugin marketplace update nscr-houdini-mcp`, then
+   <!-- lint-allow: client-names -->
+   `claude plugin update nscr-houdini@nscr-houdini-mcp`.
+
+<details>
+<summary><strong>Other apps that read the same marketplace</strong></summary>
+
+<!-- lint-allow: client-names -->
+The ChatGPT desktop app and the `codex` CLI read the same marketplace:
+
+1. Add it and install the plugin from a shell:
+
+   ```sh
+   # lint-allow: client-names
+   codex plugin marketplace add nscrdev/nscr-houdini-mcp
+   # lint-allow: client-names
+   codex plugin add nscr-houdini@nscr-houdini-mcp
+   ```
+
+   After that the app lists it under Plugins, as `nscr Houdini`.
+
+2. Install the Houdini side once, as in step 2 above.
+
+3. Updates are on. Each time the app or the CLI starts, it checks this
+   repository for a new commit and reinstalls the plugin when there is one.
+   The server rebuilds from the new files the next time it starts. An app
+   left open does not check again until it restarts. To update by hand:
+   <!-- lint-allow: client-names -->
+   `codex plugin marketplace upgrade nscr-houdini-mcp`.
+
+</details>
+
+Every other client keeps the Quick start install. If you also added the
+server by hand, remove that entry, or the agent sees two copies of every tool.
+
+### Manual install (any MCP client)
+
+<details>
+<summary><strong>Quick start: five steps</strong></summary>
 
 You need Houdini 22 and [uv](https://docs.astral.sh/uv/). Nothing is
 published to a package index; everything installs from this repository.
@@ -89,133 +194,30 @@ published to a package index; everything installs from this repository.
 5. Start Houdini, then your client. Ask the agent to run `hou_ping`; it
    answers with the session it found.
 
-<!-- lint-allow: client-names -->
-## Install as a Claude Code plugin
+</details>
 
-This repository is also a plugin marketplace. Its one plugin, `nscr-houdini`,
-brings the server and the `houdini-artist` skill in a single install. You
-still need [uv](https://docs.astral.sh/uv/). The plugin starts the server
-with `uvx`, which builds it from the plugin's own files, so step 1 of the
-Quick start is not needed.
+## The tools
 
-1. Add the marketplace, then install the plugin:
+Eleven tools. Click a group to read the details.
 
-   ```text
-   /plugin marketplace add nscrdev/nscr-houdini-mcp
-   /plugin install nscr-houdini@nscr-houdini-mcp
-   ```
+| Tool | What it does |
+|------|--------------|
+| `hou_ping` | Says which Houdini a call reaches, and that it answers. |
+| `hou_sessions` | Lists open and background Houdinis. Starts and stops background workers. |
+| `hou_scene` | Reads, opens and saves the scene, and saves the next `_v###` version. |
+| `hou_inspect` | Reads nodes, networks and parameters. |
+| `hou_python` | Runs Python inside Houdini with the whole `hou` API, as one undo step. |
+| `hou_jobs` | Follows long work, such as a frame sequence, by its job id. |
+| `hou_node_type` | Reads a node type's parameters and inputs before a node is made. |
+| `hou_docs` | Searches and reads Houdini's own help for the build in use. |
+| `hou_compare` | Compares a picture with a reference image and says how far apart they are. |
+| `hou_outputs` | Hands out versioned output paths and lists what a scene made. |
+| `hou_capture` | Saves pictures of what Houdini shows: viewport, quad view, turntable, sequence. |
 
-   <!-- lint-allow: client-names -->
-   From a shell, run the same two commands with `claude plugin` in place of
-   `/plugin`. The desktop app reads the same marketplaces: add this one from
-   a shell, then in a Code session click **+**, choose Plugins, then Add
-   plugin, and install `nscr-houdini`.
+<details>
+<summary><strong>hou_ping, hou_sessions and hou_scene</strong></summary>
 
-2. Install the Houdini side once, as in step 2 of the Quick start. If
-   `nscr-houdini-mcp` is not on your path, run it through `uvx`:
-
-   ```sh
-   uvx --from git+https://github.com/nscrdev/nscr-houdini-mcp nscr-houdini-mcp bridge install --autostart
-   ```
-
-   The install copies what Houdini needs into a folder of its own, so it
-   keeps working when uv clears its cache.
-
-3. Updates are off by default for a marketplace you add yourself. To turn
-   them on, run `/plugin`, open Marketplaces, pick `nscr-houdini-mcp` and
-   choose Enable auto-update. Every new commit on `main` counts as a new
-   version. To update by hand instead, refresh the marketplace, then the
-   plugin, from a shell:
-   <!-- lint-allow: client-names -->
-   `claude plugin marketplace update nscr-houdini-mcp`, then
-   <!-- lint-allow: client-names -->
-   `claude plugin update nscr-houdini@nscr-houdini-mcp`.
-
-<!-- lint-allow: client-names -->
-The ChatGPT desktop app and the `codex` CLI read the same marketplace:
-
-1. Add it and install the plugin from a shell:
-
-   ```sh
-   # lint-allow: client-names
-   codex plugin marketplace add nscrdev/nscr-houdini-mcp
-   # lint-allow: client-names
-   codex plugin add nscr-houdini@nscr-houdini-mcp
-   ```
-
-   After that the app lists it under Plugins, as `nscr Houdini`.
-
-2. Install the Houdini side once, as in step 2 above.
-
-3. Updates are on. Each time the app or the CLI starts, it checks this
-   repository for a new commit and reinstalls the plugin when there is one.
-   The server rebuilds from the new files the next time it starts. An app
-   left open does not check again until it restarts. To update by hand:
-   <!-- lint-allow: client-names -->
-   `codex plugin marketplace upgrade nscr-houdini-mcp`.
-
-Every other client keeps the Quick start install. If you also added the
-server by hand, remove that entry, or the agent sees two copies of every tool.
-
-## Development
-
-Python 3.11 or newer. The server process never imports `hou`.
-
-Setup, with [uv](https://docs.astral.sh/uv/):
-
-```sh
-uv venv
-uv pip install -e ".[dev]"
-```
-
-Or with the standard library (`.venv\Scripts\activate` on Windows):
-
-```sh
-python3 -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev]"
-```
-
-Checks, the same ones CI runs:
-
-```sh
-ruff check . && ruff format --check .
-pytest -q
-python scripts/lint_client_names.py   # shipped text must not name any client or vendor
-python scripts/tools_list_cost.py     # token cost of the tools/list payload
-```
-
-Before a release, check a clean install from a built wheel in a throwaway
-environment, with no checkout in reach. It needs `uv`, writes its own files
-only inside one temporary folder (uv keeps its usual cache, and may download
-a Python to make the environment with), and prints each check:
-
-```sh
-python scripts/check_install.py
-python scripts/check_install.py --hython /path/to/hython   # also import it in Houdini
-```
-
-Among its checks: the folder the package file puts on Houdini's path holds
-this package and nothing else of the environment, and a Python with no
-site-packages imports the bridge from it alone.
-
-`scripts/tools_list_cost.py` serialises the tool list the way a client receives
-it and counts its tokens, in total and per tool, against a budget of 4,000.
-With the dev extras installed it counts with `tiktoken` and the `o200k_base`
-encoding (`--encoding` names another), read from tiktoken's cache, or fetched
-once with a ten second limit when it is not there. Without the package, or
-with the encoding neither cached nor fetched, it falls back to bytes divided
-by four, rounded up, and says which of the two happened. `tiktoken` is only ever a dev
-dependency. Either count is a budget signal to watch across commits, since a
-client on another encoding pays a somewhat different number. Pass
-`--max-tokens N` to make it fail over a budget.
-
-Run the server on stdio:
-
-```sh
-nscr-houdini-mcp
-```
-
-Eleven tools. `hou_ping` says which session a call reaches and that it
+`hou_ping` says which session a call reaches and that it
 answers. `hou_sessions` lists every session with its state (`live`, `busy`,
 `unresponsive`, `crashed` or `gone`) and starts and stops workers under the
 pool's rules; it never closes a Houdini with a user interface. `hou_scene`
@@ -230,6 +232,11 @@ dirty after any call that changes the scene or a merge, and unknown at start
 or after code that saved or loaded by itself, when it cannot tell.
 Opening a scene runs the code that scene file carries, as Houdini always
 does, so only open files you trust.
+
+</details>
+
+<details>
+<summary><strong>hou_inspect</strong></summary>
 
 `hou_inspect` reads nodes, networks and parameters. `tree` lists what is
 under a path, `node` reads one node or a batch of up to fifty, `parms` reads
@@ -272,6 +279,11 @@ Every tool that reads takes the same three `detail` levels:
 
 `include` brings single items into a lower level: `wires`, `flags`, `errors`,
 `expressions`, `code`, `notes` or `cook_time`.
+
+</details>
+
+<details>
+<summary><strong>hou_python</strong></summary>
 
 `hou_python` runs Python inside a session with the whole `hou` API. What the
 code leaves in a variable named `result` comes back, turned into JSON on the
@@ -351,6 +363,11 @@ the session is going down. Code that stops once it has seen a cancel ends
 request still on the job. Code that stops because its session is going down
 ends `lost`, as it would had the session gone first.
 
+</details>
+
+<details>
+<summary><strong>hou_jobs</strong></summary>
+
 `hou_jobs` follows long running work by id. `status`, the default, reads one
 job: its state (`queued`, `running`, `done`, `failed`, `cancelled` or
 `lost`), progress, outputs, error, when it started and ended, the scene epoch
@@ -380,6 +397,11 @@ job to follow, rather than its answer, leaves a readable copy of itself
 beside the scene file when it ends, in `.agent/jobs/`, and nothing is made
 beside a scene file that is not there. Jobs are kept for 7 days after they
 end, and their copies go with them.
+
+</details>
+
+<details>
+<summary><strong>hou_node_type</strong></summary>
 
 `hou_node_type` reads a node type from the running Houdini before any node of
 it is made, so installed assets and this build's own versions are the ones
@@ -417,6 +439,11 @@ what it found with `stopped`. When the shipped help is missing or cannot be
 read, the answer says `help_available: false`, and it is tried again a
 minute later.
 
+</details>
+
+<details>
+<summary><strong>hou_docs</strong></summary>
+
 `hou_docs` reads Houdini's own documentation for the build in use. `search`
 looks for `query` in page titles and first paragraphs and ranks a title that
 is the query first, then one that starts with it, then one that holds it,
@@ -447,6 +474,11 @@ a small cache under the state folder, and search uses an index of every page,
 built once per build and kept beside it; the first result's `note` says how
 long that took. The cache holds at most 64 MB across builds, the builds used
 least recently going first, and a build whose install has gone is removed.
+
+</details>
+
+<details>
+<summary><strong>hou_compare</strong></summary>
 
 `hou_compare` puts a candidate image beside a reference and says how far
 apart they are, as pictures and as numbers. It never says pass or fail: there
@@ -573,6 +605,11 @@ one shared folder never interleave. A result in a series with earlier runs
 carries the trend, and one that starts a new series says which of those
 changed.
 
+</details>
+
+<details>
+<summary><strong>hou_outputs</strong></summary>
+
 `hou_outputs` hands out managed paths and reads back what a scene made.
 `resolve` takes a place for a `kind` and a `name`, with `ext` when the kind's
 own extension is not the one wanted and `node` for the node the output
@@ -601,6 +638,11 @@ could give and `unexpanded` for a variable it cannot fill in. Nothing is
 evaluated and nothing cooks: values are expanded from the table's variables
 and the node's and scene's own names. `list` and `lint` page with `limit` and
 `next_page`, the way reads do.
+
+</details>
+
+<details>
+<summary><strong>hou_capture</strong></summary>
 
 `hou_capture` saves a picture of what a session shows: the `viewport`, one
 `node` on its own, the `network` editor, a `cop` output or a `pane` by name
@@ -667,293 +709,44 @@ the top left. `frames: [start, end, step]` captures a sequence, which is a
 job: it answers inline when it is done within `inline_wait_s`, and with the
 job to follow in `hou_jobs` when it is not.
 
-### The Houdini side
+</details>
 
-`nscr_houdini_mcp.bridge` runs inside Houdini's own Python. It serves two
-endpoints on loopback, registers the session in the coordination store and
-takes it out again when the process quits.
+## Skills
 
-What the bridge guards against: a web page in a browser on this machine,
-another person with an account on it, and the network. Not the owner's own
-programs. Anything running as the same person can read that person's files,
-token included, and could drive Houdini with or without this.
+A skill is a plain `SKILL.md` file that tells an agent how to work: what to
+plan before building, what to look at before calling something finished, and
+when to stop and report. The first one, `houdini-artist`, covers modelling,
+lookdev, cleaning up a network, matching a reference, finding out why a scene
+is slow and getting a scene ready to hand on. It is written for this server,
+and still helps with planning when no Houdini is connected.
 
-The token is never sent. Each request is signed with it and each answer is
-signed back, so nothing on the port learns anything it could use again, and a
-caller can tell the bridge from something that took its port after a crash. A
-request is also refused if it carries `Origin` or `Referer`, names a host
-other than this bridge, is not JSON, is over the size cap, or nests too deeply
-for an envelope. The bridge registers no built in API route, so the one that
-parses a posted form before any handler runs does not exist on its server.
-
-### Addressing a session, and sending a call twice
-
-A session has two handles. `session_id` is random, minted at start and never
-reused. `alias` is the readable name: a session with a scene is named after
-the scene file, a worker is `w1`, `w2` and so on, and two Houdinis on the same
-file get different names. Either handle addresses a session. The name never
-moves once it is settled, so a scene saved under a different name leaves the
-session's name out of date, which health and every reply say and nothing
-silently corrects.
-
-`scene_epoch` counts the times a session has replaced its scene, which is any
-open, new scene or reload. A call carrying an older epoch is refused with
-`SCENE_REPLACED` and a summary of the scene there is now, before the tool
-runs. A call addressed to a session whose process has gone is refused by the
-calling end with `SESSION_DEAD` and the id of whatever answers to the same
-name now. Nothing is sent to the new process.
-
-A call that changes the scene carries an `operation_id`. The bridge takes a
-receipt under that id before the work runs and finishes it with the answer, so
-the same id arriving again is answered from the receipt rather than doing the
-work twice. The same id with different arguments is `OPERATION_MISMATCH`, and
-an id whose first attempt left no answer is `OUTCOME_UNKNOWN` rather than a
-guess. Reads take no receipt.
-
-That is what makes a retry safe, and the only retry the client does by itself:
-one, on a lost reply (the connection closed, or the read ran out of time), and
-only for a call that carries an operation id, using that same id. A reply that
-arrived is never sent again, whatever it says.
-
-A reply is usually lost because this end gave up on the socket first, so the
-work is often still running when the second send arrives. That send queues
-behind it, asking for a longer turn than the first, and can still come back
-`SESSION_BUSY`. The answer is in the receipt as soon as the work ends, so the
-way on from there is the same id again, not a fresh call.
-
-Start one in a headless Houdini:
+The skills ship with the package:
 
 ```sh
-hython -m nscr_houdini_mcp.bridge.main --home <state folder>
+nscr-houdini-mcp skills path                # where the shipped skills are
+nscr-houdini-mcp skills install <folder>    # copy them into a folder you name
 ```
 
-It stops when its input closes, or on the word `stop`. A start like this puts
-Qt on its offscreen screen plugin unless `QT_QPA_PLATFORM` already names one,
-as the pool does for its workers. On another plugin and a dense display a
-render node draws larger than asked; a capture then reads the scale and makes
-up for it, or says `framing_unverified` when it cannot.
+Clients that read skills usually look in a skills folder in your user settings
+or in the project, with one subfolder per skill. Point `install` at the one
+yours uses. A copy already there that differs from the shipped one is left
+alone, so your edits survive an upgrade; `--force` writes the shipped files
+over it.
 
-### Pacing a Houdini with a user interface
-
-In a session with a user interface every call runs on Houdini's main thread,
-the one that draws the interface. Calls sent back to back leave it no room,
-and an agent in a loop can send a great many, so the server paces the calls it
-sends to such a session: one call out at a time, a pause after each one ends,
-and a cap on how many start in a second. Two keys in `config.toml` set the pace:
-
-```toml
-gui_min_pause_ms = 50     # least time from one call ending to the next starting
-gui_max_calls_per_s = 10  # most calls that may start in any one second
-```
-
-A value of 0 turns that rule off, and both at 0 turn pacing off altogether;
-a negative value is refused.
-
-The wait for a turn comes out of the call's own `wait_s` (a second unless it
-says), and the bridge gets what is left. Calls sent side by side queue and go
-out one after another, however long the call out may run. A call is answered
-at once with `SESSION_BUSY` when the pause and the cap alone would hold it
-past its wait, when it passed `skip_if_busy`, or when the queue is full; one
-whose wait runs out in the queue gets the same answer then. So a call may be
-refused up front when the calls queued ahead of it, at the rate cap, already
-fill its `wait_s`, and `retry_after_s` says when to come back. Nothing of a
-refused call is sent, so a caller that has given up never has its change made
-later. `retry_after_s` is an estimate from the calls queued ahead and how
-long the session's last few calls took, between the pause and 30 seconds; a
-call out longer than usual is guessed to run as long again. The answer also
-carries `queued_ahead`, how many calls waited ahead. A call that did wait
-says how long in its trace, as `throttled_ms`, and when it was let through,
-as `admitted_at`.
-
-The pace is kept per server process and per session. Two agents sharing one
-server process share its one allowance; two server processes, one per
-client, each have their own, so together they get no more than twice it.
-A call sent again under the operation id of the call that is out goes
-straight through, since the bridge answers it from that call's receipt. At
-most 32 calls wait on one session's turn; one more is answered
-`SESSION_BUSY` at once, and a call whose client cancels leaves the queue
-without being sent. Workers are headless and are not paced. A cancel is never
-paced either, since it runs beside the call it stops.
-
-The bridge has a limit of its own, whoever sends: it remembers the signed
-requests of the last two minutes, 20,000 at most, and refuses one more with
-`FLOOD_GUARD`, naming the limit and how many seconds to wait.
-
-### Installing the Houdini side
-
-One command writes the Houdini package that puts this on a session's path:
-
-```sh
-nscr-houdini-mcp bridge install                  # for Houdini 22.0
-nscr-houdini-mcp bridge install --houdini-version 22.0 --dry-run
-nscr-houdini-mcp bridge install --autostart      # every Houdini opens a port
-nscr-houdini-mcp bridge uninstall
-nscr-houdini-mcp bridge status
-nscr-houdini-mcp bridge snippet
-```
-
-It writes one file, `nscr_houdini_mcp.json`, into the packages folder Houdini
-reads. That folder is often not where a shell would guess, because a launcher,
-a line in `houdini.env`, another package or a synced documents folder can move
-it, so it is worked out in this order:
-
-1. `--packages-dir`, on `install`, `uninstall` and `status`.
-2. `HOUDINI_PACKAGE_DIR` in this shell. Houdini reads every folder it names,
-   so the first is written into and the rest are reported.
-3. A real Houdini, asked. One short script runs in `hython` with a ten second
-   cap and reports the home folder, `HOUDINI_PACKAGE_DIR`, `HOUDINI_USER_PREF_DIR`
-   and `HSITE` as Houdini itself sees them, after `houdini.env` and packages.
-   A Houdini that is missing or slow leaves a note and the lookup carries on.
-   `HSITE` is other people's, so it is reported and never written to.
-4. `HOUDINI_USER_PREF_DIR` in this shell, with `__HVER__` filled in.
-5. The usual folder for the system: `~/Library/Preferences/houdini/<version>`
-   on macOS, `Documents\houdini<version>` under the profile on Windows,
-   `~/houdini<version>` on Linux.
-
-Nothing is remembered between runs, and `bridge status` prints which of those
-decided and every folder it considered.
-
-The file points `HOUDINI_PATH` at this copy's `houdini/` folder and puts a
-folder that holds `nscr_houdini_mcp` and nothing else in front of Houdini's
-`PYTHONPATH`. In a checkout those are `houdini/` and `src/`, as they stand, so
-an edit there reaches the next Houdini. An installed copy never names its
-site-packages folder: every other library of the environment is there too,
-and numpy, Pillow or anything else in it would load in place of Houdini's own
-and break Houdini's own tools. Instead the install copies the package alone
-into `houdini-python/` under the state folder, and both paths name that copy,
-so the startup files and the bridge they start are always one version.
-
-A copy is named after what it holds and never changes once made. After an
-upgrade, run `bridge install` again and restart Houdini: the new version gets
-a copy of its own, and the old one stays for a week for a Houdini still
-running from it. The copies made for workers the pool starts follow the same
-rules, and one no worker has asked for in a week is taken away. `bridge
-status` says when a package file's copy is another version than the server,
-and when a package file an older install wrote names a whole site-packages
-folder. Each bridge also reports the version it runs, and `hou_ping` and
-`hou_sessions` warn with `BRIDGE_VERSION_MISMATCH` when it is not the
-server's. Inside Houdini the bridge needs only the standard library, `hou`
-and, for reading images, the numpy, OpenImageIO and OpenColorIO Houdini ships.
-
-Every path is worked out from where this copy is running, so there is nothing
-to edit by hand. Every file it writes carries a marker: a package of the same
-name that this did not write, or a link where the file should be, is reported
-and left exactly as it is, and `uninstall` takes away only its own, plus any
-folder and copy it made and nothing else.
-
-Installing opens no port. Auto start is off unless you ask for it with
-`--autostart`, which sets `NSCR_MCP_AUTOSTART` to `1` in the package. The
-start hangs off `python3.13libs/ready.py`, which Houdini runs for every folder
-on its path, in a session with an interface and without, so this package takes
-nobody else's startup script away.
-
-`bridge status` lists the sessions running now with their ids, names, ports,
-scenes and whether each is busy, asks each one whether it is healthy under one
-shared time budget, and says which folders have the package and where Houdini
-is installed.
-
-To start a bridge inside a Houdini that is already open, paste what `bridge
-snippet` prints into its Python shell. It works out the source path as it
-prints, a copy of the package alone for an installed copy as above, so the
-lines run as they stand.
-
-`houdini/packages/nscr_houdini_mcp.json` is the same file as a template, for
-anyone who would rather place it themselves.
-
-### The worker pool
-
-A worker is a headless Houdini of its own with a bridge in it, kept warm so
-the next piece of work does not pay a cold start:
-
-```sh
-nscr-houdini-mcp bridge worker start             # one worker, if there is room
-nscr-houdini-mcp bridge worker start --weight heavy --max-threads 8
-nscr-houdini-mcp bridge worker list
-nscr-houdini-mcp bridge worker reserve w1 --job job-1
-nscr-houdini-mcp bridge worker release w1
-nscr-houdini-mcp bridge worker stop w1
-```
-
-A worker started from a client through `hou_sessions` takes `pool_cap`,
-`hython` or `houdini_build`, and `worker_ports` from `config.toml`, and so
-does `worker start` for any flag it is not given.
-
-Three workers may run at once by default. The slot is taken in one
-transaction in the coordination store, which counts the workers that are
-still starting, so several servers on one machine cannot hand out the same
-last slot, and `POOL_FULL` is the answer when there is none. A start that
-fails gives its slot straight back. Each reservation also carries a weight,
-and the pool holds a budget of its own, so a heavy job is refused while the
-machine is busy even when a slot is free.
-
-A worker does not belong to the process that started it. It is started
-detached, with its output in `logs/worker-<name>.log` under the state folder,
-and it stays when its server exits, except in the Windows case below, so a
-client restart normally keeps the warm pool. The log is private to its
-owner and is rolled over when it grows, keeping the last two. What ends a
-worker is its lease: it watches its own row and goes when a server asks
-it to, or when nobody has wanted it for half an hour. Routing a call to it
-renews the lease, and a worker running a call or a job is never idle,
-however long the work takes and whether or not
-anybody routes to it meanwhile. `stop` asks first and
-ends the process itself only if the ask was not enough, and never unless that
-process can be shown to still be the worker. `start` exits 3 when the pool is
-full and 1 when the start went wrong.
-
-A worker inherits this process's environment on purpose: it has to see the
-same licensing, path and package settings as the shell the tool was started
-from, or it is a different Houdini from the artist's. Three things are decided
-rather than inherited. Its state folder is the one the pool is using, its
-reservation token arrives in the environment and never on the command line,
-which every account on the machine can read, and its thread cap is either the
-one you named with `--max-threads` or the one the weight implies: a heavy
-worker gets the machine, a light one is left at Houdini's own default.
-
-On Windows, some clients do not let a worker run independently. Such a
-worker reports `lifetime: server`. Closing or restarting the client then
-ends the worker, interrupts its jobs and loses unsaved changes in that
-worker, so save first. It shows as `crashed` in `hou_sessions` list
-afterwards; that means the client ended it, not that Houdini crashed.
-
-Each worker is asked once, when it comes up, what it can do: the build, the
-license it got, the renderers that are really installed, how it can make a
-picture, and that it can be cancelled. The answer is kept beside the worker,
-so another process can pick one without asking it anything.
-
-Tests marked `houdini` need a Houdini on the machine and skip when there is
-none, so `pytest -q` is complete everywhere. Run only those with `pytest -m
-houdini`, or skip them with `pytest -m "not houdini"`. The bridge is found
-through `NSCR_MCP_HYTHON`, then `HFS`, then the usual install folder.
-
-### Running the sequence yourself
-
-`tests/sequence.py` is one scripted pass over every tool, the way a client
-would go about a first piece of work: list the tools, find a session, start a
-worker, read its scene, build three nodes with a lost reply sent again under
-the same operation id, read them back, look up `attribwrangle` and its help
-page, take a cache path, save the next version, follow slow code that became a
-job, compare two images and stop the worker. Every step checks the shape of
-its result and records the tool, how long it took, and whether the reply
-carried structured content, a text block and an image.
-
-```sh
-pytest -m houdini -s tests/test_sequence_hython.py
-```
-
-runs it three times, each with a server process of its own over stdio: under
-the current protocol revision, under the older handshake revision, and through
-the SDK's lower level client class. `-s` prints each run's steps. A last check
-holds the three to the same shapes. The only difference the revision makes is
-its own: the current one stamps every result with the server's details in its
-metadata. Everything the pass writes stays in pytest's temporary folder.
-
-`tests/test_storm_cap_hython.py` has two server processes hammer one worker
-that is paced as if it had an interface, which only a test can ask for, through
-the server's constructor, and prints the rates with and without the pace. Both
-files carry their own deadline of 900 seconds, longer than the suite's usual
-limit, for a slow Houdini to start in.
+The skills are yours to edit. The block at the top, House conventions, is the
+dial: the output marker, when to save an increment, how many attempts one
+detail gets, what good enough means for this pass, what node colours mean and
+where files may be written. Change those lines to fit how you work, and keep
+the output marker in step with the `[conventions]` table in
+[Output folders](#output-folders).
 
 ## Output folders
+
+Renders, caches and captures go to versioned folders next to the scene file.
+You can change where and how they are named.
+
+<details>
+<summary><strong>How output folders work</strong></summary>
 
 No tool takes an output path. You name a kind and a name, and the server
 builds the path from a token table. Renders, flipbooks and comps go to dated
@@ -1067,7 +860,281 @@ A scene that has never been saved has no `$HIP`, so its runs go under
 `unsaved_hip`, which is the cue to save and run again. The template keeps the
 variable, so saving that scene later leaves nothing about this machine in it.
 
-## Logs
+</details>
+
+## How it works
+
+<details>
+<summary><strong>The Houdini side</strong></summary>
+
+`nscr_houdini_mcp.bridge` runs inside Houdini's own Python. It serves two
+endpoints on loopback, registers the session in the coordination store and
+takes it out again when the process quits.
+
+What the bridge guards against: a web page in a browser on this machine,
+another person with an account on it, and the network. Not the owner's own
+programs. Anything running as the same person can read that person's files,
+token included, and could drive Houdini with or without this.
+
+The token is never sent. Each request is signed with it and each answer is
+signed back, so nothing on the port learns anything it could use again, and a
+caller can tell the bridge from something that took its port after a crash. A
+request is also refused if it carries `Origin` or `Referer`, names a host
+other than this bridge, is not JSON, is over the size cap, or nests too deeply
+for an envelope. The bridge registers no built in API route, so the one that
+parses a posted form before any handler runs does not exist on its server.
+
+</details>
+
+<details>
+<summary><strong>Addressing a session, and sending a call twice</strong></summary>
+
+A session has two handles. `session_id` is random, minted at start and never
+reused. `alias` is the readable name: a session with a scene is named after
+the scene file, a worker is `w1`, `w2` and so on, and two Houdinis on the same
+file get different names. Either handle addresses a session. The name never
+moves once it is settled, so a scene saved under a different name leaves the
+session's name out of date, which health and every reply say and nothing
+silently corrects.
+
+`scene_epoch` counts the times a session has replaced its scene, which is any
+open, new scene or reload. A call carrying an older epoch is refused with
+`SCENE_REPLACED` and a summary of the scene there is now, before the tool
+runs. A call addressed to a session whose process has gone is refused by the
+calling end with `SESSION_DEAD` and the id of whatever answers to the same
+name now. Nothing is sent to the new process.
+
+A call that changes the scene carries an `operation_id`. The bridge takes a
+receipt under that id before the work runs and finishes it with the answer, so
+the same id arriving again is answered from the receipt rather than doing the
+work twice. The same id with different arguments is `OPERATION_MISMATCH`, and
+an id whose first attempt left no answer is `OUTCOME_UNKNOWN` rather than a
+guess. Reads take no receipt.
+
+That is what makes a retry safe, and the only retry the client does by itself:
+one, on a lost reply (the connection closed, or the read ran out of time), and
+only for a call that carries an operation id, using that same id. A reply that
+arrived is never sent again, whatever it says.
+
+A reply is usually lost because this end gave up on the socket first, so the
+work is often still running when the second send arrives. That send queues
+behind it, asking for a longer turn than the first, and can still come back
+`SESSION_BUSY`. The answer is in the receipt as soon as the work ends, so the
+way on from there is the same id again, not a fresh call.
+
+Start one in a headless Houdini:
+
+```sh
+hython -m nscr_houdini_mcp.bridge.main --home <state folder>
+```
+
+It stops when its input closes, or on the word `stop`. A start like this puts
+Qt on its offscreen screen plugin unless `QT_QPA_PLATFORM` already names one,
+as the pool does for its workers. On another plugin and a dense display a
+render node draws larger than asked; a capture then reads the scale and makes
+up for it, or says `framing_unverified` when it cannot.
+
+</details>
+
+<details>
+<summary><strong>Pacing a Houdini with a user interface</strong></summary>
+
+In a session with a user interface every call runs on Houdini's main thread,
+the one that draws the interface. Calls sent back to back leave it no room,
+and an agent in a loop can send a great many, so the server paces the calls it
+sends to such a session: one call out at a time, a pause after each one ends,
+and a cap on how many start in a second. Two keys in `config.toml` set the pace:
+
+```toml
+gui_min_pause_ms = 50     # least time from one call ending to the next starting
+gui_max_calls_per_s = 10  # most calls that may start in any one second
+```
+
+A value of 0 turns that rule off, and both at 0 turn pacing off altogether;
+a negative value is refused.
+
+The wait for a turn comes out of the call's own `wait_s` (a second unless it
+says), and the bridge gets what is left. Calls sent side by side queue and go
+out one after another, however long the call out may run. A call is answered
+at once with `SESSION_BUSY` when the pause and the cap alone would hold it
+past its wait, when it passed `skip_if_busy`, or when the queue is full; one
+whose wait runs out in the queue gets the same answer then. So a call may be
+refused up front when the calls queued ahead of it, at the rate cap, already
+fill its `wait_s`, and `retry_after_s` says when to come back. Nothing of a
+refused call is sent, so a caller that has given up never has its change made
+later. `retry_after_s` is an estimate from the calls queued ahead and how
+long the session's last few calls took, between the pause and 30 seconds; a
+call out longer than usual is guessed to run as long again. The answer also
+carries `queued_ahead`, how many calls waited ahead. A call that did wait
+says how long in its trace, as `throttled_ms`, and when it was let through,
+as `admitted_at`.
+
+The pace is kept per server process and per session. Two agents sharing one
+server process share its one allowance; two server processes, one per
+client, each have their own, so together they get no more than twice it.
+A call sent again under the operation id of the call that is out goes
+straight through, since the bridge answers it from that call's receipt. At
+most 32 calls wait on one session's turn; one more is answered
+`SESSION_BUSY` at once, and a call whose client cancels leaves the queue
+without being sent. Workers are headless and are not paced. A cancel is never
+paced either, since it runs beside the call it stops.
+
+The bridge has a limit of its own, whoever sends: it remembers the signed
+requests of the last two minutes, 20,000 at most, and refuses one more with
+`FLOOD_GUARD`, naming the limit and how many seconds to wait.
+
+</details>
+
+<a name="installing-the-houdini-side"></a>
+<details>
+<summary><strong>Installing the Houdini side</strong></summary>
+
+One command writes the Houdini package that puts this on a session's path:
+
+```sh
+nscr-houdini-mcp bridge install                  # for Houdini 22.0
+nscr-houdini-mcp bridge install --houdini-version 22.0 --dry-run
+nscr-houdini-mcp bridge install --autostart      # every Houdini opens a port
+nscr-houdini-mcp bridge uninstall
+nscr-houdini-mcp bridge status
+nscr-houdini-mcp bridge snippet
+```
+
+It writes one file, `nscr_houdini_mcp.json`, into the packages folder Houdini
+reads. That folder is often not where a shell would guess, because a launcher,
+a line in `houdini.env`, another package or a synced documents folder can move
+it, so it is worked out in this order:
+
+1. `--packages-dir`, on `install`, `uninstall` and `status`.
+2. `HOUDINI_PACKAGE_DIR` in this shell. Houdini reads every folder it names,
+   so the first is written into and the rest are reported.
+3. A real Houdini, asked. One short script runs in `hython` with a ten second
+   cap and reports the home folder, `HOUDINI_PACKAGE_DIR`, `HOUDINI_USER_PREF_DIR`
+   and `HSITE` as Houdini itself sees them, after `houdini.env` and packages.
+   A Houdini that is missing or slow leaves a note and the lookup carries on.
+   `HSITE` is other people's, so it is reported and never written to.
+4. `HOUDINI_USER_PREF_DIR` in this shell, with `__HVER__` filled in.
+5. The usual folder for the system: `~/Library/Preferences/houdini/<version>`
+   on macOS, `Documents\houdini<version>` under the profile on Windows,
+   `~/houdini<version>` on Linux.
+
+Nothing is remembered between runs, and `bridge status` prints which of those
+decided and every folder it considered.
+
+The file points `HOUDINI_PATH` at this copy's `houdini/` folder and puts a
+folder that holds `nscr_houdini_mcp` and nothing else in front of Houdini's
+`PYTHONPATH`. In a checkout those are `houdini/` and `src/`, as they stand, so
+an edit there reaches the next Houdini. An installed copy never names its
+site-packages folder: every other library of the environment is there too,
+and numpy, Pillow or anything else in it would load in place of Houdini's own
+and break Houdini's own tools. Instead the install copies the package alone
+into `houdini-python/` under the state folder, and both paths name that copy,
+so the startup files and the bridge they start are always one version.
+
+A copy is named after what it holds and never changes once made. After an
+upgrade, run `bridge install` again and restart Houdini: the new version gets
+a copy of its own, and the old one stays for a week for a Houdini still
+running from it. The copies made for workers the pool starts follow the same
+rules, and one no worker has asked for in a week is taken away. `bridge
+status` says when a package file's copy is another version than the server,
+and when a package file an older install wrote names a whole site-packages
+folder. Each bridge also reports the version it runs, and `hou_ping` and
+`hou_sessions` warn with `BRIDGE_VERSION_MISMATCH` when it is not the
+server's. Inside Houdini the bridge needs only the standard library, `hou`
+and, for reading images, the numpy, OpenImageIO and OpenColorIO Houdini ships.
+
+Every path is worked out from where this copy is running, so there is nothing
+to edit by hand. Every file it writes carries a marker: a package of the same
+name that this did not write, or a link where the file should be, is reported
+and left exactly as it is, and `uninstall` takes away only its own, plus any
+folder and copy it made and nothing else.
+
+Installing opens no port. Auto start is off unless you ask for it with
+`--autostart`, which sets `NSCR_MCP_AUTOSTART` to `1` in the package. The
+start hangs off `python3.13libs/ready.py`, which Houdini runs for every folder
+on its path, in a session with an interface and without, so this package takes
+nobody else's startup script away.
+
+`bridge status` lists the sessions running now with their ids, names, ports,
+scenes and whether each is busy, asks each one whether it is healthy under one
+shared time budget, and says which folders have the package and where Houdini
+is installed.
+
+To start a bridge inside a Houdini that is already open, paste what `bridge
+snippet` prints into its Python shell. It works out the source path as it
+prints, a copy of the package alone for an installed copy as above, so the
+lines run as they stand.
+
+`houdini/packages/nscr_houdini_mcp.json` is the same file as a template, for
+anyone who would rather place it themselves.
+
+</details>
+
+<details>
+<summary><strong>The worker pool</strong></summary>
+
+A worker is a headless Houdini of its own with a bridge in it, kept warm so
+the next piece of work does not pay a cold start:
+
+```sh
+nscr-houdini-mcp bridge worker start             # one worker, if there is room
+nscr-houdini-mcp bridge worker start --weight heavy --max-threads 8
+nscr-houdini-mcp bridge worker list
+nscr-houdini-mcp bridge worker reserve w1 --job job-1
+nscr-houdini-mcp bridge worker release w1
+nscr-houdini-mcp bridge worker stop w1
+```
+
+A worker started from a client through `hou_sessions` takes `pool_cap`,
+`hython` or `houdini_build`, and `worker_ports` from `config.toml`, and so
+does `worker start` for any flag it is not given.
+
+Three workers may run at once by default. The slot is taken in one
+transaction in the coordination store, which counts the workers that are
+still starting, so several servers on one machine cannot hand out the same
+last slot, and `POOL_FULL` is the answer when there is none. A start that
+fails gives its slot straight back. Each reservation also carries a weight,
+and the pool holds a budget of its own, so a heavy job is refused while the
+machine is busy even when a slot is free.
+
+A worker does not belong to the process that started it. It is started
+detached, with its output in `logs/worker-<name>.log` under the state folder,
+and it stays when its server exits, except in the Windows case below, so a
+client restart normally keeps the warm pool. The log is private to its
+owner and is rolled over when it grows, keeping the last two. What ends a
+worker is its lease: it watches its own row and goes when a server asks
+it to, or when nobody has wanted it for half an hour. Routing a call to it
+renews the lease, and a worker running a call or a job is never idle,
+however long the work takes and whether or not
+anybody routes to it meanwhile. `stop` asks first and
+ends the process itself only if the ask was not enough, and never unless that
+process can be shown to still be the worker. `start` exits 3 when the pool is
+full and 1 when the start went wrong.
+
+A worker inherits this process's environment on purpose: it has to see the
+same licensing, path and package settings as the shell the tool was started
+from, or it is a different Houdini from the artist's. Three things are decided
+rather than inherited. Its state folder is the one the pool is using, its
+reservation token arrives in the environment and never on the command line,
+which every account on the machine can read, and its thread cap is either the
+one you named with `--max-threads` or the one the weight implies: a heavy
+worker gets the machine, a light one is left at Houdini's own default.
+
+On Windows, some clients do not let a worker run independently. Such a
+worker reports `lifetime: server`. Closing or restarting the client then
+ends the worker, interrupts its jobs and loses unsaved changes in that
+worker, so save first. It shows as `crashed` in `hou_sessions` list
+afterwards; that means the client ended it, not that Houdini crashed.
+
+Each worker is asked once, when it comes up, what it can do: the build, the
+license it got, the renderers that are really installed, how it can make a
+picture, and that it can be cancelled. The answer is kept beside the worker,
+so another process can pick one without asking it anything.
+
+</details>
+
+<details>
+<summary><strong>Logs</strong></summary>
 
 Every log lives in the `logs` folder of the state folder:
 
@@ -1112,33 +1179,106 @@ logs, which have no level and are written whatever it says, nor the MCP
 library's own logging, which it sets up on standard error at `info` apart
 from this setting, so lines of its own can appear there whatever it says.
 
-## Skills
+</details>
 
-A skill is a plain `SKILL.md` file that tells an agent how to work: what to
-plan before building, what to look at before calling something finished, and
-when to stop and report. The first one, `houdini-artist`, covers modelling,
-lookdev, cleaning up a network, matching a reference, finding out why a scene
-is slow and getting a scene ready to hand on. It is written for this server,
-and still helps with planning when no Houdini is connected.
+## Development
 
-The skills ship with the package:
+<details>
+<summary><strong>Setup, checks and hooks</strong></summary>
+
+Python 3.11 or newer. The server process never imports `hou`.
+
+Setup, with [uv](https://docs.astral.sh/uv/):
 
 ```sh
-nscr-houdini-mcp skills path                # where the shipped skills are
-nscr-houdini-mcp skills install <folder>    # copy them into a folder you name
+uv venv
+uv pip install -e ".[dev]"
 ```
 
-Clients that read skills usually look in a skills folder in your user settings
-or in the project, with one subfolder per skill. Point `install` at the one
-yours uses. A copy already there that differs from the shipped one is left
-alone, so your edits survive an upgrade; `--force` writes the shipped files
-over it.
+Or with the standard library (`.venv\Scripts\activate` on Windows):
 
-The skills are yours to edit. The block at the top, House conventions, is the
-dial: the output marker, when to save an increment, how many attempts one
-detail gets, what good enough means for this pass, what node colours mean and
-where files may be written. Change those lines to fit how you work, and keep
-the output marker in step with the `[conventions]` table above.
+```sh
+python3 -m venv .venv && . .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+Checks, the same ones CI runs:
+
+```sh
+ruff check . && ruff format --check .
+pytest -q
+python scripts/lint_client_names.py   # shipped text must not name any client or vendor
+python scripts/tools_list_cost.py     # token cost of the tools/list payload
+```
+
+Before a release, check a clean install from a built wheel in a throwaway
+environment, with no checkout in reach. It needs `uv`, writes its own files
+only inside one temporary folder (uv keeps its usual cache, and may download
+a Python to make the environment with), and prints each check:
+
+```sh
+python scripts/check_install.py
+python scripts/check_install.py --hython /path/to/hython   # also import it in Houdini
+```
+
+Among its checks: the folder the package file puts on Houdini's path holds
+this package and nothing else of the environment, and a Python with no
+site-packages imports the bridge from it alone.
+
+`scripts/tools_list_cost.py` serialises the tool list the way a client receives
+it and counts its tokens, in total and per tool, against a budget of 4,000.
+With the dev extras installed it counts with `tiktoken` and the `o200k_base`
+encoding (`--encoding` names another), read from tiktoken's cache, or fetched
+once with a ten second limit when it is not there. Without the package, or
+with the encoding neither cached nor fetched, it falls back to bytes divided
+by four, rounded up, and says which of the two happened. `tiktoken` is only ever a dev
+dependency. Either count is a budget signal to watch across commits, since a
+client on another encoding pays a somewhat different number. Pass
+`--max-tokens N` to make it fail over a budget.
+
+Run the server on stdio:
+
+```sh
+nscr-houdini-mcp
+```
+
+Tests marked `houdini` need a Houdini on the machine and skip when there is
+none, so `pytest -q` is complete everywhere. Run only those with `pytest -m
+houdini`, or skip them with `pytest -m "not houdini"`. The bridge is found
+through `NSCR_MCP_HYTHON`, then `HFS`, then the usual install folder.
+
+</details>
+
+<details>
+<summary><strong>Running the sequence yourself</strong></summary>
+
+`tests/sequence.py` is one scripted pass over every tool, the way a client
+would go about a first piece of work: list the tools, find a session, start a
+worker, read its scene, build three nodes with a lost reply sent again under
+the same operation id, read them back, look up `attribwrangle` and its help
+page, take a cache path, save the next version, follow slow code that became a
+job, compare two images and stop the worker. Every step checks the shape of
+its result and records the tool, how long it took, and whether the reply
+carried structured content, a text block and an image.
+
+```sh
+pytest -m houdini -s tests/test_sequence_hython.py
+```
+
+runs it three times, each with a server process of its own over stdio: under
+the current protocol revision, under the older handshake revision, and through
+the SDK's lower level client class. `-s` prints each run's steps. A last check
+holds the three to the same shapes. The only difference the revision makes is
+its own: the current one stamps every result with the server's details in its
+metadata. Everything the pass writes stays in pytest's temporary folder.
+
+`tests/test_storm_cap_hython.py` has two server processes hammer one worker
+that is paced as if it had an interface, which only a test can ask for, through
+the server's constructor, and prints the rates with and without the pace. Both
+files carry their own deadline of 900 seconds, longer than the suite's usual
+limit, for a slow Houdini to start in.
+
+</details>
 
 ## License
 
