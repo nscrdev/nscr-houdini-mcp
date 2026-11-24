@@ -9,19 +9,21 @@ build and change nodes, run Python, take pictures of the viewport, and compare
 a render with a reference image before it says it is done. It works with the
 Houdini you have open, and with background Houdinis it starts by itself.
 
-Renders, caches and captures go into versioned folders next to your scene
-file. Nothing is written over.
+Renders, caches and captures go into managed folders next to your scene file,
+each with its own version or run id, so one run never writes over another.
+Saving a new scene version keeps the old file too.
 
 You need Houdini 22. To set it up, copy this and give it to your agent:
 
 ```text
 Install the nscr-houdini MCP server from https://github.com/nscrdev/nscr-houdini-mcp.
 If you can install plugins, install it as a plugin from that repository's
-marketplace and turn on auto-update. If you cannot, follow the "Manual install"
-steps in its README.
-Then install the Houdini side as the README says (bridge install --autostart)
-and tell me when to restart Houdini.
-When Houdini is open again, run hou_ping to check the connection.
+marketplace and turn on auto-update, then install the Houdini side as the
+README says (bridge install --autostart).
+If you cannot install plugins, follow the "Manual install" steps in its README.
+Tell me when to restart Houdini. When it is open again, run hou_ping and check
+that the reply says kind: gui. If more than one session is live, use
+hou_sessions to find mine.
 ```
 
 ## Status
@@ -132,6 +134,7 @@ server by hand, remove that entry, or the agent sees two copies of every tool.
 
 ### Manual install (any MCP client)
 
+<a name="quick-start"></a>
 <details>
 <summary><strong>Quick start: five steps</strong></summary>
 
@@ -1133,6 +1136,7 @@ so another process can pick one without asking it anything.
 
 </details>
 
+<a name="logs"></a>
 <details>
 <summary><strong>Logs</strong></summary>
 
