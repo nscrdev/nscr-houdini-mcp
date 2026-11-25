@@ -13,6 +13,7 @@ compatibility: "Written for the nscr-houdini-mcp server and Houdini 22."
 - Scale: one unit is one metre unless the scene already says otherwise.
 - Node colours: green for outputs, blue for inputs and imports, yellow for controls a person should touch.
 - More colours: purple for caches, red for something broken or temporary, grey for parked work.
+- Controls: a yellow `null` named `CONTROLS` inside the network it drives, placed at the top, holding every control for that network as spare parameters. Keep controls off the parent node, so the person finds them where the work is, and channel reference them from wherever the values are used.
 - Names: lowercase with underscores, and only on nodes other nodes or people refer to.
 - Reads may roam: any file the scene or the person points at.
 - Writes go where the server's output table puts them, under `$HIP` by default, never beside the source files.
