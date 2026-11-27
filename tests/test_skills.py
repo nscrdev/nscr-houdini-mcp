@@ -155,8 +155,9 @@ def test_image_to_cops_ships_what_its_text_points_at() -> None:
     text = (IMAGE_TO_COPS / "SKILL.md").read_text(encoding="utf-8")
     for rel in re.findall(r"`((?:scripts|references|examples)/[\w./-]+)`", text):
         assert (IMAGE_TO_COPS / rel).is_file(), rel
-    for script in (IMAGE_TO_COPS / "scripts").glob("*.sh"):
-        assert script.stat().st_mode & stat.S_IXUSR, script.name
+    if sys.platform != "win32":  # Windows has no executable bit to check
+        for script in (IMAGE_TO_COPS / "scripts").glob("*.sh"):
+            assert script.stat().st_mode & stat.S_IXUSR, script.name
 
 
 def test_image_to_cops_reads_the_same_as_the_rest() -> None:
@@ -296,7 +297,8 @@ def test_a_junction_where_the_skill_goes_is_never_written_through(tmp_path: Path
     _winapi.CreateJunction(str(elsewhere), str(dest / "houdini-artist"))
     assert agent_skills.is_link(dest / "houdini-artist")
     results = agent_skills.install(dest, force=True)
-    assert [item.outcome for item in results] == [agent_skills.KEPT]
+    outcomes = {item.name: item.outcome for item in results}
+    assert outcomes["houdini-artist"] == agent_skills.KEPT
     assert list(elsewhere.iterdir()) == []
 
 
@@ -310,7 +312,8 @@ def test_a_junction_inside_the_skill_is_never_written_through(tmp_path: Path) ->
     (dest / "houdini-artist").mkdir(parents=True)
     _winapi.CreateJunction(str(elsewhere), str(dest / "houdini-artist" / "extra"))
     results = agent_skills.install(dest, force=True)
-    assert [item.outcome for item in results] == [agent_skills.KEPT]
+    outcomes = {item.name: item.outcome for item in results}
+    assert outcomes["houdini-artist"] == agent_skills.KEPT
     assert list(elsewhere.iterdir()) == []
 
 
