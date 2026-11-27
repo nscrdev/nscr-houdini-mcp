@@ -9,12 +9,20 @@ Conventions
   * heights are carried in millimetres until the finishing stage
   * colours are linear Rec.709 (linear sRGB)
 """
-import hou, re, os, subprocess
 
-HB = hou.text.expandString('$HB')
-OIIO = os.path.join(HB, 'hoiiotool')
+# Node code and VEX snippets are embedded as strings, so long lines and percent
+# formatting are left as they are.
+# ruff: noqa: E501, UP031
 
-PRE = r'''
+import os
+import re
+
+import hou
+
+HB = hou.text.expandString("$HB")
+OIIO = os.path.join(HB, "hoiiotool")
+
+PRE = r"""
 static float sat(float x){return clamp(x,0.0f,1.0f);}
 static int wrapi(int a,int n){int r=a%n; return r<0?r+n:r;}
 static float h1(int x,int y,int s){uint n=(uint)x*374761393u+(uint)y*668265263u+(uint)s*1442695041u; n=(n^(n>>13))*1274126177u; n^=n>>16; return (float)(n&0xffffffu)/16777215.0f;}
@@ -82,63 +90,75 @@ static float boards(float2 p,int n,float jit,int seed,int axis,int segs,int mode
     if(mode==3) return min(fa,1.0f-fa)/(float)segs*2.0f;
     return h1(bw,wrapi((int)floor(a2),segs),seed+5);
 }
-'''
+"""
 
-_FLT = re.compile(r'(?<![\w.])(\d+\.\d*|\.\d+)(?![\w.])')
+_FLT = re.compile(r"(?<![\w.])(\d+\.\d*|\.\d+)(?![\w.])")
 
 
 def _f(code):
-    return _FLT.sub(lambda m: m.group(1) + 'f', code)
+    return _FLT.sub(lambda m: m.group(1) + "f", code)
 
 
 def col(c):
-    return '(float3)(%.5ff,%.5ff,%.5ff)' % tuple(c)
+    return "(float3)({:.5f}f,{:.5f}f,{:.5f}f)".format(*tuple(c))
 
 
 def srgb(r, g, b):
     """8 bit sRGB triple -> linear"""
-    def l(v):
+
+    def lin(v):
         v /= 255.0
         return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
-    return (l(r), l(g), l(b))
+
+    return (lin(r), lin(g), lin(b))
 
 
-class B(object):
-    def __init__(s, parent, name, tile_m, res=1024, title=''):
+class B:
+    def __init__(s, parent, name, tile_m, res=1024, title=""):
         old = parent.node(name)
         if old:
             old.destroy()
-        s.net = parent.createNode('copnet', name)
+        s.net = parent.createNode("copnet", name)
         s.name = name
         s.tile = tile_m
-        s.net.parm('setres').set(1)
-        s.net.parmTuple('res').set((res, res))
-        s.net.parm('setborder').set(1) if s.net.parm('setborder') else None
+        s.net.parm("setres").set(1)
+        s.net.parmTuple("res").set((res, res))
+        s.net.parm("setborder").set(1) if s.net.parm("setborder") else None
         try:
-            s.net.parm('border').set('wrap')
+            s.net.parm("border").set("wrap")
         except Exception:
             pass
         s.net.setComment(title)
         s.net.setGenericFlag(hou.nodeFlag.DisplayComment, True)
-        s.ctlnode = s.net.createNode('null', 'CONTROLS')
+        s.ctlnode = s.net.createNode("null", "CONTROLS")
         s.ctlnode.setColor(hou.Color(1, 0.85, 0.2))
         ptg = s.ctlnode.parmTemplateGroup()
-        ptg.append(hou.FloatParmTemplate('tile_size_m', 'Tile Size (m, info)', 1, default_value=(tile_m,)))
+        ptg.append(
+            hou.FloatParmTemplate("tile_size_m", "Tile Size (m, info)", 1, default_value=(tile_m,))
+        )
         s.ctlnode.setParmTemplateGroup(ptg)
         s.ctls = {}
         s.seed = 0
-        s.ref = s.net.createNode('constant', 'size_ref')
-        s.ref.parm('signature').set('f1')
+        s.ref = s.net.createNode("constant", "size_ref")
+        s.ref.parm("signature").set("f1")
 
     # ---------------------------------------------------------------- core
     def ctl(s, name, default, lo=0.0, hi=1.0, label=None):
         if name not in s.ctls:
             ptg = s.ctlnode.parmTemplateGroup()
-            ptg.append(hou.FloatParmTemplate(name, label or name.replace('_', ' ').title(), 1,
-                                             default_value=(default,), min=lo, max=hi))
+            ptg.append(
+                hou.FloatParmTemplate(
+                    name,
+                    label or name.replace("_", " ").title(),
+                    1,
+                    default_value=(default,),
+                    min=lo,
+                    max=hi,
+                )
+            )
             s.ctlnode.setParmTemplateGroup(ptg)
             s.ctls[name] = default
-        return '$' + name
+        return "$" + name
 
     def n(s, typ, name=None, ins=(), **p):
         nd = s.net.createNode(typ, name) if name else s.net.createNode(typ)
@@ -150,63 +170,67 @@ class B(object):
             else:
                 nd.setInput(i, src)
         for k, v in p.items():
-            if isinstance(v, str) and v.startswith('$'):
-                nd.parm(k).setExpression('ch("../CONTROLS/%s")' % v[1:])
+            if isinstance(v, str) and v.startswith("$"):
+                nd.parm(k).setExpression(f'ch("../CONTROLS/{v[1:]}")')
             elif isinstance(v, (tuple, list)):
                 nd.parmTuple(k).set(v)
             else:
                 nd.parm(k).set(v)
         return nd
 
-    def cl(s, body, out='float', name=None, **ins):
+    def cl(s, body, out="float", name=None, **ins):
         """OpenCL COP. body = statements ending in @dst.set(...).
         float inputs by name; names starting c_ are float3; '$ctl' / numbers become bound parms."""
-        nd = s.net.createNode('opencl', name) if name else s.net.createNode('opencl')
+        nd = s.net.createNode("opencl", name) if name else s.net.createNode("opencl")
         layers = [(k, v) for k, v in ins.items() if isinstance(v, (hou.Node, tuple))]
         consts = [(k, v) for k, v in ins.items() if not isinstance(v, (hou.Node, tuple))]
         if not layers:
-            layers = [('ref', s.ref)]
+            layers = [("ref", s.ref)]
         binds = []
-        nd.parm('inputs').set(len(layers))
+        nd.parm("inputs").set(len(layers))
         for i, (k, v) in enumerate(layers):
-            t = 'float3' if k.startswith('c_') else 'float'
-            nd.parm('input%d_name' % (i + 1)).set(k)
-            nd.parm('input%d_type' % (i + 1)).set(t)
-            binds.append('#bind layer %s? %s val=0' % (k, t))
+            t = "float3" if k.startswith("c_") else "float"
+            nd.parm("input%d_name" % (i + 1)).set(k)
+            nd.parm("input%d_type" % (i + 1)).set(t)
+            binds.append(f"#bind layer {k}? {t} val=0")
             if isinstance(v, tuple):
                 nd.setInput(i, v[0], v[1])
             else:
                 nd.setInput(i, v)
-        nd.parm('outputs').set(1)
-        nd.parm('output1_name').set('dst')
-        nd.parm('output1_type').set(out)
-        binds.append('#bind layer !&dst %s' % out)
-        nd.parm('bindings').set(len(consts))
+        nd.parm("outputs").set(1)
+        nd.parm("output1_name").set("dst")
+        nd.parm("output1_type").set(out)
+        binds.append(f"#bind layer !&dst {out}")
+        nd.parm("bindings").set(len(consts))
         for i, (k, v) in enumerate(consts):
             j = i + 1
-            nd.parm('bindings%d_name' % j).set(k)
-            nd.parm('bindings%d_type' % j).set('float')
+            nd.parm("bindings%d_name" % j).set(k)
+            nd.parm("bindings%d_type" % j).set("float")
             if isinstance(v, str):
-                nd.parm('bindings%d_fval' % j).setExpression('ch("../CONTROLS/%s")' % v[1:])
+                nd.parm("bindings%d_fval" % j).setExpression(f'ch("../CONTROLS/{v[1:]}")')
             else:
-                nd.parm('bindings%d_fval' % j).set(float(v))
-            binds.append('#bind parm %s float val=0' % k)
-        code = '\n'.join(binds) + '\n' + PRE + '\n@KERNEL\n{\n' + _f(body) + '\n}\n'
-        nd.parm('kernelcode').set(code)
+                nd.parm("bindings%d_fval" % j).set(float(v))
+            binds.append(f"#bind parm {k} float val=0")
+        code = "\n".join(binds) + "\n" + PRE + "\n@KERNEL\n{\n" + _f(body) + "\n}\n"
+        nd.parm("kernelcode").set(code)
         return nd
 
     def x(s, expr, name=None, **ins):
         """float expression over float inputs / controls."""
-        decl = ''
+        decl = ""
         for k in ins:
-            decl += '    float %s=@%s;\n' % (k, k) if not k.startswith('c_') else '    float3 %s=@%s;\n' % (k, k)
-        return s.cl(decl + '    @dst.set(%s);' % expr, name=name, **ins)
+            decl += (
+                f"    float {k}=@{k};\n" if not k.startswith("c_") else f"    float3 {k}=@{k};\n"
+            )
+        return s.cl(decl + f"    @dst.set({expr});", name=name, **ins)
 
     def rgb(s, expr, name=None, **ins):
-        decl = ''
+        decl = ""
         for k in ins:
-            decl += '    float %s=@%s;\n' % (k, k) if not k.startswith('c_') else '    float3 %s=@%s;\n' % (k, k)
-        return s.cl(decl + '    @dst.set(%s);' % expr, out='float3', name=name, **ins)
+            decl += (
+                f"    float {k}=@{k};\n" if not k.startswith("c_") else f"    float3 {k}=@{k};\n"
+            )
+        return s.cl(decl + f"    @dst.set({expr});", out="float3", name=name, **ins)
 
     # ------------------------------------------------------------ signals
     def _sd(s, seed):
@@ -215,33 +239,33 @@ class B(object):
             seed = s.seed
         return (seed * 1.371 + 0.13, seed * 2.113 + 0.57)
 
-    def fn(s, size, oct=6, rough=0.5, typ='perlin', sx=1.0, sy=1.0, seed=None, frac=None, **kw):
+    def fn(s, size, oct=6, rough=0.5, typ="perlin", sx=1.0, sy=1.0, seed=None, frac=None, **kw):
         p = dict(elementsize=size, oct=oct, rough=rough, noisetype=typ, off=s._sd(seed))
         if sx != 1.0 or sy != 1.0:
-            p['elementsizetype'] = 1
-            p['elementscale'] = (sx, sy)
+            p["elementsizetype"] = 1
+            p["elementscale"] = (sx, sy)
         if frac is not None:
-            p['fractaltype'] = frac
+            p["fractaltype"] = frac
         p.update(kw)
-        return s.n('fractalnoise', **p)
+        return s.n("fractalnoise", **p)
 
     def gr(s, kind, size, seed=None, **kw):
         if seed is None:
             s.seed += 1
             seed = s.seed
-        if kind == 'layerednoise':
+        if kind == "layerednoise":
             # the stock base octaves are tile sized; keep them small so the tile does not read when repeated
-            kw.setdefault('basenoise_elementsize', 0.3)
-            kw.setdefault('basecells_elementsize', 0.2)
-        nd = s.n('grunge_' + kind, elementsize=size, **kw)
-        if nd.parm('seed'):
-            nd.parm('seed').set(seed)
+            kw.setdefault("basenoise_elementsize", 0.3)
+            kw.setdefault("basecells_elementsize", 0.2)
+        nd = s.n("grunge_" + kind, elementsize=size, **kw)
+        if nd.parm("seed"):
+            nd.parm("seed").set(seed)
         else:
-            nd.parmTuple('off').set(s._sd(seed))
+            nd.parmTuple("off").set(s._sd(seed))
         return nd
 
     def wor(s, size, jit=1.0, out=0, seed=None, **kw):
-        nd = s.n('worleynoise', elementsize=size, jitter=jit, off=s._sd(seed), **kw)
+        nd = s.n("worleynoise", elementsize=size, jitter=jit, off=s._sd(seed), **kw)
         return (nd, out)
 
     def mm(s, v):
@@ -249,90 +273,127 @@ class B(object):
         return v * 0.002 / s.tile
 
     def lv(s, a, lo, hi, g=1.0):
-        return s.x('pow(sat((a-(LO))/((HI)-(LO))),G)', a=a, LO=lo, HI=hi, G=g)
+        return s.x("pow(sat((a-(LO))/((HI)-(LO))),G)", a=a, LO=lo, HI=hi, G=g)
 
     def blur(s, a, size):
-        return s.n('blur', ins=[a], size=size)
+        return s.n("blur", ins=[a], size=size)
 
     def sblur(s, a, angle, length):
-        return s.n('streakblur', ins=[a], angle=angle, length=length)
+        return s.n("streakblur", ins=[a], angle=angle, length=length)
 
     def warp(s, a, amt, size=0.3, seed=None, oct=4):
         nx = s.fn(size, oct=oct, seed=seed)
         ny = s.fn(size, oct=oct, seed=None)
-        return s.cl('    float2 o=(float2)(@nx-0.5,@ny-0.5)*@AMT;\n    @dst.set(@a.imageSample(@P+o));',
-                    a=a, nx=nx, ny=ny, AMT=amt)
+        return s.cl(
+            "    float2 o=(float2)(@nx-0.5,@ny-0.5)*@AMT;\n    @dst.set(@a.imageSample(@P+o));",
+            a=a,
+            nx=nx,
+            ny=ny,
+            AMT=amt,
+        )
 
     def pits(s, cells, dens=0.5, rmin=0.1, rmax=0.5, rpow=2.0, irr=0.18, asp=1.0, seed=None):
         if seed is None:
             s.seed += 1
             seed = s.seed
-        return s.cl('    @dst.set(pits(@P,%d,@D,%f,%f,%f,%f,%f,%d));' % (cells, rmin, rmax, rpow, irr, asp, seed * 13),
-                    D=dens)
+        return s.cl(
+            "    @dst.set(pits(@P,%d,@D,%f,%f,%f,%f,%f,%d));"
+            % (cells, rmin, rmax, rpow, irr, asp, seed * 13),
+            D=dens,
+        )
 
     def panels(s, nx, ny, stag=0.0, mode=0):
-        return s.cl('    @dst.set(panels(@P,%d,%d,%f,%d));' % (nx, ny, stag, mode))
+        return s.cl("    @dst.set(panels(@P,%d,%d,%f,%d));" % (nx, ny, stag, mode))
 
     def ties(s, nx, ny, cols, rows, mx, my, r, stag=0.0):
-        return s.cl('    @dst.set(ties(@P,%d,%d,%f,%d,%d,%f,%f,%f));' % (nx, ny, stag, cols, rows, mx, my, r))
+        return s.cl(
+            "    @dst.set(ties(@P,%d,%d,%f,%d,%d,%f,%f,%f));"
+            % (nx, ny, stag, cols, rows, mx, my, r)
+        )
 
     def boards(s, n, jit=0.5, seed=1, axis=0, segs=1, mode=0):
-        return s.cl('    @dst.set(boards(@P,%d,%f,%d,%d,%d,%d));' % (n, jit, seed, axis, segs, mode))
+        return s.cl(
+            "    @dst.set(boards(@P,%d,%f,%d,%d,%d,%d));" % (n, jit, seed, axis, segs, mode)
+        )
 
     def shift_by(s, a, idn, ax, ay):
         """sample a shifted by a per-id random offset (breaks continuity across boards/panels)"""
-        return s.cl('    float r=@id;\n    @dst.set(@a.imageSample(@P+(float2)(%f*r,%f*fmod(r*7.31,1.0))));' % (ax, ay),
-                    a=a, id=idn)
+        return s.cl(
+            f"    float r=@id;\n    @dst.set(@a.imageSample(@P+(float2)({ax:f}*r,{ay:f}*fmod(r*7.31,1.0))));",
+            a=a,
+            id=idn,
+        )
 
     def cracks(s, size, width, seed=None, cover=0.5, wamt=0.06, msize=0.5):
         b = s.wor(size, jit=1.0, out=2, seed=seed)
         w = s.warp(b, wamt, size=size * 0.6)
         w2 = s.warp(w, wamt * 0.15, size=size * 0.05)
         m = s.fn(msize, oct=3)
-        return s.x('(1.0-smoothstep(0.0,W,a))*smoothstep(C-0.08,C+0.08,m)', a=w2, m=m, W=width, C=1.0 - cover)
+        return s.x(
+            "(1.0-smoothstep(0.0,W,a))*smoothstep(C-0.08,C+0.08,m)",
+            a=w2,
+            m=m,
+            W=width,
+            C=1.0 - cover,
+        )
 
     def colmix(s, base, layers, name=None):
         """base colour, then [(mask, colour, amount)] mixed in order."""
         ins = {}
-        body = '    float3 c=%s;\n' % col(base)
+        body = f"    float3 c={col(base)};\n"
         for i, (m, c, a) in enumerate(layers):
-            ins['m%d' % i] = m
-            ins['A%d' % i] = a
-            body += '    c=mix(c,%s,sat(@m%d*@A%d));\n' % (col(c), i, i)
-        body += '    @dst.set(c);'
-        return s.cl(body, out='float3', name=name, **ins)
+            ins["m%d" % i] = m
+            ins["A%d" % i] = a
+            body += "    c=mix(c,%s,sat(@m%d*@A%d));\n" % (col(c), i, i)
+        body += "    @dst.set(c);"
+        return s.cl(body, out="float3", name=name, **ins)
 
     # ----------------------------------------------------------- finishing
     def finish(s, h_mm, albedo, rough, ao_radius=0.015, spec=None):
         t = s.tile
-        s.ctl('height_scale', 1.0, 0, 3)
-        s.ctl('albedo_gain', 1.0, 0, 2)
-        s.ctl('albedo_saturation', 1.0, 0, 2)
-        s.ctl('roughness_gain', 1.0, 0, 2)
-        s.ctl('roughness_offset', 0.0, -0.5, 0.5)
-        H = s.x('a*K', name='height_mm', a=h_mm, K='$height_scale')
-        H.setComment('height in millimetres')
-        himg = s.x('a*%g' % (0.002 / t), a=H)
-        nrm = s.n('heighttonormal', ins=[himg], normaltype='offset')
-        ao0 = s.n('heighttoambientocclusion', ins=[himg], viewradius=ao_radius)
-        ao = s.x('sat(a)', a=ao0)
+        s.ctl("height_scale", 1.0, 0, 3)
+        s.ctl("albedo_gain", 1.0, 0, 2)
+        s.ctl("albedo_saturation", 1.0, 0, 2)
+        s.ctl("roughness_gain", 1.0, 0, 2)
+        s.ctl("roughness_offset", 0.0, -0.5, 0.5)
+        H = s.x("a*K", name="height_mm", a=h_mm, K="$height_scale")
+        H.setComment("height in millimetres")
+        himg = s.x("a*%g" % (0.002 / t), a=H)
+        nrm = s.n("heighttonormal", ins=[himg], normaltype="offset")
+        ao0 = s.n("heighttoambientocclusion", ins=[himg], viewradius=ao_radius)
+        ao = s.x("sat(a)", a=ao0)
         # normalise height around its own range (set by set_height_range)
-        s.rng = s.ctl('disp_range_mm', 10.0, 0.1, 100, 'Displacement Range (mm)')
-        hn = s.x('sat(a/R+0.5)', a=H, R=s.rng)
-        alb = s.cl('    float3 c=@c_a*@G; float l=dot(c,(float3)(0.2126,0.7152,0.0722));\n'
-                   '    c=mix((float3)(l),c,@S); @dst.set(clamp(c,0.0,1.0));',
-                   out='float3', c_a=albedo, G='$albedo_gain', S='$albedo_saturation')
-        rg = s.x('clamp(a*G+O,0.03,1.0)', a=rough, G='$roughness_gain', O='$roughness_offset')
-        s.ctl('specular_gain', 1.0, 0, 2)
-        sp = s.x('clamp(a*G,0.0,1.0)', a=spec if spec is not None else s.x('1.0'), G='$specular_gain')
+        s.rng = s.ctl("disp_range_mm", 10.0, 0.1, 100, "Displacement Range (mm)")
+        hn = s.x("sat(a/R+0.5)", a=H, R=s.rng)
+        alb = s.cl(
+            "    float3 c=@c_a*@G; float l=dot(c,(float3)(0.2126,0.7152,0.0722));\n"
+            "    c=mix((float3)(l),c,@S); @dst.set(clamp(c,0.0,1.0));",
+            out="float3",
+            c_a=albedo,
+            G="$albedo_gain",
+            S="$albedo_saturation",
+        )
+        rg = s.x("clamp(a*G+O,0.03,1.0)", a=rough, G="$roughness_gain", O="$roughness_offset")
+        s.ctl("specular_gain", 1.0, 0, 2)
+        sp = s.x(
+            "clamp(a*G,0.0,1.0)", a=spec if spec is not None else s.x("1.0"), G="$specular_gain"
+        )
         s.out = {}
-        for k, nd in (('basecolor', alb), ('roughness', rg), ('specular', sp), ('height', hn), ('normal', nrm), ('ao', ao)):
-            o = s.n('null', 'OUT_' + k, ins=[nd])
+        for k, nd in (
+            ("basecolor", alb),
+            ("roughness", rg),
+            ("specular", sp),
+            ("height", hn),
+            ("normal", nrm),
+            ("ao", ao),
+        ):
+            o = s.n("null", "OUT_" + k, ins=[nd])
             o.setColor(hou.Color(0.3, 0.8, 0.3))
             s.out[k] = o
         s.Hmm = H
         # cheap lit preview (raking light), display referred
-        pv = s.cl('''    float3 n=normalize(@c_n*2.0-1.0);
+        pv = s.cl(
+            """    float3 n=normalize(@c_n*2.0-1.0);
     float3 L=normalize((float3)(-0.55,0.62,0.5));
     float3 V=(float3)(0.0,0.0,1.0); float3 Hh=normalize(L+V);
     float r=max(@r,0.05); float a2=r*r*r*r;
@@ -341,8 +402,15 @@ class B(object):
     float nl=max(dot(n,L),0.0);
     float amb=0.22*@ao;
     float3 c=@c_a*(nl*1.5+amb)+(float3)(spec*nl*1.5);
-    @dst.set(pow(clamp(c,0.0,1.0),(float3)(1.0/2.2)));''', out='float3', c_n=nrm, c_a=alb, r=rg, ao=ao, sw=sp)
-        s.out['preview'] = s.n('null', 'OUT_preview', ins=[pv])
+    @dst.set(pow(clamp(c,0.0,1.0),(float3)(1.0/2.2)));""",
+            out="float3",
+            c_n=nrm,
+            c_a=alb,
+            r=rg,
+            ao=ao,
+            sw=sp,
+        )
+        s.out["preview"] = s.n("null", "OUT_preview", ins=[pv])
         s.net.layoutChildren()
         return s
 
@@ -351,16 +419,16 @@ class B(object):
         L = s.Hmm.layer()
         m = max(abs(L.computeMin()), abs(L.computeMax()))
         r = max(0.5, round(m * 2.0 * 1.05 + 0.05, 1))
-        s.ctlnode.parm('disp_range_mm').set(r)
+        s.ctlnode.parm("disp_range_mm").set(r)
         ptg = s.ctlnode.parmTemplateGroup()
-        pt = ptg.find('disp_range_mm')
+        pt = ptg.find("disp_range_mm")
         pt.setDefaultValue((r,))
-        ptg.replace('disp_range_mm', pt)
+        ptg.replace("disp_range_mm", pt)
         s.ctlnode.setParmTemplateGroup(ptg)
         return r
 
 
-class Material(object):
+class Material:
     """material state: height (mm), colour layers, tone multipliers, roughness deltas"""
 
     def __init__(s, b, base_col, base_rough, base_spec=0.8):
@@ -368,42 +436,42 @@ class Material(object):
         s.h = None
         s.base_col = base_col
         s.base_rough = base_rough
-        s.col = []     # (mask, colour, amount)
-        s.tone = []    # (signed mask, amount)  multiplies albedo
-        s.r = []       # (mask, delta)
+        s.col = []  # (mask, colour, amount)
+        s.tone = []  # (signed mask, amount)  multiplies albedo
+        s.r = []  # (mask, delta)
         s.base_spec = base_spec
-        s.sp = []      # (mask, delta)  specular weight
+        s.sp = []  # (mask, delta)  specular weight
 
     def addh(s, mask, k):
-        s.h = s.b.x('h+m*K', h=s.h, m=mask, K=k)
+        s.h = s.b.x("h+m*K", h=s.h, m=mask, K=k)
 
     def done(s, ao_radius=0.015):
         b = s.b
         alb = b.colmix(s.base_col, s.col)
         if s.tone:
-            ins = {'c_a': alb}
-            body = '    float3 c=@c_a; float t=1.0;\n'
+            ins = {"c_a": alb}
+            body = "    float3 c=@c_a; float t=1.0;\n"
             for i, (m, a) in enumerate(s.tone):
-                ins['t%d' % i] = m
-                ins['T%d' % i] = a
-                body += '    t*=1.0+@t%d*@T%d;\n' % (i, i)
-            body += '    @dst.set(c*max(t,0.05));'
-            alb = b.cl(body, out='float3', **ins)
+                ins["t%d" % i] = m
+                ins["T%d" % i] = a
+                body += "    t*=1.0+@t%d*@T%d;\n" % (i, i)
+            body += "    @dst.set(c*max(t,0.05));"
+            alb = b.cl(body, out="float3", **ins)
         ins = {}
-        body = '    float r=%f;\n' % s.base_rough
+        body = f"    float r={s.base_rough:f};\n"
         for i, (m, d) in enumerate(s.r):
-            ins['m%d' % i] = m
-            ins['D%d' % i] = d
-            body += '    r+=@m%d*@D%d;\n' % (i, i)
-        body += '    @dst.set(r);'
+            ins["m%d" % i] = m
+            ins["D%d" % i] = d
+            body += "    r+=@m%d*@D%d;\n" % (i, i)
+        body += "    @dst.set(r);"
         rough = b.cl(body, **ins)
         ins = {}
-        body = '    float w=%f;\n' % s.base_spec
+        body = f"    float w={s.base_spec:f};\n"
         for i, (m, d) in enumerate(s.sp):
-            ins['m%d' % i] = m
-            ins['D%d' % i] = d
-            body += '    w+=@m%d*@D%d;\n' % (i, i)
-        body += '    @dst.set(w);'
+            ins["m%d" % i] = m
+            ins["D%d" % i] = d
+            body += "    w+=@m%d*@D%d;\n" % (i, i)
+        body += "    @dst.set(w);"
         spec = b.cl(body, **ins)
         b.finish(s.h, alb, rough, ao_radius=ao_radius, spec=spec)
         return b
@@ -411,10 +479,10 @@ class Material(object):
 
 # map key -> file suffix. base colour is linear Rec.709, everything else is data
 MAPS = {
-    'basecolor': 'BaseColor_lin_srgb',
-    'normal': 'Normal_raw',
-    'roughness': 'Roughness_raw',
-    'specular': 'Specular_raw',
-    'ao': 'AO_raw',
-    'height': 'Height_raw',
+    "basecolor": "BaseColor_lin_srgb",
+    "normal": "Normal_raw",
+    "roughness": "Roughness_raw",
+    "specular": "Specular_raw",
+    "ao": "AO_raw",
+    "height": "Height_raw",
 }

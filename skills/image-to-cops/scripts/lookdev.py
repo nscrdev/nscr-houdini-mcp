@@ -14,14 +14,24 @@ Colour: base colour EXRs are linear Rec.709 and are tagged so Karma converts the
 (the OCIO scene_linear role). Renders are written in the working space and converted for display
 with the config's default view, so what is judged is what a viewer would show.
 """
-import sys, os, json, subprocess, time
+
+# Node code and VEX snippets are embedded as strings, so long lines and percent
+# formatting are left as they are.
+# ruff: noqa: E501, UP031
+
+import json
+import os
+import subprocess
+import sys
+import time
+
 import hou
 
-HDRI = '$HFS/houdini/pic/hdri/HDRIHaven_kiara_5_noon_2k.rat'
-BALL_SCENE = '$HFS/houdini/usd/scenes/material_lookdev/standard_shader_ball.usd'
+HDRI = "$HFS/houdini/pic/hdri/HDRIHaven_kiara_5_noon_2k.rat"
+BALL_SCENE = "$HFS/houdini/usd/scenes/material_lookdev/standard_shader_ball.usd"
 BALL_TILES = 2
 
-MAT = r'''
+MAT = r"""
 import hou
 from pxr import Usd, UsdGeom, UsdShade, UsdLux, Sdf, Gf
 node = hou.pwd()
@@ -61,9 +71,11 @@ def make_mat(path, disp_scale):
     mat.CreateSurfaceOutput('mtlx').ConnectToSource(ss.ConnectableAPI(), 'out')
     mat.CreateDisplacementOutput('mtlx').ConnectToSource(dp.ConnectableAPI(), 'out')
     return mat
-'''
+"""
 
-SCENE = MAT + r'''
+SCENE = (
+    MAT
+    + r"""
 def quad(path, pts, st):
     m = UsdGeom.Mesh.Define(stage, path)
     m.CreatePointsAttr([Gf.Vec3f(*p) for p in pts])
@@ -96,9 +108,12 @@ def camera(path, eye, tgt, focal, ortho=0.0):
 camera('/cameras/cam', (-2.4, 1.2, 6.4), (0.4, 1.9, 0.0), 30.0)        # wide
 camera('/cameras/close', (0.75, 1.45, 1.0), (-0.25, 1.5, 0.0), 40.0)    # raking close-up for relief
 camera('/cameras/front', (0.0, 1.5 * tile, 9.0), (0.0, 1.5 * tile, 0.0), 0.0, ortho=3.0 * tile)   # 3x3 tiles, front on
-'''
+"""
+)
 
-BALL = MAT + r'''
+BALL = (
+    MAT
+    + r"""
 import numpy as np
 for p in ('/World/box', '/World/lights'):          # the scene's own light box goes; the HDRI lights it instead
     prim = stage.GetPrimAtPath(p)
@@ -123,110 +138,131 @@ api.Bind(mat, UsdShade.Tokens.strongerThanDescendants)
 api.Bind(mat, UsdShade.Tokens.strongerThanDescendants, UsdShade.Tokens.full)
 ball.CreateAttribute('primvars:karma:object:dicingquality', Sdf.ValueTypeNames.Float).Set(2.0)
 node.setUserData('per_uv', '%g' % per_uv)
-'''
+"""
+)
 
 
 def _parms(py, texdir):
     ptg = py.parmTemplateGroup()
-    ptg.append(hou.StringParmTemplate('texdir', 'Texture Dir', 1, default_value=(texdir,)))
-    ptg.append(hou.StringParmTemplate('matname', 'Material', 1))
-    ptg.append(hou.FloatParmTemplate('tile', 'Tile Size', 1, default_value=(3.0,)))
-    ptg.append(hou.FloatParmTemplate('disp_mm', 'Displacement Range mm', 1, default_value=(10.0,)))
-    ptg.append(hou.IntParmTemplate('ball_tiles', 'Tiles Across Shader Ball', 1, default_value=(BALL_TILES,)))
+    ptg.append(hou.StringParmTemplate("texdir", "Texture Dir", 1, default_value=(texdir,)))
+    ptg.append(hou.StringParmTemplate("matname", "Material", 1))
+    ptg.append(hou.FloatParmTemplate("tile", "Tile Size", 1, default_value=(3.0,)))
+    ptg.append(hou.FloatParmTemplate("disp_mm", "Displacement Range mm", 1, default_value=(10.0,)))
+    ptg.append(
+        hou.IntParmTemplate(
+            "ball_tiles", "Tiles Across Shader Ball", 1, default_value=(BALL_TILES,)
+        )
+    )
     py.setParmTemplateGroup(ptg)
 
 
 def _tail(stage, src, camera, hdri, rot, exposure, resx):
-    sky = stage.createNode('domelight', 'hdri')      # image based lighting only
+    sky = stage.createNode("domelight", "hdri")  # image based lighting only
     sky.setInput(0, src)
-    sky.parm('primpath').set('/lights/hdri')
-    sky.parm('xn__inputstexturefile_r3ah').set(hdri)
-    sky.parm('xn__inputsintensity_i0a').set(1.0)
-    sky.parm('xn__inputsexposure_vya').set(exposure)
-    sky.parm('ry').set(rot)
-    krs = stage.createNode('karmarendersettings', 'krs')
+    sky.parm("primpath").set("/lights/hdri")
+    sky.parm("xn__inputstexturefile_r3ah").set(hdri)
+    sky.parm("xn__inputsintensity_i0a").set(1.0)
+    sky.parm("xn__inputsexposure_vya").set(exposure)
+    sky.parm("ry").set(rot)
+    krs = stage.createNode("karmarendersettings", "krs")
     krs.setInput(0, sky)
-    krs.parm('camera').set(camera)
-    krs.parm('resolutionx').set(resx)
-    krs.parm('engine').set('xpu')
-    krs.parm('pathtracedsamples').set(64)
-    krs.parm('diffuselimit').set(4)             # Karma defaults to 1 diffuse bounce, which leaves shadows too dark
-    rop = stage.createNode('usdrender_rop', 'render')
+    krs.parm("camera").set(camera)
+    krs.parm("resolutionx").set(resx)
+    krs.parm("engine").set("xpu")
+    krs.parm("pathtracedsamples").set(64)
+    krs.parm("diffuselimit").set(
+        4
+    )  # Karma defaults to 1 diffuse bounce, which leaves shadows too dark
+    rop = stage.createNode("usdrender_rop", "render")
     rop.setInput(0, krs)
     stage.layoutChildren()
     return sky, krs, rop
 
 
 def build(texdir, hdri=HDRI, rot=0.0, exposure=0.0):
-    stage = hou.node('/stage')
+    stage = hou.node("/stage")
     for n in stage.children():
         n.destroy()
-    py = stage.createNode('pythonscript', 'lookdev_scene')
+    py = stage.createNode("pythonscript", "lookdev_scene")
     _parms(py, texdir)
-    py.parm('python').set(SCENE)
-    sky, krs, rop = _tail(stage, py, '/cameras/cam', hdri, rot, exposure, 1600)
+    py.parm("python").set(SCENE)
+    sky, krs, rop = _tail(stage, py, "/cameras/cam", hdri, rot, exposure, 1600)
     return py, None, sky, krs, rop
 
 
 def build_ball(texdir, hdri=HDRI, rot=0.0, exposure=0.0):
-    stage = hou.node('/stage')
+    stage = hou.node("/stage")
     for n in stage.children():
         n.destroy()
-    sub = stage.createNode('sublayer', 'material_lookdev_scene')
-    sub.parm('filepath1').set(BALL_SCENE)
-    py = stage.createNode('pythonscript', 'lookdev_scene')
+    sub = stage.createNode("sublayer", "material_lookdev_scene")
+    sub.parm("filepath1").set(BALL_SCENE)
+    py = stage.createNode("pythonscript", "lookdev_scene")
     py.setInput(0, sub)
     _parms(py, texdir)
-    py.parm('python').set(BALL)
-    sky, krs, rop = _tail(stage, py, '/World/Camera', hdri, rot, exposure, 1400)
+    py.parm("python").set(BALL)
+    sky, krs, rop = _tail(stage, py, "/World/Camera", hdri, rot, exposure, 1400)
     return py, None, sky, krs, rop
 
 
 # ---------------------------------------------------------------- command line
-if __name__ == '__main__':
+if __name__ == "__main__":
     import PyOpenColorIO as OCIO
+
     arg = sys.argv[1:]
     tex, name, out = os.path.abspath(arg[0]), arg[1], os.path.abspath(arg[2])
     ball_rot = float(arg[3]) if len(arg) > 3 else 345.0
     close_rot = float(arg[4]) if len(arg) > 4 else 110.0
     exposure = float(arg[5]) if len(arg) > 5 else 0.4
     samples = int(arg[6]) if len(arg) > 6 else 64
-    views = arg[7].split(',') if len(arg) > 7 else ['ball', 'front', 'close']
+    views = arg[7].split(",") if len(arg) > 7 else ["ball", "front", "close"]
     BALL_TILES = int(arg[8]) if len(arg) > 8 else 2
-    HDRI = os.environ.get('IMAGE_TO_COPS_HDRI', HDRI)
+    HDRI = os.environ.get("IMAGE_TO_COPS_HDRI", HDRI)
     cfg = OCIO.GetCurrentConfig()
-    work = cfg.getCanonicalName('scene_linear')
-    display = os.environ.get('IMAGE_TO_COPS_DISPLAY') or cfg.getDefaultDisplay()
-    view = os.environ.get('IMAGE_TO_COPS_VIEW') or cfg.getDefaultView(display)
-    print('working space %s | display %s | view %s' % (work, display, view))
-    meta = json.load(open(os.path.join(tex, name, 'meta.json')))
+    work = cfg.getCanonicalName("scene_linear")
+    display = os.environ.get("IMAGE_TO_COPS_DISPLAY") or cfg.getDefaultDisplay()
+    view = os.environ.get("IMAGE_TO_COPS_VIEW") or cfg.getDefaultView(display)
+    print(f"working space {work} | display {display} | view {view}")
+    meta = json.load(open(os.path.join(tex, name, "meta.json")))
     os.makedirs(out, exist_ok=True)
-    oiiotool = hou.text.expandString('$HB/hoiiotool')
+    oiiotool = hou.text.expandString("$HB/hoiiotool")
     t0 = time.time()
 
     def shoot(py, krs, rop, label, camera):
-        krs.parm('pathtracedsamples').set(samples)
-        py.parm('matname').set(name)
-        py.parm('tile').set(meta['tile'])
-        py.parm('disp_mm').set(meta['disp_mm'])
-        krs.parm('camera').set(camera)
-        pic = os.path.join(out, '%s_%s.exr' % (name, label))
-        krs.parm('picture').set(pic)
+        krs.parm("pathtracedsamples").set(samples)
+        py.parm("matname").set(name)
+        py.parm("tile").set(meta["tile"])
+        py.parm("disp_mm").set(meta["disp_mm"])
+        krs.parm("camera").set(camera)
+        pic = os.path.join(out, f"{name}_{label}.exr")
+        krs.parm("picture").set(pic)
         rop.render()
-        r = subprocess.run([oiiotool, pic, '--ch', 'R,G,B', '--ociodisplay:from=' + work, display, view,
-                            '-o', pic.replace('.exr', '.jpg')], capture_output=True, text=True)
+        r = subprocess.run(
+            [
+                oiiotool,
+                pic,
+                "--ch",
+                "R,G,B",
+                "--ociodisplay:from=" + work,
+                display,
+                view,
+                "-o",
+                pic.replace(".exr", ".jpg"),
+            ],
+            capture_output=True,
+            text=True,
+        )
         assert r.returncode == 0 and not r.stderr.strip(), r.stderr[-400:]
         os.remove(pic)
 
-    if 'ball' in views:
+    if "ball" in views:
         # the shipped scene's pale ground needs about a stop less light than the wall
         py, _, sky, krs, rop = build_ball(tex, hdri=HDRI, rot=ball_rot, exposure=exposure - 1.0)
-        shoot(py, krs, rop, 'ball', '/World/Camera')
-    wall = [v for v in views if v != 'ball']
+        shoot(py, krs, rop, "ball", "/World/Camera")
+    wall = [v for v in views if v != "ball"]
     if wall:
         py, _, sky, krs, rop = build(tex, hdri=HDRI, rot=close_rot, exposure=exposure)
         for v in wall:
-            sky.parm('ry').set(ball_rot if v == 'front' else close_rot)
-            krs.parm('resolutionx').set(1400)
-            shoot(py, krs, rop, 'wide' if v == 'cam' else v, '/cameras/' + v)
-    print('SHOT %s in %.0fs' % (name, time.time() - t0))
+            sky.parm("ry").set(ball_rot if v == "front" else close_rot)
+            krs.parm("resolutionx").set(1400)
+            shoot(py, krs, rop, "wide" if v == "cam" else v, "/cameras/" + v)
+    print(f"SHOT {name} in {time.time() - t0:.0f}s")
