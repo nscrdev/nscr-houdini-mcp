@@ -136,6 +136,41 @@ def test_the_skill_passes_the_lint() -> None:
     assert lint.main([str(SKILL)]) == 0
 
 
+# Section: the image-to-cops skill
+
+IMAGE_TO_COPS = ROOT / "skills" / "image-to-cops"
+
+
+def test_image_to_cops_names_itself_and_says_when_to_use_it() -> None:
+    fields, body = frontmatter((IMAGE_TO_COPS / "SKILL.md").read_text(encoding="utf-8"))
+    assert set(fields) == {"name", "description", "compatibility"}
+    assert fields["name"] == "image-to-cops"
+    assert len(fields["description"]) > 100
+    assert len(body.splitlines()) < 200
+    # It must ask which surface is meant before building anything.
+    assert "ask" in sections(body)["Before building: know which material"][0].lower()
+
+
+def test_image_to_cops_ships_what_its_text_points_at() -> None:
+    text = (IMAGE_TO_COPS / "SKILL.md").read_text(encoding="utf-8")
+    for rel in re.findall(r"`((?:scripts|references|examples)/[\w./-]+)`", text):
+        assert (IMAGE_TO_COPS / rel).is_file(), rel
+    for script in (IMAGE_TO_COPS / "scripts").glob("*.sh"):
+        assert script.stat().st_mode & stat.S_IXUSR, script.name
+
+
+def test_image_to_cops_reads_the_same_as_the_rest() -> None:
+    lint = load_lint()
+    files = [path for path in IMAGE_TO_COPS.rglob("*") if path.suffix in {".md", ".py", ".sh"}]
+    assert lint.check(files, ROOT) == []
+    for path in files:
+        if path.suffix != ".md":
+            continue
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            assert "\u2014" not in line and "\u2013" not in line, (path.name, number)
+            assert not re.search(r"https?://|www\.", line), (path.name, number)
+
+
 # Section: where the skills are
 
 

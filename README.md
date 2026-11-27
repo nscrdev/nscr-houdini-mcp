@@ -723,6 +723,14 @@ lookdev, cleaning up a network, matching a reference, finding out why a scene
 is slow and getting a scene ready to hand on. It is written for this server,
 and still helps with planning when no Houdini is connected.
 
+The second, `image-to-cops`, turns a material seen in a photo or film still
+into a tileable procedural material built in Copernicus. It asks which surface
+you mean when an image holds several, builds the material in layers, bakes it
+to EXR maps one process at a time under a memory guard, renders it on
+Houdini's own shader ball scene under one of its HDRIs, and lays the result
+beside the reference on a contact sheet. It carries its scripts with it, in
+the skill's `scripts` folder, and a worked set of recipes in `examples`.
+
 The skills ship with the package:
 
 ```sh

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Skills
+
+- A second skill, `image-to-cops`: recreate a material from a reference image
+  as a layered, tileable Copernicus network, bake it to EXR maps, render it on
+  the shipped shader ball scene in Karma XPU and compare it with the reference
+  on a contact sheet. It ships its own builder library, a bake that streams
+  the cook and frees layers as it goes, a memory guard for batches, and notes
+  on what makes a procedural material read as real.
+
 ### Outputs
 
 - The readable `_run.json` beside each output is now off by default. Set
