@@ -1152,6 +1152,12 @@ ends the worker, interrupts its jobs and loses unsaved changes in that
 worker, so save first. It shows as `crashed` in `hou_sessions` list
 afterwards; that means the client ended it, not that Houdini crashed.
 
+Such a worker does not rely on the client to end it. It watches for the
+server that started it, and once that server has gone it ends itself within
+a few seconds, after any call already running in it has finished. It then
+shows as `gone`. So a server that exits cleanly, or a client that leaves the
+worker running, does not leave a Houdini behind.
+
 Each worker is asked once, when it comes up, what it can do: the build, the
 license it got, the renderers that are really installed, how it can make a
 picture, and that it can be cancelled. The answer is kept beside the worker,

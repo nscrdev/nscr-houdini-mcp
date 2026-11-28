@@ -19,6 +19,13 @@ the store from a small thread of its own. Any server that routes a call to it
 renews that lease. When nobody has wanted it for `max_idle_s`, it ends itself.
 There is no daemon anywhere in this.
 
+Windows is the one place a worker may be unable to leave its server: a client
+can hold the server in a job that lets nothing out. Such a worker is said to
+live as long as its server, and it makes that true itself. Its row names the
+server, and the same thread that watches the lease ends the worker once that
+server has gone. The job is not trusted to do it, because the job a worker is
+left in may belong to something that outlives the server.
+
 Weights. Three workers can each ask for every core, so a reservation carries a
 weight and the pool holds a budget. A heavy job is refused while the machine
 is already busy, even when a slot under the cap is free.
@@ -121,6 +128,13 @@ LOG_KEEP = 2
 # How long a process is given to go after it has been ended outright. The kill
 # is not a request, so this is short.
 KILL_WAIT_S = 5.0
+
+# What a worker's capability record says when it lives only as long as the
+# server that started it, and where that record names the server.
+LIFETIME_KEY = "lifetime"
+LIFETIME_SERVER = "server"
+SERVER_PID_KEY = "server_pid"
+SERVER_PID_START_KEY = "server_pid_start"
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 ERROR_ACCESS_DENIED = 5
 
@@ -606,7 +620,11 @@ def start_worker(
         )
         capabilities = probe(entry)
         if launched.server_bound:
-            capabilities["lifetime"] = "server"
+            # The worker reads this from its own row and ends itself once
+            # this server has gone, whatever becomes of the job it is in.
+            capabilities[LIFETIME_KEY] = LIFETIME_SERVER
+            capabilities[SERVER_PID_KEY] = os.getpid()
+            capabilities[SERVER_PID_START_KEY] = process_start_stamp(os.getpid())
         # From here the worker owns its own slot. The process that started it
         # may go away without taking the warm worker with it.
         record = store.set_worker_state(
@@ -863,11 +881,13 @@ def watch_lease(
     """Watch one worker's own row until it should end, and say why.
 
     This runs inside the worker, on a thread of its own, so nothing on the
-    machine has to stay alive to look after the pool. Five answers: `asked`
+    machine has to stay alive to look after the pool. Six answers: `asked`
     when a server set the row to stopping, `idle` when nobody has wanted this
-    worker for long enough, `gone` when the row has been ended or removed
-    under it, `stopped` when the process is going down for its own reasons,
-    and `unreadable` when the store has not been readable for a long time.
+    worker for long enough, `server_gone` when the worker lives only as long
+    as the server that started it and that server has ended, `gone` when the
+    row has been ended or removed under it, `stopped` when the process is
+    going down for its own reasons, and `unreadable` when the store has not
+    been readable for a long time.
 
     A worker holding a job is never idle, however long the job runs, and
     neither is one whose `busy` says a call is running in it now: a call can
@@ -920,6 +940,12 @@ def _lease_pass(
         # about to exit: the worker releases it then, or whoever stops it
         # does once the process has gone, or the reaper.
         return "asked"
+    if server_has_gone(record.capabilities):
+        # A job on the row does not hold a bound worker: the promise is that
+        # it ends with its server, and a call already running in it is let
+        # finish by the thread that owns the process.
+        store.set_worker_state(token, "stopping")
+        return "server_gone"
     now = clock()
     # On every platform, cold startup can take longer than the idle lease.
     # Give it the startup deadline; moving to running starts the idle wait.
@@ -938,6 +964,27 @@ def _lease_pass(
         store.set_worker_state(token, "stopping")
         return "idle"
     return None
+
+
+def server_has_gone(capabilities: Any) -> bool:
+    """Whether a worker bound to its server has lost that server.
+
+    Only a worker whose record says it lives as long as its server is ever
+    bound, and only a server that can be shown to have gone counts: its pid
+    is free, or another process has started under that number since. Where
+    the system will not say, the worker stays, and the idle lease ends it as
+    it would any other.
+    """
+    if not isinstance(capabilities, Mapping):
+        return False
+    if capabilities.get(LIFETIME_KEY) != LIFETIME_SERVER:
+        return False
+    pid = capabilities.get(SERVER_PID_KEY)
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        # A row written before servers were named has nobody to look for.
+        return False
+    stamp = capabilities.get(SERVER_PID_START_KEY)
+    return same_process(pid, stamp if isinstance(stamp, str) else None) is False
 
 
 def release_on_exit(home: Path | str, token: str) -> None:
