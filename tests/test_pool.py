@@ -419,6 +419,96 @@ def test_a_worker_running_a_call_is_never_idle_however_long_it_runs(
         assert _watch_once(store, record.token, clock, threading.Event()) == "idle"
 
 
+# Section: a worker bound to its server
+
+
+def start_bound(config: pool.PoolConfig, store: Store, hython: Path):
+    """Start a worker the way Windows does when it could not leave its server's job."""
+    launcher = FakeLauncher(config.home)
+
+    def spawn(command, *, log, env):
+        launched = launcher.spawn(command, log=log, env=env)
+        return pool.Launched(launched.pid, server_bound=True)
+
+    return pool.start_worker(config, store, hython=hython, spawn=spawn, probe=launcher.probe)
+
+
+def _bind_to(store: Store, record, *, pid: int, stamp: str | None) -> None:
+    """Rewrite which server a bound worker's row names."""
+    bound = dict(record.capabilities, server_pid=pid, server_pid_start=stamp)
+    store.set_worker_state(record.token, "running", capabilities=bound)
+
+
+def test_a_server_bound_worker_records_which_server_it_is_bound_to(
+    config: pool.PoolConfig, store: Store, hython: Path
+) -> None:
+    record = start_bound(config, store, hython)
+    assert record.capabilities["server_pid"] == os.getpid()
+    assert record.capabilities["server_pid_start"] == store_module.process_start_stamp()
+
+
+def test_a_worker_that_outlives_its_server_does_not_record_one(
+    config: pool.PoolConfig, store: Store, hython: Path
+) -> None:
+    record = start(config, store, FakeLauncher(config.home), hython)
+    assert "server_pid" not in record.capabilities
+
+
+def test_a_server_bound_worker_stays_while_its_server_is_running(home: Path, hython: Path) -> None:
+    clock = FakeClock()
+    with lease_store(home, clock) as store:
+        record = start_bound(pool.PoolConfig(home=home, max_idle_s=60.0), store, hython)
+        assert _watch_once(store, record.token, clock, threading.Event()) is None
+        assert store.get_worker(record.token).state == "running"
+
+
+def test_a_server_bound_worker_ends_itself_when_its_server_has_gone(
+    home: Path, hython: Path
+) -> None:
+    """The job a worker could not leave does not always end it with the server."""
+    clock = FakeClock()
+    with lease_store(home, clock) as store:
+        record = start_bound(pool.PoolConfig(home=home, max_idle_s=60.0), store, hython)
+        _bind_to(store, record, pid=_pid_that_is_gone(), stamp=None)
+        assert _watch_once(store, record.token, clock, threading.Event()) == "server_gone"
+        # The slot stays taken until the process is about to exit.
+        assert store.get_worker(record.token).state == "stopping"
+
+
+def test_another_process_under_the_servers_old_pid_is_not_the_server(
+    home: Path, hython: Path
+) -> None:
+    clock = FakeClock()
+    with lease_store(home, clock) as store:
+        record = start_bound(pool.PoolConfig(home=home, max_idle_s=60.0), store, hython)
+        _bind_to(store, record, pid=os.getpid(), stamp="started-at-some-other-time")
+        assert _watch_once(store, record.token, clock, threading.Event()) == "server_gone"
+
+
+def test_a_server_bound_worker_on_a_job_still_ends_with_its_server(
+    home: Path, hython: Path
+) -> None:
+    """The job only keeps a worker from being idle, not from being bound."""
+    clock = FakeClock()
+    with lease_store(home, clock) as store:
+        record = start_bound(pool.PoolConfig(home=home, max_idle_s=60.0), store, hython)
+        pool.reserve(store, "w1", job_id="job-1")
+        _bind_to(store, record, pid=_pid_that_is_gone(), stamp=None)
+        assert _watch_once(store, record.token, clock, threading.Event()) == "server_gone"
+
+
+def test_a_dead_starter_does_not_end_a_worker_that_is_not_bound_to_it(
+    home: Path, hython: Path
+) -> None:
+    clock = FakeClock()
+    with lease_store(home, clock) as store:
+        config = pool.PoolConfig(home=home, max_idle_s=60.0)
+        record = start(config, store, FakeLauncher(home), hython)
+        loose = dict(record.capabilities, server_pid=_pid_that_is_gone())
+        store.set_worker_state(record.token, "running", capabilities=loose)
+        assert _watch_once(store, record.token, clock, threading.Event()) is None
+
+
 def test_a_job_on_the_worker_row_keeps_it_and_its_end_starts_the_idle_wait(
     home: Path, hython: Path
 ) -> None:

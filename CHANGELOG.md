@@ -25,6 +25,10 @@
   outlives its server as on macOS and Linux. When Windows does not allow it,
   the worker lives as long as its server, reports `lifetime: server`, and a
   warning says so.
+- A worker that reports `lifetime: server` now ends itself when its server
+  has gone. Before, it relied on the client's process job to end it, and a
+  worker left in a job that outlived the server kept running until its idle
+  limit, half an hour by default.
 - The server finds Houdini on the system drive when a client starts it
   without `ProgramFiles` set.
 - Repeated viewport captures in a worker no longer crash Houdini's Vulkan
