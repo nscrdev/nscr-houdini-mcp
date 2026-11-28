@@ -80,6 +80,21 @@ Quick start is not needed.
    a shell, then in a Code session click **+**, choose Plugins, then Add
    plugin, and install `nscr-houdini`.
 
+   The first start is the slow one. `uvx` builds the server and downloads
+   about 30 MB of dependencies before the server can answer, and the client
+   waits 30 seconds for a server to start. On a slow connection or a busy
+   machine the first start can miss that, and the server shows as failed
+   with a connection timeout. Nothing is broken: the build is kept, so the
+   next start takes a few seconds. Reconnect the server from `/mcp`, or
+   start a new session once the client retries (it skips a failed plugin
+   server for 15 minutes). To make a miss less likely:
+
+   - Run step 2 before step 1. It downloads the same dependencies, so the
+     plugin's first start only has to build.
+   - Or give servers longer to start, by setting `MCP_TIMEOUT` (in
+     milliseconds, for example `120000`) in the `env` block of the client's
+     user settings file. The plugin cannot set this for you.
+
 2. Install the Houdini side once, as in step 2 of the
    [Quick start](#manual-install-any-mcp-client). If
    `nscr-houdini-mcp` is not on your path, run it through `uvx`:

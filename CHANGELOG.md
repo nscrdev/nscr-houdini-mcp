@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Install
+
+- The README says why a plugin's first start can time out (the first `uvx`
+  build and download can pass the client's 30 second limit), that the next
+  start works, and two ways to avoid it.
+
 ### Skills
 
 - A second skill, `image-to-cops`: recreate a material from a reference image
